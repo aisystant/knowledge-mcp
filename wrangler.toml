@@ -1,0 +1,9 @@
+name = "knowledge-mcp"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[vars]
+SURREAL_HOST = "https://your-surrealdb-host.com"
+
+# Secrets (set via `wrangler secret put`):
+# OPENAI_API_KEY - for generating query embeddings
