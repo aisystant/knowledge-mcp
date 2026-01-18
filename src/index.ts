@@ -1,5 +1,7 @@
 interface Env {
   SURREAL_HOST: string;
+  SURREAL_USER: string;
+  SURREAL_PASSWORD: string;
   OPENAI_API_KEY: string;
 }
 
@@ -33,14 +35,6 @@ interface McpResponse {
   id: string | number;
   result?: unknown;
   error?: { code: number; message: string };
-}
-
-function parseAuth(authHeader: string | null): { user: string; password: string } | null {
-  if (!authHeader?.startsWith("Basic ")) return null;
-  const decoded = atob(authHeader.slice(6));
-  const [user, password] = decoded.split(":");
-  if (!user || !password) return null;
-  return { user, password };
 }
 
 async function surrealQuery<T>(
@@ -187,11 +181,11 @@ const TOOLS = [
 
 async function handleMcpRequest(
   request: McpRequest,
-  env: Env,
-  auth: { user: string; password: string }
+  env: Env
 ): Promise<McpResponse> {
   const { id, method, params } = request;
-  const namespace = auth.user;
+  const { SURREAL_USER: user, SURREAL_PASSWORD: password } = env;
+  const namespace = user;
 
   try {
     switch (method) {
@@ -216,7 +210,7 @@ async function handleMcpRequest(
         if (toolName === "search") {
           const query = args.query as string;
           const limit = (args.limit as number) || 5;
-          const results = await searchDocuments(env, namespace, auth.user, auth.password, query, limit);
+          const results = await searchDocuments(env, namespace, user, password, query, limit);
           return {
             jsonrpc: "2.0",
             id,
@@ -228,7 +222,7 @@ async function handleMcpRequest(
 
         if (toolName === "get_document") {
           const filename = args.filename as string;
-          const doc = await getDocument(env, namespace, auth.user, auth.password, filename);
+          const doc = await getDocument(env, namespace, user, password, filename);
           if (!doc) {
             return {
               jsonrpc: "2.0",
@@ -289,19 +283,10 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // Auth check
-    const auth = parseAuth(request.headers.get("Authorization"));
-    if (!auth) {
-      return new Response("Unauthorized: Basic auth required (user:password)", {
-        status: 401,
-        headers: { ...corsHeaders, "WWW-Authenticate": "Basic" },
-      });
-    }
-
     // MCP endpoint
     if (url.pathname === "/mcp" && request.method === "POST") {
       const body = (await request.json()) as McpRequest;
-      const response = await handleMcpRequest(body, env, auth);
+      const response = await handleMcpRequest(body, env);
       return new Response(JSON.stringify(response), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
