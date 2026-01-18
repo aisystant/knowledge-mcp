@@ -37,28 +37,50 @@ interface McpResponse {
   error?: { code: number; message: string };
 }
 
+async function surrealSignin(
+  host: string,
+  namespace: string,
+  username: string,
+  password: string
+): Promise<string> {
+  const response = await fetch(`${host}/signin`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({ ns: namespace, user: username, pass: password }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`SurrealDB signin error: ${response.status} ${text}`);
+  }
+
+  const data = (await response.json()) as { token: string };
+  return data.token;
+}
+
 async function surrealQuery<T>(
   host: string,
   namespace: string,
   database: string,
   user: string,
   password: string,
-  query: string,
-  vars?: Record<string, unknown>
+  query: string
 ): Promise<T[]> {
-  const url = `${host}/sql`;
-  const body = vars ? { query, vars } : query;
+  const token = await surrealSignin(host, namespace, user, password);
 
-  const response = await fetch(url, {
+  const response = await fetch(`${host}/sql`, {
     method: "POST",
     headers: {
-      "Content-Type": vars ? "application/json" : "text/plain",
+      "Content-Type": "text/plain",
       Accept: "application/json",
-      NS: namespace,
-      DB: database,
-      Authorization: `Basic ${btoa(`${user}:${password}`)}`,
+      "surreal-ns": namespace,
+      "surreal-db": database,
+      Authorization: `Bearer ${token}`,
     },
-    body: typeof body === "string" ? body : JSON.stringify(body),
+    body: query,
   });
 
   if (!response.ok) {
@@ -66,9 +88,11 @@ async function surrealQuery<T>(
     throw new Error(`SurrealDB error: ${response.status} ${text}`);
   }
 
-  const results = (await response.json()) as SurrealResponse<T[]>[];
+  const json = await response.json();
+  const results = json as SurrealResponse<T[]>[];
   if (!results.length || !results[0].result) return [];
-  return results[0].result;
+  const result = results[0].result;
+  return Array.isArray(result) ? result : [result] as T[];
 }
 
 async function getEmbedding(apiKey: string, text: string): Promise<number[]> {
@@ -102,6 +126,7 @@ async function searchDocuments(
   limit: number = 5
 ): Promise<{ filename: string; content: string; score: number }[]> {
   const queryEmbedding = await getEmbedding(env.OPENAI_API_KEY, query);
+  const embeddingStr = `[${queryEmbedding.join(",")}]`;
 
   const results = await surrealQuery<Document & { score: number }>(
     env.SURREAL_HOST,
@@ -109,11 +134,7 @@ async function searchDocuments(
     DEFAULT_DB,
     user,
     password,
-    `SELECT filename, content, vector::similarity::cosine(embedding, $embedding) AS score
-     FROM ${TABLE_NAME}
-     ORDER BY score DESC
-     LIMIT $limit`,
-    { embedding: queryEmbedding, limit }
+    `SELECT filename, content, vector::similarity::cosine(embedding, ${embeddingStr}) AS score FROM ${TABLE_NAME} ORDER BY score DESC LIMIT ${limit}`
   );
 
   return results.map((r) => ({
@@ -130,14 +151,14 @@ async function getDocument(
   password: string,
   filename: string
 ): Promise<{ filename: string; content: string } | null> {
+  const escaped = filename.replace(/'/g, "\\'");
   const results = await surrealQuery<Document>(
     env.SURREAL_HOST,
     namespace,
     DEFAULT_DB,
     user,
     password,
-    `SELECT filename, content FROM ${TABLE_NAME} WHERE filename = $filename`,
-    { filename }
+    `SELECT filename, content FROM ${TABLE_NAME} WHERE filename = '${escaped}'`
   );
 
   if (!results.length) return null;
