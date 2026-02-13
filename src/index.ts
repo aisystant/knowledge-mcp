@@ -2,7 +2,7 @@
  * Knowledge MCP Server v3.0 — Cloudflare Workers AI + Neon (pgvector)
  *
  * Unified MCP server for Pack, guides, and DS knowledge.
- * Embeddings: Cloudflare Workers AI (@cf/baai/bge-base-en-v1.5, 768d)
+ * Embeddings: Cloudflare Workers AI (@cf/baai/bge-m3, 1024d, multilingual)
  * Storage: Neon PostgreSQL with pgvector extension
  */
 
@@ -31,7 +31,7 @@ interface McpResponse {
 
 // --- Config ---
 
-const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
+const EMBEDDING_MODEL = "@cf/baai/bge-m3";
 
 // --- Helpers ---
 

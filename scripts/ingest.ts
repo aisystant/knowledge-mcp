@@ -26,8 +26,8 @@ const __dirname = dirname(__filename);
 
 // --- Config ---
 
-const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
-const EMBEDDING_DIM = 768;
+const EMBEDDING_MODEL = "@cf/baai/bge-m3";
+const EMBEDDING_DIM = 1024;
 const BATCH_SIZE = 10;
 const SKIP_PATTERNS = [
   /node_modules/,
@@ -55,26 +55,37 @@ async function getEmbeddings(
   apiToken: string,
   texts: string[]
 ): Promise<number[][]> {
-  const response = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${EMBEDDING_MODEL}`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ text: texts }),
+  const MAX_RETRIES = 5;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    const response = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${EMBEDDING_MODEL}`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ text: texts }),
+      }
+    );
+
+    if (response.status === 429) {
+      const wait = Math.pow(2, attempt + 1) * 1000;
+      console.log(`  Rate limited, waiting ${wait / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES})...`);
+      await new Promise((r) => setTimeout(r, wait));
+      continue;
     }
-  );
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Cloudflare AI error: ${response.status} ${text}`);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Cloudflare AI error: ${response.status} ${text}`);
+    }
+
+    const data = (await response.json()) as { result: { data: number[][] }; success: boolean };
+    if (!data.success) throw new Error("Cloudflare AI: request failed");
+    return data.result.data;
   }
-
-  const data = (await response.json()) as { result: { data: number[][] }; success: boolean };
-  if (!data.success) throw new Error("Cloudflare AI: request failed");
-  return data.result.data;
+  throw new Error("Cloudflare AI: max retries exceeded (rate limited)");
 }
 
 // --- File scanning ---

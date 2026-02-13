@@ -22,5 +22,11 @@
     "source_type": "ds",
     "path": "~/Github/DS-ecosystem-development",
     "exclude": ["node_modules/", ".git/", "images/"]
+  },
+  {
+    "source": "docs-courses",
+    "source_type": "guides",
+    "path": "~/Github/docs/docs/ru",
+    "exclude": ["node_modules/", "public/"]
   }
 ]

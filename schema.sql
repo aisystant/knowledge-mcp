@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS documents (
   source TEXT NOT NULL DEFAULT '',
   source_type TEXT NOT NULL DEFAULT '',
   hash VARCHAR(16) NOT NULL DEFAULT '',
-  embedding vector(768),
+  embedding vector(1024),
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
