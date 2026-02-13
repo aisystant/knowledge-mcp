@@ -28,5 +28,11 @@
     "source_type": "guides",
     "path": "~/Github/docs/docs/ru",
     "exclude": ["node_modules/", "public/"]
+  },
+  {
+    "source": "DS-Knowledge-Index-Tseren",
+    "source_type": "ds",
+    "path": "~/Github/DS-Knowledge-Index-Tseren",
+    "exclude": ["node_modules/", ".git/", "scripts/", "sources/", "docs/2020/", "docs/2021/", "docs/2022/", "docs/2023/", "docs/2024/", "docs/FPF/"]
   }
 ]
