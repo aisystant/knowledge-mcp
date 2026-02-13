@@ -1,28 +1,18 @@
+/**
+ * Knowledge MCP Server v3.0 — Cloudflare Workers AI + Neon (pgvector)
+ *
+ * Unified MCP server for Pack, guides, and DS knowledge.
+ * Embeddings: Cloudflare Workers AI (@cf/baai/bge-base-en-v1.5, 768d)
+ * Storage: Neon PostgreSQL with pgvector extension
+ */
+
+import { neon } from "@neondatabase/serverless";
+
+// --- Types ---
+
 interface Env {
-  SURREAL_HOST: string;
-  SURREAL_USER: string;
-  SURREAL_PASSWORD: string;
-  OPENAI_API_KEY: string;
-}
-
-const EMBEDDING_MODEL = "text-embedding-3-large";
-const TABLE_NAME = "documents";
-const DEFAULT_DB = "knowledge";
-
-interface Document {
-  id: string;
-  filename: string;
-  content: string;
-  embedding: number[];
-  hash: string;
-  source: string;
-  source_type: string;
-}
-
-interface SurrealResponse<T> {
-  result: T;
-  status: string;
-  time: string;
+  DATABASE_URL: string;
+  AI: Ai;
 }
 
 interface McpRequest {
@@ -39,191 +29,101 @@ interface McpResponse {
   error?: { code: number; message: string };
 }
 
-async function surrealSignin(
-  host: string,
-  namespace: string,
-  username: string,
-  password: string
-): Promise<string> {
-  const response = await fetch(`${host}/signin`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify({ ns: namespace, user: username, pass: password }),
-  });
+// --- Config ---
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`SurrealDB signin error: ${response.status} ${text}`);
-  }
+const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
 
-  const data = (await response.json()) as { token: string };
-  return data.token;
+// --- Helpers ---
+
+async function getEmbedding(ai: Ai, text: string): Promise<number[]> {
+  const result = await ai.run(EMBEDDING_MODEL, { text: [text] });
+  return (result as { data: number[][] }).data[0];
 }
 
-async function surrealQuery<T>(
-  host: string,
-  namespace: string,
-  database: string,
-  user: string,
-  password: string,
-  query: string
-): Promise<T[]> {
-  const token = await surrealSignin(host, namespace, user, password);
-
-  const response = await fetch(`${host}/sql`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "text/plain",
-      Accept: "application/json",
-      "surreal-ns": namespace,
-      "surreal-db": database,
-      Authorization: `Bearer ${token}`,
-    },
-    body: query,
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`SurrealDB error: ${response.status} ${text}`);
-  }
-
-  const json = await response.json();
-  const results = json as SurrealResponse<T[]>[];
-  if (!results.length || !results[0].result) return [];
-  const result = results[0].result;
-  return Array.isArray(result) ? result : [result] as T[];
-}
-
-async function getEmbedding(apiKey: string, text: string): Promise<number[]> {
-  const response = await fetch("https://api.openai.com/v1/embeddings", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      input: text,
-      model: EMBEDDING_MODEL,
-    }),
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`OpenAI error: ${response.status} ${text}`);
-  }
-
-  const data = (await response.json()) as { data: [{ embedding: number[] }] };
-  return data.data[0].embedding;
+function db(env: Env) {
+  return neon(env.DATABASE_URL);
 }
 
 // --- Tool implementations ---
 
 async function searchDocuments(
   env: Env,
-  namespace: string,
-  user: string,
-  password: string,
   query: string,
   source?: string,
   sourceType?: string,
   limit: number = 5
 ): Promise<{ filename: string; content: string; source: string; source_type: string; score: number }[]> {
-  const queryEmbedding = await getEmbedding(env.OPENAI_API_KEY, query);
-  const embeddingStr = `[${queryEmbedding.join(",")}]`;
+  const embedding = await getEmbedding(env.AI, query);
+  const vec = `[${embedding.join(",")}]`;
+  const sql = db(env);
+  const src = source ?? null;
+  const stype = sourceType ?? null;
 
-  const conditions: string[] = [];
-  if (source) {
-    const escaped = source.replace(/'/g, "\\'");
-    conditions.push(`source = '${escaped}'`);
-  }
-  if (sourceType) {
-    const escaped = sourceType.replace(/'/g, "\\'");
-    conditions.push(`source_type = '${escaped}'`);
-  }
+  const rows = await sql`
+    SELECT filename, content, source, source_type,
+           1 - (embedding <=> ${vec}::vector) AS score
+    FROM documents
+    WHERE (${src}::text IS NULL OR source = ${src})
+      AND (${stype}::text IS NULL OR source_type = ${stype})
+    ORDER BY embedding <=> ${vec}::vector
+    LIMIT ${limit}
+  `;
 
-  const whereClause = conditions.length > 0
-    ? `WHERE ${conditions.join(" AND ")}`
-    : "";
-
-  const results = await surrealQuery<Document & { score: number }>(
-    env.SURREAL_HOST,
-    namespace,
-    DEFAULT_DB,
-    user,
-    password,
-    `SELECT filename, content, source, source_type, vector::similarity::cosine(embedding, ${embeddingStr}) AS score FROM ${TABLE_NAME} ${whereClause} ORDER BY score DESC LIMIT ${limit}`
-  );
-
-  return results.map((r) => ({
-    filename: r.filename,
-    content: r.content,
-    source: r.source || "",
-    source_type: r.source_type || "",
-    score: r.score,
+  return rows.map((r) => ({
+    filename: r.filename as string,
+    content: r.content as string,
+    source: (r.source as string) || "",
+    source_type: (r.source_type as string) || "",
+    score: r.score as number,
   }));
 }
 
 async function getDocument(
   env: Env,
-  namespace: string,
-  user: string,
-  password: string,
   filename: string,
   source?: string
 ): Promise<{ filename: string; content: string; source: string; source_type: string } | null> {
-  const escaped = filename.replace(/'/g, "\\'");
-  let query = `SELECT filename, content, source, source_type FROM ${TABLE_NAME} WHERE filename = '${escaped}'`;
+  const sql = db(env);
+  const src = source ?? null;
 
-  if (source) {
-    const escapedSource = source.replace(/'/g, "\\'");
-    query += ` AND source = '${escapedSource}'`;
-  }
+  const rows = await sql`
+    SELECT filename, content, source, source_type
+    FROM documents
+    WHERE filename = ${filename}
+      AND (${src}::text IS NULL OR source = ${src})
+    LIMIT 1
+  `;
 
-  const results = await surrealQuery<Document>(
-    env.SURREAL_HOST,
-    namespace,
-    DEFAULT_DB,
-    user,
-    password,
-    query
-  );
-
-  if (!results.length) return null;
+  if (!rows.length) return null;
+  const r = rows[0];
   return {
-    filename: results[0].filename,
-    content: results[0].content,
-    source: results[0].source || "",
-    source_type: results[0].source_type || "",
+    filename: r.filename as string,
+    content: r.content as string,
+    source: (r.source as string) || "",
+    source_type: (r.source_type as string) || "",
   };
 }
 
 async function listSources(
   env: Env,
-  namespace: string,
-  user: string,
-  password: string,
   sourceType?: string
 ): Promise<{ source: string; source_type: string; doc_count: number }[]> {
-  let query = `SELECT source, source_type, count() AS doc_count FROM ${TABLE_NAME}`;
+  const sql = db(env);
+  const stype = sourceType ?? null;
 
-  if (sourceType) {
-    const escaped = sourceType.replace(/'/g, "\\'");
-    query += ` WHERE source_type = '${escaped}'`;
-  }
+  const rows = await sql`
+    SELECT source, source_type, COUNT(*)::int AS doc_count
+    FROM documents
+    WHERE (${stype}::text IS NULL OR source_type = ${stype})
+    GROUP BY source, source_type
+    ORDER BY source_type, source
+  `;
 
-  query += ` GROUP BY source, source_type ORDER BY source_type, source`;
-
-  return await surrealQuery<{ source: string; source_type: string; doc_count: number }>(
-    env.SURREAL_HOST,
-    namespace,
-    DEFAULT_DB,
-    user,
-    password,
-    query
-  );
+  return rows.map((r) => ({
+    source: (r.source as string) || "",
+    source_type: (r.source_type as string) || "",
+    doc_count: r.doc_count as number,
+  }));
 }
 
 // --- MCP tool definitions ---
@@ -231,27 +131,22 @@ async function listSources(
 const TOOLS = [
   {
     name: "search",
-    description: "Semantic search across knowledge base documents. Searches Pack entities, guides, and DS knowledge. Use source_type to filter by category.",
+    description:
+      "Semantic search across knowledge base documents. Searches Pack entities, guides, and DS knowledge.",
     inputSchema: {
       type: "object",
       properties: {
-        query: {
-          type: "string",
-          description: "Search query text",
-        },
+        query: { type: "string", description: "Search query text" },
         source: {
           type: "string",
-          description: "Filter by specific source (e.g., 'PACK-digital-platform', 'PACK-personal')",
+          description: "Filter by specific source (e.g., 'PACK-digital-platform')",
         },
         source_type: {
           type: "string",
           enum: ["pack", "guides", "ds"],
-          description: "Filter by source type: pack (domain knowledge), guides (educational content), ds (ecosystem processes)",
+          description: "Filter by source type: pack (domain knowledge), guides (educational), ds (processes)",
         },
-        limit: {
-          type: "number",
-          description: "Maximum number of results (default: 5)",
-        },
+        limit: { type: "number", description: "Maximum number of results (default: 5)" },
       },
       required: ["query"],
     },
@@ -262,14 +157,8 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        filename: {
-          type: "string",
-          description: "Document filename (relative path)",
-        },
-        source: {
-          type: "string",
-          description: "Source name to disambiguate if filename exists in multiple sources",
-        },
+        filename: { type: "string", description: "Document filename (relative path)" },
+        source: { type: "string", description: "Source name to disambiguate" },
       },
       required: ["filename"],
     },
@@ -290,15 +179,10 @@ const TOOLS = [
   },
 ];
 
-// --- MCP request handler ---
+// --- MCP handler ---
 
-async function handleMcpRequest(
-  request: McpRequest,
-  env: Env
-): Promise<McpResponse> {
+async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpResponse> {
   const { id, method, params } = request;
-  const { SURREAL_USER: user, SURREAL_PASSWORD: password } = env;
-  const namespace = user;
 
   try {
     switch (method) {
@@ -309,7 +193,7 @@ async function handleMcpRequest(
           result: {
             protocolVersion: "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "knowledge-mcp", version: "2.0.0" },
+            serverInfo: { name: "knowledge-mcp", version: "3.0.0" },
           },
         };
 
@@ -318,74 +202,56 @@ async function handleMcpRequest(
 
       case "tools/call": {
         const toolName = (params as { name: string }).name;
-        const args = (params as { arguments: Record<string, unknown> }).arguments;
+        const args = (params as { arguments: Record<string, unknown> }).arguments || {};
 
         if (toolName === "search") {
-          const query = args.query as string;
-          const source = args.source as string | undefined;
-          const sourceType = args.source_type as string | undefined;
-          const limit = (args.limit as number) || 5;
-          const results = await searchDocuments(env, namespace, user, password, query, source, sourceType, limit);
+          const results = await searchDocuments(
+            env,
+            args.query as string,
+            args.source as string | undefined,
+            args.source_type as string | undefined,
+            (args.limit as number) || 5
+          );
           return {
             jsonrpc: "2.0",
             id,
-            result: {
-              content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
-            },
+            result: { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] },
           };
         }
 
         if (toolName === "get_document") {
-          const filename = args.filename as string;
-          const source = args.source as string | undefined;
-          const doc = await getDocument(env, namespace, user, password, filename, source);
+          const doc = await getDocument(env, args.filename as string, args.source as string | undefined);
           if (!doc) {
             return {
               jsonrpc: "2.0",
               id,
-              result: {
-                content: [{ type: "text", text: "Document not found" }],
-                isError: true,
-              },
+              result: { content: [{ type: "text", text: "Document not found" }], isError: true },
             };
           }
           return {
             jsonrpc: "2.0",
             id,
-            result: {
-              content: [{ type: "text", text: doc.content }],
-            },
+            result: { content: [{ type: "text", text: doc.content }] },
           };
         }
 
         if (toolName === "list_sources") {
-          const sourceType = args?.source_type as string | undefined;
-          const sources = await listSources(env, namespace, user, password, sourceType);
+          const sources = await listSources(env, args.source_type as string | undefined);
           return {
             jsonrpc: "2.0",
             id,
-            result: {
-              content: [{ type: "text", text: JSON.stringify(sources, null, 2) }],
-            },
+            result: { content: [{ type: "text", text: JSON.stringify(sources, null, 2) }] },
           };
         }
 
-        return {
-          jsonrpc: "2.0",
-          id,
-          error: { code: -32601, message: `Unknown tool: ${toolName}` },
-        };
+        return { jsonrpc: "2.0", id, error: { code: -32601, message: `Unknown tool: ${toolName}` } };
       }
 
       case "ping":
         return { jsonrpc: "2.0", id, result: {} };
 
       default:
-        return {
-          jsonrpc: "2.0",
-          id,
-          error: { code: -32601, message: `Method not found: ${method}` },
-        };
+        return { jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } };
     }
   } catch (err) {
     return {
@@ -412,7 +278,6 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // MCP endpoint
     if (url.pathname === "/mcp" && request.method === "POST") {
       const body = (await request.json()) as McpRequest;
       const response = await handleMcpRequest(body, env);
@@ -421,7 +286,6 @@ export default {
       });
     }
 
-    // Health check / info
     if (url.pathname === "/health") {
       return new Response("OK", { headers: corsHeaders });
     }
@@ -430,10 +294,9 @@ export default {
       return new Response(
         JSON.stringify({
           name: "Knowledge MCP Server",
-          version: "2.0.0",
-          description: "Unified MCP server for Pack, guides, and DS knowledge",
+          version: "3.0.0",
+          description: "Unified MCP — Cloudflare Workers AI + Neon pgvector",
           mcp_endpoint: "/mcp",
-          transport: "HTTP POST (JSON-RPC)",
           tools: TOOLS.map((t) => t.name),
           source_types: ["pack", "guides", "ds"],
         }),

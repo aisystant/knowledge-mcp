@@ -1,16 +1,14 @@
 # Knowledge MCP — Environment Variables
 # Copy to .dev.vars and fill in values
 
-# SurrealDB credentials (for knowledge DB)
-SURREAL_HOST=https://surrealdb.aisystant.com
-SURREAL_USER=your_username
-SURREAL_PASSWORD=your_password
+# Neon PostgreSQL connection string
+DATABASE_URL=postgresql://user:pass@ep-xxx.us-east-2.aws.neon.tech/knowledge?sslmode=require
 
-# OpenAI (for embeddings)
-OPENAI_API_KEY=sk-...
+# Cloudflare (for local scripts — Workers AI REST API)
+CLOUDFLARE_ACCOUNT_ID=b6ea9a991319d14c2e78590526c5fb4f
+CLOUDFLARE_API_TOKEN=your_cloudflare_api_token
 
-# Guides DB credentials (for migrate-guides.ts)
-# Defaults to SURREAL_USER/SURREAL_PASSWORD if not set
+# SurrealDB guides credentials (only for migrate-guides.ts)
 # GUIDES_NS=mcp
 # GUIDES_DB=guides
 # GUIDES_USER=your_username

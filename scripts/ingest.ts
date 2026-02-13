@@ -1,30 +1,30 @@
 #!/usr/bin/env npx tsx
 /**
- * Knowledge MCP — Data Ingestion Script
+ * Knowledge MCP — Data Ingestion Script (Neon + Cloudflare Workers AI)
  *
- * Reads markdown files from Pack/DS/guides repos and indexes them into SurrealDB
- * with embeddings for semantic search.
+ * Reads markdown files from Pack/DS/guides repos and indexes them into
+ * Neon PostgreSQL with embeddings from Cloudflare Workers AI.
  *
  * Usage:
  *   npx tsx scripts/ingest.ts --source PACK-digital-platform --type pack --path ~/Github/PACK-digital-platform/pack
- *   npx tsx scripts/ingest.ts --source PACK-personal --type pack --path ~/Github/PACK-personal/pack
- *   npx tsx scripts/ingest.ts --source DS-ecosystem-development --type ds --path ~/Github/DS-ecosystem-development
  *   npx tsx scripts/ingest.ts --config scripts/sources.json   # bulk ingest from config
  *
  * Environment variables (or .dev.vars file):
- *   SURREAL_HOST, SURREAL_USER, SURREAL_PASSWORD, OPENAI_API_KEY
+ *   DATABASE_URL — Neon PostgreSQL connection string
+ *   CLOUDFLARE_ACCOUNT_ID — Cloudflare account ID (for Workers AI)
+ *   CLOUDFLARE_API_TOKEN — Cloudflare API token (for Workers AI)
  */
 
 import { readFileSync, readdirSync, statSync, existsSync } from "fs";
 import { join, relative, extname } from "path";
 import { createHash } from "crypto";
+import { neon } from "@neondatabase/serverless";
 
 // --- Config ---
 
-const EMBEDDING_MODEL = "text-embedding-3-large";
-const TABLE_NAME = "documents";
-const DEFAULT_DB = "knowledge";
-const BATCH_SIZE = 10; // documents per embedding batch
+const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
+const EMBEDDING_DIM = 768;
+const BATCH_SIZE = 10;
 const SKIP_PATTERNS = [
   /node_modules/,
   /\.git\//,
@@ -41,70 +41,36 @@ interface SourceConfig {
   source: string;
   source_type: "pack" | "guides" | "ds";
   path: string;
-  include?: string[];  // glob patterns, default: ["**/*.md"]
-  exclude?: string[];  // additional exclude patterns
+  exclude?: string[];
 }
 
-interface DocumentRecord {
-  filename: string;
-  content: string;
-  source: string;
-  source_type: string;
-  hash: string;
-  embedding: number[];
-}
+// --- Cloudflare Workers AI (REST API) ---
 
-// --- SurrealDB ---
-
-async function surrealSignin(host: string, user: string, password: string): Promise<string> {
-  const response = await fetch(`${host}/signin`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ ns: user, user, pass: password }),
-  });
-  if (!response.ok) throw new Error(`SurrealDB signin: ${response.status} ${await response.text()}`);
-  const data = (await response.json()) as { token: string };
-  return data.token;
-}
-
-async function surrealExec(host: string, user: string, password: string, query: string): Promise<unknown[]> {
-  const token = await surrealSignin(host, user, password);
-  const response = await fetch(`${host}/sql`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "text/plain",
-      Accept: "application/json",
-      "surreal-ns": user,
-      "surreal-db": DEFAULT_DB,
-      Authorization: `Bearer ${token}`,
-    },
-    body: query,
-  });
-  if (!response.ok) throw new Error(`SurrealDB query: ${response.status} ${await response.text()}`);
-  return (await response.json()) as unknown[];
-}
-
-// --- OpenAI Embeddings ---
-
-async function getEmbeddings(apiKey: string, texts: string[]): Promise<number[][]> {
-  const response = await fetch("https://api.openai.com/v1/embeddings", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({ input: texts, model: EMBEDDING_MODEL }),
-  });
+async function getEmbeddings(
+  accountId: string,
+  apiToken: string,
+  texts: string[]
+): Promise<number[][]> {
+  const response = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${EMBEDDING_MODEL}`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ text: texts }),
+    }
+  );
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`OpenAI error: ${response.status} ${text}`);
+    throw new Error(`Cloudflare AI error: ${response.status} ${text}`);
   }
 
-  const data = (await response.json()) as { data: { embedding: number[]; index: number }[] };
-  return data.data
-    .sort((a, b) => a.index - b.index)
-    .map((d) => d.embedding);
+  const data = (await response.json()) as { result: { data: number[][] }; success: boolean };
+  if (!data.success) throw new Error("Cloudflare AI: request failed");
+  return data.result.data;
 }
 
 // --- File scanning ---
@@ -151,25 +117,31 @@ function contentHash(content: string): string {
 
 // --- Main ingestion ---
 
-async function ingestSource(config: SourceConfig, env: Record<string, string>): Promise<number> {
+async function ingestSource(
+  config: SourceConfig,
+  sql: ReturnType<typeof neon>,
+  accountId: string,
+  apiToken: string
+): Promise<number> {
   const { source, source_type, path: basePath } = config;
 
-  if (!existsSync(basePath)) {
-    console.error(`  Path not found: ${basePath}`);
+  const resolvedPath = basePath.replace("~", process.env.HOME || "");
+  if (!existsSync(resolvedPath)) {
+    console.error(`  Path not found: ${resolvedPath}`);
     return 0;
   }
 
-  console.log(`\n  Scanning ${basePath}...`);
-  const files = scanMarkdownFiles(basePath, config.exclude);
+  console.log(`\n  Scanning ${resolvedPath}...`);
+  const files = scanMarkdownFiles(resolvedPath, config.exclude);
   console.log(`  Found ${files.length} markdown files`);
 
   if (files.length === 0) return 0;
 
-  // Read all files and compute hashes
+  // Read files and compute hashes
   const documents: { filename: string; content: string; hash: string }[] = [];
   for (const file of files) {
     const content = readFileSync(file.filepath, "utf-8");
-    if (content.trim().length < 10) continue; // skip near-empty
+    if (content.trim().length < 10) continue;
     documents.push({
       filename: file.relative,
       content,
@@ -179,22 +151,17 @@ async function ingestSource(config: SourceConfig, env: Record<string, string>): 
 
   console.log(`  ${documents.length} documents to process`);
 
-  // Check existing hashes to skip unchanged documents
-  const existingResult = await surrealExec(
-    env.SURREAL_HOST,
-    env.SURREAL_USER,
-    env.SURREAL_PASSWORD,
-    `SELECT filename, hash FROM ${TABLE_NAME} WHERE source = '${source.replace(/'/g, "\\'")}'`
+  // Check existing hashes
+  const existingRows = await sql(
+    "SELECT filename, hash FROM documents WHERE source = $1",
+    [source]
   );
   const existingHashes = new Map<string, string>();
-  const rows = (existingResult[0] as any)?.result;
-  if (Array.isArray(rows)) {
-    for (const row of rows) {
-      existingHashes.set(row.filename, row.hash);
-    }
+  for (const row of existingRows) {
+    existingHashes.set(row.filename as string, row.hash as string);
   }
 
-  // Filter to only new/changed documents
+  // Filter to new/changed
   const toIndex = documents.filter((d) => existingHashes.get(d.filename) !== d.hash);
   const unchanged = documents.length - toIndex.length;
   if (unchanged > 0) console.log(`  ${unchanged} unchanged (skipped)`);
@@ -209,40 +176,28 @@ async function ingestSource(config: SourceConfig, env: Record<string, string>): 
   let indexed = 0;
   for (let i = 0; i < toIndex.length; i += BATCH_SIZE) {
     const batch = toIndex.slice(i, i + BATCH_SIZE);
-    const texts = batch.map((d) => d.content.slice(0, 8000)); // truncate for embedding
+    const texts = batch.map((d) => d.content.slice(0, 8000));
 
-    // Generate embeddings
-    const embeddings = await getEmbeddings(env.OPENAI_API_KEY, texts);
+    const embeddings = await getEmbeddings(accountId, apiToken, texts);
 
-    // Upsert into SurrealDB
     for (let j = 0; j < batch.length; j++) {
       const doc = batch[j];
-      const embedding = embeddings[j];
-      const escapedFilename = doc.filename.replace(/'/g, "\\'");
-      const escapedContent = doc.content.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-      const embeddingStr = `[${embedding.join(",")}]`;
+      const embeddingStr = `[${embeddings[j].join(",")}]`;
 
-      // Use UPSERT: if filename+source exists, update; else insert
-      const query = `
-        DELETE FROM ${TABLE_NAME} WHERE filename = '${escapedFilename}' AND source = '${source.replace(/'/g, "\\'")}';
-        CREATE ${TABLE_NAME} SET
-          filename = '${escapedFilename}',
-          content = '${escapedContent}',
-          source = '${source}',
-          source_type = '${source_type}',
-          hash = '${doc.hash}',
-          embedding = ${embeddingStr};
-      `;
-
-      await surrealExec(env.SURREAL_HOST, env.SURREAL_USER, env.SURREAL_PASSWORD, query);
+      await sql(
+        `INSERT INTO documents (filename, content, source, source_type, hash, embedding)
+         VALUES ($1, $2, $3, $4, $5, $6::vector)
+         ON CONFLICT (filename, source)
+         DO UPDATE SET content = $2, source_type = $4, hash = $5, embedding = $6::vector`,
+        [doc.filename, doc.content, source, source_type, doc.hash, embeddingStr]
+      );
     }
 
     indexed += batch.length;
     console.log(`  ${indexed}/${toIndex.length} indexed`);
 
-    // Rate limit: pause between batches
     if (i + BATCH_SIZE < toIndex.length) {
-      await new Promise((r) => setTimeout(r, 500));
+      await new Promise((r) => setTimeout(r, 300));
     }
   }
 
@@ -254,12 +209,11 @@ async function ingestSource(config: SourceConfig, env: Record<string, string>): 
 async function main() {
   const args = process.argv.slice(2);
 
-  // Load env from .dev.vars if exists
+  // Load env from .dev.vars
   const env: Record<string, string> = {
-    SURREAL_HOST: process.env.SURREAL_HOST || "https://surrealdb.aisystant.com",
-    SURREAL_USER: process.env.SURREAL_USER || "",
-    SURREAL_PASSWORD: process.env.SURREAL_PASSWORD || "",
-    OPENAI_API_KEY: process.env.OPENAI_API_KEY || "",
+    DATABASE_URL: process.env.DATABASE_URL || "",
+    CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID || "",
+    CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN || "",
   };
 
   const devVarsPath = join(__dirname, "../.dev.vars");
@@ -271,26 +225,25 @@ async function main() {
     }
   }
 
-  if (!env.SURREAL_USER || !env.SURREAL_PASSWORD || !env.OPENAI_API_KEY) {
-    console.error("Missing env vars: SURREAL_USER, SURREAL_PASSWORD, OPENAI_API_KEY");
+  if (!env.DATABASE_URL || !env.CLOUDFLARE_ACCOUNT_ID || !env.CLOUDFLARE_API_TOKEN) {
+    console.error("Missing env vars: DATABASE_URL, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN");
     console.error("Set them in environment or in .dev.vars file");
     process.exit(1);
   }
 
-  // Parse CLI args
+  const sql = neon(env.DATABASE_URL);
+
   if (args.includes("--config")) {
-    // Bulk mode: read from config file
     const configPath = args[args.indexOf("--config") + 1];
     const configs: SourceConfig[] = JSON.parse(readFileSync(configPath, "utf-8"));
     console.log(`Ingesting ${configs.length} sources from ${configPath}`);
     let total = 0;
     for (const config of configs) {
       console.log(`\n[${config.source}] (${config.source_type})`);
-      total += await ingestSource(config, env);
+      total += await ingestSource(config, sql, env.CLOUDFLARE_ACCOUNT_ID, env.CLOUDFLARE_API_TOKEN);
     }
     console.log(`\nDone. Total indexed: ${total}`);
   } else {
-    // Single source mode
     const sourceIdx = args.indexOf("--source");
     const typeIdx = args.indexOf("--type");
     const pathIdx = args.indexOf("--path");
@@ -304,11 +257,11 @@ async function main() {
     const config: SourceConfig = {
       source: args[sourceIdx + 1],
       source_type: args[typeIdx + 1] as "pack" | "guides" | "ds",
-      path: args[pathIdx + 1].replace("~", process.env.HOME || ""),
+      path: args[pathIdx + 1],
     };
 
     console.log(`Ingesting [${config.source}] (${config.source_type}) from ${config.path}`);
-    const count = await ingestSource(config, env);
+    const count = await ingestSource(config, sql, env.CLOUDFLARE_ACCOUNT_ID, env.CLOUDFLARE_API_TOKEN);
     console.log(`\nDone. Indexed: ${count}`);
   }
 }

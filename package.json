@@ -1,18 +1,23 @@
 {
   "name": "knowledge-mcp",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "ingest": "tsx scripts/ingest.ts",
-    "ingest:all": "tsx scripts/ingest.ts --config scripts/sources.json"
+    "ingest:all": "tsx scripts/ingest.ts --config scripts/sources.json",
+    "migrate-guides": "tsx scripts/migrate-guides.ts",
+    "schema": "psql $DATABASE_URL -f schema.sql"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241230.0",
     "tsx": "^4.7.0",
     "typescript": "^5.7.0",
     "wrangler": "^3.99.0"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.0.2"
   }
 }
