@@ -17,9 +17,13 @@
  */
 
 import { readFileSync, existsSync } from "fs";
-import { join } from "path";
+import { join, dirname } from "path";
 import { createHash } from "crypto";
+import { fileURLToPath } from "url";
 import { neon } from "@neondatabase/serverless";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 // --- Config ---
 
@@ -159,10 +163,9 @@ async function main() {
 
   // Step 2: Check existing
   console.log("\n[2] Checking existing...");
-  const existingRows = await sql(
-    "SELECT filename, hash FROM documents WHERE source_type = $1",
-    [SOURCE_TYPE]
-  );
+  const existingRows = await sql`
+    SELECT filename, hash FROM documents WHERE source_type = ${SOURCE_TYPE}
+  `;
   const existingHashes = new Map<string, string>();
   for (const row of existingRows) {
     existingHashes.set(row.filename as string, row.hash as string);
@@ -197,13 +200,12 @@ async function main() {
       const doc = batch[j];
       const embeddingStr = `[${embeddings[j].join(",")}]`;
 
-      await sql(
-        `INSERT INTO documents (filename, content, source, source_type, hash, embedding)
-         VALUES ($1, $2, $3, $4, $5, $6::vector)
-         ON CONFLICT (filename, source)
-         DO UPDATE SET content = $2, source_type = $4, hash = $5, embedding = $6::vector`,
-        [doc.filename, doc.content, SOURCE_NAME, SOURCE_TYPE, doc.hash, embeddingStr]
-      );
+      await sql`
+        INSERT INTO documents (filename, content, source, source_type, hash, embedding)
+        VALUES (${doc.filename}, ${doc.content}, ${SOURCE_NAME}, ${SOURCE_TYPE}, ${doc.hash}, ${embeddingStr}::vector)
+        ON CONFLICT (filename, source)
+        DO UPDATE SET content = ${doc.content}, source_type = ${SOURCE_TYPE}, hash = ${doc.hash}, embedding = ${embeddingStr}::vector
+      `;
     }
 
     indexed += batch.length;
