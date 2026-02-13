@@ -1,14 +1,17 @@
 {
   "name": "knowledge-mcp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "ingest": "tsx scripts/ingest.ts",
+    "ingest:all": "tsx scripts/ingest.ts --config scripts/sources.json"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241230.0",
+    "tsx": "^4.7.0",
     "typescript": "^5.7.0",
     "wrangler": "^3.99.0"
   }

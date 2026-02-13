@@ -1,0 +1,26 @@
+[
+  {
+    "source": "PACK-digital-platform",
+    "source_type": "pack",
+    "path": "~/Github/PACK-digital-platform/pack",
+    "exclude": ["images/", "assets/"]
+  },
+  {
+    "source": "PACK-personal",
+    "source_type": "pack",
+    "path": "~/Github/PACK-personal/pack",
+    "exclude": ["images/", "assets/"]
+  },
+  {
+    "source": "PACK-MIM",
+    "source_type": "pack",
+    "path": "~/Github/PACK-MIM/pack",
+    "exclude": ["images/", "assets/"]
+  },
+  {
+    "source": "DS-ecosystem-development",
+    "source_type": "ds",
+    "path": "~/Github/DS-ecosystem-development",
+    "exclude": ["node_modules/", ".git/", "images/"]
+  }
+]

@@ -15,6 +15,8 @@ interface Document {
   content: string;
   embedding: number[];
   hash: string;
+  source: string;
+  source_type: string;
 }
 
 interface SurrealResponse<T> {
@@ -117,16 +119,34 @@ async function getEmbedding(apiKey: string, text: string): Promise<number[]> {
   return data.data[0].embedding;
 }
 
+// --- Tool implementations ---
+
 async function searchDocuments(
   env: Env,
   namespace: string,
   user: string,
   password: string,
   query: string,
+  source?: string,
+  sourceType?: string,
   limit: number = 5
-): Promise<{ filename: string; content: string; score: number }[]> {
+): Promise<{ filename: string; content: string; source: string; source_type: string; score: number }[]> {
   const queryEmbedding = await getEmbedding(env.OPENAI_API_KEY, query);
   const embeddingStr = `[${queryEmbedding.join(",")}]`;
+
+  const conditions: string[] = [];
+  if (source) {
+    const escaped = source.replace(/'/g, "\\'");
+    conditions.push(`source = '${escaped}'`);
+  }
+  if (sourceType) {
+    const escaped = sourceType.replace(/'/g, "\\'");
+    conditions.push(`source_type = '${escaped}'`);
+  }
+
+  const whereClause = conditions.length > 0
+    ? `WHERE ${conditions.join(" AND ")}`
+    : "";
 
   const results = await surrealQuery<Document & { score: number }>(
     env.SURREAL_HOST,
@@ -134,12 +154,14 @@ async function searchDocuments(
     DEFAULT_DB,
     user,
     password,
-    `SELECT filename, content, vector::similarity::cosine(embedding, ${embeddingStr}) AS score FROM ${TABLE_NAME} ORDER BY score DESC LIMIT ${limit}`
+    `SELECT filename, content, source, source_type, vector::similarity::cosine(embedding, ${embeddingStr}) AS score FROM ${TABLE_NAME} ${whereClause} ORDER BY score DESC LIMIT ${limit}`
   );
 
   return results.map((r) => ({
     filename: r.filename,
     content: r.content,
+    source: r.source || "",
+    source_type: r.source_type || "",
     score: r.score,
   }));
 }
@@ -149,32 +171,82 @@ async function getDocument(
   namespace: string,
   user: string,
   password: string,
-  filename: string
-): Promise<{ filename: string; content: string } | null> {
+  filename: string,
+  source?: string
+): Promise<{ filename: string; content: string; source: string; source_type: string } | null> {
   const escaped = filename.replace(/'/g, "\\'");
+  let query = `SELECT filename, content, source, source_type FROM ${TABLE_NAME} WHERE filename = '${escaped}'`;
+
+  if (source) {
+    const escapedSource = source.replace(/'/g, "\\'");
+    query += ` AND source = '${escapedSource}'`;
+  }
+
   const results = await surrealQuery<Document>(
     env.SURREAL_HOST,
     namespace,
     DEFAULT_DB,
     user,
     password,
-    `SELECT filename, content FROM ${TABLE_NAME} WHERE filename = '${escaped}'`
+    query
   );
 
   if (!results.length) return null;
-  return { filename: results[0].filename, content: results[0].content };
+  return {
+    filename: results[0].filename,
+    content: results[0].content,
+    source: results[0].source || "",
+    source_type: results[0].source_type || "",
+  };
 }
+
+async function listSources(
+  env: Env,
+  namespace: string,
+  user: string,
+  password: string,
+  sourceType?: string
+): Promise<{ source: string; source_type: string; doc_count: number }[]> {
+  let query = `SELECT source, source_type, count() AS doc_count FROM ${TABLE_NAME}`;
+
+  if (sourceType) {
+    const escaped = sourceType.replace(/'/g, "\\'");
+    query += ` WHERE source_type = '${escaped}'`;
+  }
+
+  query += ` GROUP BY source, source_type ORDER BY source_type, source`;
+
+  return await surrealQuery<{ source: string; source_type: string; doc_count: number }>(
+    env.SURREAL_HOST,
+    namespace,
+    DEFAULT_DB,
+    user,
+    password,
+    query
+  );
+}
+
+// --- MCP tool definitions ---
 
 const TOOLS = [
   {
     name: "search",
-    description: "Semantic search across knowledge base documents",
+    description: "Semantic search across knowledge base documents. Searches Pack entities, guides, and DS knowledge. Use source_type to filter by category.",
     inputSchema: {
       type: "object",
       properties: {
         query: {
           type: "string",
           description: "Search query text",
+        },
+        source: {
+          type: "string",
+          description: "Filter by specific source (e.g., 'PACK-digital-platform', 'PACK-personal')",
+        },
+        source_type: {
+          type: "string",
+          enum: ["pack", "guides", "ds"],
+          description: "Filter by source type: pack (domain knowledge), guides (educational content), ds (ecosystem processes)",
         },
         limit: {
           type: "number",
@@ -194,11 +266,31 @@ const TOOLS = [
           type: "string",
           description: "Document filename (relative path)",
         },
+        source: {
+          type: "string",
+          description: "Source name to disambiguate if filename exists in multiple sources",
+        },
       },
       required: ["filename"],
     },
   },
+  {
+    name: "list_sources",
+    description: "List all available knowledge sources with document counts",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source_type: {
+          type: "string",
+          enum: ["pack", "guides", "ds"],
+          description: "Filter by source type",
+        },
+      },
+    },
+  },
 ];
+
+// --- MCP request handler ---
 
 async function handleMcpRequest(
   request: McpRequest,
@@ -217,7 +309,7 @@ async function handleMcpRequest(
           result: {
             protocolVersion: "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "knowledge-mcp", version: "1.0.0" },
+            serverInfo: { name: "knowledge-mcp", version: "2.0.0" },
           },
         };
 
@@ -230,8 +322,10 @@ async function handleMcpRequest(
 
         if (toolName === "search") {
           const query = args.query as string;
+          const source = args.source as string | undefined;
+          const sourceType = args.source_type as string | undefined;
           const limit = (args.limit as number) || 5;
-          const results = await searchDocuments(env, namespace, user, password, query, limit);
+          const results = await searchDocuments(env, namespace, user, password, query, source, sourceType, limit);
           return {
             jsonrpc: "2.0",
             id,
@@ -243,7 +337,8 @@ async function handleMcpRequest(
 
         if (toolName === "get_document") {
           const filename = args.filename as string;
-          const doc = await getDocument(env, namespace, user, password, filename);
+          const source = args.source as string | undefined;
+          const doc = await getDocument(env, namespace, user, password, filename, source);
           if (!doc) {
             return {
               jsonrpc: "2.0",
@@ -259,6 +354,18 @@ async function handleMcpRequest(
             id,
             result: {
               content: [{ type: "text", text: doc.content }],
+            },
+          };
+        }
+
+        if (toolName === "list_sources") {
+          const sourceType = args?.source_type as string | undefined;
+          const sources = await listSources(env, namespace, user, password, sourceType);
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: {
+              content: [{ type: "text", text: JSON.stringify(sources, null, 2) }],
             },
           };
         }
@@ -289,11 +396,12 @@ async function handleMcpRequest(
   }
 }
 
+// --- HTTP server ---
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // CORS headers
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -313,29 +421,24 @@ export default {
       });
     }
 
-    // SSE endpoint for MCP
-    if (url.pathname === "/sse" && request.method === "GET") {
-      const { readable, writable } = new TransformStream();
-      const writer = writable.getWriter();
-      const encoder = new TextEncoder();
-
-      // Send initial connection message
-      const sessionId = crypto.randomUUID();
-      writer.write(encoder.encode(`data: ${JSON.stringify({ type: "session", sessionId })}\n\n`));
-
-      return new Response(readable, {
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-        },
-      });
-    }
-
-    // Health check
+    // Health check / info
     if (url.pathname === "/health") {
       return new Response("OK", { headers: corsHeaders });
+    }
+
+    if (url.pathname === "/") {
+      return new Response(
+        JSON.stringify({
+          name: "Knowledge MCP Server",
+          version: "2.0.0",
+          description: "Unified MCP server for Pack, guides, and DS knowledge",
+          mcp_endpoint: "/mcp",
+          transport: "HTTP POST (JSON-RPC)",
+          tools: TOOLS.map((t) => t.name),
+          source_types: ["pack", "guides", "ds"],
+        }),
+        { headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
     }
 
     return new Response("Not found", { status: 404, headers: corsHeaders });
