@@ -1,0 +1,17 @@
+# Knowledge MCP — Environment Variables
+# Copy to .dev.vars and fill in values
+
+# SurrealDB credentials (for knowledge DB)
+SURREAL_HOST=https://surrealdb.aisystant.com
+SURREAL_USER=your_username
+SURREAL_PASSWORD=your_password
+
+# OpenAI (for embeddings)
+OPENAI_API_KEY=sk-...
+
+# Guides DB credentials (for migrate-guides.ts)
+# Defaults to SURREAL_USER/SURREAL_PASSWORD if not set
+# GUIDES_NS=mcp
+# GUIDES_DB=guides
+# GUIDES_USER=your_username
+# GUIDES_PASS=your_password
