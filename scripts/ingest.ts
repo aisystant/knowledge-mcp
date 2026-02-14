@@ -29,6 +29,8 @@ const __dirname = dirname(__filename);
 const EMBEDDING_MODEL = "@cf/baai/bge-m3";
 const EMBEDDING_DIM = 1024;
 const BATCH_SIZE = 10;
+const CHUNK_CHAR_LIMIT = 10_000;
+const LARGE_FILE_THRESHOLD = 100_000; // 100KB — files above this get chunked
 const SKIP_PATTERNS = [
   /node_modules/,
   /\.git\//,
@@ -116,7 +118,7 @@ function scanMarkdownFiles(basePath: string, extraExclude?: string[]): { filepat
       const stat = statSync(fullPath);
       if (stat.isDirectory()) {
         walk(fullPath);
-      } else if (extname(entry) === ".md" && stat.size > 0 && stat.size < 100_000) {
+      } else if (extname(entry) === ".md" && stat.size > 0) {
         results.push({ filepath: fullPath, relative: relPath });
       }
     }
@@ -128,6 +130,99 @@ function scanMarkdownFiles(basePath: string, extraExclude?: string[]): { filepat
 
 function contentHash(content: string): string {
   return createHash("sha256").update(content).digest("hex").slice(0, 16);
+}
+
+// --- Hierarchical chunking for large files ---
+
+function chunkLargeFile(
+  content: string,
+  filename: string
+): { filename: string; content: string }[] {
+  const chunks: { filename: string; content: string }[] = [];
+
+  // Extract document title for breadcrumb prefix
+  const titleMatch = content.match(/^#\s+(.+)/m);
+  const docTitle = titleMatch ? titleMatch[1].trim() : "";
+
+  // Split by ## headers
+  const sections = content.split(/^(?=## )/m);
+
+  for (const section of sections) {
+    if (section.trim().length < 10) continue;
+
+    const headerMatch = section.match(/^##\s+(.+)/m);
+    const sectionName = headerMatch ? headerMatch[1].trim() : "_intro";
+
+    if (section.length <= CHUNK_CHAR_LIMIT) {
+      const prefix = docTitle ? `> ${docTitle} > ${sectionName}\n\n` : "";
+      chunks.push({
+        filename: `${filename}::${sectionName}`,
+        content: prefix + section,
+      });
+    } else {
+      // Section too large — split by ### sub-headers
+      const subsections = section.split(/^(?=### )/m);
+
+      for (const subsection of subsections) {
+        if (subsection.trim().length < 10) continue;
+
+        const subMatch = subsection.match(/^###\s+(.+)/m);
+        const subName = subMatch
+          ? `${sectionName} > ${subMatch[1].trim()}`
+          : sectionName;
+
+        if (subsection.length <= CHUNK_CHAR_LIMIT) {
+          const prefix = docTitle ? `> ${docTitle} > ${subName}\n\n` : "";
+          chunks.push({
+            filename: `${filename}::${subName}`,
+            content: prefix + subsection,
+          });
+        } else {
+          // Still too large — split by paragraphs
+          const paragraphs = subsection.split(/\n\n+/);
+          let accumulator = "";
+          let partIndex = 0;
+
+          for (const para of paragraphs) {
+            if (
+              accumulator.length + para.length + 2 > CHUNK_CHAR_LIMIT &&
+              accumulator.length > 0
+            ) {
+              const prefix = docTitle
+                ? `> ${docTitle} > ${subName} (part ${++partIndex})\n\n`
+                : "";
+              chunks.push({
+                filename: `${filename}::${subName}::part${partIndex}`,
+                content: prefix + accumulator.trim(),
+              });
+              accumulator = "";
+            }
+            accumulator += (accumulator ? "\n\n" : "") + para;
+          }
+
+          if (accumulator.trim().length >= 10) {
+            if (partIndex > 0) {
+              const prefix = docTitle
+                ? `> ${docTitle} > ${subName} (part ${++partIndex})\n\n`
+                : "";
+              chunks.push({
+                filename: `${filename}::${subName}::part${partIndex}`,
+                content: prefix + accumulator.trim(),
+              });
+            } else {
+              const prefix = docTitle ? `> ${docTitle} > ${subName}\n\n` : "";
+              chunks.push({
+                filename: `${filename}::${subName}`,
+                content: prefix + accumulator.trim(),
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return chunks;
 }
 
 // --- Main ingestion ---
@@ -152,16 +247,34 @@ async function ingestSource(
 
   if (files.length === 0) return 0;
 
-  // Read files and compute hashes
-  const documents: { filename: string; content: string; hash: string }[] = [];
+  // Read files and compute hashes (chunk large files)
+  const documents: { filename: string; content: string; hash: string; parentFile?: string }[] = [];
+  const chunkedParents = new Set<string>();
   for (const file of files) {
     const content = readFileSync(file.filepath, "utf-8");
     if (content.trim().length < 10) continue;
-    documents.push({
-      filename: file.relative,
-      content,
-      hash: contentHash(content),
-    });
+
+    if (content.length > LARGE_FILE_THRESHOLD) {
+      // Large file — chunk by headers
+      const chunks = chunkLargeFile(content, file.relative);
+      const parentHash = contentHash(content);
+      chunkedParents.add(file.relative);
+      console.log(`  ${file.relative}: large file (${(content.length / 1024).toFixed(0)}KB) → ${chunks.length} chunks`);
+      for (const chunk of chunks) {
+        documents.push({
+          filename: chunk.filename,
+          content: chunk.content,
+          hash: contentHash(chunk.content),
+          parentFile: file.relative,
+        });
+      }
+    } else {
+      documents.push({
+        filename: file.relative,
+        content,
+        hash: contentHash(content),
+      });
+    }
   }
 
   console.log(`  ${documents.length} documents to process`);
@@ -186,11 +299,20 @@ async function ingestSource(
 
   console.log(`  Indexing ${toIndex.length} documents...`);
 
+  // Delete old chunks for changed large files (ghost cleanup)
+  const changedParents = new Set(
+    toIndex.filter((d) => d.parentFile).map((d) => d.parentFile!)
+  );
+  for (const parentFile of changedParents) {
+    await sql`DELETE FROM documents WHERE source = ${source} AND filename LIKE ${parentFile + '::%'}`;
+    console.log(`  Cleaned old chunks for ${parentFile}`);
+  }
+
   // Process in batches
   let indexed = 0;
   for (let i = 0; i < toIndex.length; i += BATCH_SIZE) {
     const batch = toIndex.slice(i, i + BATCH_SIZE);
-    const texts = batch.map((d) => d.content.slice(0, 8000));
+    const texts = batch.map((d) => d.content.slice(0, CHUNK_CHAR_LIMIT));
 
     const embeddings = await getEmbeddings(accountId, apiToken, texts);
 

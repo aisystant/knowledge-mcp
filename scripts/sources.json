@@ -40,5 +40,17 @@
     "source_type": "ds",
     "path": "~/Github/DS-IT-systems/aist_bot_newarchitecture/docs",
     "exclude": ["plans-and-reports/"]
+  },
+  {
+    "source": "SPF",
+    "source_type": "pack",
+    "path": "~/Github/SPF",
+    "exclude": ["pack-template/", "node_modules/", ".git/"]
+  },
+  {
+    "source": "FPF",
+    "source_type": "pack",
+    "path": "~/Github/FPF",
+    "exclude": [".git/"]
   }
 ]
