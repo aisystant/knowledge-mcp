@@ -9,6 +9,7 @@
  * - Entity codes (DP.AGENT.001) → keyword path (pg_trgm ILIKE, ~5ms)
  * - Natural language → vector path (cosine similarity, ~300ms)
  * - Keyword miss → fallback to vector
+ * - Vector low confidence (score < 0.6) → fallback to keyword + merge
  */
 
 import { neon } from "@neondatabase/serverless";
@@ -37,6 +38,7 @@ interface McpResponse {
 // --- Config ---
 
 const EMBEDDING_MODEL = "@cf/baai/bge-m3";
+const VECTOR_CONFIDENCE_THRESHOLD = 0.6;
 
 // --- Helpers ---
 
@@ -77,18 +79,21 @@ async function keywordSearch(
   const src = source ?? null;
   const stype = sourceType ?? null;
   const pattern = `%${query}%`;
+  // Normalize hyphens to spaces for FTS (e.g. "ролей-агентов" → "ролей агентов")
+  const ftsQuery = query.replace(/-/g, " ");
 
   const rows = await sql`
     SELECT filename, content, source, source_type,
            CASE
              WHEN filename ILIKE ${pattern} THEN 1.0
              WHEN content ILIKE ${pattern} THEN 0.95
+             WHEN search_vector @@ plainto_tsquery('simple', ${ftsQuery}) THEN 0.8
              ELSE 0.5
            END AS score
     FROM documents
     WHERE (content ILIKE ${pattern}
            OR filename ILIKE ${pattern}
-           OR search_vector @@ plainto_tsquery('simple', ${query}))
+           OR search_vector @@ plainto_tsquery('simple', ${ftsQuery}))
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_type = ${stype})
     ORDER BY score DESC,
@@ -154,7 +159,25 @@ async function searchDocuments(
     // Fallback to vector if keyword found nothing
   }
 
-  return vectorSearch(env, query, source, sourceType, limit);
+  const vectorResults = await vectorSearch(env, query, source, sourceType, limit);
+
+  // Low-confidence fallback: if vector top score < threshold, try keyword
+  if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
+    const kwFallback = await keywordSearch(env, query, source, sourceType, limit);
+    if (kwFallback.length > 0) {
+      // Merge: deduplicate by filename, keep highest score
+      const seen = new Map<string, SearchResult>();
+      for (const r of [...kwFallback, ...vectorResults]) {
+        const existing = seen.get(r.filename);
+        if (!existing || r.score > existing.score) {
+          seen.set(r.filename, r);
+        }
+      }
+      return [...seen.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+    }
+  }
+
+  return vectorResults;
 }
 
 async function getDocument(
@@ -272,7 +295,7 @@ async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpRespo
           result: {
             protocolVersion: "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "knowledge-mcp", version: "3.1.0" },
+            serverInfo: { name: "knowledge-mcp", version: "3.1.1" },
           },
         };
 
@@ -373,7 +396,7 @@ export default {
       return new Response(
         JSON.stringify({
           name: "Knowledge MCP Server",
-          version: "3.1.0",
+          version: "3.1.1",
           description: "Hybrid MCP — Cloudflare Workers AI + Neon pgvector + pg_trgm",
           mcp_endpoint: "/mcp",
           tools: TOOLS.map((t) => t.name),
