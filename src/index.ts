@@ -1,9 +1,14 @@
 /**
- * Knowledge MCP Server v3.0 — Cloudflare Workers AI + Neon (pgvector)
+ * Knowledge MCP Server v3.1 — Hybrid Search (vector + keyword)
  *
  * Unified MCP server for Pack, guides, and DS knowledge.
  * Embeddings: Cloudflare Workers AI (@cf/baai/bge-m3, 1024d, multilingual)
- * Storage: Neon PostgreSQL with pgvector extension
+ * Storage: Neon PostgreSQL with pgvector + pg_trgm + tsvector
+ *
+ * Search routing (DP.D.024):
+ * - Entity codes (DP.AGENT.001) → keyword path (pg_trgm ILIKE, ~5ms)
+ * - Natural language → vector path (cosine similarity, ~300ms)
+ * - Keyword miss → fallback to vector
  */
 
 import { neon } from "@neondatabase/serverless";
@@ -44,15 +49,70 @@ function db(env: Env) {
   return neon(env.DATABASE_URL);
 }
 
+// --- Query type detection (DP.D.024) ---
+
+type QueryType = "keyword" | "vector";
+
+function detectQueryType(query: string): QueryType {
+  // Entity codes: DP.AGENT.001, MIM.M.003, SOTA.002, SPF.SPEC.001, etc.
+  if (/[A-Z]{2,}\.\w+\.\d+/.test(query)) return "keyword";
+  // Short queries with dots — likely structured identifiers
+  if (query.length < 30 && /\.[A-Z]/.test(query)) return "keyword";
+  // Default: semantic vector search
+  return "vector";
+}
+
 // --- Tool implementations ---
 
-async function searchDocuments(
+type SearchResult = { filename: string; content: string; source: string; source_type: string; score: number };
+
+async function keywordSearch(
   env: Env,
   query: string,
   source?: string,
   sourceType?: string,
   limit: number = 5
-): Promise<{ filename: string; content: string; source: string; source_type: string; score: number }[]> {
+): Promise<SearchResult[]> {
+  const sql = db(env);
+  const src = source ?? null;
+  const stype = sourceType ?? null;
+  const pattern = `%${query}%`;
+
+  const rows = await sql`
+    SELECT filename, content, source, source_type,
+           CASE
+             WHEN filename ILIKE ${pattern} THEN 1.0
+             WHEN content ILIKE ${pattern} THEN 0.95
+             ELSE 0.5
+           END AS score
+    FROM documents
+    WHERE (content ILIKE ${pattern}
+           OR filename ILIKE ${pattern}
+           OR search_vector @@ plainto_tsquery('simple', ${query}))
+      AND (${src}::text IS NULL OR source = ${src})
+      AND (${stype}::text IS NULL OR source_type = ${stype})
+    ORDER BY score DESC,
+             CASE WHEN filename ILIKE ${pattern} THEN 0 ELSE 1 END,
+             length(content) ASC
+    LIMIT ${limit}
+  `;
+
+  return rows.map((r) => ({
+    filename: r.filename as string,
+    content: r.content as string,
+    source: (r.source as string) || "",
+    source_type: (r.source_type as string) || "",
+    score: r.score as number,
+  }));
+}
+
+async function vectorSearch(
+  env: Env,
+  query: string,
+  source?: string,
+  sourceType?: string,
+  limit: number = 5
+): Promise<SearchResult[]> {
   const embedding = await getEmbedding(env.AI, query);
   const vec = `[${embedding.join(",")}]`;
   const sql = db(env);
@@ -76,6 +136,25 @@ async function searchDocuments(
     source_type: (r.source_type as string) || "",
     score: r.score as number,
   }));
+}
+
+async function searchDocuments(
+  env: Env,
+  query: string,
+  source?: string,
+  sourceType?: string,
+  limit: number = 5
+): Promise<SearchResult[]> {
+  const queryType = detectQueryType(query);
+
+  if (queryType === "keyword") {
+    // Keyword-first: skip embedding generation (~200ms saved)
+    const kwResults = await keywordSearch(env, query, source, sourceType, limit);
+    if (kwResults.length > 0) return kwResults;
+    // Fallback to vector if keyword found nothing
+  }
+
+  return vectorSearch(env, query, source, sourceType, limit);
 }
 
 async function getDocument(
@@ -132,7 +211,7 @@ const TOOLS = [
   {
     name: "search",
     description:
-      "Semantic search across knowledge base documents. Searches Pack entities, guides, and DS knowledge.",
+      "Hybrid search across knowledge base documents. Searches Pack entities, guides, and DS knowledge. Uses keyword search for entity codes (e.g. DP.AGENT.001) and semantic vector search for natural language queries.",
     inputSchema: {
       type: "object",
       properties: {
@@ -193,7 +272,7 @@ async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpRespo
           result: {
             protocolVersion: "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "knowledge-mcp", version: "3.0.0" },
+            serverInfo: { name: "knowledge-mcp", version: "3.1.0" },
           },
         };
 
@@ -294,8 +373,8 @@ export default {
       return new Response(
         JSON.stringify({
           name: "Knowledge MCP Server",
-          version: "3.0.0",
-          description: "Unified MCP — Cloudflare Workers AI + Neon pgvector",
+          version: "3.1.0",
+          description: "Hybrid MCP — Cloudflare Workers AI + Neon pgvector + pg_trgm",
           mcp_endpoint: "/mcp",
           tools: TOOLS.map((t) => t.name),
           source_types: ["pack", "guides", "ds"],

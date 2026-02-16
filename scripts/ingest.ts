@@ -321,10 +321,10 @@ async function ingestSource(
       const embeddingStr = `[${embeddings[j].join(",")}]`;
 
       await sql`
-        INSERT INTO documents (filename, content, source, source_type, hash, embedding)
-        VALUES (${doc.filename}, ${doc.content}, ${source}, ${source_type}, ${doc.hash}, ${embeddingStr}::vector)
+        INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector)
+        VALUES (${doc.filename}, ${doc.content}, ${source}, ${source_type}, ${doc.hash}, ${embeddingStr}::vector, to_tsvector('simple', ${doc.content}))
         ON CONFLICT (filename, source)
-        DO UPDATE SET content = ${doc.content}, source_type = ${source_type}, hash = ${doc.hash}, embedding = ${embeddingStr}::vector
+        DO UPDATE SET content = ${doc.content}, source_type = ${source_type}, hash = ${doc.hash}, embedding = ${embeddingStr}::vector, search_vector = to_tsvector('simple', ${doc.content})
       `;
     }
 
