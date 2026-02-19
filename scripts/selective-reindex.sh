@@ -83,8 +83,8 @@ while IFS=$'\t' read -r SOURCE SOURCE_TYPE SOURCE_PATH; do
         continue
     }
 
-    # Извлекаем количество проиндексированных docs (формат: "Total indexed: N")
-    INDEXED=$(echo "$OUTPUT" | grep -o 'Total indexed: [0-9]*' | grep -o '[0-9]*' || echo "0")
+    # Извлекаем количество проиндексированных docs (формат: "Done. Indexed: N" или "Total indexed: N")
+    INDEXED=$(echo "$OUTPUT" | grep -oE '(Done\. Indexed|Total indexed): [0-9]+' | grep -o '[0-9]*' || echo "0")
     TOTAL_INDEXED=$((TOTAL_INDEXED + INDEXED))
     TOTAL_SOURCES=$((TOTAL_SOURCES + 1))
 
