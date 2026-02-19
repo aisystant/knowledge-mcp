@@ -245,8 +245,8 @@ const TOOLS = [
         },
         source_type: {
           type: "string",
-          enum: ["pack", "guides", "ds"],
-          description: "Filter by source type: pack (domain knowledge), guides (educational), ds (processes)",
+          enum: ["pack", "guides", "ds", "content"],
+          description: "Filter by source type: pack (domain knowledge), guides (educational), ds (processes), content (posts/articles)",
         },
         limit: { type: "number", description: "Maximum number of results (default: 5)" },
       },
@@ -400,7 +400,7 @@ export default {
           description: "Hybrid MCP — Cloudflare Workers AI + Neon pgvector + pg_trgm",
           mcp_endpoint: "/mcp",
           tools: TOOLS.map((t) => t.name),
-          source_types: ["pack", "guides", "ds"],
+          source_types: ["pack", "guides", "ds", "content"],
         }),
         { headers: { "Content-Type": "application/json", ...corsHeaders } }
       );
