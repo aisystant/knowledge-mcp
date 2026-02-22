@@ -18,6 +18,12 @@
     "exclude": ["images/", "assets/"]
   },
   {
+    "source": "PACK-education",
+    "source_type": "pack",
+    "path": "~/Github/PACK-education/pack",
+    "exclude": ["images/", "assets/"]
+  },
+  {
     "source": "DS-ecosystem-development",
     "source_type": "ds",
     "path": "~/Github/DS-ecosystem-development",
