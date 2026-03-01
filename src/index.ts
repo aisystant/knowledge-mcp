@@ -59,7 +59,9 @@ const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> =
 function resolveGithubUrl(source: string, filename: string): string | null {
   const config = SOURCE_GITHUB_BASE[source];
   if (!config) return null;
-  return `${config.base}/${config.pathPrefix}${filename}`;
+  // Strip chunk section suffix (e.g., "FPF-Spec.md::B.1.3 - ..." → "FPF-Spec.md")
+  const cleanFilename = filename.split("::")[0];
+  return `${config.base}/${config.pathPrefix}${cleanFilename}`;
 }
 
 // --- Helpers ---

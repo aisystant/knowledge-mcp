@@ -395,6 +395,12 @@ async function main() {
       path: args[pathIdx + 1],
     };
 
+    // --clean: delete all existing entries for this source before re-indexing
+    if (args.includes("--clean")) {
+      const deleted = await sql`DELETE FROM documents WHERE source = ${config.source}`;
+      console.log(`Cleaned ${deleted.length ?? 0} old entries for [${config.source}]`);
+    }
+
     console.log(`Ingesting [${config.source}] (${config.source_type}) from ${config.path}`);
     const count = await ingestSource(config, sql, env.CLOUDFLARE_ACCOUNT_ID, env.CLOUDFLARE_API_TOKEN);
     console.log(`\nDone. Indexed: ${count}`);
