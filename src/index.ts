@@ -40,6 +40,28 @@ interface McpResponse {
 const EMBEDDING_MODEL = "@cf/baai/bge-m3";
 const VECTOR_CONFIDENCE_THRESHOLD = 0.6;
 
+// GitHub URL mapping: source name → base URL + path prefix.
+// Enables clickable source links in search results.
+const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> = {
+  "PACK-digital-platform": { base: "https://github.com/TserenTserenov/PACK-digital-platform/blob/main", pathPrefix: "pack/" },
+  "PACK-personal": { base: "https://github.com/aisystant/PACK-personal/blob/main", pathPrefix: "pack/" },
+  "PACK-MIM": { base: "https://github.com/TserenTserenov/PACK-MIM/blob/main", pathPrefix: "pack/" },
+  "PACK-education": { base: "https://github.com/TserenTserenov/PACK-education/blob/main", pathPrefix: "pack/" },
+  "SPF": { base: "https://github.com/TserenTserenov/SPF/blob/main", pathPrefix: "" },
+  "FPF": { base: "https://github.com/ailev/FPF/blob/main", pathPrefix: "" },
+  "DS-ecosystem-development": { base: "https://github.com/aisystant/DS-ecosystem-development/blob/main", pathPrefix: "" },
+  "aist-bot-docs": { base: "https://github.com/aisystant/aist_bot/blob/new-architecture", pathPrefix: "docs/" },
+  "docs-courses": { base: "https://github.com/aisystant/docs/blob/main", pathPrefix: "docs/ru/" },
+  "exocortex-template-docs": { base: "https://github.com/TserenTserenov/FMT-exocortex-template/blob/main", pathPrefix: "docs/" },
+  "DS-Knowledge-Index-Tseren": { base: "https://github.com/TserenTserenov/DS-Knowledge-Index-Tseren/blob/main", pathPrefix: "" },
+};
+
+function resolveGithubUrl(source: string, filename: string): string | null {
+  const config = SOURCE_GITHUB_BASE[source];
+  if (!config) return null;
+  return `${config.base}/${config.pathPrefix}${filename}`;
+}
+
 // --- Helpers ---
 
 async function getEmbedding(ai: Ai, text: string): Promise<number[]> {
@@ -66,7 +88,7 @@ function detectQueryType(query: string): QueryType {
 
 // --- Tool implementations ---
 
-type SearchResult = { filename: string; content: string; source: string; source_type: string; score: number };
+type SearchResult = { filename: string; content: string; source: string; source_type: string; score: number; github_url: string | null };
 
 async function keywordSearch(
   env: Env,
@@ -102,13 +124,18 @@ async function keywordSearch(
     LIMIT ${limit}
   `;
 
-  return rows.map((r) => ({
-    filename: r.filename as string,
-    content: r.content as string,
-    source: (r.source as string) || "",
-    source_type: (r.source_type as string) || "",
-    score: r.score as number,
-  }));
+  return rows.map((r) => {
+    const source = (r.source as string) || "";
+    const filename = r.filename as string;
+    return {
+      filename,
+      content: r.content as string,
+      source,
+      source_type: (r.source_type as string) || "",
+      score: r.score as number,
+      github_url: resolveGithubUrl(source, filename),
+    };
+  });
 }
 
 async function vectorSearch(
@@ -134,13 +161,18 @@ async function vectorSearch(
     LIMIT ${limit}
   `;
 
-  return rows.map((r) => ({
-    filename: r.filename as string,
-    content: r.content as string,
-    source: (r.source as string) || "",
-    source_type: (r.source_type as string) || "",
-    score: r.score as number,
-  }));
+  return rows.map((r) => {
+    const source = (r.source as string) || "";
+    const filename = r.filename as string;
+    return {
+      filename,
+      content: r.content as string,
+      source,
+      source_type: (r.source_type as string) || "",
+      score: r.score as number,
+      github_url: resolveGithubUrl(source, filename),
+    };
+  });
 }
 
 async function searchDocuments(
@@ -184,7 +216,7 @@ async function getDocument(
   env: Env,
   filename: string,
   source?: string
-): Promise<{ filename: string; content: string; source: string; source_type: string } | null> {
+): Promise<{ filename: string; content: string; source: string; source_type: string; github_url: string | null } | null> {
   const sql = db(env);
   const src = source ?? null;
 
@@ -198,11 +230,14 @@ async function getDocument(
 
   if (!rows.length) return null;
   const r = rows[0];
+  const docSource = (r.source as string) || "";
+  const docFilename = r.filename as string;
   return {
-    filename: r.filename as string,
+    filename: docFilename,
     content: r.content as string,
-    source: (r.source as string) || "",
+    source: docSource,
     source_type: (r.source_type as string) || "",
+    github_url: resolveGithubUrl(docSource, docFilename),
   };
 }
 
@@ -295,7 +330,7 @@ async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpRespo
           result: {
             protocolVersion: "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "knowledge-mcp", version: "3.1.1" },
+            serverInfo: { name: "knowledge-mcp", version: "3.2.0" },
           },
         };
 
@@ -396,7 +431,7 @@ export default {
       return new Response(
         JSON.stringify({
           name: "Knowledge MCP Server",
-          version: "3.1.1",
+          version: "3.2.0",
           description: "Hybrid MCP — Cloudflare Workers AI + Neon pgvector + pg_trgm",
           mcp_endpoint: "/mcp",
           tools: TOOLS.map((t) => t.name),
