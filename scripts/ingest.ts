@@ -6,7 +6,7 @@
  * Neon PostgreSQL with embeddings from Cloudflare Workers AI.
  *
  * Usage:
- *   npx tsx scripts/ingest.ts --source PACK-digital-platform --type pack --path ~/Github/PACK-digital-platform/pack
+ *   npx tsx scripts/ingest.ts --source PACK-digital-platform --type pack --path ~/IWE/PACK-digital-platform/pack
  *   npx tsx scripts/ingest.ts --config scripts/sources.json   # bulk ingest from config
  *
  * Environment variables (or .dev.vars file):
