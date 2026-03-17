@@ -30,7 +30,7 @@ const EMBEDDING_MODEL = "@cf/baai/bge-m3";
 const EMBEDDING_DIM = 1024;
 const BATCH_SIZE = 10;
 const CHUNK_CHAR_LIMIT = 10_000;
-const LARGE_FILE_THRESHOLD = 100_000; // 100KB — files above this get chunked
+const LARGE_FILE_THRESHOLD = CHUNK_CHAR_LIMIT; // Files above CHUNK_CHAR_LIMIT get chunked by ## headers
 const SKIP_PATTERNS = [
   /node_modules/,
   /\.git\//,

@@ -122,7 +122,7 @@ async function keywordSearch(
       AND (${stype}::text IS NULL OR source_type = ${stype})
     ORDER BY score DESC,
              CASE WHEN filename ILIKE ${pattern} THEN 0 ELSE 1 END,
-             length(content) ASC
+             length(content) DESC
     LIMIT ${limit}
   `;
 
