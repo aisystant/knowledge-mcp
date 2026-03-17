@@ -106,18 +106,33 @@ async function keywordSearch(
   // Normalize hyphens to spaces for FTS (e.g. "ролей-агентов" → "ролей агентов")
   const ftsQuery = query.replace(/-/g, " ");
 
+  // Extract entity code for filename match, rest for content match
+  // e.g. "DP.IWE.002 §4a" → entityPattern="%DP.IWE.002%", sectionPattern="%4a%"
+  const entityMatch = query.match(/[A-Z]{2,}\.\w+\.\d+/);
+  const entityPattern = entityMatch ? `%${entityMatch[0]}%` : null;
+  const sectionRest = entityMatch
+    ? query.replace(entityMatch[0], "").replace(/[§#]/g, "").trim()
+    : null;
+  const sectionPattern = sectionRest ? `%${sectionRest}%` : null;
+
   const rows = await sql`
     SELECT filename, content, source, source_type,
            CASE
              WHEN filename ILIKE ${pattern} THEN 1.0
-             WHEN content ILIKE ${pattern} THEN 0.95
+             WHEN ${entityPattern}::text IS NOT NULL
+                  AND filename ILIKE ${entityPattern}
+                  AND ${sectionPattern}::text IS NOT NULL
+                  AND content ILIKE ${sectionPattern} THEN 0.98
+             WHEN filename ILIKE ${entityPattern} AND ${entityPattern}::text IS NOT NULL THEN 0.95
+             WHEN content ILIKE ${pattern} THEN 0.90
              WHEN search_vector @@ plainto_tsquery('simple', ${ftsQuery}) THEN 0.8
              ELSE 0.5
            END AS score
     FROM documents
     WHERE (content ILIKE ${pattern}
            OR filename ILIKE ${pattern}
-           OR search_vector @@ plainto_tsquery('simple', ${ftsQuery}))
+           OR search_vector @@ plainto_tsquery('simple', ${ftsQuery})
+           OR (${entityPattern}::text IS NOT NULL AND filename ILIKE ${entityPattern}))
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_type = ${stype})
     ORDER BY score DESC,
