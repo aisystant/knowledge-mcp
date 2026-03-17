@@ -31,6 +31,7 @@ const EMBEDDING_DIM = 1024;
 const BATCH_SIZE = 10;
 const CHUNK_CHAR_LIMIT = 10_000;
 const LARGE_FILE_THRESHOLD = CHUNK_CHAR_LIMIT; // Files above CHUNK_CHAR_LIMIT get chunked by ## headers
+const VERY_LARGE_WARNING = 50_000; // Warn about files >50K — consider splitting
 const SKIP_PATTERNS = [
   /node_modules/,
   /\.git\//,
@@ -259,7 +260,9 @@ async function ingestSource(
       const chunks = chunkLargeFile(content, file.relative);
       const parentHash = contentHash(content);
       chunkedParents.add(file.relative);
-      console.log(`  ${file.relative}: large file (${(content.length / 1024).toFixed(0)}KB) → ${chunks.length} chunks`);
+      const sizeKB = (content.length / 1024).toFixed(0);
+      const warn = content.length > VERY_LARGE_WARNING ? " ⚠️  consider splitting" : "";
+      console.log(`  ${file.relative}: large file (${sizeKB}KB) → ${chunks.length} chunks${warn}`);
       for (const chunk of chunks) {
         documents.push({
           filename: chunk.filename,
