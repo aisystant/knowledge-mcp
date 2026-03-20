@@ -30,6 +30,12 @@
     "exclude": ["images/", "assets/"]
   },
   {
+    "source": "PACK-autonomous-agents",
+    "source_type": "pack",
+    "path": "~/IWE/PACK-autonomous-agents/pack",
+    "exclude": ["images/", "assets/"]
+  },
+  {
     "source": "DS-ecosystem-development",
     "source_type": "ds",
     "path": "~/IWE/DS-ecosystem-development",
