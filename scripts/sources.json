@@ -36,6 +36,12 @@
     "exclude": ["images/", "assets/"]
   },
   {
+    "source": "PACK-ecosystem",
+    "source_type": "pack",
+    "path": "~/IWE/PACK-ecosystem/pack",
+    "exclude": ["images/", "assets/"]
+  },
+  {
     "source": "DS-ecosystem-development",
     "source_type": "ds",
     "path": "~/IWE/DS-ecosystem-development",
