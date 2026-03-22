@@ -46,7 +46,6 @@ const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> =
   "PACK-digital-platform": { base: "https://github.com/TserenTserenov/PACK-digital-platform/blob/main", pathPrefix: "pack/" },
   "PACK-personal": { base: "https://github.com/aisystant/PACK-personal/blob/main", pathPrefix: "pack/" },
   "PACK-MIM": { base: "https://github.com/TserenTserenov/PACK-MIM/blob/main", pathPrefix: "pack/" },
-  "PACK-education": { base: "https://github.com/TserenTserenov/PACK-education/blob/main", pathPrefix: "pack/" },
   "SPF": { base: "https://github.com/TserenTserenov/SPF/blob/main", pathPrefix: "" },
   "FPF": { base: "https://github.com/ailev/FPF/blob/main", pathPrefix: "" },
   "DS-ecosystem-development": { base: "https://github.com/aisystant/DS-ecosystem-development/blob/main", pathPrefix: "" },

@@ -3,67 +3,99 @@
     "source": "PACK-digital-platform",
     "source_type": "pack",
     "path": "~/IWE/PACK-digital-platform/pack",
-    "exclude": ["images/", "assets/"]
+    "exclude": [
+      "images/",
+      "assets/"
+    ]
   },
   {
     "source": "PACK-personal",
     "source_type": "pack",
     "path": "~/IWE/PACK-personal/pack",
-    "exclude": ["images/", "assets/"]
+    "exclude": [
+      "images/",
+      "assets/"
+    ]
   },
   {
     "source": "PACK-MIM",
     "source_type": "pack",
     "path": "~/IWE/PACK-MIM/pack",
-    "exclude": ["images/", "assets/"]
-  },
-  {
-    "source": "PACK-education",
-    "source_type": "pack",
-    "path": "~/IWE/PACK-education/pack",
-    "exclude": ["images/", "assets/"]
+    "exclude": [
+      "images/",
+      "assets/"
+    ]
   },
   {
     "source": "PACK-verification",
     "source_type": "pack",
     "path": "~/IWE/PACK-verification/pack",
-    "exclude": ["images/", "assets/"]
+    "exclude": [
+      "images/",
+      "assets/"
+    ]
   },
   {
     "source": "PACK-autonomous-agents",
     "source_type": "pack",
     "path": "~/IWE/PACK-autonomous-agents/pack",
-    "exclude": ["images/", "assets/"]
+    "exclude": [
+      "images/",
+      "assets/"
+    ]
   },
   {
     "source": "PACK-ecosystem",
     "source_type": "pack",
     "path": "~/IWE/PACK-ecosystem/pack",
-    "exclude": ["images/", "assets/"]
+    "exclude": [
+      "images/",
+      "assets/"
+    ]
   },
   {
     "source": "DS-ecosystem-development",
     "source_type": "ds",
     "path": "~/IWE/DS-ecosystem-development",
-    "exclude": ["node_modules/", ".git/", "images/"]
+    "exclude": [
+      "node_modules/",
+      ".git/",
+      "images/"
+    ]
   },
   {
     "source": "docs-courses",
     "source_type": "guides",
     "path": "~/IWE/docs/docs/ru",
-    "exclude": ["node_modules/", "public/"]
+    "exclude": [
+      "node_modules/",
+      "public/"
+    ]
   },
   {
     "source": "DS-Knowledge-Index-Tseren",
     "source_type": "content",
     "path": "~/IWE/DS-Knowledge-Index-Tseren",
-    "exclude": ["node_modules/", ".git/", "scripts/", "sources/", "docs/2020/", "docs/2021/", "docs/2022/", "docs/2023/", "docs/2024/", "docs/FPF/"]
+    "exclude": [
+      "node_modules/",
+      ".git/",
+      "scripts/",
+      "sources/",
+      "docs/2020/",
+      "docs/2021/",
+      "docs/2022/",
+      "docs/2023/",
+      "docs/2024/",
+      "docs/FPF/"
+    ]
   },
   {
     "source": "aist-bot-docs",
     "source_type": "ds",
     "path": "~/IWE/DS-IT-systems/aist_bot_newarchitecture/docs",
-    "exclude": ["plans-and-reports/"]
+    "exclude": [
+      "plans-and-reports/"
+    ]
   },
   {
     "source": "exocortex-template-docs",
@@ -75,12 +107,18 @@
     "source": "SPF",
     "source_type": "pack",
     "path": "~/IWE/SPF",
-    "exclude": ["pack-template/", "node_modules/", ".git/"]
+    "exclude": [
+      "pack-template/",
+      "node_modules/",
+      ".git/"
+    ]
   },
   {
     "source": "FPF",
     "source_type": "pack",
     "path": "~/IWE/FPF",
-    "exclude": [".git/"]
+    "exclude": [
+      ".git/"
+    ]
   }
 ]
