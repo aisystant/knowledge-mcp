@@ -8,7 +8,6 @@
     "typecheck": "tsc --noEmit",
     "ingest": "tsx scripts/ingest.ts",
     "ingest:all": "tsx scripts/ingest.ts --config scripts/sources.json",
-    "migrate-guides": "tsx scripts/migrate-guides.ts",
     "schema": "psql $DATABASE_URL -f schema.sql"
   },
   "devDependencies": {
