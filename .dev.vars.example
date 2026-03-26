@@ -4,12 +4,5 @@
 # Neon PostgreSQL connection string
 DATABASE_URL=postgresql://user:pass@ep-xxx.us-east-2.aws.neon.tech/knowledge?sslmode=require
 
-# Cloudflare (for local scripts — Workers AI REST API)
-CLOUDFLARE_ACCOUNT_ID=b6ea9a991319d14c2e78590526c5fb4f
-CLOUDFLARE_API_TOKEN=your_cloudflare_api_token
-
-# SurrealDB guides credentials (only for migrate-guides.ts)
-# GUIDES_NS=mcp
-# GUIDES_DB=guides
-# GUIDES_USER=your_username
-# GUIDES_PASS=your_password
+# OpenAI API key (for text-embedding-3-small)
+OPENAI_API_KEY=sk-your_openai_api_key

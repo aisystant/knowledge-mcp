@@ -1,8 +1,8 @@
 /**
- * Knowledge MCP Server v3.1 — Hybrid Search (vector + keyword)
+ * Knowledge MCP Server v3.2 — Hybrid Search (vector + keyword)
  *
  * Unified MCP server for Pack, guides, and DS knowledge.
- * Embeddings: Cloudflare Workers AI (@cf/baai/bge-m3, 1024d, multilingual)
+ * Embeddings: OpenAI (text-embedding-3-small, 1024d)
  * Storage: Neon PostgreSQL with pgvector + pg_trgm + tsvector
  *
  * Search routing (DP.D.024):
@@ -18,7 +18,7 @@ import { neon } from "@neondatabase/serverless";
 
 interface Env {
   DATABASE_URL: string;
-  AI: Ai;
+  OPENAI_API_KEY: string;
 }
 
 interface McpRequest {
@@ -37,7 +37,7 @@ interface McpResponse {
 
 // --- Config ---
 
-const EMBEDDING_MODEL = "@cf/baai/bge-m3";
+const EMBEDDING_MODEL = "text-embedding-3-small";
 const VECTOR_CONFIDENCE_THRESHOLD = 0.6;
 
 // GitHub URL mapping: source name → base URL + path prefix.
@@ -65,9 +65,27 @@ function resolveGithubUrl(source: string, filename: string): string | null {
 
 // --- Helpers ---
 
-async function getEmbedding(ai: Ai, text: string): Promise<number[]> {
-  const result = await ai.run(EMBEDDING_MODEL, { text: [text] });
-  return (result as { data: number[][] }).data[0];
+async function getEmbedding(apiKey: string, text: string): Promise<number[]> {
+  const response = await fetch("https://api.openai.com/v1/embeddings", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      input: [text],
+      model: EMBEDDING_MODEL,
+      dimensions: 1024,
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`OpenAI Embeddings error: ${response.status} ${errText}`);
+  }
+
+  const data = (await response.json()) as { data: { embedding: number[] }[] };
+  return data.data[0].embedding;
 }
 
 function db(env: Env) {
@@ -161,7 +179,7 @@ async function vectorSearch(
   sourceType?: string,
   limit: number = 5
 ): Promise<SearchResult[]> {
-  const embedding = await getEmbedding(env.AI, query);
+  const embedding = await getEmbedding(env.OPENAI_API_KEY, query);
   const vec = `[${embedding.join(",")}]`;
   const sql = db(env);
   const src = source ?? null;
@@ -346,7 +364,7 @@ async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpRespo
           result: {
             protocolVersion: "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "knowledge-mcp", version: "3.2.0" },
+            serverInfo: { name: "knowledge-mcp", version: "3.3.0" },
           },
         };
 
@@ -447,8 +465,8 @@ export default {
       return new Response(
         JSON.stringify({
           name: "Knowledge MCP Server",
-          version: "3.2.0",
-          description: "Hybrid MCP — Cloudflare Workers AI + Neon pgvector + pg_trgm",
+          version: "3.3.0",
+          description: "Hybrid MCP — OpenAI Embeddings + Neon pgvector + pg_trgm",
           mcp_endpoint: "/mcp",
           tools: TOOLS.map((t) => t.name),
           source_types: ["pack", "guides", "ds", "content"],

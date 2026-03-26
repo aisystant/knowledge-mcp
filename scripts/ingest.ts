@@ -1,9 +1,9 @@
 #!/usr/bin/env npx tsx
 /**
- * Knowledge MCP — Data Ingestion Script (Neon + Cloudflare Workers AI)
+ * Knowledge MCP — Data Ingestion Script (Neon + OpenAI Embeddings)
  *
  * Reads markdown files from Pack/DS/guides repos and indexes them into
- * Neon PostgreSQL with embeddings from Cloudflare Workers AI.
+ * Neon PostgreSQL with embeddings from OpenAI (text-embedding-3-small, 1024d).
  *
  * Usage:
  *   npx tsx scripts/ingest.ts --source PACK-digital-platform --type pack --path ~/IWE/PACK-digital-platform/pack
@@ -11,8 +11,7 @@
  *
  * Environment variables (or .dev.vars file):
  *   DATABASE_URL — Neon PostgreSQL connection string
- *   CLOUDFLARE_ACCOUNT_ID — Cloudflare account ID (for Workers AI)
- *   CLOUDFLARE_API_TOKEN — Cloudflare API token (for Workers AI)
+ *   OPENAI_API_KEY — OpenAI API key
  */
 
 import { readFileSync, readdirSync, statSync, existsSync } from "fs";
@@ -26,7 +25,7 @@ const __dirname = dirname(__filename);
 
 // --- Config ---
 
-const EMBEDDING_MODEL = "@cf/baai/bge-m3";
+const EMBEDDING_MODEL = "text-embedding-3-small";
 const EMBEDDING_DIM = 1024;
 const BATCH_SIZE = 10;
 const CHUNK_CHAR_LIMIT = 10_000;
@@ -51,26 +50,26 @@ interface SourceConfig {
   exclude?: string[];
 }
 
-// --- Cloudflare Workers AI (REST API) ---
+// --- OpenAI Embeddings (REST API) ---
 
 async function getEmbeddings(
-  accountId: string,
-  apiToken: string,
+  apiKey: string,
   texts: string[]
 ): Promise<number[][]> {
   const MAX_RETRIES = 5;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    const response = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${EMBEDDING_MODEL}`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ text: texts }),
-      }
-    );
+    const response = await fetch("https://api.openai.com/v1/embeddings", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        input: texts,
+        model: EMBEDDING_MODEL,
+        dimensions: EMBEDDING_DIM,
+      }),
+    });
 
     if (response.status === 429) {
       const wait = Math.pow(2, attempt + 1) * 1000;
@@ -81,14 +80,15 @@ async function getEmbeddings(
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`Cloudflare AI error: ${response.status} ${text}`);
+      throw new Error(`OpenAI Embeddings error: ${response.status} ${text}`);
     }
 
-    const data = (await response.json()) as { result: { data: number[][] }; success: boolean };
-    if (!data.success) throw new Error("Cloudflare AI: request failed");
-    return data.result.data;
+    const data = (await response.json()) as {
+      data: { embedding: number[] }[];
+    };
+    return data.data.map((d) => d.embedding);
   }
-  throw new Error("Cloudflare AI: max retries exceeded (rate limited)");
+  throw new Error("OpenAI Embeddings: max retries exceeded (rate limited)");
 }
 
 // --- File scanning ---
@@ -231,8 +231,7 @@ function chunkLargeFile(
 async function ingestSource(
   config: SourceConfig,
   sql: ReturnType<typeof neon>,
-  accountId: string,
-  apiToken: string
+  apiKey: string
 ): Promise<number> {
   const { source, source_type, path: basePath } = config;
 
@@ -317,7 +316,7 @@ async function ingestSource(
     const batch = toIndex.slice(i, i + BATCH_SIZE);
     const texts = batch.map((d) => d.content.slice(0, CHUNK_CHAR_LIMIT));
 
-    const embeddings = await getEmbeddings(accountId, apiToken, texts);
+    const embeddings = await getEmbeddings(apiKey, texts);
 
     for (let j = 0; j < batch.length; j++) {
       const doc = batch[j];
@@ -350,8 +349,7 @@ async function main() {
   // Load env from .dev.vars
   const env: Record<string, string> = {
     DATABASE_URL: process.env.DATABASE_URL || "",
-    CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID || "",
-    CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN || "",
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY || "",
   };
 
   const devVarsPath = join(__dirname, "../.dev.vars");
@@ -363,8 +361,8 @@ async function main() {
     }
   }
 
-  if (!env.DATABASE_URL || !env.CLOUDFLARE_ACCOUNT_ID || !env.CLOUDFLARE_API_TOKEN) {
-    console.error("Missing env vars: DATABASE_URL, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN");
+  if (!env.DATABASE_URL || !env.OPENAI_API_KEY) {
+    console.error("Missing env vars: DATABASE_URL, OPENAI_API_KEY");
     console.error("Set them in environment or in .dev.vars file");
     process.exit(1);
   }
@@ -378,7 +376,7 @@ async function main() {
     let total = 0;
     for (const config of configs) {
       console.log(`\n[${config.source}] (${config.source_type})`);
-      total += await ingestSource(config, sql, env.CLOUDFLARE_ACCOUNT_ID, env.CLOUDFLARE_API_TOKEN);
+      total += await ingestSource(config, sql, env.OPENAI_API_KEY);
     }
     console.log(`\nDone. Total indexed: ${total}`);
   } else {
@@ -405,7 +403,7 @@ async function main() {
     }
 
     console.log(`Ingesting [${config.source}] (${config.source_type}) from ${config.path}`);
-    const count = await ingestSource(config, sql, env.CLOUDFLARE_ACCOUNT_ID, env.CLOUDFLARE_API_TOKEN);
+    const count = await ingestSource(config, sql, env.OPENAI_API_KEY);
     console.log(`\nDone. Indexed: ${count}`);
   }
 }

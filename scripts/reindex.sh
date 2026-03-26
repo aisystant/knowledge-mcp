@@ -1,7 +1,8 @@
 #!/bin/bash
-# reindex.sh — еженедельная переиндексация knowledge-mcp
+# reindex.sh — полная переиндексация knowledge-mcp
 #
-# Запускается scheduler.sh (Пт 19:00).
+# Вызывается event-driven: GitHub Action при push в Pack/DS/docs репо,
+# или вручную для полной переиндексации всех sources.
 # Читает sources.json, вызывает ingest.ts, отправляет отчёт через notify.sh.
 #
 # Использование:

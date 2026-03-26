@@ -3,8 +3,6 @@ main = "src/index.ts"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
 
-[ai]
-binding = "AI"
-
 # Secrets (set via `wrangler secret put`):
 # DATABASE_URL - Neon PostgreSQL connection string
+# OPENAI_API_KEY - OpenAI API key
