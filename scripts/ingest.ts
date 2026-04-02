@@ -45,7 +45,7 @@ const SKIP_PATTERNS = [
 
 interface SourceConfig {
   source: string;
-  source_type: "pack" | "guides" | "ds";
+  source_type: "pack" | "guides" | "ds" | "content";
   path: string;
   exclude?: string[];
 }

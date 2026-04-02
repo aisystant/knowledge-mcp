@@ -1,5 +1,23 @@
 [
   {
+    "source": "FPF",
+    "source_type": "pack",
+    "path": "~/IWE/FPF",
+    "exclude": [
+      ".git/"
+    ]
+  },
+  {
+    "source": "SPF",
+    "source_type": "pack",
+    "path": "~/IWE/SPF",
+    "exclude": [
+      "pack-template/",
+      "node_modules/",
+      ".git/"
+    ]
+  },
+  {
     "source": "PACK-digital-platform",
     "source_type": "pack",
     "path": "~/IWE/PACK-digital-platform/pack",
@@ -74,6 +92,17 @@
     ]
   },
   {
+    "source": "DS-principles-curriculum",
+    "source_type": "guides",
+    "path": "~/IWE/DS-principles-curriculum",
+    "exclude": [
+      "node_modules/",
+      ".git/",
+      "images/",
+      "assets/"
+    ]
+  },
+  {
     "source": "docs-courses",
     "source_type": "guides",
     "path": "~/IWE/docs/docs/ru",
@@ -83,20 +112,32 @@
     ]
   },
   {
-    "source": "DS-Knowledge-Index-Tseren",
-    "source_type": "content",
-    "path": "~/IWE/DS-Knowledge-Index-Tseren",
+    "source": "exocortex-template-docs",
+    "source_type": "guides",
+    "path": "~/IWE/FMT-exocortex-template/docs",
+    "exclude": []
+  },
+  {
+    "source": "FMT-exocortex-template",
+    "source_type": "guides",
+    "path": "~/IWE/FMT-exocortex-template",
     "exclude": [
       "node_modules/",
       ".git/",
-      "scripts/",
-      "sources/",
-      "docs/2020/",
-      "docs/2021/",
-      "docs/2022/",
-      "docs/2023/",
-      "docs/2024/",
-      "docs/FPF/"
+      "docs/",
+      "images/",
+      "assets/"
+    ]
+  },
+  {
+    "source": "FMT-s2r",
+    "source_type": "guides",
+    "path": "~/IWE/FMT-s2r",
+    "exclude": [
+      "node_modules/",
+      ".git/",
+      "images/",
+      "assets/"
     ]
   },
   {
@@ -105,30 +146,6 @@
     "path": "~/IWE/DS-IT-systems/aist_bot_newarchitecture/docs",
     "exclude": [
       "plans-and-reports/"
-    ]
-  },
-  {
-    "source": "exocortex-template-docs",
-    "source_type": "guides",
-    "path": "~/IWE/FMT-exocortex-template/docs",
-    "exclude": []
-  },
-  {
-    "source": "SPF",
-    "source_type": "pack",
-    "path": "~/IWE/SPF",
-    "exclude": [
-      "pack-template/",
-      "node_modules/",
-      ".git/"
-    ]
-  },
-  {
-    "source": "FPF",
-    "source_type": "pack",
-    "path": "~/IWE/FPF",
-    "exclude": [
-      ".git/"
     ]
   }
 ]

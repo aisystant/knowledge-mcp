@@ -13,7 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MCP_DIR="$(dirname "$SCRIPT_DIR")"
-SOURCES_JSON="$SCRIPT_DIR/sources.json"
+SOURCES_JSON="${SOURCES_CONFIG:-$SCRIPT_DIR/sources.json}"
 LOG_DIR="$HOME/logs/synchronizer"
 DATE=$(date +%Y-%m-%d)
 LOG_FILE="$LOG_DIR/selective-reindex-$DATE.log"

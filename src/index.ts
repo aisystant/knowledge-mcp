@@ -1,5 +1,5 @@
 /**
- * Knowledge MCP Server v3.2 — Hybrid Search (vector + keyword)
+ * Knowledge MCP Server v3.4 — L2 Platform — Hybrid Search (vector + keyword)
  *
  * Unified MCP server for Pack, guides, and DS knowledge.
  * Embeddings: OpenAI (text-embedding-3-small, 1024d)
@@ -52,7 +52,13 @@ const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> =
   "aist-bot-docs": { base: "https://github.com/aisystant/aist_bot/blob/new-architecture", pathPrefix: "docs/" },
   "docs-courses": { base: "https://github.com/aisystant/docs/blob/main", pathPrefix: "docs/ru/" },
   "exocortex-template-docs": { base: "https://github.com/TserenTserenov/FMT-exocortex-template/blob/main", pathPrefix: "docs/" },
-  "DS-Knowledge-Index-Tseren": { base: "https://github.com/TserenTserenov/DS-Knowledge-Index-Tseren/blob/main", pathPrefix: "" },
+  "DS-principles-curriculum": { base: "https://github.com/aisystant/DS-principles-curriculum/blob/main", pathPrefix: "" },
+  "FMT-exocortex-template": { base: "https://github.com/TserenTserenov/FMT-exocortex-template/blob/main", pathPrefix: "" },
+  "FMT-s2r": { base: "https://github.com/TserenTserenov/FMT-s2r/blob/main", pathPrefix: "" },
+  "DS-autonomous-agents": { base: "https://github.com/aisystant/DS-autonomous-agents/blob/main", pathPrefix: "" },
+  "PACK-verification": { base: "https://github.com/aisystant/PACK-verification/blob/main", pathPrefix: "pack/" },
+  "PACK-autonomous-agents": { base: "https://github.com/aisystant/PACK-autonomous-agents/blob/main", pathPrefix: "pack/" },
+  "PACK-ecosystem": { base: "https://github.com/aisystant/PACK-ecosystem/blob/main", pathPrefix: "pack/" },
 };
 
 function resolveGithubUrl(source: string, filename: string): string | null {
@@ -364,7 +370,7 @@ async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpRespo
           result: {
             protocolVersion: "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "knowledge-mcp", version: "3.3.0" },
+            serverInfo: { name: "knowledge-mcp", version: "3.4.0" },
           },
         };
 
@@ -465,7 +471,7 @@ export default {
       return new Response(
         JSON.stringify({
           name: "Knowledge MCP Server",
-          version: "3.3.0",
+          version: "3.4.0",
           description: "Hybrid MCP — OpenAI Embeddings + Neon pgvector + pg_trgm",
           mcp_endpoint: "/mcp",
           tools: TOOLS.map((t) => t.name),

@@ -17,7 +17,7 @@ LOG_DIR="$HOME/logs/synchronizer"
 DATE=$(date +%Y-%m-%d)
 LOG_FILE="$LOG_DIR/reindex-$DATE.log"
 NOTIFY_SH="$HOME/Github/DS-synchronizer/scripts/notify.sh"
-SOURCES_JSON="$SCRIPT_DIR/sources.json"
+SOURCES_JSON="${SOURCES_CONFIG:-$SCRIPT_DIR/sources.json}"
 
 mkdir -p "$LOG_DIR"
 
