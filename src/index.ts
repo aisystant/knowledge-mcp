@@ -1,5 +1,5 @@
 /**
- * Knowledge MCP Server v4.0 — L2 Platform — Hybrid Search + Parent Retrieval + LLM Reranking
+ * Knowledge MCP Server v4.1 — L2 Platform — Hybrid Search + Parent Retrieval + LLM Reranking + Feedback Loop
  *
  * Unified MCP server for Pack, guides, and DS knowledge.
  * Embeddings: OpenAI (text-embedding-3-small, 1024d)
@@ -119,6 +119,7 @@ export function detectQueryType(query: string): QueryType {
 // --- Tool implementations ---
 
 type SearchResult = {
+  id: number;
   filename: string;
   content: string;
   source: string;
@@ -153,7 +154,7 @@ async function keywordSearch(
   const sectionPattern = sectionRest ? `%${sectionRest}%` : null;
 
   const rows = await sql`
-    SELECT filename, content, source, source_type,
+    SELECT id, filename, content, source, source_type,
            CASE
              WHEN filename ILIKE ${pattern} THEN 1.0
              WHEN ${entityPattern}::text IS NOT NULL
@@ -182,6 +183,7 @@ async function keywordSearch(
     const source = (r.source as string) || "";
     const filename = r.filename as string;
     return {
+      id: r.id as number,
       filename,
       content: r.content as string,
       source,
@@ -206,7 +208,7 @@ async function vectorSearch(
   const stype = sourceType ?? null;
 
   const rows = await sql`
-    SELECT filename, content, source, source_type,
+    SELECT id, filename, content, source, source_type,
            1 - (embedding <=> ${vec}::vector) AS score
     FROM documents
     WHERE embedding IS NOT NULL
@@ -220,6 +222,7 @@ async function vectorSearch(
     const source = (r.source as string) || "";
     const filename = r.filename as string;
     return {
+      id: r.id as number,
       filename,
       content: r.content as string,
       source,
@@ -469,6 +472,65 @@ async function listSources(
   }));
 }
 
+// --- Feedback ---
+
+async function recordFeedback(
+  env: Env,
+  documentId: number,
+  query: string,
+  helpfulness: boolean
+): Promise<{ recorded: boolean }> {
+  const sql = db(env);
+  const queryHash = await hashQuery(query);
+  await sql`
+    INSERT INTO retrieval_feedback (document_id, query_hash, helpfulness)
+    VALUES (${documentId}, ${queryHash}, ${helpfulness})
+  `;
+  return { recorded: true };
+}
+
+export async function hashQuery(query: string): Promise<string> {
+  const data = new TextEncoder().encode(query);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 64);
+}
+
+async function getFeedbackStats(
+  env: Env,
+  days: number = 30,
+  limit: number = 20
+): Promise<Array<{ document_id: number; filename: string; source: string; helpful: number; not_helpful: number; total: number; helpfulness_rate: number }>> {
+  const sql = db(env);
+  const rows = await sql`
+    SELECT
+      f.document_id,
+      d.filename,
+      d.source,
+      COUNT(*) FILTER (WHERE f.helpfulness = true)::int AS helpful,
+      COUNT(*) FILTER (WHERE f.helpfulness = false)::int AS not_helpful,
+      COUNT(*)::int AS total,
+      ROUND(COUNT(*) FILTER (WHERE f.helpfulness = true)::numeric / NULLIF(COUNT(*), 0), 2) AS helpfulness_rate
+    FROM retrieval_feedback f
+    JOIN documents d ON d.id = f.document_id
+    WHERE f.created_at >= NOW() - make_interval(days => ${days})
+    GROUP BY f.document_id, d.filename, d.source
+    ORDER BY total DESC, helpfulness_rate DESC
+    LIMIT ${limit}
+  `;
+  return rows.map((r) => ({
+    document_id: r.document_id as number,
+    filename: r.filename as string,
+    source: r.source as string,
+    helpful: r.helpful as number,
+    not_helpful: r.not_helpful as number,
+    total: r.total as number,
+    helpfulness_rate: Number(r.helpfulness_rate),
+  }));
+}
+
 // --- MCP tool definitions ---
 
 const TOOLS = [
@@ -520,6 +582,32 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: "knowledge_feedback",
+    description:
+      "Record helpfulness feedback for a retrieved document. Call after using a search result to signal whether it was actually helpful. This data improves future retrieval quality.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        document_id: { type: "number", description: "ID of the document from search results" },
+        query: { type: "string", description: "Original search query that returned this document" },
+        helpfulness: { type: "boolean", description: "true if document was helpful, false otherwise" },
+      },
+      required: ["document_id", "query", "helpfulness"],
+    },
+  },
+  {
+    name: "feedback_stats",
+    description:
+      "Analytics: top documents by helpfulness feedback over a period. Shows which documents are actually used by agents.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        days: { type: "number", description: "Period in days (default: 30)" },
+        limit: { type: "number", description: "Max results (default: 20)" },
+      },
+    },
+  },
 ];
 
 // --- MCP handler ---
@@ -536,7 +624,7 @@ async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpRespo
           result: {
             protocolVersion: "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "knowledge-mcp", version: "4.0.0" },
+            serverInfo: { name: "knowledge-mcp", version: "4.1.0" },
           },
         };
 
@@ -584,6 +672,29 @@ async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpRespo
             jsonrpc: "2.0",
             id,
             result: { content: [{ type: "text", text: JSON.stringify(sources, null, 2) }] },
+          };
+        }
+
+        if (toolName === "knowledge_feedback") {
+          const result = await recordFeedback(
+            env,
+            args.document_id as number,
+            args.query as string,
+            args.helpfulness as boolean
+          );
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: { content: [{ type: "text", text: JSON.stringify(result) }] },
+          };
+        }
+
+        if (toolName === "feedback_stats") {
+          const stats = await getFeedbackStats(env, (args.days as number) || 30, (args.limit as number) || 20);
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: { content: [{ type: "text", text: JSON.stringify(stats, null, 2) }] },
           };
         }
 
@@ -637,7 +748,7 @@ export default {
       return new Response(
         JSON.stringify({
           name: "Knowledge MCP Server",
-          version: "4.0.0",
+          version: "4.1.0",
           description: "Hybrid MCP — OpenAI Embeddings + Neon pgvector + pg_trgm + LLM Reranking + Parent Retrieval",
           mcp_endpoint: "/mcp",
           tools: TOOLS.map((t) => t.name),
