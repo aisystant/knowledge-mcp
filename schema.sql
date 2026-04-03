@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS documents (
   hash VARCHAR(16) NOT NULL DEFAULT '',
   embedding vector(1024),
   search_vector tsvector,
+  parent_id BIGINT REFERENCES documents(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -38,3 +39,7 @@ CREATE INDEX IF NOT EXISTS idx_documents_source_type
 
 CREATE INDEX IF NOT EXISTS idx_documents_source
   ON documents(source);
+
+-- Parent retrieval: link chunks to parent documents
+CREATE INDEX IF NOT EXISTS idx_documents_parent_id
+  ON documents(parent_id);

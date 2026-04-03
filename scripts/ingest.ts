@@ -129,13 +129,13 @@ function scanMarkdownFiles(basePath: string, extraExclude?: string[]): { filepat
   return results;
 }
 
-function contentHash(content: string): string {
+export function contentHash(content: string): string {
   return createHash("sha256").update(content).digest("hex").slice(0, 16);
 }
 
 // --- Hierarchical chunking for large files ---
 
-function chunkLargeFile(
+export function chunkLargeFile(
   content: string,
   filename: string
 ): { filename: string; content: string }[] {
@@ -248,20 +248,30 @@ async function ingestSource(
   if (files.length === 0) return 0;
 
   // Read files and compute hashes (chunk large files)
-  const documents: { filename: string; content: string; hash: string; parentFile?: string }[] = [];
+  // Parent documents: stored without embeddings, linked via parent_id
+  const documents: { filename: string; content: string; hash: string; parentFile?: string; isParent?: boolean }[] = [];
   const chunkedParents = new Set<string>();
   for (const file of files) {
     const content = readFileSync(file.filepath, "utf-8");
     if (content.trim().length < 10) continue;
 
     if (content.length > LARGE_FILE_THRESHOLD) {
-      // Large file — chunk by headers
+      // Large file — store parent document (no embedding) + chunks with parent link
       const chunks = chunkLargeFile(content, file.relative);
       const parentHash = contentHash(content);
       chunkedParents.add(file.relative);
       const sizeKB = (content.length / 1024).toFixed(0);
       const warn = content.length > VERY_LARGE_WARNING ? " ⚠️  consider splitting" : "";
-      console.log(`  ${file.relative}: large file (${sizeKB}KB) → ${chunks.length} chunks${warn}`);
+      console.log(`  ${file.relative}: large file (${sizeKB}KB) → ${chunks.length} chunks + parent${warn}`);
+
+      // Parent document: full content, no embedding (too large for meaningful vector)
+      documents.push({
+        filename: file.relative,
+        content,
+        hash: parentHash,
+        isParent: true,
+      });
+
       for (const chunk of chunks) {
         documents.push({
           filename: chunk.filename,
@@ -307,13 +317,30 @@ async function ingestSource(
   );
   for (const parentFile of changedParents) {
     await sql`DELETE FROM documents WHERE source = ${source} AND filename LIKE ${parentFile + '::%'}`;
-    console.log(`  Cleaned old chunks for ${parentFile}`);
+    // Also delete old parent document entry
+    await sql`DELETE FROM documents WHERE source = ${source} AND filename = ${parentFile}`;
+    console.log(`  Cleaned old parent + chunks for ${parentFile}`);
   }
 
-  // Process in batches
+  // Phase 1: Upsert parent documents (no embeddings — too large for meaningful vectors)
+  const parents = toIndex.filter((d) => d.isParent);
+  for (const parent of parents) {
+    await sql`
+      INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector)
+      VALUES (${parent.filename}, ${parent.content}, ${source}, ${source_type}, ${parent.hash}, NULL, to_tsvector('simple', ${parent.content}))
+      ON CONFLICT (filename, source)
+      DO UPDATE SET content = ${parent.content}, source_type = ${source_type}, hash = ${parent.hash}, embedding = NULL, search_vector = to_tsvector('simple', ${parent.content})
+    `;
+  }
+  if (parents.length > 0) {
+    console.log(`  ${parents.length} parent documents stored`);
+  }
+
+  // Phase 2: Upsert chunks with embeddings and parent_id links
+  const chunks = toIndex.filter((d) => !d.isParent);
   let indexed = 0;
-  for (let i = 0; i < toIndex.length; i += BATCH_SIZE) {
-    const batch = toIndex.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+    const batch = chunks.slice(i, i + BATCH_SIZE);
     const texts = batch.map((d) => d.content.slice(0, CHUNK_CHAR_LIMIT));
 
     const embeddings = await getEmbeddings(apiKey, texts);
@@ -322,23 +349,41 @@ async function ingestSource(
       const doc = batch[j];
       const embeddingStr = `[${embeddings[j].join(",")}]`;
 
-      await sql`
-        INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector)
-        VALUES (${doc.filename}, ${doc.content}, ${source}, ${source_type}, ${doc.hash}, ${embeddingStr}::vector, to_tsvector('simple', ${doc.content}))
-        ON CONFLICT (filename, source)
-        DO UPDATE SET content = ${doc.content}, source_type = ${source_type}, hash = ${doc.hash}, embedding = ${embeddingStr}::vector, search_vector = to_tsvector('simple', ${doc.content})
-      `;
+      if (doc.parentFile) {
+        // Chunk with parent link: resolve parent_id from DB
+        await sql`
+          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, parent_id)
+          VALUES (
+            ${doc.filename}, ${doc.content}, ${source}, ${source_type}, ${doc.hash},
+            ${embeddingStr}::vector, to_tsvector('simple', ${doc.content}),
+            (SELECT id FROM documents WHERE filename = ${doc.parentFile} AND source = ${source} LIMIT 1)
+          )
+          ON CONFLICT (filename, source)
+          DO UPDATE SET
+            content = ${doc.content}, source_type = ${source_type}, hash = ${doc.hash},
+            embedding = ${embeddingStr}::vector, search_vector = to_tsvector('simple', ${doc.content}),
+            parent_id = (SELECT id FROM documents WHERE filename = ${doc.parentFile} AND source = ${source} LIMIT 1)
+        `;
+      } else {
+        // Regular document (not chunked): no parent
+        await sql`
+          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector)
+          VALUES (${doc.filename}, ${doc.content}, ${source}, ${source_type}, ${doc.hash}, ${embeddingStr}::vector, to_tsvector('simple', ${doc.content}))
+          ON CONFLICT (filename, source)
+          DO UPDATE SET content = ${doc.content}, source_type = ${source_type}, hash = ${doc.hash}, embedding = ${embeddingStr}::vector, search_vector = to_tsvector('simple', ${doc.content})
+        `;
+      }
     }
 
     indexed += batch.length;
-    console.log(`  ${indexed}/${toIndex.length} indexed`);
+    console.log(`  ${indexed}/${chunks.length} indexed`);
 
-    if (i + BATCH_SIZE < toIndex.length) {
+    if (i + BATCH_SIZE < chunks.length) {
       await new Promise((r) => setTimeout(r, 300));
     }
   }
 
-  return indexed;
+  return indexed + parents.length;
 }
 
 // --- CLI ---
@@ -408,7 +453,11 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
-});
+// Only run main when executed directly (not when imported for testing)
+const isDirectRun = process.argv[1]?.endsWith("ingest.ts") || process.argv[1]?.endsWith("ingest.js");
+if (isDirectRun) {
+  main().catch((err) => {
+    console.error("Fatal error:", err);
+    process.exit(1);
+  });
+}

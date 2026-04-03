@@ -1,5 +1,5 @@
 /**
- * Knowledge MCP Server v3.4 — L2 Platform — Hybrid Search (vector + keyword)
+ * Knowledge MCP Server v4.0 — L2 Platform — Hybrid Search + Parent Retrieval + LLM Reranking
  *
  * Unified MCP server for Pack, guides, and DS knowledge.
  * Embeddings: OpenAI (text-embedding-3-small, 1024d)
@@ -39,6 +39,11 @@ interface McpResponse {
 
 const EMBEDDING_MODEL = "text-embedding-3-small";
 const VECTOR_CONFIDENCE_THRESHOLD = 0.6;
+const RERANK_MODEL = "gpt-4o-mini";
+const RERANK_CANDIDATES = 20; // Fetch top-N for reranking, return top-K
+const RERANK_TIMEOUT_MS = 5000;
+const RERANK_VECTOR_WEIGHT = 0.3;
+const RERANK_LLM_WEIGHT = 0.7;
 
 // GitHub URL mapping: source name → base URL + path prefix.
 // Enables clickable source links in search results.
@@ -61,7 +66,7 @@ const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> =
   "PACK-ecosystem": { base: "https://github.com/aisystant/PACK-ecosystem/blob/main", pathPrefix: "pack/" },
 };
 
-function resolveGithubUrl(source: string, filename: string): string | null {
+export function resolveGithubUrl(source: string, filename: string): string | null {
   const config = SOURCE_GITHUB_BASE[source];
   if (!config) return null;
   // Strip chunk section suffix (e.g., "FPF-Spec.md::B.1.3 - ..." → "FPF-Spec.md")
@@ -102,7 +107,7 @@ function db(env: Env) {
 
 type QueryType = "keyword" | "vector";
 
-function detectQueryType(query: string): QueryType {
+export function detectQueryType(query: string): QueryType {
   // Entity codes: DP.AGENT.001, MIM.M.003, SOTA.002, SPF.SPEC.001, etc.
   if (/[A-Z]{2,}\.\w+\.\d+/.test(query)) return "keyword";
   // Short queries with dots — likely structured identifiers
@@ -113,7 +118,16 @@ function detectQueryType(query: string): QueryType {
 
 // --- Tool implementations ---
 
-type SearchResult = { filename: string; content: string; source: string; source_type: string; score: number; github_url: string | null };
+type SearchResult = {
+  filename: string;
+  content: string;
+  source: string;
+  source_type: string;
+  score: number;
+  github_url: string | null;
+  parent_content?: string;
+  parent_filename?: string;
+};
 
 async function keywordSearch(
   env: Env,
@@ -152,7 +166,8 @@ async function keywordSearch(
              ELSE 0.5
            END AS score
     FROM documents
-    WHERE (content ILIKE ${pattern}
+    WHERE embedding IS NOT NULL
+      AND (content ILIKE ${pattern}
            OR filename ILIKE ${pattern}
            OR search_vector @@ plainto_tsquery('simple', ${ftsQuery})
            OR (${entityPattern}::text IS NOT NULL AND filename ILIKE ${entityPattern}))
@@ -195,7 +210,8 @@ async function vectorSearch(
     SELECT filename, content, source, source_type,
            1 - (embedding <=> ${vec}::vector) AS score
     FROM documents
-    WHERE (${src}::text IS NULL OR source = ${src})
+    WHERE embedding IS NOT NULL
+      AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_type = ${stype})
     ORDER BY embedding <=> ${vec}::vector
     LIMIT ${limit}
@@ -215,6 +231,150 @@ async function vectorSearch(
   });
 }
 
+// --- LLM Reranking ---
+
+interface RerankScore {
+  index: number;
+  relevance_score: number;
+}
+
+/**
+ * LLM Reranking: sends query + candidate snippets to gpt-4o-mini for relevance scoring.
+ * Returns reordered results with hybrid score (vector * 0.3 + llm * 0.7).
+ * Fallback: returns original order on any error/timeout.
+ */
+async function rerankWithLLM(
+  apiKey: string,
+  query: string,
+  results: SearchResult[],
+  limit: number
+): Promise<SearchResult[]> {
+  if (results.length <= 1) return results.slice(0, limit);
+
+  // Prepare candidate snippets (truncate content to save tokens)
+  const candidates = results.map((r, i) => ({
+    index: i,
+    filename: r.filename,
+    snippet: r.content.slice(0, 500),
+  }));
+
+  const systemPrompt = `You are a relevance judge. Given a query and candidate documents, score each document's relevance to the query on a scale of 0.0 to 1.0.
+
+Respond with a JSON array of objects: [{"index": 0, "relevance_score": 0.85}, ...]
+Include ALL candidates. Score based on how well the document answers the query.`;
+
+  const userPrompt = `Query: ${query}
+
+Candidates:
+${candidates.map((c) => `[${c.index}] ${c.filename}\n${c.snippet}`).join("\n\n")}`;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), RERANK_TIMEOUT_MS);
+
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: RERANK_MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        temperature: 0,
+        response_format: { type: "json_object" },
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      // Fallback: return original order
+      return results.slice(0, limit);
+    }
+
+    const data = (await response.json()) as {
+      choices: { message: { content: string } }[];
+    };
+
+    const content = data.choices[0]?.message?.content;
+    if (!content) return results.slice(0, limit);
+
+    // Parse LLM scores — handle both array and {scores: [...]} formats
+    const parsed = JSON.parse(content);
+    const scores: RerankScore[] = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed.scores)
+        ? parsed.scores
+        : [];
+
+    if (scores.length === 0) return results.slice(0, limit);
+
+    // Build score map
+    const llmScoreMap = new Map<number, number>();
+    for (const s of scores) {
+      if (typeof s.index === "number" && typeof s.relevance_score === "number") {
+        llmScoreMap.set(s.index, Math.max(0, Math.min(1, s.relevance_score)));
+      }
+    }
+
+    // Compute hybrid score and reorder
+    const reranked = results.map((r, i) => {
+      const llmScore = llmScoreMap.get(i) ?? 0.5; // default 0.5 if missing
+      const hybridScore = r.score * RERANK_VECTOR_WEIGHT + llmScore * RERANK_LLM_WEIGHT;
+      return { ...r, score: hybridScore };
+    });
+
+    reranked.sort((a, b) => b.score - a.score);
+    return reranked.slice(0, limit);
+  } catch {
+    // Timeout or parse error — fallback to original order
+    return results.slice(0, limit);
+  }
+}
+
+/** Enrich search results with parent document content when available */
+async function enrichWithParentContent(env: Env, results: SearchResult[]): Promise<SearchResult[]> {
+  if (results.length === 0) return results;
+  const sql = db(env);
+
+  // Batch-fetch parent info for all results that are chunks (have parent_id)
+  const filenames = results.map((r) => r.filename);
+  const sources = results.map((r) => r.source);
+
+  const parentRows = await sql`
+    SELECT c.filename AS chunk_filename, c.source AS chunk_source,
+           p.filename AS parent_filename, p.content AS parent_content
+    FROM documents c
+    JOIN documents p ON c.parent_id = p.id
+    WHERE c.parent_id IS NOT NULL
+      AND (c.filename, c.source) IN (
+        SELECT unnest(${filenames}::text[]), unnest(${sources}::text[])
+      )
+  `;
+
+  const parentMap = new Map<string, { parent_filename: string; parent_content: string }>();
+  for (const row of parentRows) {
+    const key = `${row.chunk_filename}||${row.chunk_source}`;
+    parentMap.set(key, {
+      parent_filename: row.parent_filename as string,
+      parent_content: row.parent_content as string,
+    });
+  }
+
+  return results.map((r) => {
+    const parent = parentMap.get(`${r.filename}||${r.source}`);
+    if (parent) {
+      return { ...r, parent_filename: parent.parent_filename, parent_content: parent.parent_content };
+    }
+    return r;
+  });
+}
+
 async function searchDocuments(
   env: Env,
   query: string,
@@ -225,13 +385,15 @@ async function searchDocuments(
   const queryType = detectQueryType(query);
 
   if (queryType === "keyword") {
-    // Keyword-first: skip embedding generation (~200ms saved)
+    // Keyword-first: skip embedding generation (~200ms saved), no reranking needed
     const kwResults = await keywordSearch(env, query, source, sourceType, limit);
-    if (kwResults.length > 0) return kwResults;
+    if (kwResults.length > 0) return enrichWithParentContent(env, kwResults);
     // Fallback to vector if keyword found nothing
   }
 
-  const vectorResults = await vectorSearch(env, query, source, sourceType, limit);
+  // Vector path: fetch extra candidates for LLM reranking
+  const fetchLimit = Math.max(limit, RERANK_CANDIDATES);
+  const vectorResults = await vectorSearch(env, query, source, sourceType, fetchLimit);
 
   // Low-confidence fallback: if vector top score < threshold, try keyword
   if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
@@ -245,11 +407,16 @@ async function searchDocuments(
           seen.set(r.filename, r);
         }
       }
-      return [...seen.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+      const merged = [...seen.values()].sort((a, b) => b.score - a.score);
+      // Rerank merged results
+      const reranked = await rerankWithLLM(env.OPENAI_API_KEY, query, merged, limit);
+      return enrichWithParentContent(env, reranked);
     }
   }
 
-  return vectorResults;
+  // LLM rerank vector results → return top-K
+  const reranked = await rerankWithLLM(env.OPENAI_API_KEY, query, vectorResults, limit);
+  return enrichWithParentContent(env, reranked);
 }
 
 async function getDocument(
@@ -309,7 +476,7 @@ const TOOLS = [
   {
     name: "search",
     description:
-      "Hybrid search across knowledge base documents. Searches Pack entities, guides, and DS knowledge. Uses keyword search for entity codes (e.g. DP.AGENT.001) and semantic vector search for natural language queries.",
+      "Hybrid search across knowledge base documents with LLM reranking. Searches Pack entities, guides, and DS knowledge. Uses keyword search for entity codes (e.g. DP.AGENT.001) and semantic vector search with LLM reranking for natural language queries. Returns parent document content when available for chunked documents.",
     inputSchema: {
       type: "object",
       properties: {
@@ -370,7 +537,7 @@ async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpRespo
           result: {
             protocolVersion: "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "knowledge-mcp", version: "3.4.0" },
+            serverInfo: { name: "knowledge-mcp", version: "4.0.0" },
           },
         };
 
@@ -471,8 +638,8 @@ export default {
       return new Response(
         JSON.stringify({
           name: "Knowledge MCP Server",
-          version: "3.4.0",
-          description: "Hybrid MCP — OpenAI Embeddings + Neon pgvector + pg_trgm",
+          version: "4.0.0",
+          description: "Hybrid MCP — OpenAI Embeddings + Neon pgvector + pg_trgm + LLM Reranking + Parent Retrieval",
           mcp_endpoint: "/mcp",
           tools: TOOLS.map((t) => t.name),
           source_types: ["pack", "guides", "ds", "content"],
