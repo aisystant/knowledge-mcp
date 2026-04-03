@@ -1,6 +1,12 @@
-import { describe, it, expect, vi } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery } from "./index.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent } from "./index.js";
+import type { SearchResult, Env } from "./index.js";
 import { chunkLargeFile, contentHash } from "../scripts/ingest.js";
+import { neon } from "@neondatabase/serverless";
+
+vi.mock("@neondatabase/serverless", () => ({
+  neon: vi.fn(),
+}));
 
 // --- detectQueryType ---
 
@@ -98,35 +104,219 @@ describe("contentHash", () => {
   });
 });
 
-// --- rerankWithLLM (integration-style test with mock) ---
+// --- rerankWithLLM ---
 
-describe("rerankWithLLM fallback", () => {
-  it("handles empty results", async () => {
-    // Import the module dynamically to test reranking
-    // Since rerankWithLLM is not exported, we test via searchDocuments behavior
-    // The key invariant: reranking never crashes, always returns results
-    expect(true).toBe(true); // placeholder — real test needs DB
+function makeResult(overrides: Partial<SearchResult> & { id: number; score: number }): SearchResult {
+  return {
+    filename: `doc-${overrides.id}.md`,
+    content: `Content of document ${overrides.id}`,
+    source: "test",
+    source_type: "pack",
+    github_url: null,
+    ...overrides,
+  };
+}
+
+function mockFetchResponse(scores: { index: number; relevance_score: number }[]) {
+  return {
+    ok: true,
+    json: async () => ({
+      choices: [{ message: { content: JSON.stringify({ scores }) } }],
+    }),
+  };
+}
+
+describe("rerankWithLLM", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("returns single result unchanged", async () => {
+    const results = [makeResult({ id: 1, score: 0.8 })];
+    const out = await rerankWithLLM("fake-key", "test query", results, 5);
+    expect(out).toHaveLength(1);
+    expect(out[0].id).toBe(1);
+  });
+
+  it("reranks by hybrid score (vector 0.3 + LLM 0.7)", async () => {
+    const results = [
+      makeResult({ id: 1, score: 0.9 }), // high vector, low LLM
+      makeResult({ id: 2, score: 0.5 }), // low vector, high LLM
+    ];
+
+    globalThis.fetch = vi.fn().mockResolvedValue(mockFetchResponse([
+      { index: 0, relevance_score: 0.2 }, // id=1: 0.9*0.3 + 0.2*0.7 = 0.41
+      { index: 1, relevance_score: 0.95 }, // id=2: 0.5*0.3 + 0.95*0.7 = 0.815
+    ]));
+
+    const out = await rerankWithLLM("fake-key", "test query", results, 5);
+    expect(out[0].id).toBe(2); // LLM preferred doc-2
+    expect(out[1].id).toBe(1);
+    expect(out[0].score).toBeCloseTo(0.815, 2);
+    expect(out[1].score).toBeCloseTo(0.41, 2);
+  });
+
+  it("respects limit parameter", async () => {
+    const results = [
+      makeResult({ id: 1, score: 0.9 }),
+      makeResult({ id: 2, score: 0.8 }),
+      makeResult({ id: 3, score: 0.7 }),
+    ];
+
+    globalThis.fetch = vi.fn().mockResolvedValue(mockFetchResponse([
+      { index: 0, relevance_score: 0.9 },
+      { index: 1, relevance_score: 0.8 },
+      { index: 2, relevance_score: 0.7 },
+    ]));
+
+    const out = await rerankWithLLM("fake-key", "query", results, 2);
+    expect(out).toHaveLength(2);
+  });
+
+  it("falls back to original order on fetch error", async () => {
+    const results = [
+      makeResult({ id: 1, score: 0.9 }),
+      makeResult({ id: 2, score: 0.5 }),
+    ];
+
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 500 });
+
+    const out = await rerankWithLLM("fake-key", "query", results, 5);
+    expect(out[0].id).toBe(1);
+    expect(out[0].score).toBe(0.9); // original scores preserved
+  });
+
+  it("falls back on network error (timeout/abort)", async () => {
+    const results = [
+      makeResult({ id: 1, score: 0.8 }),
+      makeResult({ id: 2, score: 0.6 }),
+    ];
+
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error("AbortError"));
+
+    const out = await rerankWithLLM("fake-key", "query", results, 5);
+    expect(out).toHaveLength(2);
+    expect(out[0].score).toBe(0.8); // unchanged
+  });
+
+  it("handles missing LLM scores with default 0.5", async () => {
+    const results = [
+      makeResult({ id: 1, score: 0.9 }),
+      makeResult({ id: 2, score: 0.4 }),
+    ];
+
+    // Only score for index 0, index 1 gets default 0.5
+    globalThis.fetch = vi.fn().mockResolvedValue(mockFetchResponse([
+      { index: 0, relevance_score: 0.3 },
+    ]));
+
+    const out = await rerankWithLLM("fake-key", "query", results, 5);
+    // id=1: 0.9*0.3 + 0.3*0.7 = 0.48
+    // id=2: 0.4*0.3 + 0.5*0.7 = 0.47 (default 0.5)
+    expect(out[0].id).toBe(1);
+    expect(out[1].id).toBe(2);
+  });
+
+  it("handles array format response (not wrapped in {scores})", async () => {
+    const results = [
+      makeResult({ id: 1, score: 0.5 }),
+      makeResult({ id: 2, score: 0.5 }),
+    ];
+
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: JSON.stringify([
+          { index: 0, relevance_score: 0.3 },
+          { index: 1, relevance_score: 0.9 },
+        ]) } }],
+      }),
+    });
+
+    const out = await rerankWithLLM("fake-key", "query", results, 5);
+    expect(out[0].id).toBe(2); // higher LLM score wins
+  });
+
+  it("clamps LLM scores to 0-1 range", async () => {
+    const results = [
+      makeResult({ id: 1, score: 0.5 }),
+      makeResult({ id: 2, score: 0.5 }),
+    ];
+
+    globalThis.fetch = vi.fn().mockResolvedValue(mockFetchResponse([
+      { index: 0, relevance_score: 1.5 },  // should clamp to 1.0
+      { index: 1, relevance_score: -0.3 }, // should clamp to 0.0
+    ]));
+
+    const out = await rerankWithLLM("fake-key", "query", results, 5);
+    // id=1: 0.5*0.3 + 1.0*0.7 = 0.85
+    // id=2: 0.5*0.3 + 0.0*0.7 = 0.15
+    expect(out[0].score).toBeCloseTo(0.85, 2);
+    expect(out[1].score).toBeCloseTo(0.15, 2);
+  });
+
+  it("falls back on empty choices", async () => {
+    const results = [makeResult({ id: 1, score: 0.7 }), makeResult({ id: 2, score: 0.6 })];
+
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [] }),
+    });
+
+    const out = await rerankWithLLM("fake-key", "query", results, 5);
+    expect(out[0].score).toBe(0.7); // original
   });
 });
 
-// --- SearchResult type with parent fields ---
+// --- enrichWithParentContent ---
 
-describe("SearchResult parent fields", () => {
-  it("type includes optional parent_content and parent_filename", () => {
-    // Type-level test: if this compiles, the type is correct
-    const result = {
-      id: 1,
-      filename: "test.md::Section",
-      content: "chunk content",
-      source: "test",
-      source_type: "pack",
-      score: 0.9,
-      github_url: null,
-      parent_content: "full document content",
-      parent_filename: "test.md",
-    };
-    expect(result.parent_content).toBe("full document content");
-    expect(result.parent_filename).toBe("test.md");
+describe("enrichWithParentContent", () => {
+  it("returns empty array for empty input", async () => {
+    const env = { DATABASE_URL: "fake", OPENAI_API_KEY: "fake" } as Env;
+    const out = await enrichWithParentContent(env, []);
+    expect(out).toEqual([]);
+  });
+
+  it("enriches chunks with parent content", async () => {
+    const mockSql = vi.fn().mockResolvedValue([
+      {
+        chunk_filename: "doc.md::Section A",
+        chunk_source: "PACK-digital-platform",
+        parent_filename: "doc.md",
+        parent_content: "Full parent document content here",
+      },
+    ]);
+    vi.mocked(neon).mockReturnValue(mockSql as any);
+
+    const env = { DATABASE_URL: "postgres://fake", OPENAI_API_KEY: "fake" } as Env;
+    const results: SearchResult[] = [
+      makeResult({ id: 10, score: 0.9, filename: "doc.md::Section A", source: "PACK-digital-platform" }),
+      makeResult({ id: 11, score: 0.8, filename: "other.md", source: "SPF" }),
+    ];
+
+    const out = await enrichWithParentContent(env, results);
+
+    expect(out[0].parent_filename).toBe("doc.md");
+    expect(out[0].parent_content).toBe("Full parent document content here");
+    // Second result has no parent
+    expect(out[1].parent_filename).toBeUndefined();
+    expect(out[1].parent_content).toBeUndefined();
+  });
+
+  it("handles no parent rows gracefully", async () => {
+    const mockSql = vi.fn().mockResolvedValue([]);
+    vi.mocked(neon).mockReturnValue(mockSql as any);
+
+    const env = { DATABASE_URL: "postgres://fake", OPENAI_API_KEY: "fake" } as Env;
+    const results: SearchResult[] = [
+      makeResult({ id: 5, score: 0.7, filename: "standalone.md", source: "SPF" }),
+    ];
+
+    const out = await enrichWithParentContent(env, results);
+    expect(out[0].parent_filename).toBeUndefined();
+    expect(out[0].filename).toBe("standalone.md");
   });
 });
 

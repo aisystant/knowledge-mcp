@@ -16,7 +16,7 @@ import { neon } from "@neondatabase/serverless";
 
 // --- Types ---
 
-interface Env {
+export interface Env {
   DATABASE_URL: string;
   OPENAI_API_KEY: string;
 }
@@ -118,7 +118,7 @@ export function detectQueryType(query: string): QueryType {
 
 // --- Tool implementations ---
 
-type SearchResult = {
+export type SearchResult = {
   id: number;
   filename: string;
   content: string;
@@ -245,7 +245,7 @@ interface RerankScore {
  * Returns reordered results with hybrid score (vector * 0.3 + llm * 0.7).
  * Fallback: returns original order on any error/timeout.
  */
-async function rerankWithLLM(
+export async function rerankWithLLM(
   apiKey: string,
   query: string,
   results: SearchResult[],
@@ -340,7 +340,7 @@ ${candidates.map((c) => `[${c.index}] ${c.filename}\n${c.snippet}`).join("\n\n")
 }
 
 /** Enrich search results with parent document content when available */
-async function enrichWithParentContent(env: Env, results: SearchResult[]): Promise<SearchResult[]> {
+export async function enrichWithParentContent(env: Env, results: SearchResult[]): Promise<SearchResult[]> {
   if (results.length === 0) return results;
   const sql = db(env);
 
