@@ -166,8 +166,7 @@ async function keywordSearch(
              ELSE 0.5
            END AS score
     FROM documents
-    WHERE embedding IS NOT NULL
-      AND (content ILIKE ${pattern}
+    WHERE (content ILIKE ${pattern}
            OR filename ILIKE ${pattern}
            OR search_vector @@ plainto_tsquery('simple', ${ftsQuery})
            OR (${entityPattern}::text IS NOT NULL AND filename ILIKE ${entityPattern}))
@@ -260,7 +259,7 @@ async function rerankWithLLM(
 
   const systemPrompt = `You are a relevance judge. Given a query and candidate documents, score each document's relevance to the query on a scale of 0.0 to 1.0.
 
-Respond with a JSON array of objects: [{"index": 0, "relevance_score": 0.85}, ...]
+Respond with a JSON object: {"scores": [{"index": 0, "relevance_score": 0.85}, ...]}
 Include ALL candidates. Score based on how well the document answers the query.`;
 
   const userPrompt = `Query: ${query}
