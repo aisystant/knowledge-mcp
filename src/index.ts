@@ -725,7 +725,7 @@ export default {
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, x-trace-id",
     };
 
     if (request.method === "OPTIONS") {
@@ -733,10 +733,18 @@ export default {
     }
 
     if (url.pathname === "/mcp" && request.method === "POST") {
+      const traceId = request.headers.get("x-trace-id") || undefined;
       const body = (await request.json()) as McpRequest;
       const response = await handleMcpRequest(body, env);
+      const responseHeaders: Record<string, string> = {
+        ...corsHeaders,
+        "Content-Type": "application/json",
+      };
+      if (traceId) {
+        responseHeaders["x-trace-id"] = traceId;
+      }
       return new Response(JSON.stringify(response), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        headers: responseHeaders,
       });
     }
 
