@@ -38,5 +38,29 @@
       "images/",
       "assets/"
     ]
+  },
+  {
+    "source": "DS-marathon-v2-tseren",
+    "source_type": "ds",
+    "path": "~/IWE/DS-marathon-v2-tseren",
+    "exclude": [
+      "node_modules/",
+      ".git/",
+      "images/",
+      "assets/"
+    ]
+  },
+  {
+    "source": "DS-agent-workspace",
+    "source_type": "ds",
+    "path": "~/IWE/DS-agent-workspace",
+    "exclude": [
+      "node_modules/",
+      ".git/",
+      ".venv/",
+      "__pycache__/",
+      "images/",
+      "assets/"
+    ]
   }
 ]
