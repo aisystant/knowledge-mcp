@@ -57,15 +57,15 @@ CREATE INDEX IF NOT EXISTS idx_user_sources_user
   ON user_sources(user_id);
 
 -- Step 4: Backfill — assign existing personal documents to Tseren
-UPDATE documents SET user_id = '406284c1-f89b-4cbd-acb1-894e34ce648c'
+UPDATE documents SET user_id = '25d91dbb-6ea2-46a7-a3da-cc1fd9dc9340'
   WHERE source IN ('DS-Knowledge-Index-Tseren', 'DS-my-strategy', 'DS-creator-development', 'DS-marathon-v2-tseren', 'DS-agent-workspace')
     AND user_id IS NULL;
 
 -- Backfill user_sources for Tseren
 INSERT INTO user_sources (user_id, source, github_owner, github_repo) VALUES
-  ('406284c1-f89b-4cbd-acb1-894e34ce648c', 'DS-Knowledge-Index-Tseren', 'TserenTserenov', 'DS-Knowledge-Index-Tseren'),
-  ('406284c1-f89b-4cbd-acb1-894e34ce648c', 'DS-my-strategy', 'TserenTserenov', 'DS-my-strategy'),
-  ('406284c1-f89b-4cbd-acb1-894e34ce648c', 'DS-creator-development', 'TserenTserenov', 'DS-creator-development'),
-  ('406284c1-f89b-4cbd-acb1-894e34ce648c', 'DS-marathon-v2-tseren', 'TserenTserenov', 'DS-marathon-v2-tseren'),
-  ('406284c1-f89b-4cbd-acb1-894e34ce648c', 'DS-agent-workspace', 'TserenTserenov', 'DS-agent-workspace')
+  ('25d91dbb-6ea2-46a7-a3da-cc1fd9dc9340', 'DS-Knowledge-Index-Tseren', 'TserenTserenov', 'DS-Knowledge-Index-Tseren'),
+  ('25d91dbb-6ea2-46a7-a3da-cc1fd9dc9340', 'DS-my-strategy', 'TserenTserenov', 'DS-my-strategy'),
+  ('25d91dbb-6ea2-46a7-a3da-cc1fd9dc9340', 'DS-creator-development', 'TserenTserenov', 'DS-creator-development'),
+  ('25d91dbb-6ea2-46a7-a3da-cc1fd9dc9340', 'DS-marathon-v2-tseren', 'TserenTserenov', 'DS-marathon-v2-tseren'),
+  ('25d91dbb-6ea2-46a7-a3da-cc1fd9dc9340', 'DS-agent-workspace', 'TserenTserenov', 'DS-agent-workspace')
 ON CONFLICT (user_id, source) DO NOTHING;
