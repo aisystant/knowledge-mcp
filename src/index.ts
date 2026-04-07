@@ -531,6 +531,504 @@ async function getFeedbackStats(
   }));
 }
 
+// --- WP-208: Concept Graph — analyze_verbalization ---
+
+interface ConceptMatch {
+  code: string;
+  name: string;
+  level: string;
+  score: number; // cosine similarity to user text segment
+}
+
+interface VerbalizationResult {
+  topic: string;
+  total_concepts: number;
+  matched_concepts: ConceptMatch[];
+  missed_concepts: { code: string; name: string; centrality: number }[];
+  coverage: number; // 0-1
+  edge_coverage: number; // 0-1
+  misconceptions_found: { text: string; correct: string | null; category: string; explanation?: string }[];
+  recommendations: string[];
+  mastery_updated: boolean;
+}
+
+async function analyzeVerbalization(
+  env: Env,
+  text: string,
+  topic: string | undefined,
+  domain: string | undefined,
+  level: string | undefined,
+  userId: string | undefined
+): Promise<VerbalizationResult> {
+  const sql = db(env);
+
+  // 1. Get topic concepts subgraph
+  // If topic is given, search for concepts matching the topic
+  // Otherwise use domain/level filters
+  let topicConcepts: any[];
+
+  if (topic) {
+    // Embed the topic to find relevant concepts
+    const topicEmbedding = await getEmbedding(env.OPENAI_API_KEY, topic);
+    const vecStr = `[${topicEmbedding.join(",")}]`;
+    topicConcepts = await sql`
+      SELECT id, code, name, definition, level, domain,
+             1 - (embedding <=> ${vecStr}::vector) AS similarity
+      FROM concept_graph.concepts
+      WHERE status = 'active'
+      ORDER BY embedding <=> ${vecStr}::vector
+      LIMIT 50
+    `;
+  } else {
+    // Filter by domain and/or level
+    topicConcepts = await sql`
+      SELECT id, code, name, definition, level, domain, 1.0 AS similarity
+      FROM concept_graph.concepts
+      WHERE status = 'active'
+        AND (${domain}::text IS NULL OR domain = ${domain})
+        AND (${level}::text IS NULL OR level = ${level})
+      LIMIT 100
+    `;
+  }
+
+  if (topicConcepts.length === 0) {
+    return {
+      topic: topic || domain || "all",
+      total_concepts: 0,
+      matched_concepts: [],
+      missed_concepts: [],
+      coverage: 0,
+      edge_coverage: 0,
+      misconceptions_found: [],
+      recommendations: ["Тема не найдена в графе понятий"],
+      mastery_updated: false,
+    };
+  }
+
+  const conceptIds = topicConcepts.map((c) => c.id);
+
+  // 2. Find which concepts appear in the user text via LLM-as-judge
+  // Replaces stemming (too many false positives) with precise LLM classification
+  const matched: ConceptMatch[] = [];
+  const missed: { code: string; name: string; centrality: number }[] = [];
+  const textLower = text.toLowerCase();
+
+  // Build concept list for LLM
+  const conceptList = topicConcepts.map((c, i) => `[${i}] ${c.name}`).join("\n");
+
+  const matchPrompt = `Определи, какие понятия из списка реально использованы или объяснены в тексте ученика.
+
+Текст:
+"""
+${text.slice(0, 2000)}
+"""
+
+Понятия:
+${conceptList}
+
+Правила:
+- Понятие "использовано" если ученик упоминает его (в любой форме слова) ИЛИ объясняет его суть своими словами
+- НЕ считай понятие использованным если упомянуто только одно общеупотребительное слово из составного термина (например, "роль" в бытовом смысле ≠ "проектная роль")
+- Будь строгим: лучше пропустить, чем ложно засчитать
+
+Ответь JSON: {"found": [0, 3, 7], "confidence": [0.9, 0.7, 0.8]}
+Если ничего не найдено: {"found": [], "confidence": []}`;
+
+  try {
+    const matchResponse = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: matchPrompt }],
+        temperature: 0.1,
+        max_tokens: 300,
+        response_format: { type: "json_object" },
+      }),
+    });
+
+    if (matchResponse.ok) {
+      const matchData = (await matchResponse.json()) as {
+        choices: { message: { content: string } }[];
+      };
+      const parsed = JSON.parse(matchData.choices[0]?.message?.content || "{}") as {
+        found: number[];
+        confidence: number[];
+      };
+
+      const foundSet = new Set(parsed.found || []);
+      for (let i = 0; i < topicConcepts.length; i++) {
+        const concept = topicConcepts[i];
+        if (foundSet.has(i)) {
+          matched.push({
+            code: concept.code,
+            name: concept.name,
+            level: concept.level,
+            score: parsed.confidence?.[parsed.found.indexOf(i)] || 0.7,
+          });
+        } else {
+          missed.push({
+            code: concept.code,
+            name: concept.name,
+            centrality: Number(concept.similarity),
+          });
+        }
+      }
+    } else {
+      // Fallback: simple full-name matching
+      for (const concept of topicConcepts) {
+        const conceptName = (concept.name as string).toLowerCase();
+        if (textLower.includes(conceptName)) {
+          matched.push({ code: concept.code, name: concept.name, level: concept.level, score: 0.9 });
+        } else {
+          missed.push({ code: concept.code, name: concept.name, centrality: Number(concept.similarity) });
+        }
+      }
+    }
+  } catch {
+    // Fallback: simple full-name matching
+    for (const concept of topicConcepts) {
+      const conceptName = (concept.name as string).toLowerCase();
+      if (textLower.includes(conceptName)) {
+        matched.push({ code: concept.code, name: concept.name, level: concept.level, score: 0.9 });
+      } else {
+        missed.push({ code: concept.code, name: concept.name, centrality: Number(concept.similarity) });
+      }
+    }
+  }
+
+  // Sort matched by score desc, missed by centrality desc
+  matched.sort((a, b) => b.score - a.score);
+  missed.sort((a, b) => b.centrality - a.centrality);
+
+  // 3. Edge coverage: how many edges between matched concepts exist
+  const matchedIds = matched
+    .map((m) => topicConcepts.find((c) => c.code === m.code)?.id)
+    .filter(Boolean);
+
+  let edgeCoverage = 0;
+  if (matchedIds.length >= 2) {
+    const edgeRows = await sql`
+      SELECT COUNT(*) AS cnt
+      FROM concept_graph.concept_edges
+      WHERE from_concept_id = ANY(${matchedIds})
+        AND to_concept_id = ANY(${matchedIds})
+    `;
+    const totalPossibleEdges = await sql`
+      SELECT COUNT(*) AS cnt
+      FROM concept_graph.concept_edges
+      WHERE from_concept_id = ANY(${conceptIds})
+        AND to_concept_id = ANY(${conceptIds})
+    `;
+    const matched_edges = Number(edgeRows[0]?.cnt || 0);
+    const total_edges = Number(totalPossibleEdges[0]?.cnt || 0);
+    edgeCoverage = total_edges > 0 ? matched_edges / total_edges : 0;
+  }
+
+  // 4. Check for misconceptions via LLM-as-judge (WP-208 Ф4)
+  const misconceptions = await sql`
+    SELECT cm.misconception_text, cm.correct_version, cm.category, cm.folk_term, c.name AS concept_name
+    FROM concept_graph.concept_misconceptions cm
+    JOIN concept_graph.concepts c ON c.id = cm.concept_id
+    WHERE cm.concept_id = ANY(${conceptIds})
+    LIMIT 30
+  `;
+
+  const foundMisconceptions: VerbalizationResult["misconceptions_found"] = [];
+
+  if (misconceptions.length > 0 && text.length > 20) {
+    // Build misconception catalog for LLM
+    const miscCatalog = misconceptions.map((m, i) =>
+      `[${i}] Мем: ${m.misconception_text} | Понятие: ${m.concept_name} | Тип: ${m.category}${m.correct_version ? ` | Правильно: ${m.correct_version}` : ""}${m.folk_term ? ` | Бытовой термин: ${m.folk_term}` : ""}`
+    ).join("\n");
+
+    const llmPrompt = `Ты — эксперт по выявлению подмен понятий (мемов) в текстах учеников.
+
+Текст ученика:
+"""
+${text.slice(0, 2000)}
+"""
+
+Каталог известных мемов (подмен понятий):
+${miscCatalog}
+
+Задача: определи, какие мемы из каталога проявляются в тексте ученика.
+
+Мем проявляется если:
+- Ученик использует бытовую подмену вместо правильного термина (folk_substitution)
+- Ученик применяет понятие неправильно (wrong_application)
+- Ученик путает одно понятие с другим (wrong_concept)
+
+Ответь СТРОГО в JSON формате — массив номеров мемов из каталога:
+{"found": [0, 3, 7], "explanations": ["краткое пояснение для каждого найденного"]}
+
+Если мемов не обнаружено: {"found": [], "explanations": []}`;
+
+    try {
+      const llmResponse = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [{ role: "user", content: llmPrompt }],
+          temperature: 0.1,
+          max_tokens: 500,
+          response_format: { type: "json_object" },
+        }),
+      });
+
+      if (llmResponse.ok) {
+        const llmData = (await llmResponse.json()) as {
+          choices: { message: { content: string } }[];
+        };
+        const content = llmData.choices[0]?.message?.content || "{}";
+        const parsed = JSON.parse(content) as { found: number[]; explanations: string[] };
+
+        for (let i = 0; i < (parsed.found || []).length; i++) {
+          const idx = parsed.found[i];
+          if (idx >= 0 && idx < misconceptions.length) {
+            const m = misconceptions[idx];
+            foundMisconceptions.push({
+              text: m.misconception_text as string,
+              correct: m.correct_version as string | null,
+              category: m.category as string,
+              explanation: parsed.explanations?.[i] || undefined,
+            });
+          }
+        }
+      }
+    } catch {
+      // Fallback to simple string matching if LLM fails
+      for (const m of misconceptions) {
+        const miscText = (m.misconception_text as string).toLowerCase().replace(/[«»"]/g, "");
+        if (miscText.length > 5 && textLower.includes(miscText.slice(0, 20).toLowerCase())) {
+          foundMisconceptions.push({
+            text: m.misconception_text as string,
+            correct: m.correct_version as string | null,
+            category: m.category as string,
+          });
+        }
+      }
+    }
+  }
+
+  // 5. Generate recommendations
+  const coverage = topicConcepts.length > 0 ? matched.length / topicConcepts.length : 0;
+  const recommendations: string[] = [];
+
+  if (coverage < 0.3) {
+    recommendations.push(`Покрытие понятий низкое (${Math.round(coverage * 100)}%). Проговорите больше понятий темы.`);
+  }
+
+  // Top 3 missed high-centrality concepts
+  const topMissed = missed.slice(0, 3);
+  for (const m of topMissed) {
+    recommendations.push(`Проговорите «${m.name}» — важное понятие темы.`);
+  }
+
+  if (foundMisconceptions.length > 0) {
+    recommendations.push(`Обнаружено ${foundMisconceptions.length} подмен понятий — проверьте определения.`);
+  }
+
+  if (edgeCoverage < 0.3 && matched.length >= 3) {
+    recommendations.push("Понятия упомянуты, но слабо связаны между собой. Попробуйте объяснить связи.");
+  }
+
+  // 6. Update learner mastery (Ф5) — Bayesian update per matched concept
+  if (userId && matched.length > 0) {
+    const ALPHA = 0.3; // learning rate
+    for (const m of matched) {
+      const conceptRow = topicConcepts.find((c) => c.code === m.code);
+      if (!conceptRow) continue;
+
+      // Bayesian update: M_new = M_old + α * (score - M_old)
+      await sql`
+        INSERT INTO concept_graph.learner_concept_mastery
+          (user_id, concept_id, mastery, attempts, last_score, last_assessed_at)
+        VALUES (${userId}, ${conceptRow.id}, ${ALPHA * m.score}, 1, ${m.score}, NOW())
+        ON CONFLICT (user_id, concept_id) DO UPDATE SET
+          mastery = concept_graph.learner_concept_mastery.mastery +
+            ${ALPHA} * (${m.score} - concept_graph.learner_concept_mastery.mastery),
+          attempts = concept_graph.learner_concept_mastery.attempts + 1,
+          last_score = ${m.score},
+          last_assessed_at = NOW(),
+          updated_at = NOW()
+      `;
+    }
+  }
+
+  return {
+    topic: topic || domain || "all",
+    total_concepts: topicConcepts.length,
+    matched_concepts: matched.slice(0, 20),
+    missed_concepts: missed.slice(0, 10),
+    coverage: Math.round(coverage * 1000) / 1000,
+    edge_coverage: Math.round(edgeCoverage * 1000) / 1000,
+    misconceptions_found: foundMisconceptions,
+    recommendations,
+    mastery_updated: !!userId,
+  };
+}
+
+// --- WP-208: graph_stats ---
+
+async function getGraphStats(env: Env) {
+  const sql = db(env);
+
+  const [conceptCount] = await sql`SELECT COUNT(*)::int AS cnt FROM concept_graph.concepts WHERE status = 'active'`;
+  const [edgeCount] = await sql`SELECT COUNT(*)::int AS cnt FROM concept_graph.concept_edges`;
+  const [miscCount] = await sql`SELECT COUNT(*)::int AS cnt FROM concept_graph.concept_misconceptions`;
+
+  const byLevel = await sql`
+    SELECT level, COUNT(*)::int AS cnt
+    FROM concept_graph.concepts WHERE status = 'active'
+    GROUP BY level ORDER BY cnt DESC
+  `;
+
+  const byEdgeType = await sql`
+    SELECT edge_type, COUNT(*)::int AS cnt
+    FROM concept_graph.concept_edges
+    GROUP BY edge_type ORDER BY cnt DESC
+  `;
+
+  const orphans = await sql`
+    SELECT c.code, c.name, c.level
+    FROM concept_graph.concepts c
+    LEFT JOIN concept_graph.concept_edges e1 ON e1.from_concept_id = c.id
+    LEFT JOIN concept_graph.concept_edges e2 ON e2.to_concept_id = c.id
+    WHERE c.status = 'active' AND e1.id IS NULL AND e2.id IS NULL
+    LIMIT 20
+  `;
+
+  // Suspicious edges (АрхГейт L2.2 mitigation)
+  const suspiciousEdges = await sql`
+    SELECT c1.code AS from_code, c1.name AS from_name,
+           c2.code AS to_code, c2.name AS to_name,
+           e.weight, e.weight_source
+    FROM concept_graph.concept_edges e
+    JOIN concept_graph.concepts c1 ON c1.id = e.from_concept_id
+    JOIN concept_graph.concepts c2 ON c2.id = e.to_concept_id
+    WHERE e.edge_type = 'specializes'
+      AND e.weight_source = 'embedding'
+      AND e.weight < 0.8
+    LIMIT 20
+  `;
+
+  const topCentral = await sql`
+    SELECT c.code, c.name, COUNT(*)::int AS connections
+    FROM concept_graph.concepts c
+    LEFT JOIN concept_graph.concept_edges e ON e.from_concept_id = c.id OR e.to_concept_id = c.id
+    WHERE c.status = 'active'
+    GROUP BY c.id, c.code, c.name
+    ORDER BY connections DESC
+    LIMIT 10
+  `;
+
+  return {
+    concepts: conceptCount.cnt,
+    edges: edgeCount.cnt,
+    misconceptions: miscCount.cnt,
+    by_level: byLevel,
+    by_edge_type: byEdgeType,
+    orphans: orphans.length > 0 ? orphans : "none",
+    suspicious_edges: suspiciousEdges.length > 0 ? suspiciousEdges : "none",
+    top_central: topCentral,
+  };
+}
+
+// --- WP-208 Ф5: learner_progress ---
+
+async function getLearnerProgress(env: Env, userId: string, domain: string | undefined) {
+  const sql = db(env);
+
+  // Overall stats
+  const [totalConcepts] = await sql`
+    SELECT COUNT(*)::int AS cnt FROM concept_graph.concepts
+    WHERE status = 'active' AND (${domain}::text IS NULL OR domain = ${domain})
+  `;
+  const [masteredCount] = await sql`
+    SELECT COUNT(*)::int AS cnt FROM concept_graph.learner_concept_mastery lm
+    JOIN concept_graph.concepts c ON c.id = lm.concept_id
+    WHERE lm.user_id = ${userId} AND lm.mastery >= 0.5
+      AND (${domain}::text IS NULL OR c.domain = ${domain})
+  `;
+  const [totalAttempts] = await sql`
+    SELECT COALESCE(SUM(attempts), 0)::int AS cnt FROM concept_graph.learner_concept_mastery
+    WHERE user_id = ${userId}
+  `;
+
+  // Per-domain breakdown
+  const byDomain = await sql`
+    SELECT c.domain,
+           COUNT(DISTINCT c.id)::int AS total_concepts,
+           COUNT(DISTINCT lm.concept_id) FILTER (WHERE lm.mastery >= 0.5)::int AS mastered,
+           ROUND(AVG(lm.mastery)::numeric, 2) AS avg_mastery
+    FROM concept_graph.concepts c
+    LEFT JOIN concept_graph.learner_concept_mastery lm
+      ON lm.concept_id = c.id AND lm.user_id = ${userId}
+    WHERE c.status = 'active' AND c.domain IS NOT NULL
+      AND (${domain}::text IS NULL OR c.domain = ${domain})
+    GROUP BY c.domain
+    ORDER BY total_concepts DESC
+  `;
+
+  // Top mastered concepts
+  const topMastered = await sql`
+    SELECT c.code, c.name, c.level, lm.mastery, lm.attempts, lm.last_assessed_at
+    FROM concept_graph.learner_concept_mastery lm
+    JOIN concept_graph.concepts c ON c.id = lm.concept_id
+    WHERE lm.user_id = ${userId}
+      AND (${domain}::text IS NULL OR c.domain = ${domain})
+    ORDER BY lm.mastery DESC
+    LIMIT 10
+  `;
+
+  // Weakest concepts (assessed but low mastery)
+  const weakest = await sql`
+    SELECT c.code, c.name, c.level, lm.mastery, lm.attempts
+    FROM concept_graph.learner_concept_mastery lm
+    JOIN concept_graph.concepts c ON c.id = lm.concept_id
+    WHERE lm.user_id = ${userId} AND lm.mastery < 0.5 AND lm.attempts >= 1
+      AND (${domain}::text IS NULL OR c.domain = ${domain})
+    ORDER BY lm.mastery ASC
+    LIMIT 10
+  `;
+
+  // Recommended next concepts (high centrality, not yet assessed)
+  const recommended = await sql`
+    SELECT c.code, c.name, c.level, c.domain,
+           COUNT(e.id)::int AS connections
+    FROM concept_graph.concepts c
+    LEFT JOIN concept_graph.concept_edges e ON e.from_concept_id = c.id OR e.to_concept_id = c.id
+    LEFT JOIN concept_graph.learner_concept_mastery lm ON lm.concept_id = c.id AND lm.user_id = ${userId}
+    WHERE c.status = 'active' AND lm.id IS NULL
+      AND c.level IN ('guide', 'pack')
+      AND (${domain}::text IS NULL OR c.domain = ${domain})
+    GROUP BY c.id, c.code, c.name, c.level, c.domain
+    ORDER BY connections DESC
+    LIMIT 5
+  `;
+
+  return {
+    user_id: userId,
+    domain: domain || "all",
+    total_concepts: totalConcepts.cnt,
+    mastered: masteredCount.cnt,
+    coverage: totalConcepts.cnt > 0 ? Math.round(masteredCount.cnt / totalConcepts.cnt * 1000) / 1000 : 0,
+    total_attempts: totalAttempts.cnt,
+    by_domain: byDomain,
+    top_mastered: topMastered,
+    weakest: weakest,
+    recommended_next: recommended,
+  };
+}
+
 // --- MCP tool definitions ---
 
 const TOOLS = [
@@ -606,6 +1104,44 @@ const TOOLS = [
         days: { type: "number", description: "Period in days (default: 30)" },
         limit: { type: "number", description: "Max results (default: 20)" },
       },
+    },
+  },
+  {
+    name: "analyze_verbalization",
+    description:
+      "Анализирует текст пользователя (ДЗ, эссе, проговаривание) на предмет использования понятий из графа знаний. Возвращает: покрытие понятий, пропущенные ключевые понятия, связность, обнаруженные мемы/подмены, рекомендации. Используй для оценки качества проговаривания или письменной работы.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Текст пользователя для анализа (ДЗ, эссе, проговаривание)" },
+        topic: { type: "string", description: "Тема/раздел для сравнения (например, 'Роли и мастерство', 'Собранность'). Если не указано — анализ по всему графу" },
+        domain: { type: "string", description: "Фильтр по домену: MIM, DP, PD, ECO и т.д." },
+        level: { type: "string", enum: ["zp", "fpf", "pack", "guide", "course"], description: "Фильтр по уровню иерархии знаний" },
+        user_id: { type: "string", description: "Ory user UUID — если передан, обновляет mastery ученика по результатам анализа" },
+      },
+      required: ["text"],
+    },
+  },
+  {
+    name: "graph_stats",
+    description:
+      "Статистика графа понятий: количество понятий по уровням, связи по типам, orphan-понятия (без связей), подозрительные edges для ревью, топ-10 центральных понятий.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "learner_progress",
+    description:
+      "Прогресс ученика по освоению понятий: общее покрытие, разбивка по доменам, топ освоенных, слабые места, рекомендации что учить дальше. Данные обновляются при каждом вызове analyze_verbalization с user_id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        user_id: { type: "string", description: "Ory user UUID" },
+        domain: { type: "string", description: "Фильтр по домену (MIM, PD, DP и т.д.)" },
+      },
+      required: ["user_id"],
     },
   },
 ];
@@ -695,6 +1231,44 @@ async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpRespo
             jsonrpc: "2.0",
             id,
             result: { content: [{ type: "text", text: JSON.stringify(stats, null, 2) }] },
+          };
+        }
+
+        if (toolName === "analyze_verbalization") {
+          const result = await analyzeVerbalization(
+            env,
+            args.text as string,
+            args.topic as string | undefined,
+            args.domain as string | undefined,
+            args.level as string | undefined,
+            args.user_id as string | undefined
+          );
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
+          };
+        }
+
+        if (toolName === "graph_stats") {
+          const stats = await getGraphStats(env);
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: { content: [{ type: "text", text: JSON.stringify(stats, null, 2) }] },
+          };
+        }
+
+        if (toolName === "learner_progress") {
+          const progress = await getLearnerProgress(
+            env,
+            args.user_id as string,
+            args.domain as string | undefined
+          );
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: { content: [{ type: "text", text: JSON.stringify(progress, null, 2) }] },
           };
         }
 
