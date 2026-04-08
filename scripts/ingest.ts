@@ -48,6 +48,7 @@ interface SourceConfig {
   source_type: "pack" | "guides" | "ds" | "content";
   path: string;
   exclude?: string[];
+  user_id?: string;
 }
 
 // --- OpenAI Embeddings (REST API) ---
@@ -233,7 +234,8 @@ async function ingestSource(
   sql: ReturnType<typeof neon>,
   apiKey: string
 ): Promise<number> {
-  const { source, source_type, path: basePath } = config;
+  const { source, source_type, path: basePath, user_id } = config;
+  const uid = user_id ?? null;
 
   const resolvedPath = basePath.replace("~", process.env.HOME || "");
   if (!existsSync(resolvedPath)) {
@@ -326,10 +328,10 @@ async function ingestSource(
   const parents = toIndex.filter((d) => d.isParent);
   for (const parent of parents) {
     await sql`
-      INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector)
-      VALUES (${parent.filename}, ${parent.content}, ${source}, ${source_type}, ${parent.hash}, NULL, to_tsvector('simple', ${parent.content}))
+      INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
+      VALUES (${parent.filename}, ${parent.content}, ${source}, ${source_type}, ${parent.hash}, NULL, to_tsvector('simple', ${parent.content}), ${uid})
       ON CONFLICT (filename, source)
-      DO UPDATE SET content = ${parent.content}, source_type = ${source_type}, hash = ${parent.hash}, embedding = NULL, search_vector = to_tsvector('simple', ${parent.content})
+      DO UPDATE SET content = ${parent.content}, source_type = ${source_type}, hash = ${parent.hash}, embedding = NULL, search_vector = to_tsvector('simple', ${parent.content}), user_id = ${uid}
     `;
   }
   if (parents.length > 0) {
@@ -352,25 +354,27 @@ async function ingestSource(
       if (doc.parentFile) {
         // Chunk with parent link: resolve parent_id from DB
         await sql`
-          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, parent_id)
+          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, parent_id, user_id)
           VALUES (
             ${doc.filename}, ${doc.content}, ${source}, ${source_type}, ${doc.hash},
             ${embeddingStr}::vector, to_tsvector('simple', ${doc.content}),
-            (SELECT id FROM documents WHERE filename = ${doc.parentFile} AND source = ${source} LIMIT 1)
+            (SELECT id FROM documents WHERE filename = ${doc.parentFile} AND source = ${source} LIMIT 1),
+            ${uid}
           )
           ON CONFLICT (filename, source)
           DO UPDATE SET
             content = ${doc.content}, source_type = ${source_type}, hash = ${doc.hash},
             embedding = ${embeddingStr}::vector, search_vector = to_tsvector('simple', ${doc.content}),
-            parent_id = (SELECT id FROM documents WHERE filename = ${doc.parentFile} AND source = ${source} LIMIT 1)
+            parent_id = (SELECT id FROM documents WHERE filename = ${doc.parentFile} AND source = ${source} LIMIT 1),
+            user_id = ${uid}
         `;
       } else {
         // Regular document (not chunked): no parent
         await sql`
-          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector)
-          VALUES (${doc.filename}, ${doc.content}, ${source}, ${source_type}, ${doc.hash}, ${embeddingStr}::vector, to_tsvector('simple', ${doc.content}))
+          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
+          VALUES (${doc.filename}, ${doc.content}, ${source}, ${source_type}, ${doc.hash}, ${embeddingStr}::vector, to_tsvector('simple', ${doc.content}), ${uid})
           ON CONFLICT (filename, source)
-          DO UPDATE SET content = ${doc.content}, source_type = ${source_type}, hash = ${doc.hash}, embedding = ${embeddingStr}::vector, search_vector = to_tsvector('simple', ${doc.content})
+          DO UPDATE SET content = ${doc.content}, source_type = ${source_type}, hash = ${doc.hash}, embedding = ${embeddingStr}::vector, search_vector = to_tsvector('simple', ${doc.content}), user_id = ${uid}
         `;
       }
     }

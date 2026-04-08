@@ -3,6 +3,7 @@
     "source": "DS-Knowledge-Index-Tseren",
     "source_type": "content",
     "path": "~/IWE/DS-Knowledge-Index-Tseren",
+    "user_id": "25d91dbb-6ea2-46a7-a3da-cc1fd9dc9340",
     "exclude": [
       "node_modules/",
       ".git/",
@@ -20,6 +21,7 @@
     "source": "DS-my-strategy",
     "source_type": "ds",
     "path": "~/IWE/DS-my-strategy",
+    "user_id": "25d91dbb-6ea2-46a7-a3da-cc1fd9dc9340",
     "exclude": [
       "node_modules/",
       ".git/",
@@ -32,6 +34,7 @@
     "source": "DS-creator-development",
     "source_type": "ds",
     "path": "~/IWE/DS-creator-development",
+    "user_id": "25d91dbb-6ea2-46a7-a3da-cc1fd9dc9340",
     "exclude": [
       "node_modules/",
       ".git/",
@@ -43,6 +46,7 @@
     "source": "DS-marathon-v2-tseren",
     "source_type": "ds",
     "path": "~/IWE/DS-marathon-v2-tseren",
+    "user_id": "25d91dbb-6ea2-46a7-a3da-cc1fd9dc9340",
     "exclude": [
       "node_modules/",
       ".git/",
@@ -54,6 +58,7 @@
     "source": "DS-agent-workspace",
     "source_type": "ds",
     "path": "~/IWE/DS-agent-workspace",
+    "user_id": "25d91dbb-6ea2-46a7-a3da-cc1fd9dc9340",
     "exclude": [
       "node_modules/",
       ".git/",

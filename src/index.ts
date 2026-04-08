@@ -1437,6 +1437,10 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
   const sql = db(env);
   const result = { processed: 0, deleted: 0, skipped: 0, errors: [] as string[] };
 
+  // Resolve user_id from user_sources table (personal repos have user_id, platform repos don't)
+  const userRows = await sql`SELECT user_id FROM user_sources WHERE source = ${req.source} LIMIT 1`;
+  const uid = userRows.length > 0 ? (userRows[0].user_id as string) : null;
+
   if (!SOURCE_GITHUB_BASE[req.source]) {
     result.errors.push(`Unknown source: ${req.source}. Known sources: ${Object.keys(SOURCE_GITHUB_BASE).join(", ")}`);
     return result;
@@ -1494,10 +1498,10 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
 
         // Insert parent document (no embedding)
         await sql`
-          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector)
-          VALUES (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, NULL, to_tsvector('simple', ${content}))
+          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
+          VALUES (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, NULL, to_tsvector('simple', ${content}), ${uid})
           ON CONFLICT (filename, source)
-          DO UPDATE SET content = ${content}, source_type = ${sourceType}, hash = ${hash}, embedding = NULL, search_vector = to_tsvector('simple', ${content})
+          DO UPDATE SET content = ${content}, source_type = ${sourceType}, hash = ${hash}, embedding = NULL, search_vector = to_tsvector('simple', ${content}), user_id = ${uid}
         `;
 
         // Insert chunks with embeddings and parent_id
@@ -1507,17 +1511,19 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
           const chunkHash = await contentHash(chunk.content);
 
           await sql`
-            INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, parent_id)
+            INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, parent_id, user_id)
             VALUES (
               ${chunk.filename}, ${chunk.content}, ${req.source}, ${sourceType}, ${chunkHash},
               ${vec}::vector, to_tsvector('simple', ${chunk.content}),
-              (SELECT id FROM documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1)
+              (SELECT id FROM documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1),
+              ${uid}
             )
             ON CONFLICT (filename, source)
             DO UPDATE SET
               content = ${chunk.content}, source_type = ${sourceType}, hash = ${chunkHash},
               embedding = ${vec}::vector, search_vector = to_tsvector('simple', ${chunk.content}),
-              parent_id = (SELECT id FROM documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1)
+              parent_id = (SELECT id FROM documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1),
+              user_id = ${uid}
           `;
         }
       } else {
@@ -1526,10 +1532,10 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
         const vec = `[${embedding.join(",")}]`;
 
         await sql`
-          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector)
-          VALUES (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, ${vec}::vector, to_tsvector('simple', ${content}))
+          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
+          VALUES (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, ${vec}::vector, to_tsvector('simple', ${content}), ${uid})
           ON CONFLICT (filename, source)
-          DO UPDATE SET content = ${content}, source_type = ${sourceType}, hash = ${hash}, embedding = ${vec}::vector, search_vector = to_tsvector('simple', ${content})
+          DO UPDATE SET content = ${content}, source_type = ${sourceType}, hash = ${hash}, embedding = ${vec}::vector, search_vector = to_tsvector('simple', ${content}), user_id = ${uid}
         `;
       }
 
