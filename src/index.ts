@@ -19,6 +19,7 @@ import { neon } from "@neondatabase/serverless";
 export interface Env {
   DATABASE_URL: string;
   OPENAI_API_KEY: string;
+  REINDEX_SECRET?: string; // Shared secret for /reindex endpoint (set via wrangler secret)
 }
 
 interface McpRequest {
@@ -35,10 +36,25 @@ interface McpResponse {
   error?: { code: number; message: string };
 }
 
+// --- Reindex types ---
+
+interface ReindexFile {
+  path: string;
+  action: "added" | "modified" | "removed";
+}
+
+interface ReindexRequest {
+  source: string;
+  files: ReindexFile[];
+}
+
 // --- Config ---
 
 const EMBEDDING_MODEL = "text-embedding-3-small";
 const VECTOR_CONFIDENCE_THRESHOLD = 0.6;
+const CHUNK_CHAR_LIMIT = 10_000;
+const LARGE_FILE_THRESHOLD = CHUNK_CHAR_LIMIT;
+const MAX_FILE_SIZE = 100_000; // 100KB
 const RERANK_MODEL = "gpt-4o-mini";
 const RERANK_CANDIDATES = 20; // Fetch top-N for reranking, return top-K
 const RERANK_TIMEOUT_MS = 5000;
@@ -60,10 +76,10 @@ const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> =
   "DS-principles-curriculum": { base: "https://github.com/aisystant/DS-principles-curriculum/blob/main", pathPrefix: "" },
   "FMT-exocortex-template": { base: "https://github.com/TserenTserenov/FMT-exocortex-template/blob/main", pathPrefix: "" },
   "FMT-s2r": { base: "https://github.com/TserenTserenov/FMT-s2r/blob/main", pathPrefix: "" },
-  "DS-autonomous-agents": { base: "https://github.com/aisystant/DS-autonomous-agents/blob/main", pathPrefix: "" },
-  "PACK-verification": { base: "https://github.com/aisystant/PACK-verification/blob/main", pathPrefix: "pack/" },
-  "PACK-autonomous-agents": { base: "https://github.com/aisystant/PACK-autonomous-agents/blob/main", pathPrefix: "pack/" },
-  "PACK-ecosystem": { base: "https://github.com/aisystant/PACK-ecosystem/blob/main", pathPrefix: "pack/" },
+  "DS-autonomous-agents": { base: "https://github.com/TserenTserenov/DS-autonomous-agents/blob/main", pathPrefix: "" },
+  "PACK-verification": { base: "https://github.com/TserenTserenov/PACK-verification/blob/main", pathPrefix: "pack/" },
+  "PACK-autonomous-agents": { base: "https://github.com/TserenTserenov/PACK-autonomous-agents/blob/main", pathPrefix: "pack/" },
+  "PACK-ecosystem": { base: "https://github.com/TserenTserenov/PACK-ecosystem/blob/main", pathPrefix: "pack/" },
 };
 
 export function resolveGithubUrl(source: string, filename: string): string | null {
@@ -1290,6 +1306,225 @@ async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpRespo
   }
 }
 
+// --- Reindex helpers ---
+
+async function contentHash(content: string): Promise<string> {
+  const data = new TextEncoder().encode(content);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+}
+
+/**
+ * Read file from GitHub public API (no auth needed for public repos).
+ * Falls back to raw.githubusercontent.com for speed.
+ */
+async function readFromGitHubPublic(source: string, filePath: string): Promise<string | null> {
+  const config = SOURCE_GITHUB_BASE[source];
+  if (!config) return null;
+
+  // Extract owner/repo from base URL: https://github.com/OWNER/REPO/blob/BRANCH
+  const match = config.base.match(/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)/);
+  if (!match) return null;
+
+  const [, owner, repo, branch] = match;
+  // filePath from webhook already contains full path from repo root (e.g. "pack/digital-platform/...")
+  // Do NOT prepend pathPrefix — it would cause duplication (e.g. "pack/pack/...")
+  const fullPath = filePath;
+
+  const resp = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${fullPath}`, {
+    headers: { "User-Agent": "aisystant-knowledge-mcp" },
+  });
+
+  if (!resp.ok) return null;
+  return await resp.text();
+}
+
+/**
+ * Resolve source_type from SOURCE_GITHUB_BASE source name.
+ */
+function resolveSourceType(source: string): "pack" | "guides" | "ds" | "content" {
+  if (source.startsWith("PACK-")) return "pack";
+  if (source.startsWith("DS-")) return "ds";
+  if (source === "SPF" || source === "FPF" || source === "ZP") return "pack";
+  if (source.startsWith("docs-") || source.endsWith("-docs")) return "guides";
+  if (source.startsWith("FMT-")) return "ds";
+  return "ds";
+}
+
+/**
+ * Chunk large file by ## / ### headers / paragraphs.
+ * Matches ingest.ts chunkLargeFile() logic for consistency.
+ */
+function chunkLargeFile(content: string, filename: string): { filename: string; content: string }[] {
+  const chunks: { filename: string; content: string }[] = [];
+
+  const titleMatch = content.match(/^#\s+(.+)/m);
+  const docTitle = titleMatch ? titleMatch[1].trim() : "";
+
+  const sections = content.split(/^(?=## )/m);
+
+  for (const section of sections) {
+    if (section.trim().length < 10) continue;
+
+    const headerMatch = section.match(/^##\s+(.+)/m);
+    const sectionName = headerMatch ? headerMatch[1].trim() : "_intro";
+
+    if (section.length <= CHUNK_CHAR_LIMIT) {
+      const prefix = docTitle ? `> ${docTitle} > ${sectionName}\n\n` : "";
+      chunks.push({ filename: `${filename}::${sectionName}`, content: prefix + section });
+    } else {
+      const subsections = section.split(/^(?=### )/m);
+      for (const subsection of subsections) {
+        if (subsection.trim().length < 10) continue;
+        const subMatch = subsection.match(/^###\s+(.+)/m);
+        const subName = subMatch ? `${sectionName} > ${subMatch[1].trim()}` : sectionName;
+
+        if (subsection.length <= CHUNK_CHAR_LIMIT) {
+          const prefix = docTitle ? `> ${docTitle} > ${subName}\n\n` : "";
+          chunks.push({ filename: `${filename}::${subName}`, content: prefix + subsection });
+        } else {
+          const paragraphs = subsection.split(/\n\n+/);
+          let accumulator = "";
+          let partIndex = 0;
+          for (const para of paragraphs) {
+            if (accumulator.length + para.length + 2 > CHUNK_CHAR_LIMIT && accumulator.length > 0) {
+              const prefix = docTitle ? `> [${filename.split("::")[0]}] ${docTitle} > ${subName} (part ${++partIndex})\n\n` : "";
+              chunks.push({ filename: `${filename}::${subName}::part${partIndex}`, content: prefix + accumulator.trim() });
+              accumulator = "";
+            }
+            accumulator += (accumulator ? "\n\n" : "") + para;
+          }
+          if (accumulator.trim().length >= 10) {
+            if (partIndex > 0) {
+              const prefix = docTitle ? `> [${filename.split("::")[0]}] ${docTitle} > ${subName} (part ${++partIndex})\n\n` : "";
+              chunks.push({ filename: `${filename}::${subName}::part${partIndex}`, content: prefix + accumulator.trim() });
+            } else {
+              const prefix = docTitle ? `> ${docTitle} > ${subName}\n\n` : "";
+              chunks.push({ filename: `${filename}::${subName}`, content: prefix + accumulator.trim() });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return chunks;
+}
+
+/**
+ * Reindex specific files from a platform knowledge source.
+ * Called by Gateway webhook after push to PACK, SPF, FPF repos.
+ * Reads files from GitHub public API, chunks, embeds, upserts to Neon.
+ */
+async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed: number; deleted: number; skipped: number; errors: string[] }> {
+  const sql = db(env);
+  const result = { processed: 0, deleted: 0, skipped: 0, errors: [] as string[] };
+
+  if (!SOURCE_GITHUB_BASE[req.source]) {
+    result.errors.push(`Unknown source: ${req.source}. Known sources: ${Object.keys(SOURCE_GITHUB_BASE).join(", ")}`);
+    return result;
+  }
+
+  const sourceType = resolveSourceType(req.source);
+  const sourceConfig = SOURCE_GITHUB_BASE[req.source];
+  const pathPrefix = sourceConfig?.pathPrefix || "";
+
+  for (const file of req.files) {
+    if (!file.path.endsWith(".md")) {
+      result.skipped++;
+      continue;
+    }
+
+    // Normalize: strip pathPrefix from webhook path to match ingest.ts filenames in DB.
+    // Webhook sends "pack/digital-platform/..." but DB stores "digital-platform/..."
+    const dbFilename = pathPrefix && file.path.startsWith(pathPrefix)
+      ? file.path.slice(pathPrefix.length)
+      : file.path;
+
+    try {
+      if (file.action === "removed") {
+        await sql`DELETE FROM documents WHERE source = ${req.source} AND (filename = ${dbFilename} OR filename LIKE ${dbFilename + '::%'})`;
+        result.deleted++;
+        continue;
+      }
+
+      // Read content from GitHub public API (use full path from repo root)
+      const content = await readFromGitHubPublic(req.source, file.path);
+      if (!content) {
+        result.errors.push(`Cannot read ${file.path} from GitHub for source ${req.source}`);
+        continue;
+      }
+
+      if (content.length > MAX_FILE_SIZE) {
+        result.skipped++;
+        continue;
+      }
+
+      // Check hash — skip if unchanged
+      const hash = await contentHash(content);
+      const existing = await sql`SELECT hash FROM documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1`;
+      if (existing.length > 0 && existing[0].hash === hash) {
+        result.skipped++;
+        continue;
+      }
+
+      // Delete old document + chunks
+      await sql`DELETE FROM documents WHERE source = ${req.source} AND (filename = ${dbFilename} OR filename LIKE ${dbFilename + '::%'})`;
+
+      if (content.length > LARGE_FILE_THRESHOLD) {
+        // Large file: parent document (no embedding) + chunks with parent_id
+        const chunks = chunkLargeFile(content, dbFilename);
+
+        // Insert parent document (no embedding)
+        await sql`
+          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector)
+          VALUES (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, NULL, to_tsvector('simple', ${content}))
+          ON CONFLICT (filename, source)
+          DO UPDATE SET content = ${content}, source_type = ${sourceType}, hash = ${hash}, embedding = NULL, search_vector = to_tsvector('simple', ${content})
+        `;
+
+        // Insert chunks with embeddings and parent_id
+        for (const chunk of chunks) {
+          const embedding = await getEmbedding(env.OPENAI_API_KEY, chunk.content.slice(0, CHUNK_CHAR_LIMIT));
+          const vec = `[${embedding.join(",")}]`;
+          const chunkHash = await contentHash(chunk.content);
+
+          await sql`
+            INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, parent_id)
+            VALUES (
+              ${chunk.filename}, ${chunk.content}, ${req.source}, ${sourceType}, ${chunkHash},
+              ${vec}::vector, to_tsvector('simple', ${chunk.content}),
+              (SELECT id FROM documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1)
+            )
+            ON CONFLICT (filename, source)
+            DO UPDATE SET
+              content = ${chunk.content}, source_type = ${sourceType}, hash = ${chunkHash},
+              embedding = ${vec}::vector, search_vector = to_tsvector('simple', ${chunk.content}),
+              parent_id = (SELECT id FROM documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1)
+          `;
+        }
+      } else {
+        // Small file: single document with embedding
+        const embedding = await getEmbedding(env.OPENAI_API_KEY, content.slice(0, CHUNK_CHAR_LIMIT));
+        const vec = `[${embedding.join(",")}]`;
+
+        await sql`
+          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector)
+          VALUES (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, ${vec}::vector, to_tsvector('simple', ${content}))
+          ON CONFLICT (filename, source)
+          DO UPDATE SET content = ${content}, source_type = ${sourceType}, hash = ${hash}, embedding = ${vec}::vector, search_vector = to_tsvector('simple', ${content})
+        `;
+      }
+
+      result.processed++;
+    } catch (err) {
+      result.errors.push(`${file.path}: ${err instanceof Error ? err.message : "unknown error"}`);
+    }
+  }
+
+  return result;
+}
+
 // --- HTTP server ---
 
 export default {
@@ -1319,6 +1554,24 @@ export default {
       }
       return new Response(JSON.stringify(response), {
         headers: responseHeaders,
+      });
+    }
+
+    // Reindex endpoint — called by Gateway webhook handler after push to platform repos
+    if (url.pathname === "/reindex" && request.method === "POST") {
+      // Verify shared secret
+      if (env.REINDEX_SECRET) {
+        const auth = request.headers.get("Authorization");
+        if (!auth || auth !== `Bearer ${env.REINDEX_SECRET}`) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), {
+            status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+      }
+      const body = (await request.json()) as ReindexRequest;
+      const result = await reindexFiles(env, body);
+      return new Response(JSON.stringify(result), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
