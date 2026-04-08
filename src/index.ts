@@ -151,11 +151,13 @@ async function keywordSearch(
   query: string,
   source?: string,
   sourceType?: string,
-  limit: number = 5
+  limit: number = 5,
+  userId?: string
 ): Promise<SearchResult[]> {
   const sql = db(env);
   const src = source ?? null;
   const stype = sourceType ?? null;
+  const uid = userId ?? null;
   const pattern = `%${query}%`;
   // Normalize hyphens to spaces for FTS (e.g. "ролей-агентов" → "ролей агентов")
   const ftsQuery = query.replace(/-/g, " ");
@@ -189,6 +191,7 @@ async function keywordSearch(
            OR (${entityPattern}::text IS NOT NULL AND filename ILIKE ${entityPattern}))
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_type = ${stype})
+      AND (user_id IS NULL OR user_id = ${uid})
     ORDER BY score DESC,
              CASE WHEN filename ILIKE ${pattern} THEN 0 ELSE 1 END,
              length(content) DESC
@@ -215,13 +218,15 @@ async function vectorSearch(
   query: string,
   source?: string,
   sourceType?: string,
-  limit: number = 5
+  limit: number = 5,
+  userId?: string
 ): Promise<SearchResult[]> {
   const embedding = await getEmbedding(env.OPENAI_API_KEY, query);
   const vec = `[${embedding.join(",")}]`;
   const sql = db(env);
   const src = source ?? null;
   const stype = sourceType ?? null;
+  const uid = userId ?? null;
 
   const rows = await sql`
     SELECT id, filename, content, source, source_type,
@@ -230,6 +235,7 @@ async function vectorSearch(
     WHERE embedding IS NOT NULL
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_type = ${stype})
+      AND (user_id IS NULL OR user_id = ${uid})
     ORDER BY embedding <=> ${vec}::vector
     LIMIT ${limit}
   `;
@@ -398,24 +404,25 @@ async function searchDocuments(
   query: string,
   source?: string,
   sourceType?: string,
-  limit: number = 5
+  limit: number = 5,
+  userId?: string
 ): Promise<SearchResult[]> {
   const queryType = detectQueryType(query);
 
   if (queryType === "keyword") {
     // Keyword-first: skip embedding generation (~200ms saved), no reranking needed
-    const kwResults = await keywordSearch(env, query, source, sourceType, limit);
+    const kwResults = await keywordSearch(env, query, source, sourceType, limit, userId);
     if (kwResults.length > 0) return enrichWithParentContent(env, kwResults);
     // Fallback to vector if keyword found nothing
   }
 
   // Vector path: fetch extra candidates for LLM reranking
   const fetchLimit = Math.max(limit, RERANK_CANDIDATES);
-  const vectorResults = await vectorSearch(env, query, source, sourceType, fetchLimit);
+  const vectorResults = await vectorSearch(env, query, source, sourceType, fetchLimit, userId);
 
   // Low-confidence fallback: if vector top score < threshold, try keyword
   if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
-    const kwFallback = await keywordSearch(env, query, source, sourceType, limit);
+    const kwFallback = await keywordSearch(env, query, source, sourceType, limit, userId);
     if (kwFallback.length > 0) {
       // Merge: deduplicate by filename, keep highest score
       const seen = new Map<string, SearchResult>();
@@ -440,16 +447,19 @@ async function searchDocuments(
 async function getDocument(
   env: Env,
   filename: string,
-  source?: string
+  source?: string,
+  userId?: string
 ): Promise<{ filename: string; content: string; source: string; source_type: string; github_url: string | null } | null> {
   const sql = db(env);
   const src = source ?? null;
+  const uid = userId ?? null;
 
   const rows = await sql`
     SELECT filename, content, source, source_type
     FROM documents
     WHERE filename = ${filename}
       AND (${src}::text IS NULL OR source = ${src})
+      AND (user_id IS NULL OR user_id = ${uid})
     LIMIT 1
   `;
 
@@ -468,15 +478,18 @@ async function getDocument(
 
 async function listSources(
   env: Env,
-  sourceType?: string
+  sourceType?: string,
+  userId?: string
 ): Promise<{ source: string; source_type: string; doc_count: number }[]> {
   const sql = db(env);
   const stype = sourceType ?? null;
+  const uid = userId ?? null;
 
   const rows = await sql`
     SELECT source, source_type, COUNT(*)::int AS doc_count
     FROM documents
     WHERE (${stype}::text IS NULL OR source_type = ${stype})
+      AND (user_id IS NULL OR user_id = ${uid})
     GROUP BY source, source_type
     ORDER BY source_type, source
   `;
@@ -517,9 +530,11 @@ export async function hashQuery(query: string): Promise<string> {
 async function getFeedbackStats(
   env: Env,
   days: number = 30,
-  limit: number = 20
+  limit: number = 20,
+  userId?: string
 ): Promise<Array<{ document_id: number; filename: string; source: string; helpful: number; not_helpful: number; total: number; helpfulness_rate: number }>> {
   const sql = db(env);
+  const uid = userId ?? null;
   const rows = await sql`
     SELECT
       f.document_id,
@@ -532,6 +547,7 @@ async function getFeedbackStats(
     FROM retrieval_feedback f
     JOIN documents d ON d.id = f.document_id
     WHERE f.created_at >= NOW() - make_interval(days => ${days})
+      AND (d.user_id IS NULL OR d.user_id = ${uid})
     GROUP BY f.document_id, d.filename, d.source
     ORDER BY total DESC, helpfulness_rate DESC
     LIMIT ${limit}
@@ -1164,7 +1180,7 @@ const TOOLS = [
 
 // --- MCP handler ---
 
-async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpResponse> {
+async function handleMcpRequest(request: McpRequest, env: Env, userId?: string): Promise<McpResponse> {
   const { id, method, params } = request;
 
   try {
@@ -1193,7 +1209,8 @@ async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpRespo
             args.query as string,
             args.source as string | undefined,
             args.source_type as string | undefined,
-            (args.limit as number) || 5
+            (args.limit as number) || 5,
+            userId
           );
           return {
             jsonrpc: "2.0",
@@ -1203,7 +1220,7 @@ async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpRespo
         }
 
         if (toolName === "get_document") {
-          const doc = await getDocument(env, args.filename as string, args.source as string | undefined);
+          const doc = await getDocument(env, args.filename as string, args.source as string | undefined, userId);
           if (!doc) {
             return {
               jsonrpc: "2.0",
@@ -1219,7 +1236,7 @@ async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpRespo
         }
 
         if (toolName === "list_sources") {
-          const sources = await listSources(env, args.source_type as string | undefined);
+          const sources = await listSources(env, args.source_type as string | undefined, userId);
           return {
             jsonrpc: "2.0",
             id,
@@ -1242,7 +1259,7 @@ async function handleMcpRequest(request: McpRequest, env: Env): Promise<McpRespo
         }
 
         if (toolName === "feedback_stats") {
-          const stats = await getFeedbackStats(env, (args.days as number) || 30, (args.limit as number) || 20);
+          const stats = await getFeedbackStats(env, (args.days as number) || 30, (args.limit as number) || 20, userId);
           return {
             jsonrpc: "2.0",
             id,
@@ -1543,8 +1560,9 @@ export default {
 
     if (url.pathname === "/mcp" && request.method === "POST") {
       const traceId = request.headers.get("x-trace-id") || undefined;
+      const userId = request.headers.get("x-user-id") || undefined;
       const body = (await request.json()) as McpRequest;
-      const response = await handleMcpRequest(body, env);
+      const response = await handleMcpRequest(body, env, userId);
       const responseHeaders: Record<string, string> = {
         ...corsHeaders,
         "Content-Type": "application/json",
