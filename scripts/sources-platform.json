@@ -72,6 +72,15 @@
     ]
   },
   {
+    "source": "PACK-education",
+    "source_type": "pack",
+    "path": "~/IWE/PACK-education/pack",
+    "exclude": [
+      "images/",
+      "assets/"
+    ]
+  },
+  {
     "source": "DS-ecosystem-development",
     "source_type": "ds",
     "path": "~/IWE/DS-ecosystem-development",

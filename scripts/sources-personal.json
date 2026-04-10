@@ -67,5 +67,19 @@
       "images/",
       "assets/"
     ]
+  },
+  {
+    "source": "DS-ai-systems",
+    "source_type": "ds",
+    "path": "~/IWE/DS-IT-systems/DS-ai-systems",
+    "user_id": "25d91dbb-6ea2-46a7-a3da-cc1fd9dc9340",
+    "exclude": [
+      "node_modules/",
+      ".git/",
+      ".venv/",
+      "__pycache__/",
+      "images/",
+      "assets/"
+    ]
   }
 ]
