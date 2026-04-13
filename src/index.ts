@@ -21,7 +21,7 @@ import { withUserContext } from "./rls.js";
 export interface Env {
   DATABASE_URL: string;
   OPENAI_API_KEY: string;
-  ORY_URL: string; // e.g. https://auth.system-school.ru/hydra
+  ORY_URL?: string; // e.g. https://auth.system-school.ru/hydra — optional, JWT verification disabled if absent
   REINDEX_SECRET?: string; // Shared secret for /reindex endpoint (set via wrangler secret)
 }
 
@@ -1591,7 +1591,7 @@ export default {
       // (e.g. reindexer calls that don't carry a user token).
       let userId: string | undefined;
       const authHeader = request.headers.get("Authorization");
-      if (authHeader?.startsWith("Bearer ")) {
+      if (authHeader?.startsWith("Bearer ") && env.ORY_URL) {
         const token = authHeader.slice(7);
         const sub = await verifyJwtLocally(env.ORY_URL, token);
         userId = sub ?? undefined;
