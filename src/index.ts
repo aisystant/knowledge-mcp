@@ -13,6 +13,7 @@
  */
 
 import { neon } from "@neondatabase/serverless";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 import { withUserContext } from "./rls.js";
 
 // --- Types ---
@@ -20,6 +21,7 @@ import { withUserContext } from "./rls.js";
 export interface Env {
   DATABASE_URL: string;
   OPENAI_API_KEY: string;
+  ORY_URL: string; // e.g. https://auth.system-school.ru/hydra
   REINDEX_SECRET?: string; // Shared secret for /reindex endpoint (set via wrangler secret)
 }
 
@@ -47,6 +49,32 @@ interface ReindexFile {
 interface ReindexRequest {
   source: string;
   files: ReindexFile[];
+}
+
+// --- JWT verification (B4.21) ---
+
+const _jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+
+function getJwks(oryUrl: string): ReturnType<typeof createRemoteJWKSet> {
+  if (!_jwksCache.has(oryUrl)) {
+    const jwksUrl = new URL("/.well-known/jwks.json", oryUrl.replace(/\/hydra\/?$/, ""));
+    _jwksCache.set(oryUrl, createRemoteJWKSet(jwksUrl));
+  }
+  return _jwksCache.get(oryUrl)!;
+}
+
+async function verifyJwtLocally(oryUrl: string, token: string): Promise<string | null> {
+  try {
+    const jwks = getJwks(oryUrl);
+    const issuer = oryUrl.replace(/\/hydra\/?$/, "").replace(/\/?$/, "/");
+    const { payload } = await jwtVerify(token, jwks, {
+      issuer,
+      algorithms: ["RS256"],
+    });
+    return payload.sub ?? null;
+  } catch {
+    return null;
+  }
 }
 
 // --- Config ---
@@ -1552,7 +1580,20 @@ export default {
 
     if (url.pathname === "/mcp" && request.method === "POST") {
       const traceId = request.headers.get("x-trace-id") || undefined;
-      const userId = request.headers.get("x-user-id") || undefined;
+
+      // JWT verification (B4.21): verify Bearer token locally, fall back to x-user-id for
+      // platform/internal requests (e.g. reindexer) that don't carry a user token.
+      let userId: string | undefined;
+      const authHeader = request.headers.get("Authorization");
+      if (authHeader?.startsWith("Bearer ")) {
+        const token = authHeader.slice(7);
+        const sub = await verifyJwtLocally(env.ORY_URL, token);
+        userId = sub ?? undefined;
+      }
+      if (!userId) {
+        userId = request.headers.get("x-user-id") || undefined;
+      }
+
       const body = (await request.json()) as McpRequest;
       const response = await handleMcpRequest(body, env, userId);
       const responseHeaders: Record<string, string> = {

@@ -22,6 +22,7 @@
     "wrangler": "^3.99.0"
   },
   "dependencies": {
-    "@neondatabase/serverless": "^1.0.2"
+    "@neondatabase/serverless": "^1.0.2",
+    "jose": "^6.2.2"
   }
 }
