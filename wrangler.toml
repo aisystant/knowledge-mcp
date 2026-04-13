@@ -6,3 +6,4 @@ compatibility_flags = ["nodejs_compat"]
 # Secrets (set via `wrangler secret put`):
 # DATABASE_URL - Neon PostgreSQL connection string
 # OPENAI_API_KEY - OpenAI API key
+# ORY_URL - Ory Hydra base URL, e.g. https://auth.system-school.ru/hydra
