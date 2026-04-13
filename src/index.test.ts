@@ -6,6 +6,10 @@ import { neon } from "@neondatabase/serverless";
 
 vi.mock("@neondatabase/serverless", () => ({
   neon: vi.fn(),
+  neonConfig: {},
+  Pool: vi.fn(function (this: unknown) {
+    (this as { connect: () => void }).connect = vi.fn();
+  }),
 }));
 
 // --- detectQueryType ---
