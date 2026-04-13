@@ -57,7 +57,9 @@ const _jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 
 function getJwks(oryUrl: string): ReturnType<typeof createRemoteJWKSet> {
   if (!_jwksCache.has(oryUrl)) {
-    const jwksUrl = new URL("/.well-known/jwks.json", oryUrl.replace(/\/hydra\/?$/, ""));
+    // ORY_URL is the Hydra base URL (e.g. https://auth.system-school.ru/hydra)
+    // JWKS is served at <oryUrl>/.well-known/jwks.json — same pattern as gateway-mcp
+    const jwksUrl = new URL(`${oryUrl}/.well-known/jwks.json`);
     _jwksCache.set(oryUrl, createRemoteJWKSet(jwksUrl));
   }
   return _jwksCache.get(oryUrl)!;
@@ -66,7 +68,8 @@ function getJwks(oryUrl: string): ReturnType<typeof createRemoteJWKSet> {
 async function verifyJwtLocally(oryUrl: string, token: string): Promise<string | null> {
   try {
     const jwks = getJwks(oryUrl);
-    const issuer = oryUrl.replace(/\/hydra\/?$/, "").replace(/\/?$/, "/");
+    // Issuer is the base domain (without /hydra), with trailing slash — same as gateway-mcp
+    const issuer = oryUrl.replace("/hydra", "") + "/";
     const { payload } = await jwtVerify(token, jwks, {
       issuer,
       algorithms: ["RS256"],
@@ -1581,16 +1584,20 @@ export default {
     if (url.pathname === "/mcp" && request.method === "POST") {
       const traceId = request.headers.get("x-trace-id") || undefined;
 
-      // JWT verification (B4.21): verify Bearer token locally, fall back to x-user-id for
-      // platform/internal requests (e.g. reindexer) that don't carry a user token.
+      // JWT verification (B4.21): verify Bearer token locally.
+      // If Authorization header is present → MUST be a valid JWT; no x-user-id fallback
+      // (prevents spoofing userId with an expired/invalid token + custom x-user-id).
+      // If no Authorization header → fall back to x-user-id for internal/platform requests
+      // (e.g. reindexer calls that don't carry a user token).
       let userId: string | undefined;
       const authHeader = request.headers.get("Authorization");
       if (authHeader?.startsWith("Bearer ")) {
         const token = authHeader.slice(7);
         const sub = await verifyJwtLocally(env.ORY_URL, token);
         userId = sub ?? undefined;
-      }
-      if (!userId) {
+        // Note: opaque tokens (from Gateway /userinfo flow) return null sub → userId=undefined,
+        // treated as unauthenticated. Gateway should only forward JWTs to knowledge-mcp.
+      } else {
         userId = request.headers.get("x-user-id") || undefined;
       }
 
