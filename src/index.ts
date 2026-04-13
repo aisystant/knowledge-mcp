@@ -183,7 +183,7 @@ async function keywordSearch(
              WHEN search_vector @@ plainto_tsquery('simple', ${ftsQuery}) THEN 0.8
              ELSE 0.5
            END AS score
-    FROM documents
+    FROM knowledge.documents
     WHERE (content ILIKE ${pattern}
            OR filename ILIKE ${pattern}
            OR search_vector @@ plainto_tsquery('simple', ${ftsQuery})
@@ -227,7 +227,7 @@ async function vectorSearch(
   const rows = await withUserContext(env.DATABASE_URL, userId, (sql) => sql`
     SELECT id, filename, content, source, source_type,
            1 - (embedding <=> ${vec}::vector) AS score
-    FROM documents
+    FROM knowledge.documents
     WHERE embedding IS NOT NULL
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_type = ${stype})
@@ -368,8 +368,8 @@ export async function enrichWithParentContent(env: Env, results: SearchResult[])
   const parentRows = await sql`
     SELECT c.filename AS chunk_filename, c.source AS chunk_source,
            p.filename AS parent_filename, p.content AS parent_content
-    FROM documents c
-    JOIN documents p ON c.parent_id = p.id
+    FROM knowledge.documents c
+    JOIN knowledge.documents p ON c.parent_id = p.id
     WHERE c.parent_id IS NOT NULL
       AND (c.filename, c.source) IN (
         SELECT unnest(${filenames}::text[]), unnest(${sources}::text[])
@@ -449,7 +449,7 @@ async function getDocument(
 
   const rows = await withUserContext(env.DATABASE_URL, userId, (sql) => sql`
     SELECT filename, content, source, source_type
-    FROM documents
+    FROM knowledge.documents
     WHERE filename = ${filename}
       AND (${src}::text IS NULL OR source = ${src})
     LIMIT 1
@@ -477,7 +477,7 @@ async function listSources(
 
   const rows = await withUserContext(env.DATABASE_URL, userId, (sql) => sql`
     SELECT source, source_type, COUNT(*)::int AS doc_count
-    FROM documents
+    FROM knowledge.documents
     WHERE (${stype}::text IS NULL OR source_type = ${stype})
     GROUP BY source, source_type
     ORDER BY source_type, source
@@ -501,7 +501,7 @@ async function recordFeedback(
   const sql = db(env);
   const queryHash = await hashQuery(query);
   await sql`
-    INSERT INTO retrieval_feedback (document_id, query_hash, helpfulness)
+    INSERT INTO knowledge.retrieval_feedback (document_id, query_hash, helpfulness)
     VALUES (${documentId}, ${queryHash}, ${helpfulness})
   `;
   return { recorded: true };
@@ -531,8 +531,8 @@ async function getFeedbackStats(
       COUNT(*) FILTER (WHERE f.helpfulness = false)::int AS not_helpful,
       COUNT(*)::int AS total,
       ROUND(COUNT(*) FILTER (WHERE f.helpfulness = true)::numeric / NULLIF(COUNT(*), 0), 2) AS helpfulness_rate
-    FROM retrieval_feedback f
-    JOIN documents d ON d.id = f.document_id
+    FROM knowledge.retrieval_feedback f
+    JOIN knowledge.documents d ON d.id = f.document_id
     WHERE f.created_at >= NOW() - make_interval(days => ${days})
     GROUP BY f.document_id, d.filename, d.source
     ORDER BY total DESC, helpfulness_rate DESC
@@ -1424,7 +1424,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
   const result = { processed: 0, deleted: 0, skipped: 0, errors: [] as string[] };
 
   // Resolve user_id from user_sources table (personal repos have user_id, platform repos don't)
-  const userRows = await sql`SELECT user_id FROM user_sources WHERE source = ${req.source} LIMIT 1`;
+  const userRows = await sql`SELECT user_id FROM knowledge.user_sources WHERE source = ${req.source} LIMIT 1`;
   const uid = userRows.length > 0 ? (userRows[0].user_id as string) : null;
 
   if (!SOURCE_GITHUB_BASE[req.source]) {
@@ -1450,7 +1450,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
 
     try {
       if (file.action === "removed") {
-        await sql`DELETE FROM documents WHERE source = ${req.source} AND (filename = ${dbFilename} OR filename LIKE ${dbFilename + '::%'})`;
+        await sql`DELETE FROM knowledge.documents WHERE source = ${req.source} AND (filename = ${dbFilename} OR filename LIKE ${dbFilename + '::%'})`;
         result.deleted++;
         continue;
       }
@@ -1469,14 +1469,14 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
 
       // Check hash — skip if unchanged
       const hash = await contentHash(content);
-      const existing = await sql`SELECT hash FROM documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1`;
+      const existing = await sql`SELECT hash FROM knowledge.documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1`;
       if (existing.length > 0 && existing[0].hash === hash) {
         result.skipped++;
         continue;
       }
 
       // Delete old document + chunks
-      await sql`DELETE FROM documents WHERE source = ${req.source} AND (filename = ${dbFilename} OR filename LIKE ${dbFilename + '::%'})`;
+      await sql`DELETE FROM knowledge.documents WHERE source = ${req.source} AND (filename = ${dbFilename} OR filename LIKE ${dbFilename + '::%'})`;
 
       if (content.length > LARGE_FILE_THRESHOLD) {
         // Large file: parent document (no embedding) + chunks with parent_id
@@ -1484,7 +1484,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
 
         // Insert parent document (no embedding)
         await sql`
-          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
+          INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
           VALUES (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, NULL, to_tsvector('simple', ${content}), ${uid})
           ON CONFLICT (filename, source)
           DO UPDATE SET content = ${content}, source_type = ${sourceType}, hash = ${hash}, embedding = NULL, search_vector = to_tsvector('simple', ${content}), user_id = ${uid}
@@ -1497,18 +1497,18 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
           const chunkHash = await contentHash(chunk.content);
 
           await sql`
-            INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, parent_id, user_id)
+            INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, parent_id, user_id)
             VALUES (
               ${chunk.filename}, ${chunk.content}, ${req.source}, ${sourceType}, ${chunkHash},
               ${vec}::vector, to_tsvector('simple', ${chunk.content}),
-              (SELECT id FROM documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1),
+              (SELECT id FROM knowledge.documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1),
               ${uid}
             )
             ON CONFLICT (filename, source)
             DO UPDATE SET
               content = ${chunk.content}, source_type = ${sourceType}, hash = ${chunkHash},
               embedding = ${vec}::vector, search_vector = to_tsvector('simple', ${chunk.content}),
-              parent_id = (SELECT id FROM documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1),
+              parent_id = (SELECT id FROM knowledge.documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1),
               user_id = ${uid}
           `;
         }
@@ -1518,7 +1518,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
         const vec = `[${embedding.join(",")}]`;
 
         await sql`
-          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
+          INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
           VALUES (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, ${vec}::vector, to_tsvector('simple', ${content}), ${uid})
           ON CONFLICT (filename, source)
           DO UPDATE SET content = ${content}, source_type = ${sourceType}, hash = ${hash}, embedding = ${vec}::vector, search_vector = to_tsvector('simple', ${content}), user_id = ${uid}

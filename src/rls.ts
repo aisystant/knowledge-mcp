@@ -64,8 +64,9 @@ export async function withUserContext<T>(
     await client.query("BEGIN");
 
     if (userId) {
-      // SET LOCAL — действует только до конца текущей транзакции
-      await client.query("SET LOCAL app.user_id = $1", [userId]);
+      // set_config с is_local=true — эквивалент SET LOCAL, но принимает параметр
+      // SET LOCAL не поддерживает $1 параметры в протоколе PostgreSQL
+      await client.query("SELECT set_config('app.user_id', $1, true)", [userId]);
     }
 
     // Обёртка для совместимости с кодом использующим тегированный шаблон

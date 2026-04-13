@@ -1,0 +1,1 @@
+This folder contains the built output assets for the worker "knowledge-mcp" generated at 2026-04-08T11:59:11.613Z.
