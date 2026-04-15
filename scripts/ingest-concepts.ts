@@ -698,6 +698,7 @@ const SPF_TYPE_TO_FPF: Record<string, string[]> = {
   "AISYS": ["U.System", "U.Capability"], // DP: AI System
   "NAV":  ["U.Episteme"],             // DP: Navigation
   "EXOCORTEX": ["U.System"],          // DP: Exocortex
+  "IWE":  ["U.System"],               // DP: Intelligent Work Environment
 };
 
 function buildSpecializesEdges(
