@@ -507,6 +507,7 @@ function extractPackEntities(): { concepts: ConceptNode[]; edges: ConceptEdge[] 
           aggregates:   "related",
           extends:      "specializes",
           refines:      "specializes",
+          specializes:  "specializes",
           part_of:      "part_of",
           violates:     "related",
         };
