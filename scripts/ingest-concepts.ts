@@ -127,33 +127,80 @@ function parseFrontmatter(content: string): { meta: Record<string, any>; body: s
   const meta: Record<string, any> = {};
   const lines = match[1].split("\n");
   let currentKey = "";
+  let currentSubKey = "";
+  let inNestedObject = false;
   let inArray = false;
 
   for (const line of lines) {
+    // Top-level key (no leading spaces)
     const kvMatch = line.match(/^(\w[\w_]*)\s*:\s*(.*)$/);
+    // Nested key (2+ leading spaces, then word chars)
+    const nestedKvMatch = line.match(/^(\s{1,})(\w[\w_]*)\s*:\s*(.*)$/);
+
     if (kvMatch) {
       currentKey = kvMatch[1];
+      currentSubKey = "";
+      inNestedObject = false;
+      inArray = false;
       const val = kvMatch[2].trim();
       if (val === "" || val === ">") {
-        meta[currentKey] = "";
-        inArray = false;
+        // Could become a nested object — initialize as object, convert later if needed
+        meta[currentKey] = {};
+        inNestedObject = true;
       } else if (val.startsWith("[") && val.endsWith("]")) {
         meta[currentKey] = val
           .slice(1, -1)
           .split(",")
-          .map((s) => s.trim().replace(/^['"]|['"]$/g, ""));
-        inArray = false;
+          .map((s) => s.trim().replace(/^['"]|['"]$/g, ""))
+          .filter((s) => s.length > 0);
+        inNestedObject = false;
       } else {
         meta[currentKey] = val.replace(/^['"]|['"]$/g, "");
-        inArray = false;
+        inNestedObject = false;
+      }
+    } else if (nestedKvMatch && inNestedObject && currentKey) {
+      // Nested key: e.g. "  uses: [DP.X.001, DP.Y.002]"
+      currentSubKey = nestedKvMatch[2];
+      const val = nestedKvMatch[3].trim();
+      if (typeof meta[currentKey] !== "object" || Array.isArray(meta[currentKey])) {
+        meta[currentKey] = {};
+      }
+      if (val.startsWith("[") && val.endsWith("]")) {
+        meta[currentKey][currentSubKey] = val
+          .slice(1, -1)
+          .split(",")
+          .map((s) => s.trim().replace(/^['"]|['"]$/g, ""))
+          .filter((s) => s.length > 0);
+      } else if (val === "") {
+        meta[currentKey][currentSubKey] = [];
+      } else {
+        meta[currentKey][currentSubKey] = val.replace(/^['"]|['"]$/g, "");
       }
     } else if (line.match(/^\s+-\s+/)) {
-      if (!Array.isArray(meta[currentKey])) meta[currentKey] = [];
-      meta[currentKey].push(line.replace(/^\s+-\s+/, "").trim());
+      // Array item
+      const item = line.replace(/^\s+-\s+/, "").trim();
+      if (inNestedObject && currentSubKey) {
+        if (!Array.isArray(meta[currentKey][currentSubKey])) {
+          meta[currentKey][currentSubKey] = [];
+        }
+        meta[currentKey][currentSubKey].push(item);
+      } else {
+        if (!Array.isArray(meta[currentKey])) meta[currentKey] = [];
+        meta[currentKey].push(item);
+      }
       inArray = true;
-    } else if (inArray === false && currentKey && line.match(/^\s+\S/)) {
-      // continuation of multi-line value
-      meta[currentKey] += " " + line.trim();
+    } else if (!inNestedObject && inArray === false && currentKey && line.match(/^\s+\S/)) {
+      // continuation of multi-line scalar value
+      if (typeof meta[currentKey] === "string") {
+        meta[currentKey] += " " + line.trim();
+      }
+    }
+  }
+
+  // Convert empty objects (no nested keys added) back to empty string
+  for (const key of Object.keys(meta)) {
+    if (typeof meta[key] === "object" && !Array.isArray(meta[key]) && Object.keys(meta[key]).length === 0) {
+      meta[key] = "";
     }
   }
 
