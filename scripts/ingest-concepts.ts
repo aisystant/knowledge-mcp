@@ -484,13 +484,18 @@ function extractPackEntities(): { concepts: ConceptNode[]; edges: ConceptEdge[] 
       if (!meta.id) continue; // skip non-entity files
 
       const code = meta.id;
-      const name = meta.name || code;
       const domain = code.split(".")[0]; // MIM, DP, PD, ECO, etc.
 
       // Extract definition from body — first paragraph after frontmatter
       const bodyStart = content.indexOf("---", content.indexOf("---") + 3);
       const body = bodyStart >= 0 ? content.slice(bodyStart + 3).trim() : "";
       const firstParagraph = body.match(/(?:^|\n)(?!#)([^\n]+)/);
+
+      // Name fallback chain: name → title → H1 heading → summary (first clause) → code
+      const h1Match = body.match(/^#\s+(.+)/m);
+      const h1Name = h1Match ? h1Match[1].replace(/\s*\(.*?\)\s*$/, "").replace(/^[^:]+:\s*/, "").trim() : null;
+      const summaryName = typeof meta.summary === "string" ? meta.summary.split(".")[0].split(",")[0].trim().slice(0, 120) : null;
+      const name = meta.name || meta.title || h1Name || summaryName || code;
       const definition = firstParagraph ? firstParagraph[1].trim().slice(0, 500) : null;
 
       // Extract related entities
@@ -584,7 +589,7 @@ function extractMisconceptions(): Misconception[] {
     const content = readFileSync(join(dir, file), "utf-8");
     const { meta, body } = parseFrontmatter(content);
 
-    const name = meta.name || file;
+    const name = meta.name || meta.title || (typeof meta.summary === "string" ? meta.summary.split(".")[0].split(",")[0].trim().slice(0, 120) : null) || file;
 
     // Determine category from content
     let category: Misconception["category"] = "wrong_application";
