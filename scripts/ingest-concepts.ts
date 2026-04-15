@@ -55,6 +55,8 @@ const DRY_RUN = process.argv.includes("--dry-run");
 interface ConceptNode {
   code: string | null;
   name: string;
+  name_ru: string | null;
+  name_en: string | null;
   definition: string | null;
   level: "zp" | "fpf" | "pack" | "guide" | "course";
   domain: string | null;
@@ -251,6 +253,8 @@ function extractZP(): { concepts: ConceptNode[]; edges: ConceptEdge[] } {
     concepts.push({
       code,
       name,
+      name_ru: null,
+      name_en: null,
       definition,
       level: "zp",
       domain: null,
@@ -364,6 +368,8 @@ function extractCurriculumCells(): { concepts: ConceptNode[]; edges: ConceptEdge
       concepts.push({
         code: cellCode,
         name: `${name} (Bloom ${depth})`,
+        name_ru: null,
+        name_en: null,
         definition: canDo,
         level: "course",
         domain: principle.startsWith("ZP") ? null : principle.split(".")[0],
@@ -426,6 +432,8 @@ function extractGuides(): { concepts: ConceptNode[]; edges: ConceptEdge[] } {
       concepts.push({
         code,
         name: term,
+        name_ru: null,
+        name_en: null,
         definition: null, // no definition in guide lists
         level: "guide",
         domain: courseName,
@@ -537,10 +545,15 @@ function extractPackEntities(): { concepts: ConceptNode[]; edges: ConceptEdge[] 
       }
 
       const relPath = filepath.slice(join(IWE_ROOT, packDir).length + 1);
+      // Read explicit bilingual names from frontmatter (Ф3)
+      const name_ru = typeof meta.name_ru === "string" ? meta.name_ru : null;
+      const name_en = typeof meta.name_en === "string" ? meta.name_en : null;
 
       concepts.push({
         code,
         name,
+        name_ru,
+        name_en,
         definition,
         level: "pack",
         domain,
@@ -633,6 +646,8 @@ function extractFPF(): { concepts: ConceptNode[]; edges: ConceptEdge[] } {
     concepts.push({
       code,
       name,
+      name_ru: null,
+      name_en: null,
       definition,
       level: "fpf",
       domain: null,
@@ -837,18 +852,18 @@ async function main() {
 
   // Add U.* meta-concepts as explicit nodes (FPF level)
   const uConcepts: ConceptNode[] = [
-    { code: "U.Entity", name: "Entity", definition: "Primitive of distinction — everything that can be singled out and named", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.Holon", name: "Holon", definition: "Composition unit: simultaneously a whole composed of parts and a part of a larger whole", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.System", name: "System", definition: "Holon with a boundary interacting with its environment", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.Episteme", name: "Episteme", definition: "Unit of knowledge/description as an artifact", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.Method", name: "Method", definition: "Abstract way of acting (capability); design-time", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.Work", name: "Work", definition: "Dated, spatiotemporally bounded record of a completed enactment", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.Role", name: "Role", definition: "Context-bound capability/obligation schema", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.RoleAssignment", name: "RoleAssignment", definition: "First-class record: Holder#Role:Context@Window", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.Capability", name: "Capability", definition: "Dispositional ability to act", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.ServiceClause", name: "ServiceClause", definition: "Consumer-facing promise clause", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.Characteristic", name: "Characteristic", definition: "Measurable evaluation axis", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.BoundedContext", name: "BoundedContext", definition: "Semantic frame with its own vocabulary, roles, invariants, and bridges", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Entity", name: "Entity", name_ru: "Сущность", name_en: "Entity", definition: "Primitive of distinction — everything that can be singled out and named", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Holon", name: "Holon", name_ru: "Холон", name_en: "Holon", definition: "Composition unit: simultaneously a whole composed of parts and a part of a larger whole", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.System", name: "System", name_ru: "Система", name_en: "System", definition: "Holon with a boundary interacting with its environment", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Episteme", name: "Episteme", name_ru: "Эпистема", name_en: "Episteme", definition: "Unit of knowledge/description as an artifact", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Method", name: "Method", name_ru: "Метод", name_en: "Method", definition: "Abstract way of acting (capability); design-time", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Work", name: "Work", name_ru: "Работа", name_en: "Work", definition: "Dated, spatiotemporally bounded record of a completed enactment", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Role", name: "Role", name_ru: "Роль", name_en: "Role", definition: "Context-bound capability/obligation schema", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.RoleAssignment", name: "RoleAssignment", name_ru: "Назначение роли", name_en: "RoleAssignment", definition: "First-class record: Holder#Role:Context@Window", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Capability", name: "Capability", name_ru: "Способность", name_en: "Capability", definition: "Dispositional ability to act", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.ServiceClause", name: "ServiceClause", name_ru: "Пункт сервиса", name_en: "ServiceClause", definition: "Consumer-facing promise clause", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Characteristic", name: "Characteristic", name_ru: "Характеристика", name_en: "Characteristic", definition: "Measurable evaluation axis", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.BoundedContext", name: "BoundedContext", name_ru: "Ограниченный контекст", name_en: "BoundedContext", definition: "Semantic frame with its own vocabulary, roles, invariants, and bridges", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
   ];
   console.log(`  U.* meta-concepts: ${uConcepts.length}`);
 
@@ -952,10 +967,12 @@ async function main() {
     const emb = embeddings[i];
 
     await sql`
-      INSERT INTO concept_graph.concepts (code, name, definition, level, domain, source_doc, source_repo, embedding)
-      VALUES (${c.code}, ${c.name}, ${c.definition}, ${c.level}, ${c.domain}, ${c.source_doc}, ${c.source_repo}, ${vectorToSql(emb)}::vector)
+      INSERT INTO concept_graph.concepts (code, name, name_ru, name_en, definition, level, domain, source_doc, source_repo, embedding)
+      VALUES (${c.code}, ${c.name}, ${c.name_ru ?? null}, ${c.name_en ?? null}, ${c.definition}, ${c.level}, ${c.domain}, ${c.source_doc}, ${c.source_repo}, ${vectorToSql(emb)}::vector)
       ON CONFLICT (code) DO UPDATE SET
         name = EXCLUDED.name,
+        name_ru = COALESCE(EXCLUDED.name_ru, concept_graph.concepts.name_ru),
+        name_en = COALESCE(EXCLUDED.name_en, concept_graph.concepts.name_en),
         definition = EXCLUDED.definition,
         level = EXCLUDED.level,
         domain = EXCLUDED.domain,
