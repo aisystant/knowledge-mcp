@@ -439,10 +439,25 @@ function extractPackEntities(): { concepts: ConceptNode[]; edges: ConceptEdge[] 
       const definition = firstParagraph ? firstParagraph[1].trim().slice(0, 500) : null;
 
       // Extract related entities
+      // Supports two formats:
+      // Flat array: related: [DP.X.001, DP.Y.002]
+      // Nested object: related:\n  uses: [DP.X.001]\n  extends: [DP.Y.002]
       if (meta.related) {
-        const relatedObj = typeof meta.related === "object" ? meta.related : {};
-        // Handle flat array of related IDs
+        // Map nested relation types to graph edge types
+        const RELATION_TO_EDGE: Record<string, ConceptEdge["edge_type"]> = {
+          uses:         "related",
+          references:   "related",
+          distinguishes:"related",
+          prevents:     "related",
+          aggregates:   "related",
+          extends:      "specializes",
+          refines:      "specializes",
+          part_of:      "part_of",
+          violates:     "related",
+        };
+
         if (Array.isArray(meta.related)) {
+          // Flat array format: related: [DP.X.001, DP.Y.002]
           for (const ref of meta.related) {
             if (typeof ref === "string" && ref.match(/^[A-Z]+\.[A-Z]+\.\d+/)) {
               edges.push({
@@ -452,6 +467,23 @@ function extractPackEntities(): { concepts: ConceptNode[]; edges: ConceptEdge[] 
                 weight: 0.5,
                 weight_source: "manual",
               });
+            }
+          }
+        } else if (typeof meta.related === "object" && meta.related !== null) {
+          // Nested object format: related:\n  uses: [...]\n  extends: [...]
+          for (const [relType, refs] of Object.entries(meta.related)) {
+            const edgeType = RELATION_TO_EDGE[relType] ?? "related";
+            const refList = Array.isArray(refs) ? refs : [refs];
+            for (const ref of refList) {
+              if (typeof ref === "string" && ref.trim().match(/^[A-Z][A-Z.]+\.\d+/)) {
+                edges.push({
+                  from_code: code,
+                  to_code: ref.trim(),
+                  edge_type: edgeType,
+                  weight: edgeType === "specializes" ? 0.9 : 0.5,
+                  weight_source: "manual",
+                });
+              }
             }
           }
         }
