@@ -1536,7 +1536,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
         await sql`
           INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
           VALUES (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, NULL, to_tsvector('simple', ${content}), ${uid})
-          ON CONFLICT (filename, source) DO NOTHING
+          ON CONFLICT (filename, source, COALESCE(user_id, '')) DO NOTHING
         `;
 
         // Insert chunks with embeddings and parent_id
@@ -1553,7 +1553,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
               (SELECT id FROM knowledge.documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1),
               ${uid}
             )
-            ON CONFLICT (filename, source) DO NOTHING
+            ON CONFLICT (filename, source, COALESCE(user_id, '')) DO NOTHING
           `;
         }
       } else {
@@ -1564,7 +1564,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
         await sql`
           INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
           VALUES (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, ${vec}::vector, to_tsvector('simple', ${content}), ${uid})
-          ON CONFLICT (filename, source) DO NOTHING
+          ON CONFLICT (filename, source, COALESCE(user_id, '')) DO NOTHING
         `;
       }
 
