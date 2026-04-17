@@ -68,8 +68,7 @@ function getJwks(oryUrl: string): ReturnType<typeof createRemoteJWKSet> {
 async function verifyJwtLocally(oryUrl: string, token: string): Promise<string | null> {
   try {
     const jwks = getJwks(oryUrl);
-    // Issuer is the base domain (without /hydra), with trailing slash — same as gateway-mcp
-    const issuer = oryUrl.replace("/hydra", "") + "/";
+    const issuer = oryUrl.endsWith("/") ? oryUrl : oryUrl + "/";
     const { payload } = await jwtVerify(token, jwks, {
       issuer,
       algorithms: ["RS256"],
