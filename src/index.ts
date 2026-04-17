@@ -113,6 +113,15 @@ const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> =
   "PACK-ecosystem": { base: "https://github.com/TserenTserenov/PACK-ecosystem/blob/main", pathPrefix: "pack/" },
 };
 
+// L2 platform sources — always indexed with user_id=NULL, visible to all.
+// Everything else in SOURCE_GITHUB_BASE is L4 (personal) and must have user_sources entry.
+const L2_PLATFORM_SOURCES: ReadonlySet<string> = new Set([
+  "FPF", "SPF",
+  "PACK-digital-platform", "PACK-MIM", "PACK-personal", "PACK-ecosystem",
+  "docs-courses", "aist-bot-docs", "exocortex-template-docs",
+  "FMT-exocortex-template", "FMT-s2r",
+]);
+
 export function resolveGithubUrl(source: string, filename: string): string | null {
   const config = SOURCE_GITHUB_BASE[source];
   if (!config) return null;
@@ -1453,14 +1462,25 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
   const sql = db(env);
   const result = { processed: 0, deleted: 0, skipped: 0, errors: [] as string[] };
 
-  // Resolve user_id from user_sources table (personal repos have user_id, platform repos don't)
-  const userRows = await sql`SELECT user_id FROM knowledge.user_sources WHERE source = ${req.source} LIMIT 1`;
-  const uid = userRows.length > 0 ? (userRows[0].user_id as string) : null;
-
   if (!SOURCE_GITHUB_BASE[req.source]) {
     result.errors.push(`Unknown source: ${req.source}. Known sources: ${Object.keys(SOURCE_GITHUB_BASE).join(", ")}`);
     return result;
   }
+
+  // Resolve user_id: L2 platform → NULL (visible to all). L4 personal → user_sources.user_id (required).
+  const isL2 = L2_PLATFORM_SOURCES.has(req.source);
+  const userRows = await sql`SELECT user_id FROM knowledge.user_sources WHERE source = ${req.source} LIMIT 1`;
+
+  if (isL2 && userRows.length > 0) {
+    result.errors.push(`Conflict: ${req.source} is L2 platform but registered in user_sources`);
+    return result;
+  }
+  if (!isL2 && userRows.length === 0) {
+    result.errors.push(`Unregistered L4 source: ${req.source}. Add to user_sources or L2_PLATFORM_SOURCES.`);
+    return result;
+  }
+
+  const uid = isL2 ? null : (userRows[0].user_id as string);
 
   const sourceType = resolveSourceType(req.source);
   const sourceConfig = SOURCE_GITHUB_BASE[req.source];
@@ -1516,8 +1536,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
         await sql`
           INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
           VALUES (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, NULL, to_tsvector('simple', ${content}), ${uid})
-          ON CONFLICT (filename, source)
-          DO UPDATE SET content = ${content}, source_type = ${sourceType}, hash = ${hash}, embedding = NULL, search_vector = to_tsvector('simple', ${content}), user_id = ${uid}
+          ON CONFLICT (filename, source) DO NOTHING
         `;
 
         // Insert chunks with embeddings and parent_id
@@ -1534,12 +1553,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
               (SELECT id FROM knowledge.documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1),
               ${uid}
             )
-            ON CONFLICT (filename, source)
-            DO UPDATE SET
-              content = ${chunk.content}, source_type = ${sourceType}, hash = ${chunkHash},
-              embedding = ${vec}::vector, search_vector = to_tsvector('simple', ${chunk.content}),
-              parent_id = (SELECT id FROM knowledge.documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1),
-              user_id = ${uid}
+            ON CONFLICT (filename, source) DO NOTHING
           `;
         }
       } else {
@@ -1550,8 +1564,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
         await sql`
           INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
           VALUES (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, ${vec}::vector, to_tsvector('simple', ${content}), ${uid})
-          ON CONFLICT (filename, source)
-          DO UPDATE SET content = ${content}, source_type = ${sourceType}, hash = ${hash}, embedding = ${vec}::vector, search_vector = to_tsvector('simple', ${content}), user_id = ${uid}
+          ON CONFLICT (filename, source) DO NOTHING
         `;
       }
 
