@@ -1,5 +1,11 @@
+-- ⚠️ DEPRECATED (2026-04-19): схема переехала в knowledge.* на platform DB.
+-- НЕ запускайте `psql -f schema.sql` на platform — создаст теневую public.documents,
+-- невидимую для скриптов, и сломает изоляцию RLS.
+-- Актуальные миграции: DS-my-strategy/inbox/WP-232/003-knowledge-tables.sql
+-- См. WP-232 (консолидация Neon), WP-7 Scope W17 H2.
+--
 -- Knowledge MCP — PostgreSQL schema (Neon + pgvector + hybrid search)
--- Run once: psql $DATABASE_URL -f schema.sql
+-- Исторический файл. Сохранён как справка по структуре таблицы.
 
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
