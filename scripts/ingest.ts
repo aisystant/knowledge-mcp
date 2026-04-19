@@ -295,7 +295,7 @@ async function ingestSource(
 
   // Check existing hashes
   const existingRows = await sql`
-    SELECT filename, hash FROM documents WHERE source = ${source}
+    SELECT filename, hash FROM knowledge.documents WHERE source = ${source}
   `;
   const existingHashes = new Map<string, string>();
   for (const row of existingRows) {
@@ -318,9 +318,9 @@ async function ingestSource(
     toIndex.filter((d) => d.parentFile).map((d) => d.parentFile!)
   );
   for (const parentFile of changedParents) {
-    await sql`DELETE FROM documents WHERE source = ${source} AND filename LIKE ${parentFile + '::%'}`;
+    await sql`DELETE FROM knowledge.documents WHERE source = ${source} AND filename LIKE ${parentFile + '::%'}`;
     // Also delete old parent document entry
-    await sql`DELETE FROM documents WHERE source = ${source} AND filename = ${parentFile}`;
+    await sql`DELETE FROM knowledge.documents WHERE source = ${source} AND filename = ${parentFile}`;
     console.log(`  Cleaned old parent + chunks for ${parentFile}`);
   }
 
@@ -328,9 +328,9 @@ async function ingestSource(
   const parents = toIndex.filter((d) => d.isParent);
   for (const parent of parents) {
     await sql`
-      INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
+      INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
       VALUES (${parent.filename}, ${parent.content}, ${source}, ${source_type}, ${parent.hash}, NULL, to_tsvector('simple', ${parent.content}), ${uid})
-      ON CONFLICT (filename, source)
+      ON CONFLICT (filename, source, COALESCE(user_id, ''))
       DO UPDATE SET content = ${parent.content}, source_type = ${source_type}, hash = ${parent.hash}, embedding = NULL, search_vector = to_tsvector('simple', ${parent.content}), user_id = ${uid}
     `;
   }
@@ -354,26 +354,26 @@ async function ingestSource(
       if (doc.parentFile) {
         // Chunk with parent link: resolve parent_id from DB
         await sql`
-          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, parent_id, user_id)
+          INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, parent_id, user_id)
           VALUES (
             ${doc.filename}, ${doc.content}, ${source}, ${source_type}, ${doc.hash},
             ${embeddingStr}::vector, to_tsvector('simple', ${doc.content}),
-            (SELECT id FROM documents WHERE filename = ${doc.parentFile} AND source = ${source} LIMIT 1),
+            (SELECT id FROM knowledge.documents WHERE filename = ${doc.parentFile} AND source = ${source} LIMIT 1),
             ${uid}
           )
-          ON CONFLICT (filename, source)
+          ON CONFLICT (filename, source, COALESCE(user_id, ''))
           DO UPDATE SET
             content = ${doc.content}, source_type = ${source_type}, hash = ${doc.hash},
             embedding = ${embeddingStr}::vector, search_vector = to_tsvector('simple', ${doc.content}),
-            parent_id = (SELECT id FROM documents WHERE filename = ${doc.parentFile} AND source = ${source} LIMIT 1),
+            parent_id = (SELECT id FROM knowledge.documents WHERE filename = ${doc.parentFile} AND source = ${source} LIMIT 1),
             user_id = ${uid}
         `;
       } else {
         // Regular document (not chunked): no parent
         await sql`
-          INSERT INTO documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
+          INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
           VALUES (${doc.filename}, ${doc.content}, ${source}, ${source_type}, ${doc.hash}, ${embeddingStr}::vector, to_tsvector('simple', ${doc.content}), ${uid})
-          ON CONFLICT (filename, source)
+          ON CONFLICT (filename, source, COALESCE(user_id, ''))
           DO UPDATE SET content = ${doc.content}, source_type = ${source_type}, hash = ${doc.hash}, embedding = ${embeddingStr}::vector, search_vector = to_tsvector('simple', ${doc.content}), user_id = ${uid}
         `;
       }
@@ -447,7 +447,7 @@ async function main() {
 
     // --clean: delete all existing entries for this source before re-indexing
     if (args.includes("--clean")) {
-      const deleted = await sql`DELETE FROM documents WHERE source = ${config.source}`;
+      const deleted = await sql`DELETE FROM knowledge.documents WHERE source = ${config.source}`;
       console.log(`Cleaned ${deleted.length ?? 0} old entries for [${config.source}]`);
     }
 
