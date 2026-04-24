@@ -933,6 +933,298 @@ ${miscCatalog}
   };
 }
 
+// --- WP-242 Ф8.4: graph-as-runtime-instrument ---
+// SC: DP.SC.121 / Method: DP.METHOD.042
+
+type GraphUsageEvent = {
+  query_text_hash: string;
+  query_text_prefix?: string | null;
+  scenario?: string | null;
+  agent_id?: string | null;
+  user_id_hash?: string | null;
+  tool_name: string;
+  seed_concept_ids?: number[];
+  retrieved_concept_ids?: number[];
+  edge_types_used?: string[];
+  traversal_depth?: number | null;
+  stale_citation_count?: number;
+  misconception_as_auth_count?: number;
+  mode_b_active?: boolean;
+  latency_ms: number;
+  fallback_reason?: string | null;
+};
+
+// PII-safe нормализация: lowercase, trim, убрать последовательности похожие на email/tg-id
+function normalizeQueryForHash(query: string): string {
+  return query
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[\w.+-]+@[\w.-]+/g, "[email]")
+    .replace(/@[a-z0-9_]{3,}/g, "[handle]")
+    .replace(/\b\d{6,}\b/g, "[num]")
+    .trim();
+}
+
+function safeQueryPrefix(query: string, maxLen = 40): string {
+  const normalized = normalizeQueryForHash(query);
+  return normalized.length <= maxLen ? normalized : normalized.slice(0, maxLen);
+}
+
+async function logGraphUsageEvent(env: Env, ev: GraphUsageEvent): Promise<void> {
+  // Fire-and-forget: observability не должна ломать ответ
+  try {
+    const sql = db(env);
+    await sql`
+      INSERT INTO health.graph_usage_events (
+        query_text_hash, query_text_prefix, scenario, agent_id, user_id_hash,
+        tool_name, seed_concept_ids, retrieved_concept_ids, edge_types_used,
+        traversal_depth, stale_citation_count, misconception_as_auth_count,
+        mode_b_active, latency_ms, fallback_reason
+      ) VALUES (
+        ${ev.query_text_hash}, ${ev.query_text_prefix ?? null},
+        ${ev.scenario ?? null}, ${ev.agent_id ?? null}, ${ev.user_id_hash ?? null},
+        ${ev.tool_name},
+        ${ev.seed_concept_ids ?? []}::bigint[],
+        ${ev.retrieved_concept_ids ?? []}::bigint[],
+        ${ev.edge_types_used ?? []}::text[],
+        ${ev.traversal_depth ?? null},
+        ${ev.stale_citation_count ?? 0},
+        ${ev.misconception_as_auth_count ?? 0},
+        ${ev.mode_b_active ?? false},
+        ${ev.latency_ms},
+        ${ev.fallback_reason ?? null}
+      )
+    `;
+  } catch (err) {
+    // Лог в stderr, но не бросаем — observability не должна влиять на SLA tool'а
+    console.error("logGraphUsageEvent failed:", err instanceof Error ? err.message : err);
+  }
+}
+
+type ConceptStatusRow = {
+  id: number;
+  code: string | null;
+  name: string;
+  status: "active" | "deprecated" | "draft" | "superseded";
+  misconception: boolean;
+  superseded_by: number | null;
+  superseded_by_code: string | null;
+  superseded_by_name: string | null;
+  level: string;
+  domain: string | null;
+  definition: string | null;
+};
+
+async function getConceptStatus(
+  env: Env,
+  ref: { concept_id?: number; code?: string; name?: string }
+): Promise<ConceptStatusRow | null> {
+  const sql = db(env);
+  let rows: ConceptStatusRow[];
+
+  if (ref.concept_id) {
+    rows = await sql`
+      SELECT c.id, c.code, c.name, c.status, c.misconception, c.superseded_by,
+             sb.code AS superseded_by_code, sb.name AS superseded_by_name,
+             c.level, c.domain, c.definition
+      FROM concept_graph.concepts c
+      LEFT JOIN concept_graph.concepts sb ON sb.id = c.superseded_by
+      WHERE c.id = ${ref.concept_id}
+      LIMIT 1
+    ` as ConceptStatusRow[];
+  } else if (ref.code) {
+    rows = await sql`
+      SELECT c.id, c.code, c.name, c.status, c.misconception, c.superseded_by,
+             sb.code AS superseded_by_code, sb.name AS superseded_by_name,
+             c.level, c.domain, c.definition
+      FROM concept_graph.concepts c
+      LEFT JOIN concept_graph.concepts sb ON sb.id = c.superseded_by
+      WHERE c.code = ${ref.code}
+      LIMIT 1
+    ` as ConceptStatusRow[];
+  } else if (ref.name) {
+    rows = await sql`
+      SELECT c.id, c.code, c.name, c.status, c.misconception, c.superseded_by,
+             sb.code AS superseded_by_code, sb.name AS superseded_by_name,
+             c.level, c.domain, c.definition
+      FROM concept_graph.concepts c
+      LEFT JOIN concept_graph.concepts sb ON sb.id = c.superseded_by
+      WHERE LOWER(c.name) = LOWER(${ref.name})
+      ORDER BY c.status = 'active' DESC, c.id
+      LIMIT 1
+    ` as ConceptStatusRow[];
+  } else {
+    return null;
+  }
+
+  return rows[0] ?? null;
+}
+
+type ConceptSearchHit = {
+  id: number;
+  code: string | null;
+  name: string;
+  level: string;
+  domain: string | null;
+  status: string;
+  misconception: boolean;
+  similarity: number;
+};
+
+async function searchConceptByName(
+  env: Env,
+  name: string,
+  opts: { limit?: number; include_inactive?: boolean } = {}
+): Promise<ConceptSearchHit[]> {
+  const sql = db(env);
+  const limit = Math.min(opts.limit ?? 10, 50);
+
+  const rows = await sql`
+    SELECT c.id, c.code, c.name, c.level, c.domain, c.status, c.misconception,
+           similarity(c.name, ${name}) AS similarity
+    FROM concept_graph.concepts c
+    WHERE c.name % ${name}
+      ${opts.include_inactive ? sql`` : sql`AND c.status = 'active'`}
+    ORDER BY similarity DESC, c.id
+    LIMIT ${limit}
+  ` as ConceptSearchHit[];
+
+  return rows;
+}
+
+type ExpandedNeighbor = {
+  id: number;
+  code: string | null;
+  name: string;
+  status: string;
+  misconception: boolean;
+  level: string;
+  domain: string | null;
+  edge_type: string;
+  edge_weight: number;
+  direction: "out" | "in";
+  depth: number;
+};
+
+async function expandConcept(
+  env: Env,
+  seedIds: number[],
+  opts: {
+    edge_types?: string[];
+    depth?: number;
+    limit?: number;
+    include_inactive?: boolean;
+  } = {}
+): Promise<{
+  neighbors: ExpandedNeighbor[];
+  edges_traversed: number;
+  edge_types_seen: string[];
+}> {
+  const sql = db(env);
+  const depth = Math.min(Math.max(opts.depth ?? 1, 1), 3);
+  const limit = Math.min(opts.limit ?? 20, 100);
+  const edgeTypes = opts.edge_types && opts.edge_types.length > 0
+    ? opts.edge_types
+    : ["specializes", "part_of", "related", "prerequisite"];
+
+  const neighbors: ExpandedNeighbor[] = [];
+  const seen = new Set<number>(seedIds);
+  const edgeTypesSeen = new Set<string>();
+  let frontier = [...seedIds];
+  let edgesTraversed = 0;
+  const traversedEdgeIds: number[] = [];
+
+  for (let d = 1; d <= depth; d++) {
+    if (frontier.length === 0) break;
+
+    const rows = await sql`
+      SELECT e.id AS edge_id,
+             e.from_concept_id, e.to_concept_id,
+             e.edge_type, e.weight,
+             fc.id AS fc_id, fc.code AS fc_code, fc.name AS fc_name,
+             fc.status AS fc_status, fc.misconception AS fc_misc,
+             fc.level AS fc_level, fc.domain AS fc_domain,
+             tc.id AS tc_id, tc.code AS tc_code, tc.name AS tc_name,
+             tc.status AS tc_status, tc.misconception AS tc_misc,
+             tc.level AS tc_level, tc.domain AS tc_domain
+      FROM concept_graph.concept_edges e
+      JOIN concept_graph.concepts fc ON fc.id = e.from_concept_id
+      JOIN concept_graph.concepts tc ON tc.id = e.to_concept_id
+      WHERE (e.from_concept_id = ANY(${frontier}::bigint[])
+          OR e.to_concept_id = ANY(${frontier}::bigint[]))
+        AND e.edge_type = ANY(${edgeTypes}::text[])
+        ${opts.include_inactive ? sql`` : sql`AND fc.status = 'active' AND tc.status = 'active'`}
+    ` as Array<{
+      edge_id: number;
+      from_concept_id: number;
+      to_concept_id: number;
+      edge_type: string;
+      weight: number;
+      fc_id: number; fc_code: string | null; fc_name: string; fc_status: string; fc_misc: boolean; fc_level: string; fc_domain: string | null;
+      tc_id: number; tc_code: string | null; tc_name: string; tc_status: string; tc_misc: boolean; tc_level: string; tc_domain: string | null;
+    }>;
+
+    const nextFrontier: number[] = [];
+    const frontierSet = new Set(frontier);
+
+    for (const r of rows) {
+      edgesTraversed++;
+      edgeTypesSeen.add(r.edge_type);
+      traversedEdgeIds.push(r.edge_id);
+
+      const isFromInFrontier = frontierSet.has(r.from_concept_id);
+      const otherId = isFromInFrontier ? r.to_concept_id : r.from_concept_id;
+
+      if (seen.has(otherId)) continue;
+      seen.add(otherId);
+
+      const n: ExpandedNeighbor = isFromInFrontier
+        ? {
+            id: r.tc_id, code: r.tc_code, name: r.tc_name,
+            status: r.tc_status, misconception: r.tc_misc,
+            level: r.tc_level, domain: r.tc_domain,
+            edge_type: r.edge_type, edge_weight: r.weight,
+            direction: "out", depth: d,
+          }
+        : {
+            id: r.fc_id, code: r.fc_code, name: r.fc_name,
+            status: r.fc_status, misconception: r.fc_misc,
+            level: r.fc_level, domain: r.fc_domain,
+            edge_type: r.edge_type, edge_weight: r.weight,
+            direction: "in", depth: d,
+          };
+
+      neighbors.push(n);
+      nextFrontier.push(otherId);
+    }
+
+    frontier = nextFrontier;
+    if (neighbors.length >= limit) break;
+  }
+
+  // Обновляем last_traversed_at на пройденных рёбрах (fire-and-forget)
+  if (traversedEdgeIds.length > 0) {
+    try {
+      await sql`
+        UPDATE concept_graph.concept_edges
+        SET last_traversed_at = NOW()
+        WHERE id = ANY(${traversedEdgeIds}::bigint[])
+      `;
+    } catch (err) {
+      console.error("update last_traversed_at failed:", err instanceof Error ? err.message : err);
+    }
+  }
+
+  // Сортировка: по глубине, затем по весу
+  neighbors.sort((a, b) => a.depth - b.depth || b.edge_weight - a.edge_weight);
+
+  return {
+    neighbors: neighbors.slice(0, limit),
+    edges_traversed: edgesTraversed,
+    edge_types_seen: Array.from(edgeTypesSeen),
+  };
+}
+
 // --- WP-208: graph_stats ---
 
 async function getGraphStats(env: Env) {
@@ -1201,6 +1493,58 @@ const TOOLS = [
       required: ["user_id"],
     },
   },
+  {
+    name: "knowledge_concept_status",
+    description:
+      "Возвращает статус концепта (active/deprecated/draft/superseded), признак misconception, и ссылку superseded_by, если концепт заменён новым. Используй перед тем как цитировать концепт в ответе, чтобы соответствовать DP.SC.121 mode (a) — не ссылаться на устаревшие/заблуждения.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        concept_id: { type: "number", description: "id концепта (priority 1)" },
+        code: { type: "string", description: "code концепта, например 'DP.SC.121' или 'MIM.FMT.001'" },
+        name: { type: "string", description: "имя концепта (поиск exact lowercase)" },
+      },
+    },
+  },
+  {
+    name: "knowledge_concept_search_by_name",
+    description:
+      "Fuzzy-поиск концепта по имени (trigram). Для сценариев: (1) разрешить естественное имя в id; (2) проверить наличие концепта перед цитированием. Возвращает top-N с similarity, status, misconception. Отличается от 'search' тем, что работает только по полю name графа, а не по embed'ам документов.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Имя концепта для поиска (подстрока ок)" },
+        limit: { type: "number", description: "Макс. результатов (default: 10, max: 50)" },
+        include_inactive: { type: "boolean", description: "Включать deprecated/superseded (default: false)" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "knowledge_concept_expand",
+    description:
+      "BFS-обход графа от seed-концептов: возвращает соседей через рёбра specializes/part_of/related/prerequisite. Используй когда пользователь задал термин и тебе нужны связанные понятия для развёрнутого ответа (DP.METHOD.042 сценарии: определение, Pack-обучение, онтологические ответы). Автоматически фильтрует deprecated/superseded в выдаче. Обновляет last_traversed_at на пройденных рёбрах.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        concept_id: { type: "number", description: "id seed-концепта (альтернатива concept_ids/code)" },
+        concept_ids: { type: "array", items: { type: "number" }, description: "Массив seed id (BFS из нескольких точек)" },
+        code: { type: "string", description: "code seed-концепта, напр. 'DP.SC.121'" },
+        edge_types: {
+          type: "array",
+          items: { type: "string", enum: ["specializes", "part_of", "related", "prerequisite", "contradicts"] },
+          description: "Какие типы рёбер обходить. Default: specializes+part_of+related+prerequisite",
+        },
+        depth: { type: "number", description: "Глубина BFS (1-3, default 1)" },
+        limit: { type: "number", description: "Макс. соседей в ответе (default 20, max 100)" },
+        scenario: {
+          type: "string",
+          enum: ["claude-code", "pack-author", "portnoy", "ocenshik", "navigator", "learning-trajectory"],
+          description: "Сценарий использования (для observability)",
+        },
+      },
+    },
+  },
 ];
 
 // --- MCP handler ---
@@ -1327,6 +1671,149 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
             jsonrpc: "2.0",
             id,
             result: { content: [{ type: "text", text: JSON.stringify(progress, null, 2) }] },
+          };
+        }
+
+        // --- WP-242 Ф8.4 tools ---
+
+        if (toolName === "knowledge_concept_status") {
+          const t0 = Date.now();
+          const concept = await getConceptStatus(env, {
+            concept_id: args.concept_id as number | undefined,
+            code: args.code as string | undefined,
+            name: args.name as string | undefined,
+          });
+          const latency = Date.now() - t0;
+
+          const queryText = (args.code as string) || (args.name as string) || String(args.concept_id ?? "");
+          const queryHash = await hashQuery(normalizeQueryForHash(queryText));
+          await logGraphUsageEvent(env, {
+            query_text_hash: queryHash,
+            query_text_prefix: safeQueryPrefix(queryText),
+            tool_name: "knowledge_concept_status",
+            agent_id: null,
+            seed_concept_ids: concept ? [concept.id] : [],
+            retrieved_concept_ids: concept ? [concept.id] : [],
+            traversal_depth: 0,
+            latency_ms: latency,
+            fallback_reason: concept ? null : "empty_result",
+          });
+
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: {
+              content: [{ type: "text", text: JSON.stringify(concept ?? { not_found: true }, null, 2) }],
+            },
+          };
+        }
+
+        if (toolName === "knowledge_concept_search_by_name") {
+          const t0 = Date.now();
+          const name = args.name as string;
+          const hits = await searchConceptByName(env, name, {
+            limit: args.limit as number | undefined,
+            include_inactive: args.include_inactive as boolean | undefined,
+          });
+          const latency = Date.now() - t0;
+
+          const queryHash = await hashQuery(normalizeQueryForHash(name));
+          await logGraphUsageEvent(env, {
+            query_text_hash: queryHash,
+            query_text_prefix: safeQueryPrefix(name),
+            tool_name: "knowledge_concept_search_by_name",
+            seed_concept_ids: [],
+            retrieved_concept_ids: hits.map((h) => h.id),
+            traversal_depth: 0,
+            latency_ms: latency,
+            fallback_reason: hits.length === 0 ? "empty_result" : null,
+          });
+
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: { content: [{ type: "text", text: JSON.stringify(hits, null, 2) }] },
+          };
+        }
+
+        if (toolName === "knowledge_concept_expand") {
+          const t0 = Date.now();
+
+          // Resolve seed(s)
+          let seedIds: number[] = [];
+          if (Array.isArray(args.concept_ids)) {
+            seedIds = (args.concept_ids as number[]).filter((x) => typeof x === "number");
+          } else if (typeof args.concept_id === "number") {
+            seedIds = [args.concept_id];
+          } else if (typeof args.code === "string") {
+            const c = await getConceptStatus(env, { code: args.code });
+            if (c) seedIds = [c.id];
+          }
+
+          if (seedIds.length === 0) {
+            const latency = Date.now() - t0;
+            const queryText = (args.code as string) || JSON.stringify(args.concept_ids ?? args.concept_id ?? "");
+            const queryHash = await hashQuery(normalizeQueryForHash(queryText));
+            await logGraphUsageEvent(env, {
+              query_text_hash: queryHash,
+              query_text_prefix: safeQueryPrefix(queryText),
+              tool_name: "knowledge_concept_expand",
+              scenario: (args.scenario as string | undefined) ?? null,
+              seed_concept_ids: [],
+              retrieved_concept_ids: [],
+              traversal_depth: 0,
+              latency_ms: latency,
+              fallback_reason: "empty_result",
+            });
+            return {
+              jsonrpc: "2.0",
+              id,
+              result: { content: [{ type: "text", text: JSON.stringify({ neighbors: [], reason: "seed not resolved" }) }] },
+            };
+          }
+
+          const result = await expandConcept(env, seedIds, {
+            edge_types: args.edge_types as string[] | undefined,
+            depth: args.depth as number | undefined,
+            limit: args.limit as number | undefined,
+          });
+          const latency = Date.now() - t0;
+
+          const queryText = (args.code as string) || JSON.stringify(seedIds);
+          const queryHash = await hashQuery(normalizeQueryForHash(queryText));
+          await logGraphUsageEvent(env, {
+            query_text_hash: queryHash,
+            query_text_prefix: safeQueryPrefix(queryText),
+            tool_name: "knowledge_concept_expand",
+            scenario: (args.scenario as string | undefined) ?? null,
+            seed_concept_ids: seedIds,
+            retrieved_concept_ids: result.neighbors.map((n) => n.id),
+            edge_types_used: result.edge_types_seen,
+            traversal_depth: (args.depth as number | undefined) ?? 1,
+            latency_ms: latency,
+            fallback_reason: result.neighbors.length === 0 ? "empty_result" : null,
+          });
+
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      seeds: seedIds,
+                      neighbors: result.neighbors,
+                      edges_traversed: result.edges_traversed,
+                      edge_types_seen: result.edge_types_seen,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            },
           };
         }
 
