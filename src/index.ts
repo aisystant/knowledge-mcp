@@ -637,12 +637,11 @@ interface VerbalizationResult {
   mastery_updated: boolean;
 }
 
-// WP-268 Phase 2 cut-over note: концептный граф (`concept_graph.*` schema) находится в legacy
-// `neondb` и НЕ является частью этой миграции (плана не предусматривает). После cut-over на
-// `knowledge` БД эти запросы СЛОМАЮТСЯ, пока concept_graph не будет мигрирован отдельным WP.
-// Workaround: либо включить concept_graph в bulk ETL до production cut-over, либо хранить
-// отдельный CONCEPT_DATABASE_URL secret и переключить queries ниже на него.
-// Tracked in WP-268 follow-up checklist (см. PR-описание).
+// WP-268 Phase 2 cut-over: concept_graph (4 780 rows) мигрирован в `knowledge` БД,
+// schema `concept_graph` (DDL: neon-migrations/mvp/017-knowledge-concept-graph.sql,
+// ETL: neon-migrations/scripts/etl-concept-graph-bulk.py).
+// Все запросы ниже schema-qualified `concept_graph.*` и используют тот же DATABASE_URL
+// (knowledge БД) — отдельный CONCEPT_DATABASE_URL не нужен.
 async function analyzeVerbalization(
   env: Env,
   text: string,
