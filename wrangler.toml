@@ -4,6 +4,10 @@ compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
 
 # Secrets (set via `wrangler secret put`):
-# DATABASE_URL - Neon PostgreSQL connection string
+# KNOWLEDGE_DATABASE_URL - Neon `knowledge` БД connection string (WP-268 Phase 2 target)
+#   Example: postgres://...@ep-dark-hall-ag8bo8lf-pooler.../knowledge?sslmode=require
+# DATABASE_URL - DEPRECATED legacy `neondb` connection string (WP-268 Phase 2: keep
+#   during soak window, then remove after `neondb` drop). knowledge-mcp falls back
+#   to DATABASE_URL only if KNOWLEDGE_DATABASE_URL is unset.
 # OPENAI_API_KEY - OpenAI API key
 # ORY_URL - Ory Hydra base URL, e.g. https://auth.system-school.ru/hydra
