@@ -27,6 +27,13 @@ export interface Env {
   KNOWLEDGE_DATABASE_URL?: string;
   /** @deprecated WP-268 Phase 2: legacy `neondb` connection. Use KNOWLEDGE_DATABASE_URL. */
   DATABASE_URL: string;
+  /**
+   * WP-268 Phase 2 cleanup: target = `health` БД (DB #8) для observability writes
+   * (graph_usage_events). Если не задан — fallback на activeDsn (что писало раньше
+   * в `platform.health.*` через legacy DATABASE_URL).
+   * После DROP `platform.health.*` сделать обязательным.
+   */
+  HEALTH_DATABASE_URL?: string;
   OPENAI_API_KEY: string;
   ORY_URL?: string; // e.g. https://auth.system-school.ru/hydra — optional, JWT verification disabled if absent
   REINDEX_SECRET?: string; // Shared secret for /reindex endpoint (set via wrangler secret)
@@ -173,6 +180,16 @@ async function getEmbedding(apiKey: string, text: string): Promise<number[]> {
 
 function db(env: Env) {
   return neon(activeDsn(env));
+}
+
+/**
+ * WP-268 Phase 2 cleanup: отдельный connection для health-домена (DB #8).
+ * Пишет в новую `health` БД (graph_usage_events, internal_metrics).
+ * Fallback на activeDsn если HEALTH_DATABASE_URL не задан (для локального dev).
+ * После DROP `platform.health.*` fallback должен быть удалён.
+ */
+function healthDb(env: Env) {
+  return neon(env.HEALTH_DATABASE_URL || activeDsn(env));
 }
 
 // --- Query type detection (DP.D.024) ---
@@ -1004,11 +1021,12 @@ function safeQueryPrefix(query: string, maxLen = 40): string {
 }
 
 async function logGraphUsageEvent(env: Env, ev: GraphUsageEvent): Promise<void> {
-  // Fire-and-forget: observability не должна ломать ответ
+  // Fire-and-forget: observability не должна ломать ответ.
+  // WP-268 Phase 2 cleanup: target = `health` БД (DB #8), таблица в схеме public.
   try {
-    const sql = db(env);
+    const sql = healthDb(env);
     await sql`
-      INSERT INTO health.graph_usage_events (
+      INSERT INTO graph_usage_events (
         query_text_hash, query_text_prefix, scenario, agent_id, user_id_hash,
         tool_name, seed_concept_ids, retrieved_concept_ids, edge_types_used,
         traversal_depth, stale_citation_count, misconception_as_auth_count,
