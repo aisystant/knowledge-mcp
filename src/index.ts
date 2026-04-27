@@ -19,33 +19,20 @@ import { withUserContext } from "./rls.js";
 // --- Types ---
 
 export interface Env {
-  /**
-   * WP-268 Phase 2 cut-over: target = `knowledge` БД (knowledge_chunk schema).
-   * If unset, falls back to legacy `DATABASE_URL` (neondb.documents) for soak window.
-   * After legacy `neondb` drop — remove DATABASE_URL and make this required.
-   */
-  KNOWLEDGE_DATABASE_URL?: string;
-  /** @deprecated WP-268 Phase 2: legacy `neondb` connection. Use KNOWLEDGE_DATABASE_URL. */
-  DATABASE_URL: string;
-  /**
-   * WP-268 Phase 2 cleanup: target = `health` БД (DB #8) для observability writes
-   * (graph_usage_events). Если не задан — fallback на activeDsn (что писало раньше
-   * в `platform.health.*` через legacy DATABASE_URL).
-   * После DROP `platform.health.*` сделать обязательным.
-   */
-  HEALTH_DATABASE_URL?: string;
+  /** Neon `knowledge` БД connection string (knowledge_chunk + concept_graph). Required. */
+  KNOWLEDGE_DATABASE_URL: string;
+  /** Neon `health` БД (DB #8) для observability writes (graph_usage_events). Required. */
+  HEALTH_DATABASE_URL: string;
   OPENAI_API_KEY: string;
   ORY_URL?: string; // e.g. https://auth.system-school.ru/hydra — optional, JWT verification disabled if absent
   REINDEX_SECRET?: string; // Shared secret for /reindex endpoint (set via wrangler secret)
 }
 
-/**
- * WP-268: возвращает активный DSN для knowledge-mcp.
- * Приоритет: KNOWLEDGE_DATABASE_URL (новая `knowledge` БД) → DATABASE_URL (legacy `neondb`).
- * Используется во ВСЕХ местах, где раньше был прямой `env.DATABASE_URL`.
- */
 function activeDsn(env: Env): string {
-  return env.KNOWLEDGE_DATABASE_URL || env.DATABASE_URL;
+  if (!env.KNOWLEDGE_DATABASE_URL) {
+    throw new Error("KNOWLEDGE_DATABASE_URL is required (legacy DATABASE_URL fallback removed in WP-268 Phase 2 cleanup)");
+  }
+  return env.KNOWLEDGE_DATABASE_URL;
 }
 
 interface McpRequest {
@@ -183,13 +170,13 @@ function db(env: Env) {
 }
 
 /**
- * WP-268 Phase 2 cleanup: отдельный connection для health-домена (DB #8).
- * Пишет в новую `health` БД (graph_usage_events, internal_metrics).
- * Fallback на activeDsn если HEALTH_DATABASE_URL не задан (для локального dev).
- * После DROP `platform.health.*` fallback должен быть удалён.
+ * Connection для health-домена (DB #8): graph_usage_events, internal_metrics.
  */
 function healthDb(env: Env) {
-  return neon(env.HEALTH_DATABASE_URL || activeDsn(env));
+  if (!env.HEALTH_DATABASE_URL) {
+    throw new Error("HEALTH_DATABASE_URL is required (legacy fallback to platform.health removed in WP-268 Phase 2 cleanup)");
+  }
+  return neon(env.HEALTH_DATABASE_URL);
 }
 
 // --- Query type detection (DP.D.024) ---
@@ -657,7 +644,7 @@ interface VerbalizationResult {
 // WP-268 Phase 2 cut-over: concept_graph (4 780 rows) мигрирован в `knowledge` БД,
 // schema `concept_graph` (DDL: neon-migrations/mvp/017-knowledge-concept-graph.sql,
 // ETL: neon-migrations/scripts/etl-concept-graph-bulk.py).
-// Все запросы ниже schema-qualified `concept_graph.*` и используют тот же DATABASE_URL
+// Все запросы ниже schema-qualified `concept_graph.*` и используют KNOWLEDGE_DATABASE_URL
 // (knowledge БД) — отдельный CONCEPT_DATABASE_URL не нужен.
 async function analyzeVerbalization(
   env: Env,
