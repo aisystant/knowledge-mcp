@@ -278,7 +278,7 @@ describe("rerankWithLLM", () => {
 
 describe("enrichWithParentContent", () => {
   it("returns empty array for empty input", async () => {
-    const env = { DATABASE_URL: "fake", OPENAI_API_KEY: "fake" } as Env;
+    const env = { KNOWLEDGE_DATABASE_URL: "fake", HEALTH_DATABASE_URL: "fake", OPENAI_API_KEY: "fake" } as Env;
     const out = await enrichWithParentContent(env, []);
     expect(out).toEqual([]);
   });
@@ -294,7 +294,7 @@ describe("enrichWithParentContent", () => {
     ]);
     vi.mocked(neon).mockReturnValue(mockSql as any);
 
-    const env = { DATABASE_URL: "postgres://fake", OPENAI_API_KEY: "fake" } as Env;
+    const env = { KNOWLEDGE_DATABASE_URL: "postgres://fake", HEALTH_DATABASE_URL: "postgres://fake", OPENAI_API_KEY: "fake" } as Env;
     const results: SearchResult[] = [
       makeResult({ id: 10, score: 0.9, filename: "doc.md::Section A", source: "PACK-digital-platform" }),
       makeResult({ id: 11, score: 0.8, filename: "other.md", source: "SPF" }),
@@ -313,7 +313,7 @@ describe("enrichWithParentContent", () => {
     const mockSql = vi.fn().mockResolvedValue([]);
     vi.mocked(neon).mockReturnValue(mockSql as any);
 
-    const env = { DATABASE_URL: "postgres://fake", OPENAI_API_KEY: "fake" } as Env;
+    const env = { KNOWLEDGE_DATABASE_URL: "postgres://fake", HEALTH_DATABASE_URL: "postgres://fake", OPENAI_API_KEY: "fake" } as Env;
     const results: SearchResult[] = [
       makeResult({ id: 5, score: 0.7, filename: "standalone.md", source: "SPF" }),
     ];

@@ -19,10 +19,20 @@ import { withUserContext } from "./rls.js";
 // --- Types ---
 
 export interface Env {
-  DATABASE_URL: string;
+  /** Neon `knowledge` БД connection string (knowledge_chunk + concept_graph). Required. */
+  KNOWLEDGE_DATABASE_URL: string;
+  /** Neon `health` БД (DB #8) для observability writes (graph_usage_events). Required. */
+  HEALTH_DATABASE_URL: string;
   OPENAI_API_KEY: string;
   ORY_URL?: string; // e.g. https://auth.system-school.ru/hydra — optional, JWT verification disabled if absent
   REINDEX_SECRET?: string; // Shared secret for /reindex endpoint (set via wrangler secret)
+}
+
+function activeDsn(env: Env): string {
+  if (!env.KNOWLEDGE_DATABASE_URL) {
+    throw new Error("KNOWLEDGE_DATABASE_URL is required (legacy DATABASE_URL fallback removed in WP-268 Phase 2 cleanup)");
+  }
+  return env.KNOWLEDGE_DATABASE_URL;
 }
 
 interface McpRequest {
@@ -156,7 +166,17 @@ async function getEmbedding(apiKey: string, text: string): Promise<number[]> {
 }
 
 function db(env: Env) {
-  return neon(env.DATABASE_URL);
+  return neon(activeDsn(env));
+}
+
+/**
+ * Connection для health-домена (DB #8): graph_usage_events, internal_metrics.
+ */
+function healthDb(env: Env) {
+  if (!env.HEALTH_DATABASE_URL) {
+    throw new Error("HEALTH_DATABASE_URL is required (legacy fallback to platform.health removed in WP-268 Phase 2 cleanup)");
+  }
+  return neon(env.HEALTH_DATABASE_URL);
 }
 
 // --- Query type detection (DP.D.024) ---
@@ -209,28 +229,30 @@ async function keywordSearch(
     : null;
   const sectionPattern = sectionRest ? `%${sectionRest}%` : null;
 
-  const rows = await withUserContext(env.DATABASE_URL, userId, (sql) => sql`
-    SELECT id, filename, content, source, source_type,
+  // WP-268: knowledge_chunk schema. Aliases preserve external API contract:
+  //   legacy_id AS id, source_uri AS filename, source_kind AS source_type
+  const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
+    SELECT legacy_id AS id, source_uri AS filename, content, source, source_kind AS source_type,
            CASE
-             WHEN filename ILIKE ${pattern} THEN 1.0
+             WHEN source_uri ILIKE ${pattern} THEN 1.0
              WHEN ${entityPattern}::text IS NOT NULL
-                  AND filename ILIKE ${entityPattern}
+                  AND source_uri ILIKE ${entityPattern}
                   AND ${sectionPattern}::text IS NOT NULL
                   AND content ILIKE ${sectionPattern} THEN 0.98
-             WHEN filename ILIKE ${entityPattern} AND ${entityPattern}::text IS NOT NULL THEN 0.95
+             WHEN source_uri ILIKE ${entityPattern} AND ${entityPattern}::text IS NOT NULL THEN 0.95
              WHEN content ILIKE ${pattern} THEN 0.90
              WHEN search_vector @@ plainto_tsquery('simple', ${ftsQuery}) THEN 0.8
              ELSE 0.5
            END AS score
-    FROM knowledge.documents
+    FROM knowledge_chunk
     WHERE (content ILIKE ${pattern}
-           OR filename ILIKE ${pattern}
+           OR source_uri ILIKE ${pattern}
            OR search_vector @@ plainto_tsquery('simple', ${ftsQuery})
-           OR (${entityPattern}::text IS NOT NULL AND filename ILIKE ${entityPattern}))
+           OR (${entityPattern}::text IS NOT NULL AND source_uri ILIKE ${entityPattern}))
       AND (${src}::text IS NULL OR source = ${src})
-      AND (${stype}::text IS NULL OR source_type = ${stype})
+      AND (${stype}::text IS NULL OR source_kind = ${stype})
     ORDER BY score DESC,
-             CASE WHEN filename ILIKE ${pattern} THEN 0 ELSE 1 END,
+             CASE WHEN source_uri ILIKE ${pattern} THEN 0 ELSE 1 END,
              length(content) DESC
     LIMIT ${limit}
   `);
@@ -263,13 +285,14 @@ async function vectorSearch(
   const src = source ?? null;
   const stype = sourceType ?? null;
 
-  const rows = await withUserContext(env.DATABASE_URL, userId, (sql) => sql`
-    SELECT id, filename, content, source, source_type,
+  // WP-268: knowledge_chunk schema with id/filename/source_type aliases.
+  const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
+    SELECT legacy_id AS id, source_uri AS filename, content, source, source_kind AS source_type,
            1 - (embedding <=> ${vec}::vector) AS score
-    FROM knowledge.documents
+    FROM knowledge_chunk
     WHERE embedding IS NOT NULL
       AND (${src}::text IS NULL OR source = ${src})
-      AND (${stype}::text IS NULL OR source_type = ${stype})
+      AND (${stype}::text IS NULL OR source_kind = ${stype})
     ORDER BY embedding <=> ${vec}::vector
     LIMIT ${limit}
   `);
@@ -404,13 +427,16 @@ export async function enrichWithParentContent(env: Env, results: SearchResult[])
   const filenames = results.map((r) => r.filename);
   const sources = results.map((r) => r.source);
 
+  // WP-268: knowledge_chunk schema. Self-FK через parent_chunk_id (UUID built by mvp/014).
+  // Fallback path (если parent_chunk_id ещё не построен): JOIN ON p.legacy_id = c.parent_legacy_id.
+  // После apply mvp/014 — parent_chunk_id заполнен и быстрее.
   const parentRows = await sql`
-    SELECT c.filename AS chunk_filename, c.source AS chunk_source,
-           p.filename AS parent_filename, p.content AS parent_content
-    FROM knowledge.documents c
-    JOIN knowledge.documents p ON c.parent_id = p.id
-    WHERE c.parent_id IS NOT NULL
-      AND (c.filename, c.source) IN (
+    SELECT c.source_uri AS chunk_filename, c.source AS chunk_source,
+           p.source_uri AS parent_filename, p.content AS parent_content
+    FROM knowledge_chunk c
+    JOIN knowledge_chunk p ON p.chunk_uuid = c.parent_chunk_id
+    WHERE c.parent_chunk_id IS NOT NULL
+      AND (c.source_uri, c.source) IN (
         SELECT unnest(${filenames}::text[]), unnest(${sources}::text[])
       )
   `;
@@ -486,10 +512,11 @@ async function getDocument(
 ): Promise<{ filename: string; content: string; source: string; source_type: string; github_url: string | null } | null> {
   const src = source ?? null;
 
-  const rows = await withUserContext(env.DATABASE_URL, userId, (sql) => sql`
-    SELECT filename, content, source, source_type
-    FROM knowledge.documents
-    WHERE filename = ${filename}
+  // WP-268: knowledge_chunk schema with field aliases.
+  const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
+    SELECT source_uri AS filename, content, source, source_kind AS source_type
+    FROM knowledge_chunk
+    WHERE source_uri = ${filename}
       AND (${src}::text IS NULL OR source = ${src})
     LIMIT 1
   `);
@@ -514,12 +541,13 @@ async function listSources(
 ): Promise<{ source: string; source_type: string; doc_count: number }[]> {
   const stype = sourceType ?? null;
 
-  const rows = await withUserContext(env.DATABASE_URL, userId, (sql) => sql`
-    SELECT source, source_type, COUNT(*)::int AS doc_count
-    FROM knowledge.documents
-    WHERE (${stype}::text IS NULL OR source_type = ${stype})
-    GROUP BY source, source_type
-    ORDER BY source_type, source
+  // WP-268: knowledge_chunk schema. source_kind aliased back to source_type for API compat.
+  const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
+    SELECT source, source_kind AS source_type, COUNT(*)::int AS doc_count
+    FROM knowledge_chunk
+    WHERE (${stype}::text IS NULL OR source_kind = ${stype})
+    GROUP BY source, source_kind
+    ORDER BY source_kind, source
   `);
 
   return rows.map((r) => ({
@@ -539,8 +567,11 @@ async function recordFeedback(
 ): Promise<{ recorded: boolean }> {
   const sql = db(env);
   const queryHash = await hashQuery(query);
+  // WP-268: retrieval_feedback таблица создаётся в новой `knowledge` БД через
+  // mvp/016-knowledge-retrieval-feedback.sql. document_id ссылается на
+  // knowledge_chunk.legacy_id (BIGINT), сохраняя API-совместимость.
   await sql`
-    INSERT INTO knowledge.retrieval_feedback (document_id, query_hash, helpfulness)
+    INSERT INTO retrieval_feedback (document_id, query_hash, helpfulness)
     VALUES (${documentId}, ${queryHash}, ${helpfulness})
   `;
   return { recorded: true };
@@ -561,19 +592,20 @@ async function getFeedbackStats(
   limit: number = 20,
   userId?: string
 ): Promise<Array<{ document_id: number; filename: string; source: string; helpful: number; not_helpful: number; total: number; helpfulness_rate: number }>> {
-  const rows = await withUserContext(env.DATABASE_URL, userId, (sql) => sql`
+  // WP-268: knowledge_chunk schema. JOIN: retrieval_feedback.document_id (BIGINT) → knowledge_chunk.legacy_id.
+  const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
     SELECT
       f.document_id,
-      d.filename,
+      d.source_uri AS filename,
       d.source,
       COUNT(*) FILTER (WHERE f.helpfulness = true)::int AS helpful,
       COUNT(*) FILTER (WHERE f.helpfulness = false)::int AS not_helpful,
       COUNT(*)::int AS total,
       ROUND(COUNT(*) FILTER (WHERE f.helpfulness = true)::numeric / NULLIF(COUNT(*), 0), 2) AS helpfulness_rate
-    FROM knowledge.retrieval_feedback f
-    JOIN knowledge.documents d ON d.id = f.document_id
+    FROM retrieval_feedback f
+    JOIN knowledge_chunk d ON d.legacy_id = f.document_id
     WHERE f.created_at >= NOW() - make_interval(days => ${days})
-    GROUP BY f.document_id, d.filename, d.source
+    GROUP BY f.document_id, d.source_uri, d.source
     ORDER BY total DESC, helpfulness_rate DESC
     LIMIT ${limit}
   `);
@@ -609,6 +641,11 @@ interface VerbalizationResult {
   mastery_updated: boolean;
 }
 
+// WP-268 Phase 2 cut-over: concept_graph (4 780 rows) мигрирован в `knowledge` БД,
+// schema `concept_graph` (DDL: neon-migrations/mvp/017-knowledge-concept-graph.sql,
+// ETL: neon-migrations/scripts/etl-concept-graph-bulk.py).
+// Все запросы ниже schema-qualified `concept_graph.*` и используют KNOWLEDGE_DATABASE_URL
+// (knowledge БД) — отдельный CONCEPT_DATABASE_URL не нужен.
 async function analyzeVerbalization(
   env: Env,
   text: string,
@@ -971,11 +1008,12 @@ function safeQueryPrefix(query: string, maxLen = 40): string {
 }
 
 async function logGraphUsageEvent(env: Env, ev: GraphUsageEvent): Promise<void> {
-  // Fire-and-forget: observability не должна ломать ответ
+  // Fire-and-forget: observability не должна ломать ответ.
+  // WP-268 Phase 2 cleanup: target = `health` БД (DB #8), таблица в схеме public.
   try {
-    const sql = db(env);
+    const sql = healthDb(env);
     await sql`
-      INSERT INTO health.graph_usage_events (
+      INSERT INTO graph_usage_events (
         query_text_hash, query_text_prefix, scenario, agent_id, user_id_hash,
         tool_name, seed_concept_ids, retrieved_concept_ids, edge_types_used,
         traversal_depth, stale_citation_count, misconception_as_auth_count,
@@ -1955,8 +1993,9 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
   }
 
   // Resolve user_id: L2 platform → NULL (visible to all). L4 personal → user_sources.user_id (required).
+  // WP-268: user_sources перенесён в новую `knowledge` БД через mvp/016 (DDL+ETL).
   const isL2 = L2_PLATFORM_SOURCES.has(req.source);
-  const userRows = await sql`SELECT user_id FROM knowledge.user_sources WHERE source = ${req.source} LIMIT 1`;
+  const userRows = await sql`SELECT user_id FROM user_sources WHERE source = ${req.source} LIMIT 1`;
 
   if (isL2 && userRows.length > 0) {
     result.errors.push(`Conflict: ${req.source} is L2 platform but registered in user_sources`);
@@ -1985,9 +2024,19 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
       ? file.path.slice(pathPrefix.length)
       : file.path;
 
+    // WP-268 cut-over notes для INSERT в knowledge_chunk:
+    //  - collection_kind: 'platform' (uid IS NULL) | 'personal' (uid != NULL)
+    //  - account_id: UUID (cast from uid TEXT). Для platform — NULL.
+    //  - source_uri = legacy filename
+    //  - source_kind = legacy source_type
+    //  - search_vector — generated stored, не передаём
+    //  - Уникальность для ON CONFLICT: idx_kc_source_account (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
+    //    создаётся в mvp/016 одновременно с retrieval_feedback DDL.
+    const collectionKind = uid ? 'personal' : 'platform';
+    const accountUuid = uid; // pg cast TEXT→UUID при подстановке параметра
     try {
       if (file.action === "removed") {
-        await sql`DELETE FROM knowledge.documents WHERE source = ${req.source} AND (filename = ${dbFilename} OR filename LIKE ${dbFilename + '::%'})`;
+        await sql`DELETE FROM knowledge_chunk WHERE source = ${req.source} AND (source_uri = ${dbFilename} OR source_uri LIKE ${dbFilename + '::%'})`;
         result.deleted++;
         continue;
       }
@@ -2006,41 +2055,47 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
 
       // Check hash — skip if unchanged
       const hash = await contentHash(content);
-      const existing = await sql`SELECT hash FROM knowledge.documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1`;
+      const existing = await sql`SELECT hash FROM knowledge_chunk WHERE source_uri = ${dbFilename} AND source = ${req.source} LIMIT 1`;
       if (existing.length > 0 && existing[0].hash === hash) {
         result.skipped++;
         continue;
       }
 
       // Delete old document + chunks
-      await sql`DELETE FROM knowledge.documents WHERE source = ${req.source} AND (filename = ${dbFilename} OR filename LIKE ${dbFilename + '::%'})`;
+      await sql`DELETE FROM knowledge_chunk WHERE source = ${req.source} AND (source_uri = ${dbFilename} OR source_uri LIKE ${dbFilename + '::%'})`;
 
       if (content.length > LARGE_FILE_THRESHOLD) {
-        // Large file: parent document (no embedding) + chunks with parent_id
+        // Large file: parent document (no embedding) + chunks with parent_chunk_id
         const chunks = chunkLargeFile(content, dbFilename);
 
-        // Insert parent document (no embedding)
+        // Insert parent document (no embedding). search_vector — generated stored.
         await sql`
-          INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
-          VALUES (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, NULL, to_tsvector('simple', ${content}), ${uid})
-          ON CONFLICT (filename, source, COALESCE(user_id, '')) DO NOTHING
+          INSERT INTO knowledge_chunk
+            (source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind)
+          VALUES
+            (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, NULL,
+             ${accountUuid}::uuid, ${collectionKind})
+          ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
+            DO NOTHING
         `;
 
-        // Insert chunks with embeddings and parent_id
+        // Insert chunks with embeddings, link via parent_chunk_id (UUID self-FK)
         for (const chunk of chunks) {
           const embedding = await getEmbedding(env.OPENAI_API_KEY, chunk.content.slice(0, CHUNK_CHAR_LIMIT));
           const vec = `[${embedding.join(",")}]`;
           const chunkHash = await contentHash(chunk.content);
 
           await sql`
-            INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, parent_id, user_id)
+            INSERT INTO knowledge_chunk
+              (source_uri, content, source, source_kind, hash, embedding, parent_chunk_id, account_id, collection_kind)
             VALUES (
               ${chunk.filename}, ${chunk.content}, ${req.source}, ${sourceType}, ${chunkHash},
-              ${vec}::vector, to_tsvector('simple', ${chunk.content}),
-              (SELECT id FROM knowledge.documents WHERE filename = ${dbFilename} AND source = ${req.source} LIMIT 1),
-              ${uid}
+              ${vec}::vector,
+              (SELECT chunk_uuid FROM knowledge_chunk WHERE source_uri = ${dbFilename} AND source = ${req.source} LIMIT 1),
+              ${accountUuid}::uuid, ${collectionKind}
             )
-            ON CONFLICT (filename, source, COALESCE(user_id, '')) DO NOTHING
+            ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
+              DO NOTHING
           `;
         }
       } else {
@@ -2049,9 +2104,13 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
         const vec = `[${embedding.join(",")}]`;
 
         await sql`
-          INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
-          VALUES (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, ${vec}::vector, to_tsvector('simple', ${content}), ${uid})
-          ON CONFLICT (filename, source, COALESCE(user_id, '')) DO NOTHING
+          INSERT INTO knowledge_chunk
+            (source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind)
+          VALUES
+            (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, ${vec}::vector,
+             ${accountUuid}::uuid, ${collectionKind})
+          ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
+            DO NOTHING
         `;
       }
 

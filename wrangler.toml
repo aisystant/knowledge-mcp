@@ -4,6 +4,13 @@ compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
 
 # Secrets (set via `wrangler secret put`):
-# DATABASE_URL - Neon PostgreSQL connection string
+# KNOWLEDGE_DATABASE_URL - Neon `knowledge` БД connection string. REQUIRED.
+#   Example: postgres://...@ep-dark-hall-ag8bo8lf-pooler.../knowledge?sslmode=require
+# HEALTH_DATABASE_URL - Neon `health` БД (DB #8) для observability writes
+#   (graph_usage_events, internal_metrics). REQUIRED.
+#   Example: postgres://...@ep-dark-hall-ag8bo8lf-pooler.../health?sslmode=require
 # OPENAI_API_KEY - OpenAI API key
 # ORY_URL - Ory Hydra base URL, e.g. https://auth.system-school.ru/hydra
+# REINDEX_SECRET - Shared secret for /reindex endpoint
+#
+# After deploy: `wrangler secret delete DATABASE_URL` (legacy, no longer used).
