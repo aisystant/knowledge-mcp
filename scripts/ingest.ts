@@ -278,9 +278,19 @@ async function ingestSource(
         isParent: true,
       });
 
+      // Dedupe chunk filenames — markdown файлы могут иметь повторяющиеся
+      // заголовки (`## Источники` 7×) → одинаковые chunk filenames → нарушение
+      // unique index. Suffix #N для дубликатов.
+      const seen = new Map<string, number>();
       for (const chunk of chunks) {
+        let chunkFilename = chunk.filename;
+        const count = seen.get(chunkFilename) ?? 0;
+        if (count > 0) {
+          chunkFilename = `${chunk.filename}#${count + 1}`;
+        }
+        seen.set(chunk.filename, count + 1);
         documents.push({
-          filename: chunk.filename,
+          filename: chunkFilename,
           content: chunk.content,
           hash: contentHash(chunk.content),
           parentFile: file.relative,
@@ -309,7 +319,21 @@ async function ingestSource(
   }
 
   // Filter to new/changed
-  const toIndex = documents.filter((d) => existingHashes.get(d.filename) !== d.hash);
+  const initialChanged = documents.filter((d) => existingHashes.get(d.filename) !== d.hash);
+
+  // Если изменился parent OR хотя бы один его chunk → все chunks этого parent должны быть
+  // переинсёрчены (DELETE сметает все, иначе rows просто исчезнут).
+  const dirtyParents = new Set<string>();
+  for (const d of initialChanged) {
+    if (d.isParent) dirtyParents.add(d.filename);
+    if (d.parentFile) dirtyParents.add(d.parentFile);
+  }
+
+  const toIndex = documents.filter((d) => {
+    if (dirtyParents.has(d.filename) || (d.parentFile && dirtyParents.has(d.parentFile))) return true;
+    return existingHashes.get(d.filename) !== d.hash;
+  });
+
   const unchanged = documents.length - toIndex.length;
   if (unchanged > 0) console.log(`  ${unchanged} unchanged (skipped)`);
   if (toIndex.length === 0) {
@@ -320,9 +344,7 @@ async function ingestSource(
   console.log(`  Indexing ${toIndex.length} documents...`);
 
   // Delete existing rows for changed parents (and their chunks) + standalone changed files
-  const changedParents = new Set(
-    toIndex.filter((d) => d.parentFile).map((d) => d.parentFile!)
-  );
+  const changedParents = dirtyParents;
   const standaloneChanged = toIndex.filter((d) => !d.parentFile && !d.isParent).map((d) => d.filename);
 
   for (const parentFile of changedParents) {
