@@ -3,14 +3,28 @@
  * Knowledge MCP — Data Ingestion Script (Neon + OpenAI Embeddings)
  *
  * Reads markdown files from Pack/DS/guides repos and indexes them into
- * Neon PostgreSQL with embeddings from OpenAI (text-embedding-3-small, 1024d).
+ * Neon PostgreSQL `public.knowledge_chunk` (post WP-268 schema) with
+ * embeddings from OpenAI (text-embedding-3-small, 1024d).
+ *
+ * Schema mapping (WP-268 cut-over, 28 апр 2026):
+ *   knowledge.documents (legacy)  →  public.knowledge_chunk (new)
+ *   filename                      →  source_uri + document_path
+ *   content                       →  content
+ *   source                        →  source
+ *   source_type                   →  source_kind
+ *   hash                          →  content_hash + hash
+ *   embedding                     →  embedding
+ *   parent_id (FK к id)           →  parent_chunk_id (FK к chunk_uuid)
+ *   user_id                       →  account_id (NULL для platform)
+ *
+ * Все sources в sources.json — platform-wide (no user_id) → collection_kind='platform'.
  *
  * Usage:
  *   npx tsx scripts/ingest.ts --source PACK-digital-platform --type pack --path ~/IWE/PACK-digital-platform/pack
  *   npx tsx scripts/ingest.ts --config scripts/sources.json   # bulk ingest from config
  *
  * Environment variables (or .dev.vars file):
- *   DATABASE_URL — Neon PostgreSQL connection string
+ *   DATABASE_URL — Neon PostgreSQL connection string (knowledge DB)
  *   OPENAI_API_KEY — OpenAI API key
  */
 
@@ -29,8 +43,8 @@ const EMBEDDING_MODEL = "text-embedding-3-small";
 const EMBEDDING_DIM = 1024;
 const BATCH_SIZE = 10;
 const CHUNK_CHAR_LIMIT = 10_000;
-const LARGE_FILE_THRESHOLD = CHUNK_CHAR_LIMIT; // Files above CHUNK_CHAR_LIMIT get chunked by ## headers
-const VERY_LARGE_WARNING = 50_000; // Warn about files >50K — consider splitting
+const LARGE_FILE_THRESHOLD = CHUNK_CHAR_LIMIT;
+const VERY_LARGE_WARNING = 50_000;
 const SKIP_PATTERNS = [
   /node_modules/,
   /\.git\//,
@@ -48,7 +62,7 @@ interface SourceConfig {
   source_type: "pack" | "guides" | "ds" | "content";
   path: string;
   exclude?: string[];
-  user_id?: string;
+  user_id?: string; // зарезервировано на будущее (personal collections)
 }
 
 // --- OpenAI Embeddings (REST API) ---
@@ -134,7 +148,7 @@ export function contentHash(content: string): string {
   return createHash("sha256").update(content).digest("hex").slice(0, 16);
 }
 
-// --- Hierarchical chunking for large files ---
+// --- Hierarchical chunking for large files (unchanged from legacy ingest) ---
 
 export function chunkLargeFile(
   content: string,
@@ -142,11 +156,9 @@ export function chunkLargeFile(
 ): { filename: string; content: string }[] {
   const chunks: { filename: string; content: string }[] = [];
 
-  // Extract document title for breadcrumb prefix
   const titleMatch = content.match(/^#\s+(.+)/m);
   const docTitle = titleMatch ? titleMatch[1].trim() : "";
 
-  // Split by ## headers
   const sections = content.split(/^(?=## )/m);
 
   for (const section of sections) {
@@ -162,7 +174,6 @@ export function chunkLargeFile(
         content: prefix + section,
       });
     } else {
-      // Section too large — split by ### sub-headers
       const subsections = section.split(/^(?=### )/m);
 
       for (const subsection of subsections) {
@@ -180,7 +191,6 @@ export function chunkLargeFile(
             content: prefix + subsection,
           });
         } else {
-          // Still too large — split by paragraphs
           const paragraphs = subsection.split(/\n\n+/);
           let accumulator = "";
           let partIndex = 0;
@@ -227,15 +237,14 @@ export function chunkLargeFile(
   return chunks;
 }
 
-// --- Main ingestion ---
+// --- Main ingestion (REFACTORED to public.knowledge_chunk) ---
 
 async function ingestSource(
   config: SourceConfig,
   sql: ReturnType<typeof neon>,
   apiKey: string
 ): Promise<number> {
-  const { source, source_type, path: basePath, user_id } = config;
-  const uid = user_id ?? null;
+  const { source, source_type, path: basePath } = config;
 
   const resolvedPath = basePath.replace("~", process.env.HOME || "");
   if (!existsSync(resolvedPath)) {
@@ -250,23 +259,18 @@ async function ingestSource(
   if (files.length === 0) return 0;
 
   // Read files and compute hashes (chunk large files)
-  // Parent documents: stored without embeddings, linked via parent_id
   const documents: { filename: string; content: string; hash: string; parentFile?: string; isParent?: boolean }[] = [];
-  const chunkedParents = new Set<string>();
   for (const file of files) {
     const content = readFileSync(file.filepath, "utf-8");
     if (content.trim().length < 10) continue;
 
     if (content.length > LARGE_FILE_THRESHOLD) {
-      // Large file — store parent document (no embedding) + chunks with parent link
       const chunks = chunkLargeFile(content, file.relative);
       const parentHash = contentHash(content);
-      chunkedParents.add(file.relative);
       const sizeKB = (content.length / 1024).toFixed(0);
       const warn = content.length > VERY_LARGE_WARNING ? " ⚠️  consider splitting" : "";
       console.log(`  ${file.relative}: large file (${sizeKB}KB) → ${chunks.length} chunks + parent${warn}`);
 
-      // Parent document: full content, no embedding (too large for meaningful vector)
       documents.push({
         filename: file.relative,
         content,
@@ -293,13 +297,15 @@ async function ingestSource(
 
   console.log(`  ${documents.length} documents to process`);
 
-  // Check existing hashes
+  // Check existing hashes (platform collection only)
   const existingRows = await sql`
-    SELECT filename, hash FROM knowledge.documents WHERE source = ${source}
-  `;
+    SELECT source_uri, content_hash
+    FROM public.knowledge_chunk
+    WHERE source = ${source} AND collection_kind = 'platform'
+  ` as { source_uri: string; content_hash: string }[];
   const existingHashes = new Map<string, string>();
   for (const row of existingRows) {
-    existingHashes.set(row.filename as string, row.hash as string);
+    existingHashes.set(row.source_uri, row.content_hash);
   }
 
   // Filter to new/changed
@@ -313,34 +319,63 @@ async function ingestSource(
 
   console.log(`  Indexing ${toIndex.length} documents...`);
 
-  // Delete old chunks for changed large files (ghost cleanup)
+  // Delete existing rows for changed parents (and their chunks) + standalone changed files
   const changedParents = new Set(
     toIndex.filter((d) => d.parentFile).map((d) => d.parentFile!)
   );
+  const standaloneChanged = toIndex.filter((d) => !d.parentFile && !d.isParent).map((d) => d.filename);
+
   for (const parentFile of changedParents) {
-    await sql`DELETE FROM knowledge.documents WHERE source = ${source} AND filename LIKE ${parentFile + '::%'}`;
-    // Also delete old parent document entry
-    await sql`DELETE FROM knowledge.documents WHERE source = ${source} AND filename = ${parentFile}`;
+    // Delete parent + all its chunks (LIKE 'parent::%' и сам parent)
+    await sql`
+      DELETE FROM public.knowledge_chunk
+      WHERE source = ${source}
+        AND collection_kind = 'platform'
+        AND (source_uri = ${parentFile} OR source_uri LIKE ${parentFile + '::%'})
+    `;
     console.log(`  Cleaned old parent + chunks for ${parentFile}`);
   }
-
-  // Phase 1: Upsert parent documents (no embeddings — too large for meaningful vectors)
-  const parents = toIndex.filter((d) => d.isParent);
-  for (const parent of parents) {
+  // Delete changed standalone files
+  if (standaloneChanged.length > 0) {
     await sql`
-      INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
-      VALUES (${parent.filename}, ${parent.content}, ${source}, ${source_type}, ${parent.hash}, NULL, to_tsvector('simple', ${parent.content}), ${uid})
-      ON CONFLICT (filename, source, COALESCE(user_id, ''))
-      DO UPDATE SET content = ${parent.content}, source_type = ${source_type}, hash = ${parent.hash}, embedding = NULL, search_vector = to_tsvector('simple', ${parent.content}), user_id = ${uid}
+      DELETE FROM public.knowledge_chunk
+      WHERE source = ${source}
+        AND collection_kind = 'platform'
+        AND source_uri = ANY(${standaloneChanged}::text[])
     `;
+  }
+
+  // Phase 1: Insert parent documents (no embeddings — too large for meaningful vectors)
+  // Returns chunk_uuid for FK linkage to chunks.
+  const parents = toIndex.filter((d) => d.isParent);
+  const parentUuids = new Map<string, string>(); // filename -> chunk_uuid
+
+  for (const parent of parents) {
+    const chunkId = `${parent.filename}::p0`;
+    const result = await sql`
+      INSERT INTO public.knowledge_chunk (
+        chunk_id, document_path, paragraph_pos, content_hash, hash,
+        source, source_uri, source_kind, collection_kind,
+        content, embedding, indexed_at
+      )
+      VALUES (
+        ${chunkId}, ${parent.filename}, 0, ${parent.hash}, ${parent.hash},
+        ${source}, ${parent.filename}, ${source_type}, 'platform',
+        ${parent.content}, NULL, NOW()
+      )
+      RETURNING chunk_uuid
+    ` as { chunk_uuid: string }[];
+    parentUuids.set(parent.filename, result[0].chunk_uuid);
   }
   if (parents.length > 0) {
     console.log(`  ${parents.length} parent documents stored`);
   }
 
-  // Phase 2: Upsert chunks with embeddings and parent_id links
+  // Phase 2: Insert chunks with embeddings and parent_chunk_id links
   const chunks = toIndex.filter((d) => !d.isParent);
   let indexed = 0;
+  let posCounter: Record<string, number> = {};
+
   for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
     const batch = chunks.slice(i, i + BATCH_SIZE);
     const texts = batch.map((d) => d.content.slice(0, CHUNK_CHAR_LIMIT));
@@ -350,33 +385,25 @@ async function ingestSource(
     for (let j = 0; j < batch.length; j++) {
       const doc = batch[j];
       const embeddingStr = `[${embeddings[j].join(",")}]`;
+      const groupKey = doc.parentFile ?? doc.filename;
+      const pos = (posCounter[groupKey] ?? 0) + 1; // chunks start at paragraph_pos = 1 (parent = 0)
+      posCounter[groupKey] = pos;
 
-      if (doc.parentFile) {
-        // Chunk with parent link: resolve parent_id from DB
-        await sql`
-          INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, parent_id, user_id)
-          VALUES (
-            ${doc.filename}, ${doc.content}, ${source}, ${source_type}, ${doc.hash},
-            ${embeddingStr}::vector, to_tsvector('simple', ${doc.content}),
-            (SELECT id FROM knowledge.documents WHERE filename = ${doc.parentFile} AND source = ${source} LIMIT 1),
-            ${uid}
-          )
-          ON CONFLICT (filename, source, COALESCE(user_id, ''))
-          DO UPDATE SET
-            content = ${doc.content}, source_type = ${source_type}, hash = ${doc.hash},
-            embedding = ${embeddingStr}::vector, search_vector = to_tsvector('simple', ${doc.content}),
-            parent_id = (SELECT id FROM knowledge.documents WHERE filename = ${doc.parentFile} AND source = ${source} LIMIT 1),
-            user_id = ${uid}
-        `;
-      } else {
-        // Regular document (not chunked): no parent
-        await sql`
-          INSERT INTO knowledge.documents (filename, content, source, source_type, hash, embedding, search_vector, user_id)
-          VALUES (${doc.filename}, ${doc.content}, ${source}, ${source_type}, ${doc.hash}, ${embeddingStr}::vector, to_tsvector('simple', ${doc.content}), ${uid})
-          ON CONFLICT (filename, source, COALESCE(user_id, ''))
-          DO UPDATE SET content = ${doc.content}, source_type = ${source_type}, hash = ${doc.hash}, embedding = ${embeddingStr}::vector, search_vector = to_tsvector('simple', ${doc.content}), user_id = ${uid}
-        `;
-      }
+      const chunkId = `${doc.filename}::p${pos}`;
+      const parentUuid = doc.parentFile ? parentUuids.get(doc.parentFile) ?? null : null;
+
+      await sql`
+        INSERT INTO public.knowledge_chunk (
+          chunk_id, document_path, paragraph_pos, content_hash, hash,
+          source, source_uri, source_kind, collection_kind,
+          content, embedding, parent_chunk_id, indexed_at
+        )
+        VALUES (
+          ${chunkId}, ${doc.filename}, ${pos}, ${doc.hash}, ${doc.hash},
+          ${source}, ${doc.filename}, ${source_type}, 'platform',
+          ${doc.content}, ${embeddingStr}::vector, ${parentUuid}::uuid, NOW()
+        )
+      `;
     }
 
     indexed += batch.length;
@@ -395,7 +422,6 @@ async function ingestSource(
 async function main() {
   const args = process.argv.slice(2);
 
-  // Load env from .dev.vars
   const env: Record<string, string> = {
     DATABASE_URL: process.env.DATABASE_URL || "",
     OPENAI_API_KEY: process.env.OPENAI_API_KEY || "",
@@ -445,10 +471,12 @@ async function main() {
       path: args[pathIdx + 1],
     };
 
-    // --clean: delete all existing entries for this source before re-indexing
     if (args.includes("--clean")) {
-      const deleted = await sql`DELETE FROM knowledge.documents WHERE source = ${config.source}`;
-      console.log(`Cleaned ${deleted.length ?? 0} old entries for [${config.source}]`);
+      const deleted = await sql`
+        DELETE FROM public.knowledge_chunk
+        WHERE source = ${config.source} AND collection_kind = 'platform'
+      `;
+      console.log(`Cleaned ${(deleted as any).length ?? 0} old entries for [${config.source}]`);
     }
 
     console.log(`Ingesting [${config.source}] (${config.source_type}) from ${config.path}`);
@@ -457,7 +485,6 @@ async function main() {
   }
 }
 
-// Only run main when executed directly (not when imported for testing)
 const isDirectRun = process.argv[1]?.endsWith("ingest.ts") || process.argv[1]?.endsWith("ingest.js");
 if (isDirectRun) {
   main().catch((err) => {
