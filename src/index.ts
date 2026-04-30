@@ -26,6 +26,10 @@ export interface Env {
   OPENAI_API_KEY: string;
   ORY_URL?: string; // e.g. https://auth.system-school.ru/hydra — optional, JWT verification disabled if absent
   REINDEX_SECRET?: string; // Shared secret for /reindex endpoint (set via wrangler secret)
+  // WP-268 Phase 3: Schema parameterization for database migrations
+  KNOWLEDGE_DB_SCHEMA?: string; // Default: "knowledge"
+  CONCEPT_GRAPH_DB_SCHEMA?: string; // Default: "concept_graph"
+  HEALTH_DB_SCHEMA?: string; // Default: "health"
 }
 
 function activeDsn(env: Env): string {
