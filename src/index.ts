@@ -15,6 +15,14 @@
 import { neon } from "@neondatabase/serverless";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { withUserContext } from "./rls.js";
+import {
+  getKnowledgeSchema,
+  getConceptGraphSchema,
+  getHealthSchema,
+  KNOWLEDGE_TABLES,
+  CONCEPT_GRAPH_TABLES,
+  HEALTH_TABLES,
+} from "./utils/db.js";
 
 // --- Types ---
 
@@ -98,6 +106,16 @@ async function verifyJwtLocally(oryUrl: string, token: string): Promise<string |
 const EMBEDDING_MODEL = "text-embedding-3-small";
 const VECTOR_CONFIDENCE_THRESHOLD = 0.6;
 const CHUNK_CHAR_LIMIT = 10_000;
+
+// WP-268 Phase 3: Schema parameterization — table name references
+// Initialized in export default fetch() before request handling
+let knowledgeChunkTable: string;
+let retrievalFeedbackTable: string;
+let conceptsTable: string;
+let conceptEdgesTable: string;
+let misconceptionsTable: string;
+let masteryTable: string;
+let graphEventsTable: string;
 const LARGE_FILE_THRESHOLD = CHUNK_CHAR_LIMIT;
 const MAX_FILE_SIZE = 100_000; // 100KB
 const RERANK_MODEL = "gpt-4o-mini";
@@ -248,7 +266,7 @@ async function keywordSearch(
              WHEN search_vector @@ plainto_tsquery('simple', ${ftsQuery}) THEN 0.8
              ELSE 0.5
            END AS score
-    FROM knowledge_chunk
+    FROM ${sql(knowledgeChunkTable)}
     WHERE (content ILIKE ${pattern}
            OR source_uri ILIKE ${pattern}
            OR search_vector @@ plainto_tsquery('simple', ${ftsQuery})
@@ -293,7 +311,7 @@ async function vectorSearch(
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
     SELECT legacy_id AS id, source_uri AS filename, content, source, source_kind AS source_type,
            1 - (embedding <=> ${vec}::vector) AS score
-    FROM knowledge_chunk
+    FROM ${sql(knowledgeChunkTable)}
     WHERE embedding IS NOT NULL
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_kind = ${stype})
@@ -437,8 +455,8 @@ export async function enrichWithParentContent(env: Env, results: SearchResult[])
   const parentRows = await sql`
     SELECT c.source_uri AS chunk_filename, c.source AS chunk_source,
            p.source_uri AS parent_filename, p.content AS parent_content
-    FROM knowledge_chunk c
-    JOIN knowledge_chunk p ON p.chunk_uuid = c.parent_chunk_id
+    FROM ${sql(knowledgeChunkTable)} c
+    JOIN ${sql(knowledgeChunkTable)} p ON p.chunk_uuid = c.parent_chunk_id
     WHERE c.parent_chunk_id IS NOT NULL
       AND (c.source_uri, c.source) IN (
         SELECT unnest(${filenames}::text[]), unnest(${sources}::text[])
@@ -519,7 +537,7 @@ async function getDocument(
   // WP-268: knowledge_chunk schema with field aliases.
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
     SELECT source_uri AS filename, content, source, source_kind AS source_type
-    FROM knowledge_chunk
+    FROM ${sql(knowledgeChunkTable)}
     WHERE source_uri = ${filename}
       AND (${src}::text IS NULL OR source = ${src})
     LIMIT 1
@@ -548,7 +566,7 @@ async function listSources(
   // WP-268: knowledge_chunk schema. source_kind aliased back to source_type for API compat.
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
     SELECT source, source_kind AS source_type, COUNT(*)::int AS doc_count
-    FROM knowledge_chunk
+    FROM ${sql(knowledgeChunkTable)}
     WHERE (${stype}::text IS NULL OR source_kind = ${stype})
     GROUP BY source, source_kind
     ORDER BY source_kind, source
@@ -575,7 +593,7 @@ async function recordFeedback(
   // mvp/016-knowledge-retrieval-feedback.sql. document_id ссылается на
   // knowledge_chunk.legacy_id (BIGINT), сохраняя API-совместимость.
   await sql`
-    INSERT INTO retrieval_feedback (document_id, query_hash, helpfulness)
+    INSERT INTO ${sql(retrievalFeedbackTable)} (document_id, query_hash, helpfulness)
     VALUES (${documentId}, ${queryHash}, ${helpfulness})
   `;
   return { recorded: true };
@@ -606,8 +624,8 @@ async function getFeedbackStats(
       COUNT(*) FILTER (WHERE f.helpfulness = false)::int AS not_helpful,
       COUNT(*)::int AS total,
       ROUND(COUNT(*) FILTER (WHERE f.helpfulness = true)::numeric / NULLIF(COUNT(*), 0), 2) AS helpfulness_rate
-    FROM retrieval_feedback f
-    JOIN knowledge_chunk d ON d.legacy_id = f.document_id
+    FROM ${sql(retrievalFeedbackTable)} f
+    JOIN ${sql(knowledgeChunkTable)} d ON d.legacy_id = f.document_id
     WHERE f.created_at >= NOW() - make_interval(days => ${days})
     GROUP BY f.document_id, d.source_uri, d.source
     ORDER BY total DESC, helpfulness_rate DESC
@@ -672,7 +690,7 @@ async function analyzeVerbalization(
     topicConcepts = await sql`
       SELECT id, code, name, definition, level, domain,
              1 - (embedding <=> ${vecStr}::vector) AS similarity
-      FROM concept_graph.concepts
+      FROM ${sql(conceptsTable)}
       WHERE status = 'active'
       ORDER BY embedding <=> ${vecStr}::vector
       LIMIT 50
@@ -681,7 +699,7 @@ async function analyzeVerbalization(
     // Filter by domain and/or level
     topicConcepts = await sql`
       SELECT id, code, name, definition, level, domain, 1.0 AS similarity
-      FROM concept_graph.concepts
+      FROM ${sql(conceptsTable)}
       WHERE status = 'active'
         AND (${domain}::text IS NULL OR domain = ${domain})
         AND (${level}::text IS NULL OR level = ${level})
@@ -811,13 +829,13 @@ ${conceptList}
   if (matchedIds.length >= 2) {
     const edgeRows = await sql`
       SELECT COUNT(*) AS cnt
-      FROM concept_graph.concept_edges
+      FROM ${sql(conceptEdgesTable)}
       WHERE from_concept_id = ANY(${matchedIds})
         AND to_concept_id = ANY(${matchedIds})
     `;
     const totalPossibleEdges = await sql`
       SELECT COUNT(*) AS cnt
-      FROM concept_graph.concept_edges
+      FROM ${sql(conceptEdgesTable)}
       WHERE from_concept_id = ANY(${conceptIds})
         AND to_concept_id = ANY(${conceptIds})
     `;
@@ -829,8 +847,8 @@ ${conceptList}
   // 4. Check for misconceptions via LLM-as-judge (WP-208 Ф4)
   const misconceptions = await sql`
     SELECT cm.misconception_text, cm.correct_version, cm.category, cm.folk_term, c.name AS concept_name
-    FROM concept_graph.concept_misconceptions cm
-    JOIN concept_graph.concepts c ON c.id = cm.concept_id
+    FROM ${sql(misconceptionsTable)} cm
+    JOIN ${sql(conceptsTable)} c ON c.id = cm.concept_id
     WHERE cm.concept_id = ANY(${conceptIds})
     LIMIT 30
   `;
@@ -947,13 +965,13 @@ ${miscCatalog}
 
       // Bayesian update: M_new = M_old + α * (score - M_old)
       await sql`
-        INSERT INTO concept_graph.learner_concept_mastery
+        INSERT INTO ${sql(masteryTable)}
           (user_id, concept_id, mastery, attempts, last_score, last_assessed_at)
         VALUES (${userId}, ${conceptRow.id}, ${ALPHA * m.score}, 1, ${m.score}, NOW())
         ON CONFLICT (user_id, concept_id) DO UPDATE SET
-          mastery = concept_graph.learner_concept_mastery.mastery +
-            ${ALPHA} * (${m.score} - concept_graph.learner_concept_mastery.mastery),
-          attempts = concept_graph.learner_concept_mastery.attempts + 1,
+          mastery = ${sql(masteryTable)}.mastery +
+            ${ALPHA} * (${m.score} - ${sql(masteryTable)}.mastery),
+          attempts = ${sql(masteryTable)}.attempts + 1,
           last_score = ${m.score},
           last_assessed_at = NOW(),
           updated_at = NOW()
@@ -1017,7 +1035,7 @@ async function logGraphUsageEvent(env: Env, ev: GraphUsageEvent): Promise<void> 
   try {
     const sql = healthDb(env);
     await sql`
-      INSERT INTO graph_usage_events (
+      INSERT INTO ${sql(graphEventsTable)} (
         query_text_hash, query_text_prefix, scenario, agent_id, user_id_hash,
         tool_name, seed_concept_ids, retrieved_concept_ids, edge_types_used,
         traversal_depth, stale_citation_count, misconception_as_auth_count,
@@ -1069,8 +1087,8 @@ async function getConceptStatus(
       SELECT c.id, c.code, c.name, c.status, c.misconception, c.superseded_by,
              sb.code AS superseded_by_code, sb.name AS superseded_by_name,
              c.level, c.domain, c.definition
-      FROM concept_graph.concepts c
-      LEFT JOIN concept_graph.concepts sb ON sb.id = c.superseded_by
+      FROM ${sql(conceptsTable)} c
+      LEFT JOIN ${sql(conceptsTable)} sb ON sb.id = c.superseded_by
       WHERE c.id = ${ref.concept_id}
       LIMIT 1
     ` as ConceptStatusRow[];
@@ -1079,8 +1097,8 @@ async function getConceptStatus(
       SELECT c.id, c.code, c.name, c.status, c.misconception, c.superseded_by,
              sb.code AS superseded_by_code, sb.name AS superseded_by_name,
              c.level, c.domain, c.definition
-      FROM concept_graph.concepts c
-      LEFT JOIN concept_graph.concepts sb ON sb.id = c.superseded_by
+      FROM ${sql(conceptsTable)} c
+      LEFT JOIN ${sql(conceptsTable)} sb ON sb.id = c.superseded_by
       WHERE c.code = ${ref.code}
       LIMIT 1
     ` as ConceptStatusRow[];
@@ -1089,8 +1107,8 @@ async function getConceptStatus(
       SELECT c.id, c.code, c.name, c.status, c.misconception, c.superseded_by,
              sb.code AS superseded_by_code, sb.name AS superseded_by_name,
              c.level, c.domain, c.definition
-      FROM concept_graph.concepts c
-      LEFT JOIN concept_graph.concepts sb ON sb.id = c.superseded_by
+      FROM ${sql(conceptsTable)} c
+      LEFT JOIN ${sql(conceptsTable)} sb ON sb.id = c.superseded_by
       WHERE LOWER(c.name) = LOWER(${ref.name})
       ORDER BY c.status = 'active' DESC, c.id
       LIMIT 1
@@ -1124,7 +1142,7 @@ async function searchConceptByName(
   const rows = await sql`
     SELECT c.id, c.code, c.name, c.level, c.domain, c.status, c.misconception,
            similarity(c.name, ${name}) AS similarity
-    FROM concept_graph.concepts c
+    FROM ${sql(conceptsTable)} c
     WHERE c.name % ${name}
       ${opts.include_inactive ? sql`` : sql`AND c.status = 'active'`}
     ORDER BY similarity DESC, c.id
@@ -1189,9 +1207,9 @@ async function expandConcept(
              tc.id AS tc_id, tc.code AS tc_code, tc.name AS tc_name,
              tc.status AS tc_status, tc.misconception AS tc_misc,
              tc.level AS tc_level, tc.domain AS tc_domain
-      FROM concept_graph.concept_edges e
-      JOIN concept_graph.concepts fc ON fc.id = e.from_concept_id
-      JOIN concept_graph.concepts tc ON tc.id = e.to_concept_id
+      FROM ${sql(conceptEdgesTable)} e
+      JOIN ${sql(conceptsTable)} fc ON fc.id = e.from_concept_id
+      JOIN ${sql(conceptsTable)} tc ON tc.id = e.to_concept_id
       WHERE (e.from_concept_id = ANY(${frontier}::bigint[])
           OR e.to_concept_id = ANY(${frontier}::bigint[]))
         AND e.edge_type = ANY(${edgeTypes}::text[])
@@ -1248,7 +1266,7 @@ async function expandConcept(
   if (traversedEdgeIds.length > 0) {
     try {
       await sql`
-        UPDATE concept_graph.concept_edges
+        UPDATE ${sql(conceptEdgesTable)}
         SET last_traversed_at = NOW()
         WHERE id = ANY(${traversedEdgeIds}::bigint[])
       `;
@@ -1272,27 +1290,27 @@ async function expandConcept(
 async function getGraphStats(env: Env) {
   const sql = db(env);
 
-  const [conceptCount] = await sql`SELECT COUNT(*)::int AS cnt FROM concept_graph.concepts WHERE status = 'active'`;
-  const [edgeCount] = await sql`SELECT COUNT(*)::int AS cnt FROM concept_graph.concept_edges`;
-  const [miscCount] = await sql`SELECT COUNT(*)::int AS cnt FROM concept_graph.concept_misconceptions`;
+  const [conceptCount] = await sql`SELECT COUNT(*)::int AS cnt FROM ${sql(conceptsTable)} WHERE status = 'active'`;
+  const [edgeCount] = await sql`SELECT COUNT(*)::int AS cnt FROM ${sql(conceptEdgesTable)}`;
+  const [miscCount] = await sql`SELECT COUNT(*)::int AS cnt FROM ${sql(misconceptionsTable)}`;
 
   const byLevel = await sql`
     SELECT level, COUNT(*)::int AS cnt
-    FROM concept_graph.concepts WHERE status = 'active'
+    FROM ${sql(conceptsTable)} WHERE status = 'active'
     GROUP BY level ORDER BY cnt DESC
   `;
 
   const byEdgeType = await sql`
     SELECT edge_type, COUNT(*)::int AS cnt
-    FROM concept_graph.concept_edges
+    FROM ${sql(conceptEdgesTable)}
     GROUP BY edge_type ORDER BY cnt DESC
   `;
 
   const orphans = await sql`
     SELECT c.code, c.name, c.level
-    FROM concept_graph.concepts c
-    LEFT JOIN concept_graph.concept_edges e1 ON e1.from_concept_id = c.id
-    LEFT JOIN concept_graph.concept_edges e2 ON e2.to_concept_id = c.id
+    FROM ${sql(conceptsTable)} c
+    LEFT JOIN ${sql(conceptEdgesTable)} e1 ON e1.from_concept_id = c.id
+    LEFT JOIN ${sql(conceptEdgesTable)} e2 ON e2.to_concept_id = c.id
     WHERE c.status = 'active' AND e1.id IS NULL AND e2.id IS NULL
     LIMIT 20
   `;
@@ -1302,9 +1320,9 @@ async function getGraphStats(env: Env) {
     SELECT c1.code AS from_code, c1.name AS from_name,
            c2.code AS to_code, c2.name AS to_name,
            e.weight, e.weight_source
-    FROM concept_graph.concept_edges e
-    JOIN concept_graph.concepts c1 ON c1.id = e.from_concept_id
-    JOIN concept_graph.concepts c2 ON c2.id = e.to_concept_id
+    FROM ${sql(conceptEdgesTable)} e
+    JOIN ${sql(conceptsTable)} c1 ON c1.id = e.from_concept_id
+    JOIN ${sql(conceptsTable)} c2 ON c2.id = e.to_concept_id
     WHERE e.edge_type = 'specializes'
       AND e.weight_source = 'embedding'
       AND e.weight < 0.8
@@ -1313,8 +1331,8 @@ async function getGraphStats(env: Env) {
 
   const topCentral = await sql`
     SELECT c.code, c.name, COUNT(*)::int AS connections
-    FROM concept_graph.concepts c
-    LEFT JOIN concept_graph.concept_edges e ON e.from_concept_id = c.id OR e.to_concept_id = c.id
+    FROM ${sql(conceptsTable)} c
+    LEFT JOIN ${sql(conceptEdgesTable)} e ON e.from_concept_id = c.id OR e.to_concept_id = c.id
     WHERE c.status = 'active'
     GROUP BY c.id, c.code, c.name
     ORDER BY connections DESC
@@ -1340,17 +1358,17 @@ async function getLearnerProgress(env: Env, userId: string, domain: string | und
 
   // Overall stats
   const [totalConcepts] = await sql`
-    SELECT COUNT(*)::int AS cnt FROM concept_graph.concepts
+    SELECT COUNT(*)::int AS cnt FROM ${sql(conceptsTable)}
     WHERE status = 'active' AND (${domain}::text IS NULL OR domain = ${domain})
   `;
   const [masteredCount] = await sql`
-    SELECT COUNT(*)::int AS cnt FROM concept_graph.learner_concept_mastery lm
-    JOIN concept_graph.concepts c ON c.id = lm.concept_id
+    SELECT COUNT(*)::int AS cnt FROM ${sql(masteryTable)} lm
+    JOIN ${sql(conceptsTable)} c ON c.id = lm.concept_id
     WHERE lm.user_id = ${userId} AND lm.mastery >= 0.5
       AND (${domain}::text IS NULL OR c.domain = ${domain})
   `;
   const [totalAttempts] = await sql`
-    SELECT COALESCE(SUM(attempts), 0)::int AS cnt FROM concept_graph.learner_concept_mastery
+    SELECT COALESCE(SUM(attempts), 0)::int AS cnt FROM ${sql(masteryTable)}
     WHERE user_id = ${userId}
   `;
 
@@ -1360,8 +1378,8 @@ async function getLearnerProgress(env: Env, userId: string, domain: string | und
            COUNT(DISTINCT c.id)::int AS total_concepts,
            COUNT(DISTINCT lm.concept_id) FILTER (WHERE lm.mastery >= 0.5)::int AS mastered,
            ROUND(AVG(lm.mastery)::numeric, 2) AS avg_mastery
-    FROM concept_graph.concepts c
-    LEFT JOIN concept_graph.learner_concept_mastery lm
+    FROM ${sql(conceptsTable)} c
+    LEFT JOIN ${sql(masteryTable)} lm
       ON lm.concept_id = c.id AND lm.user_id = ${userId}
     WHERE c.status = 'active' AND c.domain IS NOT NULL
       AND (${domain}::text IS NULL OR c.domain = ${domain})
@@ -1372,8 +1390,8 @@ async function getLearnerProgress(env: Env, userId: string, domain: string | und
   // Top mastered concepts
   const topMastered = await sql`
     SELECT c.code, c.name, c.level, lm.mastery, lm.attempts, lm.last_assessed_at
-    FROM concept_graph.learner_concept_mastery lm
-    JOIN concept_graph.concepts c ON c.id = lm.concept_id
+    FROM ${sql(masteryTable)} lm
+    JOIN ${sql(conceptsTable)} c ON c.id = lm.concept_id
     WHERE lm.user_id = ${userId}
       AND (${domain}::text IS NULL OR c.domain = ${domain})
     ORDER BY lm.mastery DESC
@@ -1383,8 +1401,8 @@ async function getLearnerProgress(env: Env, userId: string, domain: string | und
   // Weakest concepts (assessed but low mastery)
   const weakest = await sql`
     SELECT c.code, c.name, c.level, lm.mastery, lm.attempts
-    FROM concept_graph.learner_concept_mastery lm
-    JOIN concept_graph.concepts c ON c.id = lm.concept_id
+    FROM ${sql(masteryTable)} lm
+    JOIN ${sql(conceptsTable)} c ON c.id = lm.concept_id
     WHERE lm.user_id = ${userId} AND lm.mastery < 0.5 AND lm.attempts >= 1
       AND (${domain}::text IS NULL OR c.domain = ${domain})
     ORDER BY lm.mastery ASC
@@ -1395,9 +1413,9 @@ async function getLearnerProgress(env: Env, userId: string, domain: string | und
   const recommended = await sql`
     SELECT c.code, c.name, c.level, c.domain,
            COUNT(e.id)::int AS connections
-    FROM concept_graph.concepts c
-    LEFT JOIN concept_graph.concept_edges e ON e.from_concept_id = c.id OR e.to_concept_id = c.id
-    LEFT JOIN concept_graph.learner_concept_mastery lm ON lm.concept_id = c.id AND lm.user_id = ${userId}
+    FROM ${sql(conceptsTable)} c
+    LEFT JOIN ${sql(conceptEdgesTable)} e ON e.from_concept_id = c.id OR e.to_concept_id = c.id
+    LEFT JOIN ${sql(masteryTable)} lm ON lm.concept_id = c.id AND lm.user_id = ${userId}
     WHERE c.status = 'active' AND lm.id IS NULL
       AND c.level IN ('guide', 'pack')
       AND (${domain}::text IS NULL OR c.domain = ${domain})
@@ -2040,7 +2058,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
     const accountUuid = uid; // pg cast TEXT→UUID при подстановке параметра
     try {
       if (file.action === "removed") {
-        await sql`DELETE FROM knowledge_chunk WHERE source = ${req.source} AND (source_uri = ${dbFilename} OR source_uri LIKE ${dbFilename + '::%'})`;
+        await sql`DELETE FROM ${sql(knowledgeChunkTable)} WHERE source = ${req.source} AND (source_uri = ${dbFilename} OR source_uri LIKE ${dbFilename + '::%'})`;
         result.deleted++;
         continue;
       }
@@ -2059,14 +2077,14 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
 
       // Check hash — skip if unchanged
       const hash = await contentHash(content);
-      const existing = await sql`SELECT hash FROM knowledge_chunk WHERE source_uri = ${dbFilename} AND source = ${req.source} LIMIT 1`;
+      const existing = await sql`SELECT hash FROM ${sql(knowledgeChunkTable)} WHERE source_uri = ${dbFilename} AND source = ${req.source} LIMIT 1`;
       if (existing.length > 0 && existing[0].hash === hash) {
         result.skipped++;
         continue;
       }
 
       // Delete old document + chunks
-      await sql`DELETE FROM knowledge_chunk WHERE source = ${req.source} AND (source_uri = ${dbFilename} OR source_uri LIKE ${dbFilename + '::%'})`;
+      await sql`DELETE FROM ${sql(knowledgeChunkTable)} WHERE source = ${req.source} AND (source_uri = ${dbFilename} OR source_uri LIKE ${dbFilename + '::%'})`;
 
       if (content.length > LARGE_FILE_THRESHOLD) {
         // Large file: parent document (no embedding) + chunks with parent_chunk_id
@@ -2074,7 +2092,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
 
         // Insert parent document (no embedding). search_vector — generated stored.
         await sql`
-          INSERT INTO knowledge_chunk
+          INSERT INTO ${sql(knowledgeChunkTable)}
             (source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind)
           VALUES
             (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, NULL,
@@ -2090,12 +2108,12 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
           const chunkHash = await contentHash(chunk.content);
 
           await sql`
-            INSERT INTO knowledge_chunk
+            INSERT INTO ${sql(knowledgeChunkTable)}
               (source_uri, content, source, source_kind, hash, embedding, parent_chunk_id, account_id, collection_kind)
             VALUES (
               ${chunk.filename}, ${chunk.content}, ${req.source}, ${sourceType}, ${chunkHash},
               ${vec}::vector,
-              (SELECT chunk_uuid FROM knowledge_chunk WHERE source_uri = ${dbFilename} AND source = ${req.source} LIMIT 1),
+              (SELECT chunk_uuid FROM ${sql(knowledgeChunkTable)} WHERE source_uri = ${dbFilename} AND source = ${req.source} LIMIT 1),
               ${accountUuid}::uuid, ${collectionKind}
             )
             ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
@@ -2108,7 +2126,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
         const vec = `[${embedding.join(",")}]`;
 
         await sql`
-          INSERT INTO knowledge_chunk
+          INSERT INTO ${sql(knowledgeChunkTable)}
             (source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind)
           VALUES
             (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, ${vec}::vector,
@@ -2131,6 +2149,19 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    // WP-268 Phase 3: Schema parameterization for database migrations
+    const knowledgeSchema = getKnowledgeSchema(env);
+    const conceptGraphSchema = getConceptGraphSchema(env);
+    const healthSchema = getHealthSchema(env);
+    // Table name references for SQL queries
+    const knowledgeChunkTable = KNOWLEDGE_TABLES.knowledge_chunk(knowledgeSchema);
+    const retrievalFeedbackTable = KNOWLEDGE_TABLES.retrieval_feedback(knowledgeSchema);
+    const conceptsTable = CONCEPT_GRAPH_TABLES.concepts(conceptGraphSchema);
+    const conceptEdgesTable = CONCEPT_GRAPH_TABLES.concept_edges(conceptGraphSchema);
+    const misconceptionsTable = CONCEPT_GRAPH_TABLES.concept_misconceptions(conceptGraphSchema);
+    const masteryTable = CONCEPT_GRAPH_TABLES.learner_concept_mastery(conceptGraphSchema);
+    const graphEventsTable = HEALTH_TABLES.graph_usage_events(healthSchema);
+
     const url = new URL(request.url);
 
     const corsHeaders = {
