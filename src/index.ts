@@ -253,6 +253,10 @@ async function keywordSearch(
 
   // WP-268: knowledge_chunk schema. Aliases preserve external API contract:
   //   legacy_id AS id, source_uri AS filename, source_kind AS source_type
+  // WP-7 Ф-L2-PRIVACY: explicit account_id filter — defense-in-depth alongside RLS (mvp/015).
+  //   account_id IS NULL = platform doc (visible to all)
+  //   account_id::text = app.user_id = personal doc (visible to owner)
+  //   NULLIF: если app.user_id не установлен — current_setting вернёт '' → NULL → видны только platform.
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
     SELECT legacy_id AS id, source_uri AS filename, content, source, source_kind AS source_type,
            CASE
@@ -273,6 +277,8 @@ async function keywordSearch(
            OR (${entityPattern}::text IS NOT NULL AND source_uri ILIKE ${entityPattern}))
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_kind = ${stype})
+      AND (account_id IS NULL
+           OR account_id::text = NULLIF(current_setting('app.user_id', true), ''))
     ORDER BY score DESC,
              CASE WHEN source_uri ILIKE ${pattern} THEN 0 ELSE 1 END,
              length(content) DESC
@@ -308,6 +314,7 @@ async function vectorSearch(
   const stype = sourceType ?? null;
 
   // WP-268: knowledge_chunk schema with id/filename/source_type aliases.
+  // WP-7 Ф-L2-PRIVACY: explicit account_id filter — defense-in-depth alongside RLS (mvp/015).
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
     SELECT legacy_id AS id, source_uri AS filename, content, source, source_kind AS source_type,
            1 - (embedding <=> ${vec}::vector) AS score
@@ -315,6 +322,8 @@ async function vectorSearch(
     WHERE embedding IS NOT NULL
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_kind = ${stype})
+      AND (account_id IS NULL
+           OR account_id::text = NULLIF(current_setting('app.user_id', true), ''))
     ORDER BY embedding <=> ${vec}::vector
     LIMIT ${limit}
   `);
@@ -441,9 +450,8 @@ ${candidates.map((c) => `[${c.index}] ${c.filename}\n${c.snippet}`).join("\n\n")
 }
 
 /** Enrich search results with parent document content when available */
-export async function enrichWithParentContent(env: Env, results: SearchResult[]): Promise<SearchResult[]> {
+export async function enrichWithParentContent(env: Env, results: SearchResult[], userId?: string): Promise<SearchResult[]> {
   if (results.length === 0) return results;
-  const sql = db(env);
 
   // Batch-fetch parent info for all results that are chunks (have parent_id)
   const filenames = results.map((r) => r.filename);
@@ -452,7 +460,9 @@ export async function enrichWithParentContent(env: Env, results: SearchResult[])
   // WP-268: knowledge_chunk schema. Self-FK через parent_chunk_id (UUID built by mvp/014).
   // Fallback path (если parent_chunk_id ещё не построен): JOIN ON p.legacy_id = c.parent_legacy_id.
   // После apply mvp/014 — parent_chunk_id заполнен и быстрее.
-  const parentRows = await sql`
+  // WP-7 Ф-L2-PRIVACY: withUserContext + explicit account_id filter — defense-in-depth
+  // (parent доступен только если он принадлежит тому же account_id или platform).
+  const parentRows = await withUserContext(activeDsn(env), userId, (sql) => sql`
     SELECT c.source_uri AS chunk_filename, c.source AS chunk_source,
            p.source_uri AS parent_filename, p.content AS parent_content
     FROM ${sql(knowledgeChunkTable)} c
@@ -461,7 +471,11 @@ export async function enrichWithParentContent(env: Env, results: SearchResult[])
       AND (c.source_uri, c.source) IN (
         SELECT unnest(${filenames}::text[]), unnest(${sources}::text[])
       )
-  `;
+      AND (p.account_id IS NULL
+           OR p.account_id::text = NULLIF(current_setting('app.user_id', true), ''))
+      AND (c.account_id IS NULL
+           OR c.account_id::text = NULLIF(current_setting('app.user_id', true), ''))
+  `);
 
   const parentMap = new Map<string, { parent_filename: string; parent_content: string }>();
   for (const row of parentRows) {
@@ -494,7 +508,7 @@ async function searchDocuments(
   if (queryType === "keyword") {
     // Keyword-first: skip embedding generation (~200ms saved), no reranking needed
     const kwResults = await keywordSearch(env, query, source, sourceType, limit, userId);
-    if (kwResults.length > 0) return enrichWithParentContent(env, kwResults);
+    if (kwResults.length > 0) return enrichWithParentContent(env, kwResults, userId);
     // Fallback to vector if keyword found nothing
   }
 
@@ -517,13 +531,13 @@ async function searchDocuments(
       const merged = [...seen.values()].sort((a, b) => b.score - a.score);
       // Rerank merged results
       const reranked = await rerankWithLLM(env.OPENAI_API_KEY, query, merged, limit);
-      return enrichWithParentContent(env, reranked);
+      return enrichWithParentContent(env, reranked, userId);
     }
   }
 
   // LLM rerank vector results → return top-K
   const reranked = await rerankWithLLM(env.OPENAI_API_KEY, query, vectorResults, limit);
-  return enrichWithParentContent(env, reranked);
+  return enrichWithParentContent(env, reranked, userId);
 }
 
 async function getDocument(
@@ -535,11 +549,14 @@ async function getDocument(
   const src = source ?? null;
 
   // WP-268: knowledge_chunk schema with field aliases.
+  // WP-7 Ф-L2-PRIVACY: explicit account_id filter — defense-in-depth.
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
     SELECT source_uri AS filename, content, source, source_kind AS source_type
     FROM ${sql(knowledgeChunkTable)}
     WHERE source_uri = ${filename}
       AND (${src}::text IS NULL OR source = ${src})
+      AND (account_id IS NULL
+           OR account_id::text = NULLIF(current_setting('app.user_id', true), ''))
     LIMIT 1
   `);
 
@@ -564,10 +581,13 @@ async function listSources(
   const stype = sourceType ?? null;
 
   // WP-268: knowledge_chunk schema. source_kind aliased back to source_type for API compat.
+  // WP-7 Ф-L2-PRIVACY: explicit account_id filter — defense-in-depth.
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
     SELECT source, source_kind AS source_type, COUNT(*)::int AS doc_count
     FROM ${sql(knowledgeChunkTable)}
     WHERE (${stype}::text IS NULL OR source_kind = ${stype})
+      AND (account_id IS NULL
+           OR account_id::text = NULLIF(current_setting('app.user_id', true), ''))
     GROUP BY source, source_kind
     ORDER BY source_kind, source
   `);
@@ -615,6 +635,7 @@ async function getFeedbackStats(
   userId?: string
 ): Promise<Array<{ document_id: number; filename: string; source: string; helpful: number; not_helpful: number; total: number; helpfulness_rate: number }>> {
   // WP-268: knowledge_chunk schema. JOIN: retrieval_feedback.document_id (BIGINT) → knowledge_chunk.legacy_id.
+  // WP-7 Ф-L2-PRIVACY: explicit account_id filter — defense-in-depth (statistics не должны включать чужие документы).
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
     SELECT
       f.document_id,
@@ -627,6 +648,8 @@ async function getFeedbackStats(
     FROM ${sql(retrievalFeedbackTable)} f
     JOIN ${sql(knowledgeChunkTable)} d ON d.legacy_id = f.document_id
     WHERE f.created_at >= NOW() - make_interval(days => ${days})
+      AND (d.account_id IS NULL
+           OR d.account_id::text = NULLIF(current_setting('app.user_id', true), ''))
     GROUP BY f.document_id, d.source_uri, d.source
     ORDER BY total DESC, helpfulness_rate DESC
     LIMIT ${limit}
