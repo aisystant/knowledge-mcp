@@ -2176,14 +2176,14 @@ export default {
     const knowledgeSchema = getKnowledgeSchema(env);
     const conceptGraphSchema = getConceptGraphSchema(env);
     const healthSchema = getHealthSchema(env);
-    // Table name references for SQL queries
-    const knowledgeChunkTable = KNOWLEDGE_TABLES.knowledge_chunk(knowledgeSchema);
-    const retrievalFeedbackTable = KNOWLEDGE_TABLES.retrieval_feedback(knowledgeSchema);
-    const conceptsTable = CONCEPT_GRAPH_TABLES.concepts(conceptGraphSchema);
-    const conceptEdgesTable = CONCEPT_GRAPH_TABLES.concept_edges(conceptGraphSchema);
-    const misconceptionsTable = CONCEPT_GRAPH_TABLES.concept_misconceptions(conceptGraphSchema);
-    const masteryTable = CONCEPT_GRAPH_TABLES.learner_concept_mastery(conceptGraphSchema);
-    const graphEventsTable = HEALTH_TABLES.graph_usage_events(healthSchema);
+    // Table name references for SQL queries (assign to module-level vars used by search functions)
+    knowledgeChunkTable = KNOWLEDGE_TABLES.knowledge_chunk(knowledgeSchema);
+    retrievalFeedbackTable = KNOWLEDGE_TABLES.retrieval_feedback(knowledgeSchema);
+    conceptsTable = CONCEPT_GRAPH_TABLES.concepts(conceptGraphSchema);
+    conceptEdgesTable = CONCEPT_GRAPH_TABLES.concept_edges(conceptGraphSchema);
+    misconceptionsTable = CONCEPT_GRAPH_TABLES.concept_misconceptions(conceptGraphSchema);
+    masteryTable = CONCEPT_GRAPH_TABLES.learner_concept_mastery(conceptGraphSchema);
+    graphEventsTable = HEALTH_TABLES.graph_usage_events(healthSchema);
 
     const url = new URL(request.url);
 
