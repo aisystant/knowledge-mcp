@@ -40,9 +40,13 @@ export function _resetPool(): void {
   _pool = null;
 }
 
+type IdentifierMarker = { __identifier: string };
+
 type SqlClient = {
-  // Минимальный интерфейс совместимый с neon() для передачи в функции поиска
+  // Tagged template: sql`SELECT ...`
   <T = Record<string, unknown>>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T[]>;
+  // Identifier injection: sql("schema.table") → marker for safe quoting
+  (identifier: string): IdentifierMarker;
 };
 
 /**
@@ -69,19 +73,32 @@ export async function withUserContext<T>(
       await client.query("SELECT set_config('app.user_id', $1, true)", [userId]);
     }
 
-    // Обёртка для совместимости с кодом использующим тегированный шаблон
-    const sql = (<T = Record<string, unknown>>(
-      strings: TemplateStringsArray,
-      ...values: unknown[]
-    ): Promise<T[]> => {
-      // Собираем строку запроса с numbered placeholders ($1, $2, ...)
+    // Обёртка для совместимости с кодом использующим тегированный шаблон.
+    // Поддерживает identifier injection: sql("schema.table") → маркер для безопасного цитирования.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sql = ((stringsOrName: TemplateStringsArray | string, ...values: unknown[]): any => {
+      // Вызов как обычная функция sql("schema.table") — identifier injection
+      if (typeof stringsOrName === "string") {
+        return { __identifier: stringsOrName } as IdentifierMarker;
+      }
+      // Вызов как тегированный шаблон sql`SELECT ...`
       let query = "";
-      strings.forEach((str, i) => {
+      const params: unknown[] = [];
+      stringsOrName.forEach((str, i) => {
         query += str;
-        if (i < values.length) query += `$${i + 1}`;
+        if (i < values.length) {
+          const v = values[i];
+          if (v !== null && typeof v === "object" && "__identifier" in (v as object)) {
+            // Inline quoted identifier: "schema"."table"
+            const id = (v as IdentifierMarker).__identifier;
+            query += id.split(".").map((s) => `"${s.replace(/"/g, '""')}"`).join(".");
+          } else {
+            params.push(v);
+            query += `$${params.length}`;
+          }
+        }
       });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return client.query(query, values as unknown[]).then((r) => r.rows as T[]);
+      return client.query(query, params).then((r) => r.rows);
     }) as SqlClient;
 
     const result = await fn(sql);

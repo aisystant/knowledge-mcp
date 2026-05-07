@@ -2,7 +2,7 @@
  * Smoke-тесты для withUserContext (WP-212 B4.22-3)
  *
  * Проверяют:
- * 1. SET LOCAL app.user_id устанавливается при наличии userId
+ * 1. set_config устанавливается при наличии userId
  * 2. SET LOCAL не вызывается для null userId (платформенные запросы)
  * 3. ROLLBACK вызывается при ошибке в fn
  * 4. Соединение освобождается в любом случае (release)
@@ -50,7 +50,7 @@ describe("withUserContext — SET LOCAL", () => {
 
     const calls = mockQuery.mock.calls.map((c) => c[0] as string);
     expect(calls[0]).toBe("BEGIN");
-    expect(calls.some((q) => q.includes("SET LOCAL app.user_id"))).toBe(true);
+    expect(calls.some((q) => q.includes("set_config"))).toBe(true);
     expect(calls[calls.length - 1]).toBe("COMMIT");
   });
 
@@ -58,7 +58,7 @@ describe("withUserContext — SET LOCAL", () => {
     await withUserContext(DB_URL, USER_A, async () => []);
 
     const setLocalCall = mockQuery.mock.calls.find(
-      ([q]) => typeof q === "string" && q.includes("SET LOCAL app.user_id")
+      ([q]) => typeof q === "string" && q.includes("set_config")
     );
     expect(setLocalCall).toBeDefined();
     expect(setLocalCall![1]).toEqual([USER_A]);
@@ -68,7 +68,7 @@ describe("withUserContext — SET LOCAL", () => {
     await withUserContext(DB_URL, null, async () => []);
 
     const calls = mockQuery.mock.calls.map(([q]) => q as string);
-    expect(calls.some((q) => q.includes("SET LOCAL app.user_id"))).toBe(false);
+    expect(calls.some((q) => q.includes("set_config"))).toBe(false);
     expect(calls[0]).toBe("BEGIN");
     expect(calls[calls.length - 1]).toBe("COMMIT");
   });
@@ -77,7 +77,7 @@ describe("withUserContext — SET LOCAL", () => {
     await withUserContext(DB_URL, undefined, async () => []);
 
     const calls = mockQuery.mock.calls.map(([q]) => q as string);
-    expect(calls.some((q) => q.includes("SET LOCAL app.user_id"))).toBe(false);
+    expect(calls.some((q) => q.includes("set_config"))).toBe(false);
   });
 });
 
@@ -119,7 +119,7 @@ describe("withUserContext — изоляция userId", () => {
     await withUserContext(DB_URL, USER_A, async () => []);
 
     const setLocalArgs = mockQuery.mock.calls
-      .filter(([q]) => typeof q === "string" && q.includes("SET LOCAL app.user_id"))
+      .filter(([q]) => typeof q === "string" && q.includes("set_config"))
       .map(([, args]) => args as string[]);
 
     for (const args of setLocalArgs) {
