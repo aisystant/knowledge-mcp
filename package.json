@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "npm run guard:privacy && wrangler deploy",
+    "guard:privacy": "bash scripts/check-account-id-filter.sh",
     "typecheck": "tsc --noEmit",
     "ingest": "tsx scripts/ingest.ts",
     "ingest:all": "tsx scripts/ingest.ts --config scripts/sources.json",

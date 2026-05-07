@@ -605,18 +605,30 @@ async function recordFeedback(
   env: Env,
   documentId: number,
   query: string,
-  helpfulness: boolean
+  helpfulness: boolean,
+  userId?: string
 ): Promise<{ recorded: boolean }> {
-  const sql = db(env);
   const queryHash = await hashQuery(query);
-  // WP-268: retrieval_feedback таблица создаётся в новой `knowledge` БД через
-  // mvp/016-knowledge-retrieval-feedback.sql. document_id ссылается на
-  // knowledge_chunk.legacy_id (BIGINT), сохраняя API-совместимость.
-  await sql`
-    INSERT INTO ${sql(retrievalFeedbackTable)} (document_id, query_hash, helpfulness)
-    VALUES (${documentId}, ${queryHash}, ${helpfulness})
-  `;
-  return { recorded: true };
+  // WP-268: retrieval_feedback document_id → knowledge_chunk.legacy_id (BIGINT).
+  // WP-7 Ф-L2-PRIVACY: писать фидбек только если документ виден вызывающему
+  // (платформенный с account_id IS NULL или собственный персональный).
+  return await withUserContext(activeDsn(env), userId, async (sql) => {
+    const visible = await sql`
+      SELECT 1 FROM ${sql(knowledgeChunkTable)}
+      WHERE legacy_id = ${documentId}
+        AND (account_id IS NULL
+             OR account_id::text = NULLIF(current_setting('app.user_id', true), ''))
+      LIMIT 1
+    `;
+    if (visible.length === 0) {
+      return { recorded: false };
+    }
+    await sql`
+      INSERT INTO ${sql(retrievalFeedbackTable)} (document_id, query_hash, helpfulness)
+      VALUES (${documentId}, ${queryHash}, ${helpfulness})
+    `;
+    return { recorded: true };
+  });
 }
 
 export async function hashQuery(query: string): Promise<string> {
@@ -1701,7 +1713,8 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
             env,
             args.document_id as number,
             args.query as string,
-            args.helpfulness as boolean
+            args.helpfulness as boolean,
+            userId
           );
           return {
             jsonrpc: "2.0",
@@ -2081,7 +2094,10 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
     const accountUuid = uid; // pg cast TEXT→UUID при подстановке параметра
     try {
       if (file.action === "removed") {
-        await sql`DELETE FROM ${sql(knowledgeChunkTable)} WHERE source = ${req.source} AND (source_uri = ${dbFilename} OR source_uri LIKE ${dbFilename + '::%'})`;
+        // WP-7 Ф-L2-PRIVACY: account_id фильтр чтобы L4-источник не прибил чужие L2 чанки с тем же source_uri
+        await sql`DELETE FROM ${sql(knowledgeChunkTable)} WHERE source = ${req.source}
+          AND (source_uri = ${dbFilename} OR source_uri LIKE ${dbFilename + '::%'})
+          AND (account_id IS NOT DISTINCT FROM ${accountUuid}::uuid)`;
         result.deleted++;
         continue;
       }
@@ -2107,7 +2123,10 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
       }
 
       // Delete old document + chunks
-      await sql`DELETE FROM ${sql(knowledgeChunkTable)} WHERE source = ${req.source} AND (source_uri = ${dbFilename} OR source_uri LIKE ${dbFilename + '::%'})`;
+      // WP-7 Ф-L2-PRIVACY: account_id фильтр (не прибить чужие L2 чанки)
+      await sql`DELETE FROM ${sql(knowledgeChunkTable)} WHERE source = ${req.source}
+        AND (source_uri = ${dbFilename} OR source_uri LIKE ${dbFilename + '::%'})
+        AND (account_id IS NOT DISTINCT FROM ${accountUuid}::uuid)`;
 
       if (content.length > LARGE_FILE_THRESHOLD) {
         // Large file: parent document (no embedding) + chunks with parent_chunk_id
