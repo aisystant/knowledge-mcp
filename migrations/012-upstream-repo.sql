@@ -6,13 +6,13 @@
 --
 -- Run: psql $DATABASE_URL -f migrations/012-upstream-repo.sql
 
-ALTER TABLE user_sources ADD COLUMN IF NOT EXISTS upstream_repo TEXT;
+ALTER TABLE knowledge.user_sources ADD COLUMN IF NOT EXISTS upstream_repo TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_user_sources_upstream
-  ON user_sources(upstream_repo) WHERE upstream_repo IS NOT NULL;
+  ON knowledge.user_sources(upstream_repo) WHERE upstream_repo IS NOT NULL;
 
 -- Backfill: DS-ecosystem-development у Тсерена — форк aisystant
-UPDATE user_sources
+UPDATE knowledge.user_sources
 SET upstream_repo = 'aisystant/DS-ecosystem-development'
 WHERE source = 'DS-ecosystem-development'
   AND github_owner = 'TserenTserenov'
