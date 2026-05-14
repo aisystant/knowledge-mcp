@@ -1323,154 +1323,154 @@ async function expandConcept(
 // --- WP-208: graph_stats ---
 
 async function getGraphStats(env: Env) {
-  const sql = db(env);
+  return withUserContext(activeDsn(env), null, async (sql) => {
+    const [conceptCount] = await sql`SELECT COUNT(*)::int AS cnt FROM ${sql(conceptsTable)} WHERE status = 'active'`;
+    const [edgeCount] = await sql`SELECT COUNT(*)::int AS cnt FROM ${sql(conceptEdgesTable)}`;
+    const [miscCount] = await sql`SELECT COUNT(*)::int AS cnt FROM ${sql(misconceptionsTable)}`;
 
-  const [conceptCount] = await sql`SELECT COUNT(*)::int AS cnt FROM ${sql(conceptsTable)} WHERE status = 'active'`;
-  const [edgeCount] = await sql`SELECT COUNT(*)::int AS cnt FROM ${sql(conceptEdgesTable)}`;
-  const [miscCount] = await sql`SELECT COUNT(*)::int AS cnt FROM ${sql(misconceptionsTable)}`;
+    const byLevel = await sql`
+      SELECT level, COUNT(*)::int AS cnt
+      FROM ${sql(conceptsTable)} WHERE status = 'active'
+      GROUP BY level ORDER BY cnt DESC
+    `;
 
-  const byLevel = await sql`
-    SELECT level, COUNT(*)::int AS cnt
-    FROM ${sql(conceptsTable)} WHERE status = 'active'
-    GROUP BY level ORDER BY cnt DESC
-  `;
+    const byEdgeType = await sql`
+      SELECT edge_type, COUNT(*)::int AS cnt
+      FROM ${sql(conceptEdgesTable)}
+      GROUP BY edge_type ORDER BY cnt DESC
+    `;
 
-  const byEdgeType = await sql`
-    SELECT edge_type, COUNT(*)::int AS cnt
-    FROM ${sql(conceptEdgesTable)}
-    GROUP BY edge_type ORDER BY cnt DESC
-  `;
+    const orphans = await sql`
+      SELECT c.code, c.name, c.level
+      FROM ${sql(conceptsTable)} c
+      LEFT JOIN ${sql(conceptEdgesTable)} e1 ON e1.from_concept_id = c.id
+      LEFT JOIN ${sql(conceptEdgesTable)} e2 ON e2.to_concept_id = c.id
+      WHERE c.status = 'active' AND e1.id IS NULL AND e2.id IS NULL
+      LIMIT 20
+    `;
 
-  const orphans = await sql`
-    SELECT c.code, c.name, c.level
-    FROM ${sql(conceptsTable)} c
-    LEFT JOIN ${sql(conceptEdgesTable)} e1 ON e1.from_concept_id = c.id
-    LEFT JOIN ${sql(conceptEdgesTable)} e2 ON e2.to_concept_id = c.id
-    WHERE c.status = 'active' AND e1.id IS NULL AND e2.id IS NULL
-    LIMIT 20
-  `;
+    // Suspicious edges (АрхГейт L2.2 mitigation)
+    const suspiciousEdges = await sql`
+      SELECT c1.code AS from_code, c1.name AS from_name,
+             c2.code AS to_code, c2.name AS to_name,
+             e.weight, e.weight_source
+      FROM ${sql(conceptEdgesTable)} e
+      JOIN ${sql(conceptsTable)} c1 ON c1.id = e.from_concept_id
+      JOIN ${sql(conceptsTable)} c2 ON c2.id = e.to_concept_id
+      WHERE e.edge_type = 'specializes'
+        AND e.weight_source = 'embedding'
+        AND e.weight < 0.8
+      LIMIT 20
+    `;
 
-  // Suspicious edges (АрхГейт L2.2 mitigation)
-  const suspiciousEdges = await sql`
-    SELECT c1.code AS from_code, c1.name AS from_name,
-           c2.code AS to_code, c2.name AS to_name,
-           e.weight, e.weight_source
-    FROM ${sql(conceptEdgesTable)} e
-    JOIN ${sql(conceptsTable)} c1 ON c1.id = e.from_concept_id
-    JOIN ${sql(conceptsTable)} c2 ON c2.id = e.to_concept_id
-    WHERE e.edge_type = 'specializes'
-      AND e.weight_source = 'embedding'
-      AND e.weight < 0.8
-    LIMIT 20
-  `;
+    const topCentral = await sql`
+      SELECT c.code, c.name, COUNT(*)::int AS connections
+      FROM ${sql(conceptsTable)} c
+      LEFT JOIN ${sql(conceptEdgesTable)} e ON e.from_concept_id = c.id OR e.to_concept_id = c.id
+      WHERE c.status = 'active'
+      GROUP BY c.id, c.code, c.name
+      ORDER BY connections DESC
+      LIMIT 10
+    `;
 
-  const topCentral = await sql`
-    SELECT c.code, c.name, COUNT(*)::int AS connections
-    FROM ${sql(conceptsTable)} c
-    LEFT JOIN ${sql(conceptEdgesTable)} e ON e.from_concept_id = c.id OR e.to_concept_id = c.id
-    WHERE c.status = 'active'
-    GROUP BY c.id, c.code, c.name
-    ORDER BY connections DESC
-    LIMIT 10
-  `;
-
-  return {
-    concepts: conceptCount.cnt,
-    edges: edgeCount.cnt,
-    misconceptions: miscCount.cnt,
-    by_level: byLevel,
-    by_edge_type: byEdgeType,
-    orphans: orphans.length > 0 ? orphans : "none",
-    suspicious_edges: suspiciousEdges.length > 0 ? suspiciousEdges : "none",
-    top_central: topCentral,
-  };
+    return {
+      concepts: conceptCount.cnt,
+      edges: edgeCount.cnt,
+      misconceptions: miscCount.cnt,
+      by_level: byLevel,
+      by_edge_type: byEdgeType,
+      orphans: orphans.length > 0 ? orphans : "none",
+      suspicious_edges: suspiciousEdges.length > 0 ? suspiciousEdges : "none",
+      top_central: topCentral,
+    };
+  });
 }
 
 // --- WP-208 Ф5: learner_progress ---
 
 async function getLearnerProgress(env: Env, userId: string, domain: string | undefined) {
-  const sql = db(env);
+  return withUserContext(activeDsn(env), userId, async (sql) => {
+    // Overall stats
+    const [totalConcepts] = await sql`
+      SELECT COUNT(*)::int AS cnt FROM ${sql(conceptsTable)}
+      WHERE status = 'active' AND (${domain}::text IS NULL OR domain = ${domain})
+    `;
+    const [masteredCount] = await sql`
+      SELECT COUNT(*)::int AS cnt FROM ${sql(masteryTable)} lm
+      JOIN ${sql(conceptsTable)} c ON c.id = lm.concept_id
+      WHERE lm.user_id = ${userId} AND lm.mastery >= 0.5
+        AND (${domain}::text IS NULL OR c.domain = ${domain})
+    `;
+    const [totalAttempts] = await sql`
+      SELECT COALESCE(SUM(attempts), 0)::int AS cnt FROM ${sql(masteryTable)}
+      WHERE user_id = ${userId}
+    `;
 
-  // Overall stats
-  const [totalConcepts] = await sql`
-    SELECT COUNT(*)::int AS cnt FROM ${sql(conceptsTable)}
-    WHERE status = 'active' AND (${domain}::text IS NULL OR domain = ${domain})
-  `;
-  const [masteredCount] = await sql`
-    SELECT COUNT(*)::int AS cnt FROM ${sql(masteryTable)} lm
-    JOIN ${sql(conceptsTable)} c ON c.id = lm.concept_id
-    WHERE lm.user_id = ${userId} AND lm.mastery >= 0.5
-      AND (${domain}::text IS NULL OR c.domain = ${domain})
-  `;
-  const [totalAttempts] = await sql`
-    SELECT COALESCE(SUM(attempts), 0)::int AS cnt FROM ${sql(masteryTable)}
-    WHERE user_id = ${userId}
-  `;
+    // Per-domain breakdown
+    const byDomain = await sql`
+      SELECT c.domain,
+             COUNT(DISTINCT c.id)::int AS total_concepts,
+             COUNT(DISTINCT lm.concept_id) FILTER (WHERE lm.mastery >= 0.5)::int AS mastered,
+             ROUND(AVG(lm.mastery)::numeric, 2) AS avg_mastery
+      FROM ${sql(conceptsTable)} c
+      LEFT JOIN ${sql(masteryTable)} lm
+        ON lm.concept_id = c.id AND lm.user_id = ${userId}
+      WHERE c.status = 'active' AND c.domain IS NOT NULL
+        AND (${domain}::text IS NULL OR c.domain = ${domain})
+      GROUP BY c.domain
+      ORDER BY total_concepts DESC
+    `;
 
-  // Per-domain breakdown
-  const byDomain = await sql`
-    SELECT c.domain,
-           COUNT(DISTINCT c.id)::int AS total_concepts,
-           COUNT(DISTINCT lm.concept_id) FILTER (WHERE lm.mastery >= 0.5)::int AS mastered,
-           ROUND(AVG(lm.mastery)::numeric, 2) AS avg_mastery
-    FROM ${sql(conceptsTable)} c
-    LEFT JOIN ${sql(masteryTable)} lm
-      ON lm.concept_id = c.id AND lm.user_id = ${userId}
-    WHERE c.status = 'active' AND c.domain IS NOT NULL
-      AND (${domain}::text IS NULL OR c.domain = ${domain})
-    GROUP BY c.domain
-    ORDER BY total_concepts DESC
-  `;
+    // Top mastered concepts
+    const topMastered = await sql`
+      SELECT c.code, c.name, c.level, lm.mastery, lm.attempts, lm.last_assessed_at
+      FROM ${sql(masteryTable)} lm
+      JOIN ${sql(conceptsTable)} c ON c.id = lm.concept_id
+      WHERE lm.user_id = ${userId}
+        AND (${domain}::text IS NULL OR c.domain = ${domain})
+      ORDER BY lm.mastery DESC
+      LIMIT 10
+    `;
 
-  // Top mastered concepts
-  const topMastered = await sql`
-    SELECT c.code, c.name, c.level, lm.mastery, lm.attempts, lm.last_assessed_at
-    FROM ${sql(masteryTable)} lm
-    JOIN ${sql(conceptsTable)} c ON c.id = lm.concept_id
-    WHERE lm.user_id = ${userId}
-      AND (${domain}::text IS NULL OR c.domain = ${domain})
-    ORDER BY lm.mastery DESC
-    LIMIT 10
-  `;
+    // Weakest concepts (assessed but low mastery)
+    const weakest = await sql`
+      SELECT c.code, c.name, c.level, lm.mastery, lm.attempts
+      FROM ${sql(masteryTable)} lm
+      JOIN ${sql(conceptsTable)} c ON c.id = lm.concept_id
+      WHERE lm.user_id = ${userId} AND lm.mastery < 0.5 AND lm.attempts >= 1
+        AND (${domain}::text IS NULL OR c.domain = ${domain})
+      ORDER BY lm.mastery ASC
+      LIMIT 10
+    `;
 
-  // Weakest concepts (assessed but low mastery)
-  const weakest = await sql`
-    SELECT c.code, c.name, c.level, lm.mastery, lm.attempts
-    FROM ${sql(masteryTable)} lm
-    JOIN ${sql(conceptsTable)} c ON c.id = lm.concept_id
-    WHERE lm.user_id = ${userId} AND lm.mastery < 0.5 AND lm.attempts >= 1
-      AND (${domain}::text IS NULL OR c.domain = ${domain})
-    ORDER BY lm.mastery ASC
-    LIMIT 10
-  `;
+    // Recommended next concepts (high centrality, not yet assessed)
+    const recommended = await sql`
+      SELECT c.code, c.name, c.level, c.domain,
+             COUNT(e.id)::int AS connections
+      FROM ${sql(conceptsTable)} c
+      LEFT JOIN ${sql(conceptEdgesTable)} e ON e.from_concept_id = c.id OR e.to_concept_id = c.id
+      LEFT JOIN ${sql(masteryTable)} lm ON lm.concept_id = c.id AND lm.user_id = ${userId}
+      WHERE c.status = 'active' AND lm.id IS NULL
+        AND c.level IN ('guide', 'pack')
+        AND (${domain}::text IS NULL OR c.domain = ${domain})
+      GROUP BY c.id, c.code, c.name, c.level, c.domain
+      ORDER BY connections DESC
+      LIMIT 5
+    `;
 
-  // Recommended next concepts (high centrality, not yet assessed)
-  const recommended = await sql`
-    SELECT c.code, c.name, c.level, c.domain,
-           COUNT(e.id)::int AS connections
-    FROM ${sql(conceptsTable)} c
-    LEFT JOIN ${sql(conceptEdgesTable)} e ON e.from_concept_id = c.id OR e.to_concept_id = c.id
-    LEFT JOIN ${sql(masteryTable)} lm ON lm.concept_id = c.id AND lm.user_id = ${userId}
-    WHERE c.status = 'active' AND lm.id IS NULL
-      AND c.level IN ('guide', 'pack')
-      AND (${domain}::text IS NULL OR c.domain = ${domain})
-    GROUP BY c.id, c.code, c.name, c.level, c.domain
-    ORDER BY connections DESC
-    LIMIT 5
-  `;
-
-  return {
-    user_id: userId,
-    domain: domain || "all",
-    total_concepts: totalConcepts.cnt,
-    mastered: masteredCount.cnt,
-    coverage: totalConcepts.cnt > 0 ? Math.round(masteredCount.cnt / totalConcepts.cnt * 1000) / 1000 : 0,
-    total_attempts: totalAttempts.cnt,
-    by_domain: byDomain,
-    top_mastered: topMastered,
-    weakest: weakest,
-    recommended_next: recommended,
-  };
+    return {
+      user_id: userId,
+      domain: domain || "all",
+      total_concepts: totalConcepts.cnt,
+      mastered: masteredCount.cnt,
+      coverage: totalConcepts.cnt > 0 ? Math.round(masteredCount.cnt / totalConcepts.cnt * 1000) / 1000 : 0,
+      total_attempts: totalAttempts.cnt,
+      by_domain: byDomain,
+      top_mastered: topMastered,
+      weakest: weakest,
+      recommended_next: recommended,
+    };
+  });
 }
 
 // --- MCP tool definitions ---
