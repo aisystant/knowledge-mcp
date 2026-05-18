@@ -17,7 +17,40 @@
 
 set -euo pipefail
 
-# --- Определить изменённые файлы ---
+# --- [R4] Глобальная проверка ID-коллизий (БЛОКИРУЮЩАЯ, до early-exit) ---
+# Каждый базовый ID (DP.M.NNN, DP.D.NNN, DP.SC.NNN и т.д.) должен быть уникален в репо.
+# Источник: WP-7 Ф-PACK-COLLISIONS (18 мая 2026) — обнаружено 14 коллизий, вызванных
+# параллельной разработкой без проверки свободного номера.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+# `|| true` в конце — защита от grep/awk exit 1 при пустом результате с set -e/pipefail
+COLLISIONS=$(find "$REPO_ROOT" -name "*.md" -type f 2>/dev/null \
+  | grep -v '/\.git/' \
+  | grep -v '/archive/' \
+  | grep -v '/inbox/' \
+  | xargs -n1 basename 2>/dev/null \
+  | grep -oE '^[A-Z]+\.[A-Z]+\.[0-9]+' \
+  | sort | uniq -c | awk '$1>1{print $2}' || true)
+
+if [ -n "$COLLISIONS" ]; then
+  echo ""
+  echo "❌ pack-lint [R4]: обнаружены ID-коллизии (два файла с одинаковым базовым ID):"
+  echo ""
+  echo "$COLLISIONS" | while read coll_id; do
+    echo "  [$coll_id]:"
+    find "$REPO_ROOT" -name "${coll_id}*.md" -type f 2>/dev/null \
+      | grep -v '/\.git/' | grep -v '/archive/' | grep -v '/inbox/' \
+      | sed "s|^${REPO_ROOT}/|    |"
+  done
+  echo ""
+  echo "Каждый ID должен быть уникален в репо (ссылки ломаются при дублях)."
+  echo "Решение: переименовать один из файлов на следующий свободный ID того же типа,"
+  echo "         обновить 'id:' внутри файла + slug-ссылки на него во всём IWE."
+  echo ""
+  echo "🚫 Коммит заблокирован."
+  exit 1
+fi
+
+# --- Определить изменённые файлы (для R1-R3) ---
 if git rev-parse --verify HEAD &>/dev/null; then
   CHANGED=$(git diff --cached --name-only --diff-filter=ACM | grep '\.md$' || true)
 else
@@ -144,12 +177,12 @@ done <<< "$CHANGED"
 
 # --- Вывод ---
 if [ "$WARNINGS" -eq 0 ]; then
-  echo "✅ pack-lint: $FILES_CHECKED файлов проверено, нарушений нет (пропущено: $FILES_SKIPPED)"
+  echo "✅ pack-lint: $FILES_CHECKED файлов проверено, нарушений нет (пропущено: $FILES_SKIPPED, R4 коллизий: 0)"
   exit 0
 fi
 
 echo ""
-echo "⚠️  pack-lint: $FILES_CHECKED файлов проверено, $WARNINGS предупреждений (пропущено: $FILES_SKIPPED)"
+echo "⚠️  pack-lint: $FILES_CHECKED файлов проверено, $WARNINGS предупреждений (пропущено: $FILES_SKIPPED, R4 коллизий: 0)"
 echo ""
 printf "%b" "$REPORT"
 echo "ℹ️  Норма: ontology.md (FPF-понятие) + Ф3 двуязычность. Коммит не заблокирован."
