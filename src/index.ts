@@ -1732,12 +1732,13 @@ const TOOLS = [
   {
     name: "knowledge_reindex_source",
     description:
-      "Trigger full reindex of a knowledge source (platform L2 or personal L4). Scans all .md files from GitHub, chunks, embeds, and upserts to Neon. For L2 platform sources (docs-courses, PACK-personal, etc.) — no auth needed. For L4 personal sources — requires user registration in user_sources. Use when documents are missing from search results or after pipeline fixes.",
+      "Trigger full or partial reindex of a knowledge source (platform L2 or personal L4). Scans all .md files from GitHub, chunks, embeds, and upserts to Neon. For large sources (>1000 files) use dry_run to list files, then call in batches via 'files' param. For L2 platform sources — no auth needed. For L4 personal sources — requires user registration in user_sources.",
     inputSchema: {
       type: "object",
       properties: {
         source: { type: "string", description: "Source name (e.g. 'docs-courses', 'PACK-personal')" },
         dry_run: { type: "boolean", description: "Preview files to be indexed without DB writes (default: false)" },
+        files: { type: "array", items: { type: "string" }, description: "Explicit list of file paths to reindex (batch mode). If omitted, scans all .md files from GitHub." },
       },
       required: ["source"],
     },
@@ -1988,6 +1989,7 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
         if (toolName === "knowledge_reindex_source") {
           const source = args.source as string;
           const dryRun = (args.dry_run as boolean) || false;
+          const explicitFiles = args.files as string[] | undefined;
 
           if (!SOURCE_GITHUB_BASE[source]) {
             return {
@@ -2000,7 +2002,7 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
             };
           }
 
-          const files = await listGitHubFiles(source);
+          const files = explicitFiles ?? await listGitHubFiles(source);
           if (dryRun) {
             return {
               jsonrpc: "2.0",
