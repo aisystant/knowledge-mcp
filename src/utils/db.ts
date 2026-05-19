@@ -85,8 +85,9 @@ export const CONCEPT_GRAPH_TABLES = {
 
 /**
  * Health schema tables
- * Tables: graph_usage_events (observability writes)
+ * Tables: graph_usage_events (observability writes), graph_freshness_events (WP-339 Ф6 heartbeat)
  */
 export const HEALTH_TABLES = {
   graph_usage_events: (schema: string) => qualifyTable("graph_usage_events", schema),
+  graph_freshness_events: (schema: string) => qualifyTable("graph_freshness_events", schema),
 };

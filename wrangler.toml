@@ -8,6 +8,10 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 KNOWLEDGE_DB_SCHEMA = "public"
 
+# WP-339 Ф5: Daily heartbeat cron — drift check + targeted reindex at 00:30 UTC
+[triggers]
+crons = ["30 0 * * *"]
+
 # Secrets (set via `wrangler secret put`):
 # KNOWLEDGE_DATABASE_URL - Neon `knowledge` БД connection string. REQUIRED.
 #   Example: postgres://...@ep-dark-hall-ag8bo8lf-pooler.../knowledge?sslmode=require

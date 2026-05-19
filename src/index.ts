@@ -2575,4 +2575,107 @@ export default {
 
     return new Response("Not found", { status: 404, headers: corsHeaders });
   },
+
+  // WP-339 Ф5+Ф6: Daily heartbeat cron — drift check + targeted reindex
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(runHeartbeat(env));
+  },
 };
+
+// --- WP-339 Ф5+Ф6: Heartbeat + drift detector ---
+
+// Pack sources checked on every heartbeat run. Mirrors PACK-* keys in SOURCE_GITHUB_BASE.
+const HEARTBEAT_PACK_SOURCES = Object.keys(SOURCE_GITHUB_BASE).filter(
+  (s) => s.startsWith("PACK-")
+);
+
+const DRIFT_ALERT_THRESHOLD = 5;
+const STALENESS_ALERT_HOURS = 48;
+
+async function runHeartbeat(env: Env): Promise<void> {
+  console.log("[heartbeat] start, sources:", HEARTBEAT_PACK_SOURCES.join(", "));
+  const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
+  const cgSchema = env.CONCEPT_GRAPH_DB_SCHEMA ?? "concept_graph";
+  const healthSchema = env.HEALTH_DB_SCHEMA ?? "health";
+  const ct = `${cgSchema}.concepts`;
+  const freshTable = HEALTH_TABLES.graph_freshness_events(healthSchema);
+
+  for (const source of HEARTBEAT_PACK_SOURCES) {
+    let githubCount = 0;
+    let dbCount = 0;
+    let reindexed = false;
+    let reindexProcessed: number | null = null;
+    let reindexSkipped: number | null = null;
+    let p99Hours: number | null = null;
+    let error: string | null = null;
+
+    try {
+      // 1. GitHub file count — O(1) API call via Trees endpoint
+      const files = await listGitHubFiles(source);
+      githubCount = files.length;
+
+      // 2. DB artifact count
+      const [dbRow] = await knowledgeSql`
+        SELECT count(*)::int AS cnt
+        FROM ${knowledgeSql.unsafe(ct)}
+        WHERE source_repo = ${source} AND node_type = 'artifact'
+      `;
+      dbCount = dbRow.cnt as number;
+
+      // 3. P99 staleness
+      const [staleRow] = await knowledgeSql`
+        SELECT percentile_cont(0.99) WITHIN GROUP (
+          ORDER BY EXTRACT(EPOCH FROM (NOW() - updated_at)) / 3600
+        ) AS p99
+        FROM ${knowledgeSql.unsafe(ct)}
+        WHERE source_repo = ${source} AND node_type = 'artifact'
+      `;
+      p99Hours = (staleRow?.p99 as number | null) ?? null;
+
+      const drift = Math.abs(githubCount - dbCount);
+      const stale = p99Hours !== null && p99Hours > STALENESS_ALERT_HOURS;
+
+      if (drift > DRIFT_ALERT_THRESHOLD || stale) {
+        // 4. Reindex if drift or staleness exceeds threshold
+        console.log(
+          `[heartbeat] ${source}: drift=${githubCount - dbCount}, p99=${p99Hours?.toFixed(1)}h — reindexing`
+        );
+        const fileObjs = files.map((p) => ({ path: p, action: "modified" as const }));
+        const result = await reindexConceptsForFiles(
+          env,
+          source,
+          fileObjs,
+          (path) => readFromGitHubPublic(source, path)
+        );
+        reindexed = true;
+        reindexProcessed = result.processed;
+        reindexSkipped = result.skipped;
+      } else {
+        console.log(
+          `[heartbeat] ${source}: drift=${githubCount - dbCount}, p99=${p99Hours?.toFixed(1)}h — OK`
+        );
+      }
+    } catch (e) {
+      error = String(e);
+      console.error(`[heartbeat] ${source} error:`, error);
+    }
+
+    // 5. Write metrics to health DB (non-blocking — observability must not affect SLA)
+    try {
+      const healthSql = neon(env.HEALTH_DATABASE_URL.replace("-pooler", ""));
+      await healthSql`
+        INSERT INTO ${healthSql.unsafe(freshTable)}
+          (source, github_count, db_count, reindexed, reindex_processed, reindex_skipped, p99_staleness_hours, error)
+        VALUES (
+          ${source}, ${githubCount}, ${dbCount},
+          ${reindexed}, ${reindexProcessed}, ${reindexSkipped},
+          ${p99Hours}, ${error}
+        )
+      `;
+    } catch (e) {
+      console.error(`[heartbeat] health write failed for ${source}:`, e instanceof Error ? e.message : e);
+    }
+  }
+
+  console.log("[heartbeat] complete");
+}
