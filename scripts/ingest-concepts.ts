@@ -620,6 +620,29 @@ function extractArtifacts(): ConceptNode[] {
         source_repo: packDir,
       });
     }
+
+    // WP-338 Ф4: Include README.md and CLAUDE.md from repo root for cross-Pack edges
+    for (const rootFile of ["README.md", "CLAUDE.md"]) {
+      const rootPath = join(IWE_ROOT, packDir, rootFile);
+      if (!existsSync(rootPath)) continue;
+      const code = `${packDir}/${rootFile}`;
+      if (concepts.some((c) => c.code === code)) continue; // skip if already in pack/
+      const content = readFileSync(rootPath, "utf-8");
+      const h1Match = content.match(/^#\s+(.+)/m);
+      const name = h1Match ? h1Match[1].trim() : rootFile;
+      concepts.push({
+        code,
+        name,
+        name_ru: null,
+        name_en: null,
+        definition: null,
+        level: "artifact",
+        node_type: "artifact",
+        domain: packDir.replace("PACK-", ""),
+        source_doc: rootFile,
+        source_repo: packDir,
+      });
+    }
   }
 
   console.log(`  Artifacts: ${concepts.length} artifact nodes`);
@@ -722,6 +745,65 @@ function extractArtifactEdges(packArtifacts: ConceptNode[], packConcepts: Concep
   }
 
   console.log(`  Artifact edges: ${edges.length} total (${linkMatches} from markdown links in ${parsedFiles} files, ${readErrors} read errors)`);
+  return edges;
+}
+
+// --- Source 3d: Cross-Pack edges from README/CLAUDE.md (WP-338 Ф4) ---
+
+const CROSS_PACK_PATTERN = /PACK-[\w-]+/g;
+
+function extractCrossPackEdges(allArtifacts: ConceptNode[]): ConceptEdge[] {
+  const edges: ConceptEdge[] = [];
+  const artifactCodes = new Set(allArtifacts.map((a) => a.code));
+  const seen = new Set<string>(); // dedup: "from→to"
+  let matchedPacks = 0;
+
+  const packDirs = readdirSync(IWE_ROOT)
+    .filter((d) => d.startsWith("PACK-") && statSync(join(IWE_ROOT, d)).isDirectory());
+
+  for (const packDir of packDirs) {
+    for (const rootFile of ["README.md", "CLAUDE.md"]) {
+      const filepath = join(IWE_ROOT, packDir, rootFile);
+      if (!existsSync(filepath)) continue;
+
+      let content: string;
+      try {
+        content = readFileSync(filepath, "utf-8");
+      } catch (err) {
+        console.log(`  [skip cross-pack] ${filepath}: ${(err as Error).message}`);
+        continue;
+      }
+      const { body } = parseFrontmatter(content);
+      const text = body || content;
+
+      // Find all unique PACK-* mentions (excluding self-reference)
+      const mentioned = new Set<string>();
+      for (const match of text.matchAll(CROSS_PACK_PATTERN)) {
+        const targetPack = match[0];
+        if (targetPack === packDir) continue;
+        mentioned.add(targetPack);
+      }
+
+      for (const targetPack of mentioned) {
+        const fromCode = `${packDir}/${rootFile}`;
+        const toCode = `${targetPack}/README.md`;
+        const edgeKey = `${fromCode}→${toCode}`;
+        if (seen.has(edgeKey)) continue;
+        if (!artifactCodes.has(fromCode) || !artifactCodes.has(toCode)) continue;
+        edges.push({
+          from_code: fromCode,
+          to_code: toCode,
+          edge_type: "pack_depends_on",
+          weight: 0.5,
+          weight_source: "manual",
+        });
+        seen.add(edgeKey);
+        matchedPacks++;
+      }
+    }
+  }
+
+  console.log(`  Cross-Pack edges: ${edges.length} total (${matchedPacks} unique Pack mentions)`);
   return edges;
 }
 
@@ -1034,8 +1116,11 @@ async function main() {
   // WP-338 Ф3: Artifact edges from markdown links
   const artifactEdges = extractArtifactEdges(artifacts, pack.concepts);
 
+  // WP-338 Ф4: Cross-Pack edges from README/CLAUDE.md
+  const crossPackEdges = extractCrossPackEdges(artifacts);
+
   const allConcepts = [...uConcepts, ...zp.concepts, ...fpf.concepts, ...pack.concepts, ...guides.concepts, ...cells.concepts, ...artifacts];
-  const allEdges = [...zp.edges, ...fpf.edges, ...pack.edges, ...guides.edges, ...cells.edges, ...specializesPackEdges, ...artifactEdges];
+  const allEdges = [...zp.edges, ...fpf.edges, ...pack.edges, ...guides.edges, ...cells.edges, ...specializesPackEdges, ...artifactEdges, ...crossPackEdges];
 
   console.log(`\nTotal: ${allConcepts.length} concepts, ${allEdges.length} edges, ${misconceptions.length} misconceptions\n`);
 
