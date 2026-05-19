@@ -101,6 +101,11 @@ export async function withUserContext<T>(
       return client.query(query, params).then((r) => r.rows);
     }) as SqlClient;
 
+    // Compatibility with neon()'s sql.unsafe() — used throughout index.ts
+    (sql as any).unsafe = (identifier: string): IdentifierMarker => {
+      return { __identifier: identifier };
+    };
+
     const result = await fn(sql);
 
     await client.query("COMMIT");
