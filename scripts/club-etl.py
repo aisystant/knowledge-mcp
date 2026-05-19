@@ -50,7 +50,7 @@ class ClubETL:
     def _headers(self) -> dict:
         return {
             "Api-Key": self.api_key,
-            "Api-Username": "system",
+            "Api-Username": "Aisystant",
         }
 
     async def _get(self, url: str) -> dict:
