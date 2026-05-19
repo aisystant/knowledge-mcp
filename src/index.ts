@@ -1616,6 +1616,19 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_reindex_source",
+    description:
+      "Trigger full reindex of a knowledge source (platform L2 or personal L4). Scans all .md files from GitHub, chunks, embeds, and upserts to Neon. For L2 platform sources (docs-courses, PACK-personal, etc.) — no auth needed. For L4 personal sources — requires user registration in user_sources. Use when documents are missing from search results or after pipeline fixes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: { type: "string", description: "Source name (e.g. 'docs-courses', 'PACK-personal')" },
+        dry_run: { type: "boolean", description: "Preview files to be indexed without DB writes (default: false)" },
+      },
+      required: ["source"],
+    },
+  },
+  {
     name: "knowledge_concept_expand",
     description:
       "BFS-обход графа от seed-концептов: возвращает соседей через рёбра specializes/part_of/related/prerequisite. Используй когда пользователь задал термин и тебе нужны связанные понятия для развёрнутого ответа (DP.METHOD.042 сценарии: определение, Pack-обучение, онтологические ответы). Автоматически фильтрует deprecated/superseded в выдаче. Обновляет last_traversed_at на пройденных рёбрах.",
@@ -1832,6 +1845,44 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
           };
         }
 
+        if (toolName === "knowledge_reindex_source") {
+          const source = args.source as string;
+          const dryRun = (args.dry_run as boolean) || false;
+
+          if (!SOURCE_GITHUB_BASE[source]) {
+            return {
+              jsonrpc: "2.0",
+              id,
+              result: {
+                content: [{ type: "text", text: JSON.stringify({ error: `Unknown source: ${source}` }) }],
+                isError: true,
+              },
+            };
+          }
+
+          const files = await listGitHubFiles(source);
+          if (dryRun) {
+            return {
+              jsonrpc: "2.0",
+              id,
+              result: {
+                content: [{ type: "text", text: JSON.stringify({ source, files_found: files.length, sample_files: files.slice(0, 20) }) }],
+              },
+            };
+          }
+
+          const reindexReq: ReindexRequest = {
+            source,
+            files: files.map((path) => ({ path, action: "modified" })),
+          };
+          const result = await reindexFiles(env, reindexReq);
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
+          };
+        }
+
         if (toolName === "knowledge_concept_expand") {
           const t0 = Date.now();
 
@@ -1962,6 +2013,29 @@ async function readFromGitHubPublic(source: string, filePath: string): Promise<s
 
   if (!resp.ok) return null;
   return await resp.text();
+}
+
+/**
+ * List all .md files from a GitHub repo via Trees API (recursive).
+ * Returns paths relative to repo root (including pathPrefix if present).
+ */
+async function listGitHubFiles(source: string): Promise<string[]> {
+  const config = SOURCE_GITHUB_BASE[source];
+  if (!config) return [];
+
+  const match = config.base.match(/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)/);
+  if (!match) return [];
+
+  const [, owner, repo, branch] = match;
+  const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, {
+    headers: { "User-Agent": "aisystant-knowledge-mcp" },
+  });
+
+  if (!resp.ok) return [];
+  const data = await resp.json() as { tree: Array<{ path: string; type: string }> };
+  return data.tree
+    .filter((f) => f.type === "blob" && f.path.endsWith(".md"))
+    .map((f) => f.path);
 }
 
 /**
