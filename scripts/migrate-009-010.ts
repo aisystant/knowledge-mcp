@@ -2,6 +2,11 @@
 /**
  * Apply migrations 009 (reindex_jobs) + 010 (heartbeat cols) to Neon knowledge DB.
  * WP-339 Ф5 prerequisite.
+ *
+ * NOTE — schema drift: the .sql source files use `knowledge.` prefix because they were
+ * written before KNOWLEDGE_DB_SCHEMA parameterization (WP-268). Production uses
+ * KNOWLEDGE_DB_SCHEMA="public" (wrangler.toml), so this script creates tables in `public`.
+ * The .sql files are kept as-is for reference; this script is the canonical apply path.
  */
 
 import { readFileSync } from "fs";

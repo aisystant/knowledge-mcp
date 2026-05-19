@@ -2636,11 +2636,26 @@ async function runHeartbeat(env: Env): Promise<void> {
       const stale = p99Hours !== null && p99Hours > STALENESS_ALERT_HOURS;
 
       if (drift > DRIFT_ALERT_THRESHOLD || stale) {
-        // 4. Reindex if drift or staleness exceeds threshold
+        // 4. Reindex if drift or staleness exceeds threshold.
+        // Detect orphan nodes: files that are in DB but no longer in GitHub → action: "removed"
+        const dbFilesRows = await knowledgeSql`
+          SELECT DISTINCT source_doc
+          FROM ${knowledgeSql.unsafe(ct)}
+          WHERE source_repo = ${source} AND node_type = 'artifact' AND source_doc IS NOT NULL
+        `;
+        const githubFileSet = new Set(files);
+        const removedPaths = dbFilesRows
+          .map((r: any) => r.source_doc as string)
+          .filter((p) => !githubFileSet.has(p));
+
+        const fileObjs = [
+          ...files.map((p) => ({ path: p, action: "modified" as const })),
+          ...removedPaths.map((p) => ({ path: p, action: "removed" as const })),
+        ];
+
         console.log(
-          `[heartbeat] ${source}: drift=${githubCount - dbCount}, p99=${p99Hours?.toFixed(1)}h — reindexing`
+          `[heartbeat] ${source}: drift=${githubCount - dbCount}, p99=${p99Hours?.toFixed(1)}h — reindexing (modified=${files.length}, removed=${removedPaths.length})`
         );
-        const fileObjs = files.map((p) => ({ path: p, action: "modified" as const }));
         const result = await reindexConceptsForFiles(
           env,
           source,
