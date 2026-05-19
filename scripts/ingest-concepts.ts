@@ -58,7 +58,8 @@ interface ConceptNode {
   name_ru: string | null;
   name_en: string | null;
   definition: string | null;
-  level: "zp" | "fpf" | "pack" | "guide" | "course";
+  level: "zp" | "fpf" | "pack" | "guide" | "course" | "artifact";
+  node_type: "concept" | "artifact";
   domain: string | null;
   source_doc: string | null;
   source_repo: string;
@@ -257,6 +258,7 @@ function extractZP(): { concepts: ConceptNode[]; edges: ConceptEdge[] } {
       name_en: null,
       definition,
       level: "zp",
+      node_type: "concept",
       domain: null,
       source_doc: `principles/${file}`,
       source_repo: "ZP",
@@ -372,6 +374,7 @@ function extractCurriculumCells(): { concepts: ConceptNode[]; edges: ConceptEdge
         name_en: null,
         definition: canDo,
         level: "course",
+        node_type: "concept",
         domain: principle.startsWith("ZP") ? null : principle.split(".")[0],
         source_doc: `cells/${file}`,
         source_repo: "DS-principles-curriculum",
@@ -402,7 +405,8 @@ function extractGuides(): { concepts: ConceptNode[]; edges: ConceptEdge[] } {
     const content = readFileSync(filepath, "utf-8");
 
     // Parse "**Основные понятия**: term1, term2, ..." pattern
-    const conceptListMatch = content.match(/\*\*Основные понятия\*\*\s*[:\s]\s*(.+)/);
+    // Covers: **Основные понятия:** (colon inside bold) and **Основные понятия**: (colon outside bold)
+    const conceptListMatch = content.match(/\*\*Основные понятия(?:[:：]\*\*|\*\*[:：]?)\s*(.+)/);
     if (!conceptListMatch) continue;
 
     const relPath = filepath.slice(baseDir.length + 1);
@@ -436,6 +440,7 @@ function extractGuides(): { concepts: ConceptNode[]; edges: ConceptEdge[] } {
         name_en: null,
         definition: null, // no definition in guide lists
         level: "guide",
+        node_type: "concept",
         domain: courseName,
         source_doc: relPath,
         source_repo: "docs-courses",
@@ -562,6 +567,7 @@ function extractPackEntities(): { concepts: ConceptNode[]; edges: ConceptEdge[] 
         name_en,
         definition,
         level: "pack",
+        node_type: "concept",
         domain,
         source_doc: relPath,
         source_repo: packDir,
@@ -571,6 +577,50 @@ function extractPackEntities(): { concepts: ConceptNode[]; edges: ConceptEdge[] 
 
   console.log(`  Pack: ${concepts.length} concepts, ${edges.length} edges`);
   return { concepts, edges };
+}
+
+// --- Source 3b: Pack Artifacts (WP-338 Ф2) ---
+
+function extractArtifacts(): ConceptNode[] {
+  const concepts: ConceptNode[] = [];
+
+  const packDirs = readdirSync(IWE_ROOT)
+    .filter((d) => d.startsWith("PACK-") && statSync(join(IWE_ROOT, d)).isDirectory());
+
+  for (const packDir of packDirs) {
+    const packPath = join(IWE_ROOT, packDir, "pack");
+    if (!existsSync(packPath)) continue;
+
+    const allFiles = walkDir(packPath).filter((f) => f.endsWith(".md"));
+
+    for (const filepath of allFiles) {
+      const content = readFileSync(filepath, "utf-8");
+      const { meta } = parseFrontmatter(content);
+
+      const relPath = filepath.slice(join(IWE_ROOT, packDir).length + 1);
+      const code = `${packDir}/${relPath}`;
+
+      // Name fallback: frontmatter title → H1 → filename
+      const h1Match = content.match(/^#\s+(.+)/m);
+      const name = meta.title || meta.name || (h1Match ? h1Match[1].trim() : relPath.split("/").pop()!);
+
+      concepts.push({
+        code,
+        name,
+        name_ru: null,
+        name_en: null,
+        definition: null,
+        level: "artifact",
+        node_type: "artifact",
+        domain: packDir.replace("PACK-", ""),
+        source_doc: relPath,
+        source_repo: packDir,
+      });
+    }
+  }
+
+  console.log(`  Artifacts: ${concepts.length} artifact nodes`);
+  return concepts;
 }
 
 // --- Source 4: CAT.001 Misconceptions ---
@@ -656,6 +706,7 @@ function extractFPF(): { concepts: ConceptNode[]; edges: ConceptEdge[] } {
       name_en: null,
       definition,
       level: "fpf",
+      node_type: "concept",
       domain: null,
       source_doc: "FPF-Spec.md",
       source_repo: "FPF",
@@ -854,30 +905,31 @@ async function main() {
   const cells = extractCurriculumCells();
   const guides = extractGuides();
   const pack = extractPackEntities();
+  const artifacts = extractArtifacts();
   const fpf = extractFPF();
   const misconceptions = extractMisconceptions();
 
   // Add U.* meta-concepts as explicit nodes (FPF level)
   const uConcepts: ConceptNode[] = [
-    { code: "U.Entity", name: "Entity", name_ru: "Сущность", name_en: "Entity", definition: "Primitive of distinction — everything that can be singled out and named", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.Holon", name: "Holon", name_ru: "Холон", name_en: "Holon", definition: "Composition unit: simultaneously a whole composed of parts and a part of a larger whole", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.System", name: "System", name_ru: "Система", name_en: "System", definition: "Holon with a boundary interacting with its environment", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.Episteme", name: "Episteme", name_ru: "Эпистема", name_en: "Episteme", definition: "Unit of knowledge/description as an artifact", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.Method", name: "Method", name_ru: "Метод", name_en: "Method", definition: "Abstract way of acting (capability); design-time", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.Work", name: "Work", name_ru: "Работа", name_en: "Work", definition: "Dated, spatiotemporally bounded record of a completed enactment", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.Role", name: "Role", name_ru: "Роль", name_en: "Role", definition: "Context-bound capability/obligation schema", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.RoleAssignment", name: "RoleAssignment", name_ru: "Назначение роли", name_en: "RoleAssignment", definition: "First-class record: Holder#Role:Context@Window", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.Capability", name: "Capability", name_ru: "Способность", name_en: "Capability", definition: "Dispositional ability to act", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.ServiceClause", name: "ServiceClause", name_ru: "Пункт сервиса", name_en: "ServiceClause", definition: "Consumer-facing promise clause", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.Characteristic", name: "Characteristic", name_ru: "Характеристика", name_en: "Characteristic", definition: "Measurable evaluation axis", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
-    { code: "U.BoundedContext", name: "BoundedContext", name_ru: "Ограниченный контекст", name_en: "BoundedContext", definition: "Semantic frame with its own vocabulary, roles, invariants, and bridges", level: "fpf", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Entity", name: "Entity", name_ru: "Сущность", name_en: "Entity", definition: "Primitive of distinction — everything that can be singled out and named", level: "fpf", node_type: "concept", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Holon", name: "Holon", name_ru: "Холон", name_en: "Holon", definition: "Composition unit: simultaneously a whole composed of parts and a part of a larger whole", level: "fpf", node_type: "concept", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.System", name: "System", name_ru: "Система", name_en: "System", definition: "Holon with a boundary interacting with its environment", level: "fpf", node_type: "concept", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Episteme", name: "Episteme", name_ru: "Эпистема", name_en: "Episteme", definition: "Unit of knowledge/description as an artifact", level: "fpf", node_type: "concept", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Method", name: "Method", name_ru: "Метод", name_en: "Method", definition: "Abstract way of acting (capability); design-time", level: "fpf", node_type: "concept", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Work", name: "Work", name_ru: "Работа", name_en: "Work", definition: "Dated, spatiotemporally bounded record of a completed enactment", level: "fpf", node_type: "concept", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Role", name: "Role", name_ru: "Роль", name_en: "Role", definition: "Context-bound capability/obligation schema", level: "fpf", node_type: "concept", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.RoleAssignment", name: "RoleAssignment", name_ru: "Назначение роли", name_en: "RoleAssignment", definition: "First-class record: Holder#Role:Context@Window", level: "fpf", node_type: "concept", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Capability", name: "Capability", name_ru: "Способность", name_en: "Capability", definition: "Dispositional ability to act", level: "fpf", node_type: "concept", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.ServiceClause", name: "ServiceClause", name_ru: "Пункт сервиса", name_en: "ServiceClause", definition: "Consumer-facing promise clause", level: "fpf", node_type: "concept", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.Characteristic", name: "Characteristic", name_ru: "Характеристика", name_en: "Characteristic", definition: "Measurable evaluation axis", level: "fpf", node_type: "concept", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
+    { code: "U.BoundedContext", name: "BoundedContext", name_ru: "Ограниченный контекст", name_en: "BoundedContext", definition: "Semantic frame with its own vocabulary, roles, invariants, and bridges", level: "fpf", node_type: "concept", domain: null, source_doc: "FPF-Spec.md", source_repo: "FPF" },
   ];
   console.log(`  U.* meta-concepts: ${uConcepts.length}`);
 
   // Build specializes edges: Pack → FPF (via SPF mapping)
   const specializesPackEdges = buildSpecializesEdges(pack.concepts, [...fpf.concepts, ...uConcepts]);
 
-  const allConcepts = [...uConcepts, ...zp.concepts, ...fpf.concepts, ...pack.concepts, ...guides.concepts, ...cells.concepts];
+  const allConcepts = [...uConcepts, ...zp.concepts, ...fpf.concepts, ...pack.concepts, ...guides.concepts, ...cells.concepts, ...artifacts];
   const allEdges = [...zp.edges, ...fpf.edges, ...pack.edges, ...guides.edges, ...cells.edges, ...specializesPackEdges];
 
   console.log(`\nTotal: ${allConcepts.length} concepts, ${allEdges.length} edges, ${misconceptions.length} misconceptions\n`);
@@ -974,14 +1026,15 @@ async function main() {
     const emb = embeddings[i];
 
     await sql`
-      INSERT INTO concept_graph.concepts (code, name, name_ru, name_en, definition, level, domain, source_doc, source_repo, embedding)
-      VALUES (${c.code}, ${c.name}, ${c.name_ru ?? null}, ${c.name_en ?? null}, ${c.definition}, ${c.level}, ${c.domain}, ${c.source_doc}, ${c.source_repo}, ${vectorToSql(emb)}::vector)
+      INSERT INTO concept_graph.concepts (code, name, name_ru, name_en, definition, level, node_type, domain, source_doc, source_repo, embedding)
+      VALUES (${c.code}, ${c.name}, ${c.name_ru ?? null}, ${c.name_en ?? null}, ${c.definition}, ${c.level}, ${c.node_type}, ${c.domain}, ${c.source_doc}, ${c.source_repo}, ${vectorToSql(emb)}::vector)
       ON CONFLICT (code) DO UPDATE SET
         name = EXCLUDED.name,
         name_ru = COALESCE(EXCLUDED.name_ru, concept_graph.concepts.name_ru),
         name_en = COALESCE(EXCLUDED.name_en, concept_graph.concepts.name_en),
         definition = EXCLUDED.definition,
         level = EXCLUDED.level,
+        node_type = EXCLUDED.node_type,
         domain = EXCLUDED.domain,
         source_doc = EXCLUDED.source_doc,
         source_repo = EXCLUDED.source_repo,
