@@ -1,6 +1,11 @@
 #!/usr/bin/env npx tsx
 /**
- * Concept Graph Ingestion — WP-208
+ * Concept Graph Ingestion — WP-208 + WP-339
+ *
+ * ⚠️ DEPRECATED for regular operations — WP-339 Ф3 unified pipeline supersedes this.
+ * Use `reindexConceptsForFiles()` in `src/concept-indexer.ts` for incremental updates.
+ * This script remains valid for cold-start / full rebuild only (non-Pack sources:
+ * ZP, FPF, Guides, Cells, Misconceptions).
  *
  * Extracts concepts from ZP, FPF, Pack entities, curriculum cells, and misconceptions.
  * Builds weighted concept graph in Neon PostgreSQL.
@@ -12,7 +17,7 @@
  *   4. DS-principles-curriculum/data/curriculum/CAT.001/ → misconceptions
  *   5. FPF/FPF-Spec.md         → meta-ontology patterns (level: fpf)
  *
- * Usage:
+ * Usage (cold-start only):
  *   npx tsx scripts/ingest-concepts.ts
  *   npx tsx scripts/ingest-concepts.ts --dry-run   # preview without DB writes
  *

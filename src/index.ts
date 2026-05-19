@@ -23,6 +23,7 @@ import {
   CONCEPT_GRAPH_TABLES,
   HEALTH_TABLES,
 } from "./utils/db.js";
+import { reindexConceptsForFiles } from "./concept-indexer.js";
 
 // --- Types ---
 
@@ -2536,8 +2537,20 @@ export default {
         }
       }
       const body = (await request.json()) as ReindexRequest;
-      const result = await reindexFiles(env, body);
-      return new Response(JSON.stringify(result), {
+      const chunkResult = await reindexFiles(env, body);
+
+      // WP-339 Ф3: Incremental concept graph update for Pack sources
+      let graphResult;
+      if (body.source.startsWith("PACK-")) {
+        graphResult = await reindexConceptsForFiles(
+          env,
+          body.source,
+          body.files,
+          (path: string) => readFromGitHubPublic(body.source, path)
+        );
+      }
+
+      return new Response(JSON.stringify({ chunks: chunkResult, graph: graphResult }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
