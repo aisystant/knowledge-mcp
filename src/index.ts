@@ -2406,24 +2406,27 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
         // Insert parent document (no embedding). search_vector — generated stored.
         await sql`
           INSERT INTO ${sql.unsafe(knowledgeChunkTable)}
-            (source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind)
+            (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind)
           VALUES
-            (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, NULL,
+            (${dbFilename + '::p0'}, ${dbFilename}, 0, ${hash}, ${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, NULL,
              ${accountUuid}::uuid, ${collectionKind})
           ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
             DO NOTHING
         `;
 
         // Insert chunks with embeddings, link via parent_chunk_id (UUID self-FK)
+        let chunkPos = 0;
         for (const chunk of chunks) {
+          chunkPos++;
           const embedding = await getEmbedding(env.OPENAI_API_KEY, chunk.content.slice(0, CHUNK_CHAR_LIMIT));
           const vec = `[${embedding.join(",")}]`;
           const chunkHash = await contentHash(chunk.content);
 
           await sql`
             INSERT INTO ${sql.unsafe(knowledgeChunkTable)}
-              (source_uri, content, source, source_kind, hash, embedding, parent_chunk_id, account_id, collection_kind)
+              (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, parent_chunk_id, account_id, collection_kind)
             VALUES (
+              ${chunk.filename + '::p' + chunkPos}, ${chunk.filename}, ${chunkPos}, ${chunkHash},
               ${chunk.filename}, ${chunk.content}, ${req.source}, ${sourceType}, ${chunkHash},
               ${vec}::vector,
               (SELECT chunk_uuid FROM ${sql.unsafe(knowledgeChunkTable)} WHERE source_uri = ${dbFilename} AND source = ${req.source} LIMIT 1),
@@ -2440,9 +2443,9 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
 
         await sql`
           INSERT INTO ${sql.unsafe(knowledgeChunkTable)}
-            (source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind)
+            (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind)
           VALUES
-            (${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, ${vec}::vector,
+            (${dbFilename + '::p0'}, ${dbFilename}, 0, ${hash}, ${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, ${vec}::vector,
              ${accountUuid}::uuid, ${collectionKind})
           ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
             DO NOTHING
