@@ -751,12 +751,19 @@ function extractArtifactEdges(packArtifacts: ConceptNode[], packConcepts: Concep
 // --- Source 3d: Cross-Pack edges from README/CLAUDE.md (WP-338 Ф4) ---
 
 const CROSS_PACK_PATTERN = /PACK-[\w-]+/g;
+const NEGATIVE_CONTEXT_WORDS = ["расформирован", "поглощён", "бывший", "deprecated", "archived", "закрыт", "closed", "disbanded", "merged into"];
+
+function hasNegativeContext(line: string): boolean {
+  const lower = line.toLowerCase();
+  return NEGATIVE_CONTEXT_WORDS.some((word) => lower.includes(word.toLowerCase()));
+}
 
 function extractCrossPackEdges(allArtifacts: ConceptNode[]): ConceptEdge[] {
   const edges: ConceptEdge[] = [];
   const artifactCodes = new Set(allArtifacts.map((a) => a.code));
   const seen = new Set<string>(); // dedup: "from→to"
   let matchedPacks = 0;
+  let skippedNegative = 0;
 
   const packDirs = readdirSync(IWE_ROOT)
     .filter((d) => d.startsWith("PACK-") && statSync(join(IWE_ROOT, d)).isDirectory());
@@ -776,12 +783,19 @@ function extractCrossPackEdges(allArtifacts: ConceptNode[]): ConceptEdge[] {
       const { body } = parseFrontmatter(content);
       const text = body || content;
 
-      // Find all unique PACK-* mentions (excluding self-reference)
+      // Find all unique PACK-* mentions line-by-line, filtering negative context
       const mentioned = new Set<string>();
-      for (const match of text.matchAll(CROSS_PACK_PATTERN)) {
-        const targetPack = match[0];
-        if (targetPack === packDir) continue;
-        mentioned.add(targetPack);
+      for (const line of text.split("\n")) {
+        for (const match of line.matchAll(CROSS_PACK_PATTERN)) {
+          const targetPack = match[0];
+          if (targetPack === packDir) continue;
+          if (hasNegativeContext(line)) {
+            skippedNegative++;
+            console.log(`  [skip cross-pack] ${packDir} → ${targetPack}: negative context`);
+            continue;
+          }
+          mentioned.add(targetPack);
+        }
       }
 
       for (const targetPack of mentioned) {
@@ -803,7 +817,7 @@ function extractCrossPackEdges(allArtifacts: ConceptNode[]): ConceptEdge[] {
     }
   }
 
-  console.log(`  Cross-Pack edges: ${edges.length} total (${matchedPacks} unique Pack mentions)`);
+  console.log(`  Cross-Pack edges: ${edges.length} total (${matchedPacks} unique Pack mentions, ${skippedNegative} skipped by negative context)`);
   return edges;
 }
 
