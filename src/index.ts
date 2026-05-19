@@ -2021,20 +2021,27 @@ async function readFromGitHubPublic(source: string, filePath: string): Promise<s
  */
 async function listGitHubFiles(source: string): Promise<string[]> {
   const config = SOURCE_GITHUB_BASE[source];
-  if (!config) return [];
+  if (!config) throw new Error(`Unknown source: ${source}`);
 
   const match = config.base.match(/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)/);
-  if (!match) return [];
+  if (!match) throw new Error(`Invalid GitHub base URL for source: ${source}`);
 
   const [, owner, repo, branch] = match;
   const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, {
     headers: { "User-Agent": "aisystant-knowledge-mcp" },
   });
 
-  if (!resp.ok) return [];
-  const data = await resp.json() as { tree: Array<{ path: string; type: string }> };
+  if (!resp.ok) throw new Error(`GitHub Trees API ${resp.status} for ${source}`);
+  const data = await resp.json() as { tree: Array<{ path: string; type: string }>; truncated?: boolean };
+  if (data.truncated) {
+    throw new Error(`GitHub tree truncated for ${source} — too many files. Use webhook-based reindex instead.`);
+  }
   return data.tree
-    .filter((f) => f.type === "blob" && f.path.endsWith(".md"))
+    .filter((f) =>
+      f.type === "blob" &&
+      f.path.endsWith(".md") &&
+      (!config.pathPrefix || f.path.startsWith(config.pathPrefix))
+    )
     .map((f) => f.path);
 }
 
