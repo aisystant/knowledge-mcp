@@ -68,7 +68,10 @@ interface ConceptNode {
 interface ConceptEdge {
   from_code: string;
   to_code: string;
-  edge_type: "prerequisite" | "related" | "part_of" | "specializes" | "contradicts";
+  edge_type:
+    | "prerequisite" | "related" | "part_of" | "specializes" | "contradicts"
+    | "pack_cites" | "pack_depends_on" | "pack_contradicts" | "pack_extends" | "pack_implements"
+    | "artifact_defines_concept";
   weight: number;
   weight_source: "manual" | "llm" | "pmi" | "embedding" | "computed";
 }
@@ -623,6 +626,89 @@ function extractArtifacts(): ConceptNode[] {
   return concepts;
 }
 
+// --- Source 3c: Artifact edges — markdown link extractor (WP-338 Ф3) ---
+
+const CONTEXTUAL_EDGE_MAP: Record<string, ConceptEdge["edge_type"]> = {
+  "связано с": "pack_cites",
+  "противопоставлено": "pack_contradicts",
+  "опирается на": "pack_depends_on",
+  "расширяет": "pack_extends",
+  "реализует": "pack_implements",
+};
+
+function detectArtifactEdgeType(textBeforeLink: string): ConceptEdge["edge_type"] {
+  const lower = textBeforeLink.toLowerCase();
+  for (const [phrase, edgeType] of Object.entries(CONTEXTUAL_EDGE_MAP)) {
+    if (lower.includes(phrase)) return edgeType;
+  }
+  return "pack_cites";
+}
+
+function extractArtifactEdges(packArtifacts: ConceptNode[], packConcepts: ConceptNode[]): ConceptEdge[] {
+  const edges: ConceptEdge[] = [];
+
+  // 1. Build concept_code → artifact_code map (via source_repo + source_doc match)
+  const conceptToArtifact = new Map<string, string>();
+  for (const concept of packConcepts) {
+    if (!concept.code || !concept.source_doc || !concept.source_repo) continue;
+    const expectedArtifactCode = `${concept.source_repo}/${concept.source_doc}`;
+    const found = packArtifacts.find((a) => a.code === expectedArtifactCode);
+    if (found) {
+      conceptToArtifact.set(concept.code, found.code!);
+    }
+  }
+  console.log(`  Artifact→Concept map: ${conceptToArtifact.size} pairs`);
+
+  // 2. artifact_defines_concept edges
+  for (const [conceptCode, artifactCode] of conceptToArtifact) {
+    edges.push({
+      from_code: artifactCode,
+      to_code: conceptCode,
+      edge_type: "artifact_defines_concept",
+      weight: 0.95,
+      weight_source: "manual",
+    });
+  }
+
+  // 3. Parse markdown links in artifact bodies
+  const linkRegex = /\[([A-Z][A-Z.]*\.\d+)[^\]]*\]/g;
+  let parsedFiles = 0;
+  let linkMatches = 0;
+
+  for (const artifact of packArtifacts) {
+    if (!artifact.code || !artifact.source_repo || !artifact.source_doc) continue;
+    const filepath = join(IWE_ROOT, artifact.source_repo, artifact.source_doc);
+    if (!existsSync(filepath)) continue;
+
+    const content = readFileSync(filepath, "utf-8");
+    const { body } = parseFrontmatter(content);
+    if (!body) continue;
+    parsedFiles++;
+
+    for (const match of body.matchAll(linkRegex)) {
+      const conceptCode = match[1];
+      const startIdx = match.index || 0;
+      const textBefore = body.slice(Math.max(0, startIdx - 120), startIdx);
+      const edgeType = detectArtifactEdgeType(textBefore);
+
+      const targetArtifactCode = conceptToArtifact.get(conceptCode);
+      if (targetArtifactCode && targetArtifactCode !== artifact.code) {
+        edges.push({
+          from_code: artifact.code,
+          to_code: targetArtifactCode,
+          edge_type: edgeType,
+          weight: edgeType === "pack_cites" ? 0.4 : 0.7,
+          weight_source: "computed",
+        });
+        linkMatches++;
+      }
+    }
+  }
+
+  console.log(`  Artifact edges: ${edges.length} total (${linkMatches} from markdown links in ${parsedFiles} files)`);
+  return edges;
+}
+
 // --- Source 4: CAT.001 Misconceptions ---
 
 function extractMisconceptions(): Misconception[] {
@@ -929,8 +1015,11 @@ async function main() {
   // Build specializes edges: Pack → FPF (via SPF mapping)
   const specializesPackEdges = buildSpecializesEdges(pack.concepts, [...fpf.concepts, ...uConcepts]);
 
+  // WP-338 Ф3: Artifact edges from markdown links
+  const artifactEdges = extractArtifactEdges(artifacts, pack.concepts);
+
   const allConcepts = [...uConcepts, ...zp.concepts, ...fpf.concepts, ...pack.concepts, ...guides.concepts, ...cells.concepts, ...artifacts];
-  const allEdges = [...zp.edges, ...fpf.edges, ...pack.edges, ...guides.edges, ...cells.edges, ...specializesPackEdges];
+  const allEdges = [...zp.edges, ...fpf.edges, ...pack.edges, ...guides.edges, ...cells.edges, ...specializesPackEdges, ...artifactEdges];
 
   console.log(`\nTotal: ${allConcepts.length} concepts, ${allEdges.length} edges, ${misconceptions.length} misconceptions\n`);
 
