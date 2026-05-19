@@ -574,6 +574,37 @@ async function getDocument(
   };
 }
 
+interface DocumentHeading {
+  level: number;
+  title: string;
+}
+
+async function getDocumentStructure(
+  env: Env,
+  filename: string,
+  source?: string,
+  userId?: string
+): Promise<{ filename: string; headings: DocumentHeading[] } | null> {
+  const doc = await getDocument(env, filename, source, userId);
+  if (!doc) return null;
+
+  const headings: DocumentHeading[] = [];
+  for (const line of doc.content.split("\n")) {
+    const match = line.match(/^(#{1,6})\s+(.+)$/);
+    if (match) {
+      headings.push({
+        level: match[1].length,
+        title: match[2].trim(),
+      });
+    }
+  }
+
+  return {
+    filename: doc.filename,
+    headings,
+  };
+}
+
 async function listSources(
   env: Env,
   sourceType?: string,
@@ -598,6 +629,42 @@ async function listSources(
     source_type: (r.source_type as string) || "",
     doc_count: r.doc_count as number,
   }));
+}
+
+async function listDocuments(
+  env: Env,
+  source?: string,
+  sourceType?: string,
+  limit: number = 100,
+  userId?: string
+): Promise<{ filename: string; source: string; source_type: string; github_url: string | null }[]> {
+  const src = source ?? null;
+  const stype = sourceType ?? null;
+
+  // WP-268: knowledge_chunk schema. Distinct source_uri excludes chunk suffixes (::section).
+  // WP-7 Ф-L2-PRIVACY: explicit account_id filter — defense-in-depth.
+  const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
+    SELECT DISTINCT source_uri AS filename, source, source_kind AS source_type
+    FROM ${sql.unsafe(knowledgeChunkTable)}
+    WHERE source_uri NOT LIKE '%::%'
+      AND (${src}::text IS NULL OR source = ${src})
+      AND (${stype}::text IS NULL OR source_kind = ${stype})
+      AND (account_id IS NULL
+           OR account_id::text = NULLIF(current_setting('app.user_id', true), ''))
+    ORDER BY source, source_uri
+    LIMIT ${limit}
+  `);
+
+  return rows.map((r) => {
+    const docSource = (r.source as string) || "";
+    const docFilename = r.filename as string;
+    return {
+      filename: docFilename,
+      source: docSource,
+      source_type: (r.source_type as string) || "",
+      github_url: resolveGithubUrl(docSource, docFilename),
+    };
+  });
 }
 
 // --- Feedback ---
@@ -1615,12 +1682,18 @@ const TOOLS = [
   },
   {
     name: "get_document",
-    description: "Get a specific document by filename",
+    description:
+      "Get a specific document by filename, or extract its heading structure (table of contents). Use format=headings to see the outline without reading the full content.",
     inputSchema: {
       type: "object",
       properties: {
         filename: { type: "string", description: "Document filename (relative path)" },
         source: { type: "string", description: "Source name to disambiguate" },
+        format: {
+          type: "string",
+          enum: ["full", "headings"],
+          description: "Output format: full (default) returns document content, headings returns h1-h6 outline",
+        },
       },
       required: ["filename"],
     },
@@ -1639,6 +1712,27 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: "list_documents",
+    description:
+      "List documents (files) within a knowledge source. Returns filenames with GitHub links. Use to discover the structure of a guide, Pack, or DS source before retrieving specific documents.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: {
+          type: "string",
+          description: "Source name to list documents from (e.g., 'PACK-digital-platform', 'FMT-exocortex-template'). If omitted, lists across all visible sources.",
+        },
+        source_type: {
+          type: "string",
+          enum: ["pack", "guides", "ds", "content"],
+          description: "Filter by source type",
+        },
+        limit: { type: "number", description: "Maximum number of documents (default: 100)" },
+      },
+    },
+  },
+
   {
     name: "knowledge_feedback",
     description:
@@ -1839,6 +1933,28 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
         }
 
         if (toolName === "get_document") {
+          const format = (args.format as string) || "full";
+          if (format === "headings") {
+            const structure = await getDocumentStructure(
+              env,
+              args.filename as string,
+              args.source as string | undefined,
+              userId
+            );
+            if (!structure) {
+              return {
+                jsonrpc: "2.0",
+                id,
+                result: { content: [{ type: "text", text: "Document not found" }], isError: true },
+              };
+            }
+            return {
+              jsonrpc: "2.0",
+              id,
+              result: { content: [{ type: "text", text: JSON.stringify(structure, null, 2) }] },
+            };
+          }
+
           const doc = await getDocument(env, args.filename as string, args.source as string | undefined, userId);
           if (!doc) {
             return {
@@ -1860,6 +1976,21 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
             jsonrpc: "2.0",
             id,
             result: { content: [{ type: "text", text: JSON.stringify(sources, null, 2) }] },
+          };
+        }
+
+        if (toolName === "list_documents") {
+          const docs = await listDocuments(
+            env,
+            args.source as string | undefined,
+            args.source_type as string | undefined,
+            (args.limit as number) || 100,
+            userId
+          );
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: { content: [{ type: "text", text: JSON.stringify(docs, null, 2) }] },
           };
         }
 
