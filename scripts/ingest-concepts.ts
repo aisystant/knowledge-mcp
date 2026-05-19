@@ -648,14 +648,22 @@ function extractArtifactEdges(packArtifacts: ConceptNode[], packConcepts: Concep
   const edges: ConceptEdge[] = [];
 
   // 1. Build concept_code → artifact_code map (via source_repo + source_doc match)
+  // O(1) lookup via Map instead of O(n) find() per concept
+  const artifactByCode = new Map(packArtifacts.map((a) => [a.code, a]));
   const conceptToArtifact = new Map<string, string>();
+  const artifactConceptCount = new Map<string, number>(); // track multi-concept files
   for (const concept of packConcepts) {
     if (!concept.code || !concept.source_doc || !concept.source_repo) continue;
     const expectedArtifactCode = `${concept.source_repo}/${concept.source_doc}`;
-    const found = packArtifacts.find((a) => a.code === expectedArtifactCode);
+    const found = artifactByCode.get(expectedArtifactCode);
     if (found) {
       conceptToArtifact.set(concept.code, found.code!);
+      artifactConceptCount.set(expectedArtifactCode, (artifactConceptCount.get(expectedArtifactCode) || 0) + 1);
     }
+  }
+  const multiConceptArtifacts = [...artifactConceptCount.entries()].filter(([, c]) => c > 1);
+  if (multiConceptArtifacts.length > 0) {
+    console.log(`  ⚠️ ${multiConceptArtifacts.length} artifacts define multiple concepts: ${multiConceptArtifacts.slice(0, 3).map(([a]) => a).join(", ")}${multiConceptArtifacts.length > 3 ? "..." : ""}`);
   }
   console.log(`  Artifact→Concept map: ${conceptToArtifact.size} pairs`);
 
@@ -674,13 +682,21 @@ function extractArtifactEdges(packArtifacts: ConceptNode[], packConcepts: Concep
   const linkRegex = /\[([A-Z][A-Z.]*\.\d+)[^\]]*\]/g;
   let parsedFiles = 0;
   let linkMatches = 0;
+  let readErrors = 0;
 
   for (const artifact of packArtifacts) {
     if (!artifact.code || !artifact.source_repo || !artifact.source_doc) continue;
     const filepath = join(IWE_ROOT, artifact.source_repo, artifact.source_doc);
     if (!existsSync(filepath)) continue;
 
-    const content = readFileSync(filepath, "utf-8");
+    let content: string;
+    try {
+      content = readFileSync(filepath, "utf-8");
+    } catch (err) {
+      readErrors++;
+      console.log(`  [skip edge parse] ${filepath}: ${(err as Error).message}`);
+      continue;
+    }
     const { body } = parseFrontmatter(content);
     if (!body) continue;
     parsedFiles++;
@@ -705,7 +721,7 @@ function extractArtifactEdges(packArtifacts: ConceptNode[], packConcepts: Concep
     }
   }
 
-  console.log(`  Artifact edges: ${edges.length} total (${linkMatches} from markdown links in ${parsedFiles} files)`);
+  console.log(`  Artifact edges: ${edges.length} total (${linkMatches} from markdown links in ${parsedFiles} files, ${readErrors} read errors)`);
   return edges;
 }
 
