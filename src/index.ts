@@ -1320,6 +1320,120 @@ async function expandConcept(
   };
 }
 
+// --- WP-338 Ф5: Artifact traversal (pack_traverse) ---
+
+type TraversedNode = {
+  id: number;
+  code: string | null;
+  name: string;
+  level: string;
+  domain: string | null;
+  node_type: string;
+  edge_type: string;
+  edge_weight: number;
+  depth: number;
+};
+
+async function expandArtifact(
+  env: Env,
+  seedCodes: string[],
+  opts: {
+    edge_types?: string[];
+    depth?: number;
+    limit?: number;
+  } = {}
+): Promise<{
+  nodes: TraversedNode[];
+  edges_traversed: number;
+  edge_types_seen: string[];
+}> {
+  const sql = db(env);
+  const depth = Math.min(Math.max(opts.depth ?? 2, 1), 3);
+  const limit = Math.min(opts.limit ?? 20, 100);
+  const edgeTypes = opts.edge_types && opts.edge_types.length > 0
+    ? opts.edge_types
+    : ["pack_cites", "pack_depends_on", "pack_extends", "pack_implements", "artifact_defines_concept"];
+
+  // Resolve seed codes to ids
+  const seedRows = await sql`
+    SELECT id, code, name, level, domain, node_type
+    FROM ${sql.unsafe(conceptsTable)}
+    WHERE code = ANY(${seedCodes}::text[])
+      AND node_type = 'artifact'
+  ` as Array<{ id: number; code: string | null; name: string; level: string; domain: string | null; node_type: string }>;
+
+  const seedIds = seedRows.map((r) => r.id);
+  if (seedIds.length === 0) {
+    return { nodes: [], edges_traversed: 0, edge_types_seen: [] };
+  }
+
+  const nodes: TraversedNode[] = [];
+  const seen = new Set<number>(seedIds);
+  const edgeTypesSeen = new Set<string>();
+  let frontier = [...seedIds];
+  let edgesTraversed = 0;
+
+  for (let d = 1; d <= depth; d++) {
+    if (frontier.length === 0) break;
+
+    const rows = await sql`
+      SELECT e.id AS edge_id,
+             e.from_concept_id, e.to_concept_id,
+             e.edge_type, e.weight,
+             tc.id AS tc_id, tc.code AS tc_code, tc.name AS tc_name,
+             tc.level AS tc_level, tc.domain AS tc_domain,
+             tc.node_type AS tc_node_type
+      FROM ${sql.unsafe(conceptEdgesTable)} e
+      JOIN ${sql.unsafe(conceptsTable)} fc ON fc.id = e.from_concept_id
+      JOIN ${sql.unsafe(conceptsTable)} tc ON tc.id = e.to_concept_id
+      WHERE e.from_concept_id = ANY(${frontier}::bigint[])
+        AND e.edge_type = ANY(${edgeTypes}::text[])
+        AND fc.node_type = 'artifact'
+    ` as Array<{
+      edge_id: number;
+      from_concept_id: number;
+      to_concept_id: number;
+      edge_type: string;
+      weight: number;
+      tc_id: number; tc_code: string | null; tc_name: string;
+      tc_level: string; tc_domain: string | null; tc_node_type: string;
+    }>;
+
+    const nextFrontier: number[] = [];
+
+    for (const r of rows) {
+      edgesTraversed++;
+      edgeTypesSeen.add(r.edge_type);
+
+      if (seen.has(r.to_concept_id)) continue;
+      seen.add(r.to_concept_id);
+
+      nodes.push({
+        id: r.tc_id,
+        code: r.tc_code,
+        name: r.tc_name,
+        level: r.tc_level,
+        domain: r.tc_domain,
+        node_type: r.tc_node_type,
+        edge_type: r.edge_type,
+        edge_weight: r.weight,
+        depth: d,
+      });
+      nextFrontier.push(r.to_concept_id);
+    }
+
+    frontier = nextFrontier;
+    if (nodes.length >= limit) break;
+  }
+
+  nodes.sort((a, b) => a.depth - b.depth || b.edge_weight - a.edge_weight);
+  return {
+    nodes: nodes.slice(0, limit),
+    edges_traversed: edgesTraversed,
+    edge_types_seen: Array.from(edgeTypesSeen),
+  };
+}
+
 // --- WP-208: graph_stats ---
 
 async function getGraphStats(env: Env) {
@@ -1653,6 +1767,32 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: "knowledge_pack_traverse",
+    description:
+      "BFS-обход графа от seed-artifact'ов (Pack-файлов): возвращает достигнутые узлы через рёбра pack_cites/pack_depends_on/pack_extends/pack_implements/artifact_defines_concept. Используй для кросс-Pack запросов: 'покажи все произведения, которые меняют культуру' → обход от SA.D.001 через pack_cites + artifact_defines_concept. Стартует только от artifact-узлов (node_type='artifact').",
+    inputSchema: {
+      type: "object",
+      properties: {
+        seed_codes: {
+          type: "array",
+          items: { type: "string" },
+          description: "Массив seed artifact codes, напр. ['PACK-systems-art/pack/SA.D.001.md']",
+        },
+        edge_types: {
+          type: "array",
+          items: {
+            type: "string",
+            enum: ["pack_cites", "pack_depends_on", "pack_extends", "pack_implements", "artifact_defines_concept"],
+          },
+          description: "Какие типы рёбер обходить. Default: все pack_* + artifact_defines_concept",
+        },
+        depth: { type: "number", description: "Глубина BFS (1-3, default 2)" },
+        limit: { type: "number", description: "Макс. узлов в ответе (default 20, max 100)" },
+      },
+      required: ["seed_codes"],
+    },
+  },
 ];
 
 // --- MCP handler ---
@@ -1952,6 +2092,54 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
                     {
                       seeds: seedIds,
                       neighbors: result.neighbors,
+                      edges_traversed: result.edges_traversed,
+                      edge_types_seen: result.edge_types_seen,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            },
+          };
+        }
+
+        if (toolName === "knowledge_pack_traverse") {
+          const t0 = Date.now();
+          const seedCodes = (args.seed_codes as string[]) || [];
+
+          const result = await expandArtifact(env, seedCodes, {
+            edge_types: args.edge_types as string[] | undefined,
+            depth: args.depth as number | undefined,
+            limit: args.limit as number | undefined,
+          });
+          const latency = Date.now() - t0;
+
+          const queryHash = await hashQuery(normalizeQueryForHash(seedCodes.join(",")));
+          await logGraphUsageEvent(env, {
+            query_text_hash: queryHash,
+            query_text_prefix: safeQueryPrefix(seedCodes.join(",")),
+            tool_name: "knowledge_pack_traverse",
+            scenario: null,
+            seed_concept_ids: [],
+            retrieved_concept_ids: result.nodes.map((n) => n.id),
+            edge_types_used: result.edge_types_seen,
+            traversal_depth: (args.depth as number | undefined) ?? 2,
+            latency_ms: latency,
+            fallback_reason: result.nodes.length === 0 ? "empty_result" : null,
+          });
+
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      seeds: seedCodes,
+                      nodes: result.nodes,
                       edges_traversed: result.edges_traversed,
                       edge_types_seen: result.edge_types_seen,
                     },
