@@ -50,7 +50,31 @@ if [ -n "$COLLISIONS" ]; then
   exit 1
 fi
 
-# --- Определить изменённые файлы (для R1-R3) ---
+# --- [R5] Загрузка disjointness registry (если есть) ---
+DISJOINTNESS_FILE=""
+DISJOINT_PAIRS=""
+if [ -f "$REPO_ROOT/pack/mim/01-domain-contract/disjointness.md" ]; then
+  DISJOINTNESS_FILE="$REPO_ROOT/pack/mim/01-domain-contract/disjointness.md"
+elif [ -f "$REPO_ROOT/01-domain-contract/disjointness.md" ]; then
+  DISJOINTNESS_FILE="$REPO_ROOT/01-domain-contract/disjointness.md"
+fi
+
+if [ -n "$DISJOINTNESS_FILE" ]; then
+  DISJOINT_PAIRS=$(awk '/^disjoint_pairs:/{p=1; next} /^[a-zA-Z#]/ && !/^    /{if(p) p=0} p' "$DISJOINTNESS_FILE" | \
+    awk '/class_a:/{a=$2} /class_b:/{b=$2; print a "|" b}')
+fi
+
+# --- [R6-узкий] Загрузка constraints из 00-pack-manifest.md (если есть) ---
+MANIFEST_FILE=""
+if [ -f "$REPO_ROOT/pack/mim/00-pack-manifest.md" ]; then
+  MANIFEST_FILE="$REPO_ROOT/pack/mim/00-pack-manifest.md"
+elif [ -f "$REPO_ROOT/00-pack-manifest.md" ]; then
+  MANIFEST_FILE="$REPO_ROOT/00-pack-manifest.md"
+fi
+
+VALID_CONSTRAINT_TARGETS="M|WP|D|R|FM|CHR|MAP|SC|SOTA|FMT|PRG|FORM|SOP"
+
+# --- Определить изменённые файлы (для R1-R5) ---
 if git rev-parse --verify HEAD &>/dev/null; then
   CHANGED=$(git diff --cached --name-only --diff-filter=ACM | grep '\.md$' || true)
 else
@@ -168,12 +192,65 @@ while IFS= read -r rel_file; do
     WARNINGS=$((WARNINGS + 1))
   fi
 
+  # [R5] disjointness check (only if disjointness.md exists and file has type/types)
+  if [ -n "$DISJOINT_PAIRS" ]; then
+    file_types_raw=$(get_frontmatter "$rel_file" | awk '
+      /^type:/{gsub(/^type:[[:space:]]*/, ""); gsub(/"/, ""); print; next}
+      /^types:/{p=1; next}
+      p && /^  -/{gsub(/^  -[[:space:]]*/, ""); gsub(/"/, ""); print; next}
+      p && /^[^ \t]/{p=0}
+    ')
+    if [ -n "$file_types_raw" ]; then
+      while IFS='|' read -r class_a class_b; do
+        [ -z "$class_a" ] || [ -z "$class_b" ] && continue
+        has_a=false
+        has_b=false
+        while IFS= read -r t; do
+          [ -z "$t" ] && continue
+          if echo "$t" | grep -qxF "$class_a"; then has_a=true; fi
+          if echo "$t" | grep -qxF "$class_b"; then has_b=true; fi
+        done <<< "$file_types_raw"
+        if $has_a && $has_b; then
+          file_warns="${file_warns}  [R5] disjointness violation: entity maps to both '$class_a' and '$class_b' (see disjointness.md)\n"
+          WARNINGS=$((WARNINGS + 1))
+        fi
+      done <<< "$DISJOINT_PAIRS"
+    fi
+  fi
+
   # Добавить в отчёт если есть предупреждения
   if [ -n "$file_warns" ]; then
     REPORT="${REPORT}📄 ${rel_file}  [${doc_id}]\n${file_warns}\n"
   fi
 
 done <<< "$CHANGED"
+
+# --- [R6-узкий] Validate constraints section in 00-pack-manifest.md ---
+if [ -n "$MANIFEST_FILE" ] && echo "$CHANGED" | grep -q "00-pack-manifest.md"; then
+  manifest_constraints=$(get_frontmatter "$MANIFEST_FILE" | awk '/^constraints:/{p=1; next} p && /^[^ \t]/{p=0} p')
+  if [ -n "$manifest_constraints" ]; then
+    # Check each constraint has target and required_fields
+    constraint_issues=""
+    while IFS= read -r line; do
+      if echo "$line" | grep -q "target:"; then
+        ct=$(echo "$line" | sed 's/.*target:[[:space:]]*//' | tr -d '"' | tr -d "'")
+        if ! echo "$VALID_CONSTRAINT_TARGETS" | grep -q "\b$ct\b"; then
+          constraint_issues="${constraint_issues}  Unknown constraint target '$ct' (valid: $VALID_CONSTRAINT_TARGETS)\n"
+        fi
+      fi
+      if echo "$line" | grep -q "required_fields:"; then
+        rf=$(echo "$line" | sed 's/.*required_fields:[[:space:]]*//' | tr -d '[]' | tr -d '"')
+        if [ -z "$rf" ] || [ "$rf" = "null" ]; then
+          constraint_issues="${constraint_issues}  Empty required_fields in constraint\n"
+        fi
+      fi
+    done <<< "$manifest_constraints"
+    if [ -n "$constraint_issues" ]; then
+      REPORT="${REPORT}📄 $(basename "$MANIFEST_FILE")  [manifest constraints]\n${constraint_issues}\n"
+      WARNINGS=$((WARNINGS + 1))
+    fi
+  fi
+fi
 
 # --- Вывод ---
 if [ "$WARNINGS" -eq 0 ]; then
