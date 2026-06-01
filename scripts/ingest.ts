@@ -495,15 +495,41 @@ async function main() {
       process.exit(1);
     }
 
+    const uidIdx = args.indexOf("--user-id");
+    const userId: string | undefined = uidIdx !== -1 ? args[uidIdx + 1] : undefined;
+
     const config: SourceConfig = {
       source: args[sourceIdx + 1],
       source_type: args[typeIdx + 1] as "pack" | "guides" | "ds",
       path: args[pathIdx + 1],
+      user_id: userId,
     };
 
+    // Guard: block platform ingest when path is covered by a personal source config
+    const personalConfigPath = join(__dirname, "sources-personal.json");
+    if (!userId && existsSync(personalConfigPath)) {
+      const home = process.env.HOME;
+      if (!home) {
+        console.error("⛔ HOME env var is not set — cannot resolve ~/paths for personal-source guard. Aborting.");
+        process.exit(1);
+      }
+      const personalSources: SourceConfig[] = JSON.parse(readFileSync(personalConfigPath, "utf-8"));
+      const normalize = (p: string) => (p.endsWith("/") ? p : p + "/");
+      const resolvedPath = normalize(config.path.replace("~/", home + "/"));
+      const covered = personalSources.find((s) => {
+        const sPath = normalize(s.path.replace("~/", home + "/"));
+        return resolvedPath.startsWith(sPath) || sPath.startsWith(resolvedPath);
+      });
+      if (covered) {
+        console.error(`⛔ GUARD: "${config.path}" покрыт personal-источником "${covered.source}" (sources-personal.json).`);
+        console.error(`   Добавь --user-id ${covered.user_id} чтобы индексировать как personal.`);
+        console.error(`   Без --user-id данные будут записаны как platform (видны всем) — это ошибка для личного контента.`);
+        process.exit(1);
+      }
+    }
+
     if (args.includes("--clean")) {
-      const uidIdx = args.indexOf("--user-id");
-      const cleanAccountId: string | null = uidIdx !== -1 ? args[uidIdx + 1] : null;
+      const cleanAccountId: string | null = userId ?? null;
       const deleted = await sql`
         DELETE FROM public.knowledge_chunk
         WHERE source = ${config.source}
