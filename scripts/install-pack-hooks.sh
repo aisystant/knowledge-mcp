@@ -21,7 +21,6 @@ PACK_REPOS=(
   "PACK-MIM"
   "PACK-autonomous-agents"
   "PACK-ecosystem"
-  "PACK-education"
   "PACK-verification"
 )
 
