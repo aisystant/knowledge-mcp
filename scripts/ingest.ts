@@ -62,7 +62,7 @@ interface SourceConfig {
   source_type: "pack" | "guides" | "ds" | "content";
   path: string;
   exclude?: string[];
-  user_id?: string; // зарезервировано на будущее (personal collections)
+  user_id?: string; // если задан → personal collection (account_id, collection_kind='personal')
 }
 
 // --- OpenAI Embeddings (REST API) ---
@@ -245,6 +245,9 @@ async function ingestSource(
   apiKey: string
 ): Promise<number> {
   const { source, source_type, path: basePath } = config;
+  // Personal vs platform: use user_id from config if present
+  const collectionKind = config.user_id ? 'personal' : 'platform';
+  const accountId: string | null = config.user_id ?? null;
 
   const resolvedPath = basePath.replace("~", process.env.HOME || "");
   if (!existsSync(resolvedPath)) {
@@ -307,11 +310,12 @@ async function ingestSource(
 
   console.log(`  ${documents.length} documents to process`);
 
-  // Check existing hashes (platform collection only)
+  // Check existing hashes for this source + owner
   const existingRows = await sql`
     SELECT source_uri, content_hash
     FROM public.knowledge_chunk
-    WHERE source = ${source} AND collection_kind = 'platform'
+    WHERE source = ${source}
+      AND account_id IS NOT DISTINCT FROM ${accountId}::uuid
   ` as { source_uri: string; content_hash: string }[];
   const existingHashes = new Map<string, string>();
   for (const row of existingRows) {
@@ -352,7 +356,7 @@ async function ingestSource(
     await sql`
       DELETE FROM public.knowledge_chunk
       WHERE source = ${source}
-        AND collection_kind = 'platform'
+        AND account_id IS NOT DISTINCT FROM ${accountId}::uuid
         AND (source_uri = ${parentFile} OR source_uri LIKE ${parentFile + '::%'})
     `;
     console.log(`  Cleaned old parent + chunks for ${parentFile}`);
@@ -362,7 +366,7 @@ async function ingestSource(
     await sql`
       DELETE FROM public.knowledge_chunk
       WHERE source = ${source}
-        AND collection_kind = 'platform'
+        AND account_id IS NOT DISTINCT FROM ${accountId}::uuid
         AND source_uri = ANY(${standaloneChanged}::text[])
     `;
   }
@@ -377,17 +381,19 @@ async function ingestSource(
     const result = await sql`
       INSERT INTO public.knowledge_chunk (
         chunk_id, document_path, paragraph_pos, content_hash, hash,
-        source, source_uri, source_kind, collection_kind,
+        source, source_uri, source_kind, collection_kind, account_id,
         content, embedding, indexed_at
       )
       VALUES (
         ${chunkId}, ${parent.filename}, 0, ${parent.hash}, ${parent.hash},
-        ${source}, ${parent.filename}, ${source_type}, 'platform',
+        ${source}, ${parent.filename}, ${source_type}, ${collectionKind}, ${accountId}::uuid,
         ${parent.content}, NULL, NOW()
       )
+      ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
+      DO NOTHING
       RETURNING chunk_uuid
     ` as { chunk_uuid: string }[];
-    parentUuids.set(parent.filename, result[0].chunk_uuid);
+    if (result[0]) parentUuids.set(parent.filename, result[0].chunk_uuid);
   }
   if (parents.length > 0) {
     console.log(`  ${parents.length} parent documents stored`);
@@ -417,14 +423,16 @@ async function ingestSource(
       await sql`
         INSERT INTO public.knowledge_chunk (
           chunk_id, document_path, paragraph_pos, content_hash, hash,
-          source, source_uri, source_kind, collection_kind,
+          source, source_uri, source_kind, collection_kind, account_id,
           content, embedding, parent_chunk_id, indexed_at
         )
         VALUES (
           ${chunkId}, ${doc.filename}, ${pos}, ${doc.hash}, ${doc.hash},
-          ${source}, ${doc.filename}, ${source_type}, 'platform',
+          ${source}, ${doc.filename}, ${source_type}, ${collectionKind}, ${accountId}::uuid,
           ${doc.content}, ${embeddingStr}::vector, ${parentUuid}::uuid, NOW()
         )
+        ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
+        DO NOTHING
       `;
     }
 
@@ -494,9 +502,12 @@ async function main() {
     };
 
     if (args.includes("--clean")) {
+      const uidIdx = args.indexOf("--user-id");
+      const cleanAccountId: string | null = uidIdx !== -1 ? args[uidIdx + 1] : null;
       const deleted = await sql`
         DELETE FROM public.knowledge_chunk
-        WHERE source = ${config.source} AND collection_kind = 'platform'
+        WHERE source = ${config.source}
+          AND account_id IS NOT DISTINCT FROM ${cleanAccountId}::uuid
       `;
       console.log(`Cleaned ${(deleted as any).length ?? 0} old entries for [${config.source}]`);
     }
