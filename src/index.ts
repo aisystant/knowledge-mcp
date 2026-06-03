@@ -2307,20 +2307,29 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
               result: { content: [{ type: "text", text: `Invalid skill name: ${skillName}. Use only lowercase letters, numbers, hyphens and underscores.` }], isError: true },
             };
           }
-          const filename = `.claude/skills/${skillName}/SKILL.md`;
-          const doc = await getDocument(env, filename, "FMT-exocortex-template", userId);
-          if (!doc) {
+          try {
+            const filename = `.claude/skills/${skillName}/SKILL.md`;
+            const doc = await getDocument(env, filename, "FMT-exocortex-template", userId);
+            if (!doc) {
+              return {
+                jsonrpc: "2.0",
+                id,
+                result: { content: [{ type: "text", text: `Skill not found: ${skillName}. Use list_documents(source: "FMT-exocortex-template") to discover available skills.` }], isError: true },
+              };
+            }
             return {
               jsonrpc: "2.0",
               id,
-              result: { content: [{ type: "text", text: `Skill not found: ${skillName}. Use list_documents(source: "FMT-exocortex-template") to discover available skills.` }], isError: true },
+              result: { content: [{ type: "text", text: doc.content }], isError: false },
+            };
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : "Unknown error";
+            return {
+              jsonrpc: "2.0",
+              id,
+              result: { content: [{ type: "text", text: `Error loading skill: ${msg}` }], isError: true },
             };
           }
-          return {
-            jsonrpc: "2.0",
-            id,
-            result: { content: [{ type: "text", text: doc.content }] },
-          };
         }
 
         return { jsonrpc: "2.0", id, error: { code: -32601, message: `Unknown tool: ${toolName}` } };
