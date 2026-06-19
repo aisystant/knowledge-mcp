@@ -4,5 +4,5 @@
 # Neon PostgreSQL connection string
 DATABASE_URL=postgresql://user:pass@ep-xxx.us-east-2.aws.neon.tech/knowledge?sslmode=require
 
-# OpenAI API key (for text-embedding-3-small)
-OPENAI_API_KEY=sk-your_openai_api_key
+# OpenRouter API key (routes to openai/text-embedding-3-small + openai/gpt-4o-mini)
+OPENROUTER_API_KEY=sk-or-your_openrouter_api_key

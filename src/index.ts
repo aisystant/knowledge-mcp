@@ -2,7 +2,7 @@
  * Knowledge MCP Server v4.1 — L2 Platform — Hybrid Search + Parent Retrieval + LLM Reranking + Feedback Loop
  *
  * Unified MCP server for Pack, guides, and DS knowledge.
- * Embeddings: OpenAI (text-embedding-3-small, 1024d)
+ * Embeddings: OpenRouter → openai/text-embedding-3-small, 1024d
  * Storage: Neon PostgreSQL with pgvector + pg_trgm + tsvector
  *
  * Search routing (DP.D.024):
@@ -32,7 +32,7 @@ export interface Env {
   KNOWLEDGE_DATABASE_URL: string;
   /** Neon `health` БД (DB #8) для observability writes (graph_usage_events). Required. */
   HEALTH_DATABASE_URL: string;
-  OPENAI_API_KEY: string;
+  OPENROUTER_API_KEY: string;
   ORY_URL?: string; // e.g. https://auth.system-school.ru/hydra — optional, JWT verification disabled if absent
   REINDEX_SECRET?: string; // Shared secret for /reindex endpoint (set via wrangler secret)
   // WP-268 Phase 3: Schema parameterization for database migrations
@@ -104,7 +104,7 @@ async function verifyJwtLocally(oryUrl: string, token: string): Promise<string |
 
 // --- Config ---
 
-const EMBEDDING_MODEL = "text-embedding-3-small";
+const EMBEDDING_MODEL = "openai/text-embedding-3-small";
 const VECTOR_CONFIDENCE_THRESHOLD = 0.6;
 const CHUNK_CHAR_LIMIT = 10_000;
 
@@ -119,7 +119,7 @@ let masteryTable: string;
 let graphEventsTable: string;
 const LARGE_FILE_THRESHOLD = CHUNK_CHAR_LIMIT;
 const MAX_FILE_SIZE = 100_000; // 100KB
-const RERANK_MODEL = "gpt-4o-mini";
+const RERANK_MODEL = "openai/gpt-4o-mini";
 const RERANK_CANDIDATES = 20; // Fetch top-N for reranking, return top-K
 const RERANK_TIMEOUT_MS = 5000;
 const RERANK_VECTOR_WEIGHT = 0.3;
@@ -166,7 +166,7 @@ export function resolveGithubUrl(source: string, filename: string): string | nul
 // --- Helpers ---
 
 async function getEmbedding(apiKey: string, text: string): Promise<number[]> {
-  const response = await fetch("https://api.openai.com/v1/embeddings", {
+  const response = await fetch("https://openrouter.ai/api/v1/embeddings", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -309,7 +309,7 @@ async function vectorSearch(
   limit: number = 5,
   userId?: string
 ): Promise<SearchResult[]> {
-  const embedding = await getEmbedding(env.OPENAI_API_KEY, query);
+  const embedding = await getEmbedding(env.OPENROUTER_API_KEY, query);
   const vec = `[${embedding.join(",")}]`;
   const src = source ?? null;
   const stype = sourceType ?? null;
@@ -385,7 +385,7 @@ ${candidates.map((c) => `[${c.index}] ${c.filename}\n${c.snippet}`).join("\n\n")
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), RERANK_TIMEOUT_MS);
 
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -531,13 +531,13 @@ async function searchDocuments(
       }
       const merged = [...seen.values()].sort((a, b) => b.score - a.score);
       // Rerank merged results
-      const reranked = await rerankWithLLM(env.OPENAI_API_KEY, query, merged, limit);
+      const reranked = await rerankWithLLM(env.OPENROUTER_API_KEY, query, merged, limit);
       return enrichWithParentContent(env, reranked, userId);
     }
   }
 
   // LLM rerank vector results → return top-K
-  const reranked = await rerankWithLLM(env.OPENAI_API_KEY, query, vectorResults, limit);
+  const reranked = await rerankWithLLM(env.OPENROUTER_API_KEY, query, vectorResults, limit);
   return enrichWithParentContent(env, reranked, userId);
 }
 
@@ -788,7 +788,7 @@ async function analyzeVerbalization(
 
   if (topic) {
     // Embed the topic to find relevant concepts
-    const topicEmbedding = await getEmbedding(env.OPENAI_API_KEY, topic);
+    const topicEmbedding = await getEmbedding(env.OPENROUTER_API_KEY, topic);
     const vecStr = `[${topicEmbedding.join(",")}]`;
     topicConcepts = await sql`
       SELECT id, code, name, definition, level, domain,
@@ -854,14 +854,14 @@ ${conceptList}
 Если ничего не найдено: {"found": [], "confidence": []}`;
 
   try {
-    const matchResponse = await fetch("https://api.openai.com/v1/chat/completions", {
+    const matchResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini",
+        model: "openai/gpt-4o-mini",
         messages: [{ role: "user", content: matchPrompt }],
         temperature: 0.1,
         max_tokens: 300,
@@ -987,14 +987,14 @@ ${miscCatalog}
 Если мемов не обнаружено: {"found": [], "explanations": []}`;
 
     try {
-      const llmResponse = await fetch("https://api.openai.com/v1/chat/completions", {
+      const llmResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+          Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          model: "gpt-4o-mini",
+          model: "openai/gpt-4o-mini",
           messages: [{ role: "user", content: llmPrompt }],
           temperature: 0.1,
           max_tokens: 500,
@@ -2596,7 +2596,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
         let chunkPos = 0;
         for (const chunk of chunks) {
           chunkPos++;
-          const embedding = await getEmbedding(env.OPENAI_API_KEY, chunk.content.slice(0, CHUNK_CHAR_LIMIT));
+          const embedding = await getEmbedding(env.OPENROUTER_API_KEY, chunk.content.slice(0, CHUNK_CHAR_LIMIT));
           const vec = `[${embedding.join(",")}]`;
           const chunkHash = await contentHash(chunk.content);
 
@@ -2616,7 +2616,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
         }
       } else {
         // Small file: single document with embedding
-        const embedding = await getEmbedding(env.OPENAI_API_KEY, content.slice(0, CHUNK_CHAR_LIMIT));
+        const embedding = await getEmbedding(env.OPENROUTER_API_KEY, content.slice(0, CHUNK_CHAR_LIMIT));
         const vec = `[${embedding.join(",")}]`;
 
         await sql`
