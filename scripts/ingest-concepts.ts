@@ -883,11 +883,21 @@ function extractFPF(): { concepts: ConceptNode[]; edges: ConceptEdge[] } {
   const concepts: ConceptNode[] = [];
   const edges: ConceptEdge[] = [];
 
-  // Extract ## headers as pattern names (top-level patterns only)
-  const patternHeaders = content.matchAll(/^## ([A-K]\.\d+(?:\.\d+)?)\s*[-—]\s*(.+)/gm);
-  const seen = new Set<string>();
+  // Extract ## headers as pattern names (top-level patterns only).
+  const FPF_HEADER_RE = /^## ([A-K]\.\d+(?:\.\d+)?)\s*[-—]\s*(.+)/gm;
 
-  for (const match of patternHeaders) {
+  // Pass 1: collect all valid codes so part_of edges are not order-dependent.
+  // Without this, a child appearing before its parent in the file (e.g. E.17.0
+  // before E.17) would incorrectly get 0 edges — an orphan due to file order,
+  // not a real structural gap.
+  const allFpfCodes = new Set<string>();
+  for (const m of content.matchAll(new RegExp(FPF_HEADER_RE.source, "gm"))) {
+    if (m[1].split(".").length <= 3) allFpfCodes.add(m[1]);
+  }
+
+  // Pass 2: create concepts and part_of edges.
+  const seen = new Set<string>();
+  for (const match of content.matchAll(FPF_HEADER_RE)) {
     const code = match[1];
     const name = match[2].trim();
 
@@ -915,9 +925,11 @@ function extractFPF(): { concepts: ConceptNode[]; edges: ConceptEdge[] } {
       source_repo: "FPF",
     });
 
-    // Parent-child edges: A.1 → A.1.1
+    // Parent-child edges: A.1 → A.1.1.
+    // Uses allFpfCodes (all codes in file) so edge is created even when parent
+    // appears after child in the source file (e.g. E.17 after E.17.0).
     const parentCode = code.split(".").slice(0, -1).join(".");
-    if (parentCode && seen.has(parentCode)) {
+    if (parentCode && allFpfCodes.has(parentCode)) {
       edges.push({
         from_code: parentCode,
         to_code: code,
