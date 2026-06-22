@@ -1734,7 +1734,7 @@ const TOOLS = [
   },
 
   {
-    name: "knowledge_feedback",
+    name: "feedback",
     description:
       "Record helpfulness feedback for a retrieved document. Call after using a search result to signal whether it was actually helpful. This data improves future retrieval quality.",
     inputSchema: {
@@ -1798,7 +1798,7 @@ const TOOLS = [
     },
   },
   {
-    name: "knowledge_concept_status",
+    name: "concept_status",
     description:
       "Возвращает статус концепта (active/deprecated/draft/superseded), признак misconception, и ссылку superseded_by, если концепт заменён новым. Используй перед тем как цитировать концепт в ответе, чтобы соответствовать DP.SC.121 mode (a) — не ссылаться на устаревшие/заблуждения.",
     inputSchema: {
@@ -1811,7 +1811,7 @@ const TOOLS = [
     },
   },
   {
-    name: "knowledge_concept_search_by_name",
+    name: "concept_search_by_name",
     description:
       "Fuzzy-поиск концепта по имени (trigram). Для сценариев: (1) разрешить естественное имя в id; (2) проверить наличие концепта перед цитированием. Возвращает top-N с similarity, status, misconception. Отличается от 'search' тем, что работает только по полю name графа, а не по embed'ам документов.",
     inputSchema: {
@@ -1825,7 +1825,7 @@ const TOOLS = [
     },
   },
   {
-    name: "knowledge_reindex_source",
+    name: "reindex_source",
     description:
       "Trigger full or partial reindex of a knowledge source (platform L2 or personal L4). Scans all .md files from GitHub, chunks, embeds, and upserts to Neon. For large sources (>1000 files) use dry_run to list files, then call in batches via 'files' param. For L2 platform sources — no auth needed. For L4 personal sources — requires user registration in user_sources.",
     inputSchema: {
@@ -1839,7 +1839,7 @@ const TOOLS = [
     },
   },
   {
-    name: "knowledge_concept_expand",
+    name: "concept_expand",
     description:
       "BFS-обход графа от seed-концептов: возвращает соседей через рёбра specializes/part_of/related/prerequisite. Используй когда пользователь задал термин и тебе нужны связанные понятия для развёрнутого ответа (DP.METHOD.042 сценарии: определение, Pack-обучение, онтологические ответы). Автоматически фильтрует deprecated/superseded в выдаче. Обновляет last_traversed_at на пройденных рёбрах.",
     inputSchema: {
@@ -1864,7 +1864,7 @@ const TOOLS = [
     },
   },
   {
-    name: "knowledge_pack_traverse",
+    name: "pack_traverse",
     description:
       "BFS-обход графа от seed-artifact'ов (Pack-файлов): возвращает достигнутые узлы через рёбра pack_cites/pack_depends_on/pack_extends/pack_implements/artifact_defines_concept. Используй для кросс-Pack запросов: 'покажи все произведения, которые меняют культуру' → обход от SA.D.001 через pack_cites + artifact_defines_concept. Стартует только от artifact-узлов (node_type='artifact').",
     inputSchema: {
@@ -2006,7 +2006,7 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
           };
         }
 
-        if (toolName === "knowledge_feedback") {
+        if (toolName === "feedback") {
           const result = await recordFeedback(
             env,
             args.document_id as number,
@@ -2070,7 +2070,7 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
 
         // --- WP-242 Ф8.4 tools ---
 
-        if (toolName === "knowledge_concept_status") {
+        if (toolName === "concept_status") {
           const t0 = Date.now();
           const concept = await getConceptStatus(env, {
             concept_id: args.concept_id as number | undefined,
@@ -2084,7 +2084,7 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
           await logGraphUsageEvent(env, {
             query_text_hash: queryHash,
             query_text_prefix: safeQueryPrefix(queryText),
-            tool_name: "knowledge_concept_status",
+            tool_name: "concept_status",
             agent_id: null,
             seed_concept_ids: concept ? [concept.id] : [],
             retrieved_concept_ids: concept ? [concept.id] : [],
@@ -2102,7 +2102,7 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
           };
         }
 
-        if (toolName === "knowledge_concept_search_by_name") {
+        if (toolName === "concept_search_by_name") {
           const t0 = Date.now();
           const name = args.name as string;
           const hits = await searchConceptByName(env, name, {
@@ -2115,7 +2115,7 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
           await logGraphUsageEvent(env, {
             query_text_hash: queryHash,
             query_text_prefix: safeQueryPrefix(name),
-            tool_name: "knowledge_concept_search_by_name",
+            tool_name: "concept_search_by_name",
             seed_concept_ids: [],
             retrieved_concept_ids: hits.map((h) => h.id),
             traversal_depth: 0,
@@ -2130,7 +2130,7 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
           };
         }
 
-        if (toolName === "knowledge_reindex_source") {
+        if (toolName === "reindex_source") {
           const source = args.source as string;
           const dryRun = (args.dry_run as boolean) || false;
           const explicitFiles = args.files as string[] | undefined;
@@ -2169,7 +2169,7 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
           };
         }
 
-        if (toolName === "knowledge_concept_expand") {
+        if (toolName === "concept_expand") {
           const t0 = Date.now();
 
           // Resolve seed(s)
@@ -2190,7 +2190,7 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
             await logGraphUsageEvent(env, {
               query_text_hash: queryHash,
               query_text_prefix: safeQueryPrefix(queryText),
-              tool_name: "knowledge_concept_expand",
+              tool_name: "concept_expand",
               scenario: (args.scenario as string | undefined) ?? null,
               seed_concept_ids: [],
               retrieved_concept_ids: [],
@@ -2217,7 +2217,7 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
           await logGraphUsageEvent(env, {
             query_text_hash: queryHash,
             query_text_prefix: safeQueryPrefix(queryText),
-            tool_name: "knowledge_concept_expand",
+            tool_name: "concept_expand",
             scenario: (args.scenario as string | undefined) ?? null,
             seed_concept_ids: seedIds,
             retrieved_concept_ids: result.neighbors.map((n) => n.id),
@@ -2250,7 +2250,7 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
           };
         }
 
-        if (toolName === "knowledge_pack_traverse") {
+        if (toolName === "pack_traverse") {
           const t0 = Date.now();
           const seedCodes = (args.seed_codes as string[]) || [];
 
@@ -2265,7 +2265,7 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
           await logGraphUsageEvent(env, {
             query_text_hash: queryHash,
             query_text_prefix: safeQueryPrefix(seedCodes.join(",")),
-            tool_name: "knowledge_pack_traverse",
+            tool_name: "pack_traverse",
             scenario: null,
             seed_concept_ids: [],
             retrieved_concept_ids: result.nodes.map((n) => n.id),

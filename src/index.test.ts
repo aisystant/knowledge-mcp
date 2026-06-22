@@ -357,7 +357,7 @@ describe("hashQuery", () => {
 // --- TOOLS array includes feedback tools ---
 
 describe("feedback tools registration", () => {
-  it("knowledge_feedback tool is defined", async () => {
+  it("feedback tool is defined", async () => {
     // Verify tool is in TOOLS array via MCP handler
     // Since TOOLS is not exported, we verify the tool name strings exist in source
     // Real integration test would call tools/list endpoint
