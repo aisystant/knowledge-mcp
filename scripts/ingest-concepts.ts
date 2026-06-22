@@ -23,7 +23,7 @@
  *
  * Environment:
  *   DATABASE_URL — Neon PostgreSQL
- *   OPENAI_API_KEY — for embeddings (text-embedding-3-small, 1024d)
+ *   OPENROUTER_API_KEY — for embeddings (OpenRouter, openai/text-embedding-3-small, 1024d); falls back to OPENAI_API_KEY
  */
 
 import { readFileSync, readdirSync, statSync, existsSync } from "fs";
@@ -34,7 +34,7 @@ import { neon } from "@neondatabase/serverless";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Load .dev.vars if env vars not set
-if (!process.env.DATABASE_URL || !process.env.OPENAI_API_KEY) {
+if (!process.env.DATABASE_URL || !(process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY)) {
   const devVarsPath = join(__dirname, "../.dev.vars");
   if (existsSync(devVarsPath)) {
     const vars = readFileSync(devVarsPath, "utf-8");
@@ -50,7 +50,7 @@ if (!process.env.DATABASE_URL || !process.env.OPENAI_API_KEY) {
 // --- Config ---
 
 const IWE_ROOT = process.env.IWE_ROOT || join(process.env.HOME!, "IWE");
-const EMBEDDING_MODEL = "text-embedding-3-small";
+const EMBEDDING_MODEL = "openai/text-embedding-3-small";  // OpenRouter requires provider prefix
 const EMBEDDING_DIM = 1024;
 const BATCH_SIZE = 20;
 const DRY_RUN = process.argv.includes("--dry-run");
@@ -90,16 +90,16 @@ interface Misconception {
   source_file: string;
 }
 
-// --- OpenAI Embeddings ---
+// --- OpenRouter Embeddings (mirror worker src/index.ts; offline scripts were left on OpenAI after migration 4df872b) ---
 
 async function getEmbeddings(texts: string[]): Promise<number[][]> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error("OPENAI_API_KEY required");
+  const apiKey = process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("OPENROUTER_API_KEY or OPENAI_API_KEY required");
 
   const results: number[][] = [];
   for (let i = 0; i < texts.length; i += BATCH_SIZE) {
     const batch = texts.slice(i, i + BATCH_SIZE);
-    const response = await fetch("https://api.openai.com/v1/embeddings", {
+    const response = await fetch("https://openrouter.ai/api/v1/embeddings", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -114,7 +114,7 @@ async function getEmbeddings(texts: string[]): Promise<number[][]> {
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`OpenAI error: ${response.status} ${text}`);
+      throw new Error(`OpenRouter embeddings error: ${response.status} ${text}`);
     }
 
     const data = (await response.json()) as {
