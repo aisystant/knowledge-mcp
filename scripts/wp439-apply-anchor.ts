@@ -10,8 +10,8 @@
  *      matching concepts with name_en + name_en_source='glossary'.
  *
  * Anchor precedence (glossary beats unaudited, never overwrites canonical):
- *   - source IN ('fpf','manual','inherited') -> protected: never re-stamp;
- *                                               log only if glossary disagrees
+ *   - source IN ('fpf','manual') -> protected: never re-stamp;
+ *                                    log only if glossary disagrees
  *   - name_en NULL                           -> set from glossary ('glossary')
  *   - source IN ('unknown','llm')            -> overwrite to 'glossary' (the audit)
  *   - source 'glossary', same value          -> confirm (idempotent no-op)
@@ -212,11 +212,11 @@ async function main() {
   const conflicts: Array<{ code: string; current: string; glossary: string; source: string }> = [];
   let unmatched = 0;
 
-  // Canonical/intentional sources (fpf, manual, inherited) are checked FIRST and
-  // never re-stamped — only logged on disagreement. Without this guard, U.Method
-  // / U.Role (source='fpf', name_en already 'Method'/'Role') match a glossary
-  // term and get re-stamped 'glossary', clobbering FPF provenance
-  // (cold-review 2026-06-25-08, Critical).
+  // Canonical/intentional sources (fpf, manual) are checked FIRST and never
+  // re-stamped — only logged on disagreement. Without this guard, U.Method /
+  // U.Role (source='fpf', name_en already 'Method'/'Role') match a glossary term
+  // and get re-stamped 'glossary', clobbering FPF provenance
+  // (cold-review 2026-06-25-08, Critical). 'inherited' dropped in Ф2 (migration 018).
   for (const entry of glossary) {
     const rows = byKey.get(entry.termRu);
     if (!rows || rows.length === 0) {
@@ -225,7 +225,7 @@ async function main() {
     }
     for (const c of rows) {
       const src = c.name_en_source;
-      if (src === "fpf" || src === "manual" || src === "inherited") {
+      if (src === "fpf" || src === "manual") {
         if (c.name_en !== entry.termEn) {
           conflicts.push({
             code: c.code,
@@ -240,12 +240,18 @@ async function main() {
       } else if (src === "unknown" || src === "llm") {
         if (c.name_en === entry.termEn) toConfirm.push(c.id);
         else toOverwrite.push(c.id);
-      } else if (c.name_en === entry.termEn) {
-        // already 'glossary' (or null source) with same value -> idempotent confirm
-        toConfirm.push(c.id);
+      } else if (src === "glossary") {
+        // already glossary: same value -> confirm (no-op); csv changed -> re-apply
+        if (c.name_en === entry.termEn) toConfirm.push(c.id);
+        else toOverwrite.push(c.id);
       } else {
-        // 'glossary' with a changed value (csv updated) -> re-apply
-        toOverwrite.push(c.id);
+        // unexpected: name_en present but source is null/other -> log, do not clobber
+        conflicts.push({
+          code: c.code,
+          current: c.name_en ?? "(null)",
+          glossary: entry.termEn,
+          source: src ?? "(null)",
+        });
       }
     }
   }
