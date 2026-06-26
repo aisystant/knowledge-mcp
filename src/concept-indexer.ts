@@ -10,12 +10,15 @@
 
 import { neon } from "@neondatabase/serverless";
 import { getConceptGraphSchema, CONCEPT_GRAPH_TABLES } from "./utils/db.js";
+import { glossaryLookup, translateWithLlm } from "./translation.js";
 
 // --- Types ---
 
 export interface Env {
   KNOWLEDGE_DATABASE_URL: string;
   OPENAI_API_KEY: string;
+  /** OpenRouter key for concept name translation. Optional — translation skipped if absent. */
+  OPENROUTER_API_KEY?: string;
   CONCEPT_GRAPH_DB_SCHEMA?: string;
 }
 
@@ -586,6 +589,12 @@ export async function reindexConceptsForFiles(
         `;
       }
 
+      // Attempt best-effort translation for concepts without a name_en.
+      // Two-tier: glossary (sync) → LLM (async, 3s timeout, requires OPENROUTER_API_KEY).
+      // On timeout or missing key the concept stays name_en=NULL; apply-translations.py
+      // picks it up in the next batch run (pending-queue pattern).
+      await translateNewConcepts(env, sql, ct, extracted.concepts);
+
       // Upsert edges
       let edgesWritten = 0;
       for (const e of extracted.edges) {
@@ -622,4 +631,75 @@ export async function reindexConceptsForFiles(
   }
 
   return result;
+}
+
+// --- Translation helpers ---
+
+// WHY: db() returns neon() without options → NeonQueryFunction<false, false>.
+// ReturnType<typeof neon> would give the generic overload NeonQueryFunction<boolean, boolean>,
+// which is contravariant-incompatible with <false, false> at the call site.
+type SqlClient = ReturnType<typeof db>;
+
+/**
+ * Translate newly upserted concepts that have no name_en.
+ *
+ * Glossary hits resolve synchronously (source=glossary, status=ok).
+ * LLM hits resolve async with a 3s timeout per concept (source=llm, status=pending).
+ * All translations run in parallel; results are written atomically per concept
+ * only when name_en IS NULL (guard against overwriting a manual name_en that
+ * arrived via a concurrent upsert).
+ */
+async function translateNewConcepts(
+  env: Env,
+  sql: SqlClient,
+  ct: string,
+  concepts: ConceptNode[],
+): Promise<void> {
+  const untranslated = concepts.filter((c) => c.code && !c.name_en && c.name_ru);
+  if (untranslated.length === 0) return;
+
+  const tasks = untranslated.map(async (c) => {
+    const nameRu = c.name_ru!;
+
+    // Tier 1: synchronous glossary lookup — no I/O, always fast.
+    const glossaryHit = glossaryLookup(nameRu);
+    if (glossaryHit) {
+      await writeTranslation(sql, ct, c.code!, glossaryHit.nameEn, glossaryHit.source, glossaryHit.status);
+      return;
+    }
+
+    // Tier 2: LLM via OpenRouter with timeout.
+    if (!env.OPENROUTER_API_KEY) return;
+    const llmHit = await translateWithLlm(nameRu, null, env.OPENROUTER_API_KEY, 3000);
+    if (llmHit) {
+      await writeTranslation(sql, ct, c.code!, llmHit.nameEn, llmHit.source, llmHit.status);
+    }
+    // On timeout/error: leave name_en NULL — apply-translations.py handles it.
+  });
+
+  const results = await Promise.allSettled(tasks);
+  for (const r of results) {
+    if (r.status === "rejected") {
+      console.warn("[translateNewConcepts] write failed:", r.reason);
+    }
+  }
+}
+
+async function writeTranslation(
+  sql: SqlClient,
+  ct: string,
+  code: string,
+  nameEn: string,
+  source: string,
+  status: string,
+): Promise<void> {
+  await sql`
+    UPDATE ${sql.unsafe(ct)}
+    SET name_en = ${nameEn},
+        name_en_source = ${source},
+        name_en_status = ${status},
+        updated_at = NOW()
+    WHERE code = ${code}
+      AND name_en IS NULL
+  `;
 }

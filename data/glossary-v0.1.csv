@@ -1,0 +1,127 @@
+term_ru,term_en,context,notes
+Созидатель,Creator,Person building value in IWE,core term
+Ступень мастерства,Mastery stage,cp-profile level 1-5,
+Рабочий продукт,Work Product,WP abbreviation retained,
+Скилл,Skill,Agent skill/capability,
+Среда,Environment,IWE working environment,
+Пак,Pack,Knowledge pack,
+Конвейер,Pipeline,Automated pipeline,
+Рубеж работы,Work milestone,Decision point in workflow,
+Напарник,Peer partner,Peer agent in DP.SC.154,
+Открытие,Opening,ORZ Opening phase,
+Закрытие,Closing,ORZ Closing phase,
+Рабочий ход,Work turn,Turn in peer session,
+Аудит,Audit,Audit process,
+Различение,Distinction,Key conceptual distinction,
+Поток,Flow/Stream,Learning or work stream,
+Форматирование,Formatting,Document formatting,
+Ролевой префикс,Role prefix,Role activation prefix,
+Блокирующее правило,Blocking rule,Mandatory rule,
+Предметная область,Domain,DDD modeling and design,Core DDD term
+Ограниченный контекст,Bounded Context,DDD strategic design,Core DDD term
+Агрегат,Aggregate,DDD tactical patterns,Core DDD term
+Репозиторий,Repository,DDD tactical patterns,Core DDD term
+Фабрика,Factory,DDD tactical patterns / creational patterns,Can also be Abstract Factory
+Сервис предметной области,Domain Service,DDD tactical patterns,Distinct from Application Service
+Событие предметной области,Domain Event,DDD tactical patterns / event-driven,Core DDD term
+Общий язык,Ubiquitous Language,DDD strategic design,Not Universal Language
+Антикоррупционный слой,Anti-Corruption Layer,DDD integration patterns,Abbrev. ACL common
+Карта контекстов,Context Map,DDD strategic design,Core DDD term
+Системное мышление,Systems Thinking,Systems engineering / IWE,Discipline/methodology term
+Целевая система,System of Interest,Systems engineering / IWE,Also Target System in some texts
+Надсистема,Supersystem,Systems engineering / IWE,Also Wider System; uncertain mapping
+Подсистема,Subsystem,Systems engineering decomposition,Standard universal term
+Роль,Role,IWE / organizational modeling,Context-dependent term
+Исполнитель роли,Role Performer,IWE / organizational modeling,Also Actor in some frameworks
+Функциональное место,Functional Position,IWE / organizational design,uncertain
+Метод,Method,Engineering practice / methodology,General term; context-dependent
+Практика,Practice,Engineering methodology / IWE,Standard methodology term
+Дисциплина,Discipline,Engineering methodology / IWE,Standard methodology term
+Область знаний,Knowledge Domain,DDD bounded context and ontology design,"Also ""Body of Knowledge"" in standards"
+Онтология,Ontology,formal knowledge representation model,Used in semantic/conceptual modeling
+Концепция,Concept,conceptual modeling and domain design,"Not ""conception""; avoid ambiguity"
+Артефакт,Artifact,systems engineering deliverable or output,"Also spelled ""artefact"" (British)"
+Заинтересованная сторона,Stakeholder,requirements and systems engineering,Standard SE/BABOK term
+Потребность,Need,stakeholder needs before requirements,"Distinct from ""requirement""; higher level"
+Требование,Requirement,systems and software requirements,Core SE/SysML/INCOSE term
+Ограничение,Constraint,design and requirements engineering,"Also ""limitation"" in some contexts"
+Интерфейс,Interface,system boundary and integration design,Standard technical term
+Архитектура,Architecture,system and software design structure,Standard SE/DDD term
+Компонент,Component,system decomposition and design,Standard SysML/UML term
+Модуль,Module,software and system decomposition,Slightly lower-level than component
+Платформа,Platform,technology stack and deployment context,Standard technical term
+Сервис,Service,SOA DDD and microservices design,Standard DDD/SOA term
+Инфраструктура,Infrastructure,deployment and operational environment,Standard DevOps/SE term
+Реестр,Registry,centralized repository or catalog,"Not ""register""; context-dependent"
+Протокол,Protocol,communication and integration design,Standard networking/SE term
+Сессия,Session,runtime interaction and state management,Standard software/networking term
+Шаг,Step,process workflow and procedure design,"Also ""stage"" depending on context"
+Фаза,Phase,project lifecycle and process modeling,Standard PM/SE lifecycle term
+Приоритет,Priority,task/backlog item ordering,straightforward
+Бэклог,Backlog,agile product/sprint planning,straightforward
+Верификация,Verification,QA and requirements validation,distinct from Validation
+Ревью,Review,code review or document review,informal borrowing from English
+Хук,Hook,event-driven or lifecycle callbacks,e.g. Git hooks or framework hooks
+Скрипт,Script,automation or build scripting,straightforward
+Шаблон,Template,document or code generation patterns,also means Pattern in some contexts
+Манифест,Manifest,deployment or package declaration files,e.g. Kubernetes manifest
+Конфигурация,Configuration,system or application settings,straightforward
+Развёртывание,Deployment,releasing software to environment,straightforward
+Интеграция,Integration,system or service integration,straightforward
+Миграция,Migration,data or schema migration processes,straightforward
+Рефакторинг,Refactoring,code restructuring without behavior change,straightforward
+Мастерство,Mastery,competency and skill development models,implies high-level expertise
+Компетенция,Competency,HR and capability frameworks,broader than Skill
+Навык,Skill,individual capability or ability,narrower than Competency
+Знание,Knowledge,learning and knowledge management,cognitive domain
+Понимание,Understanding,learning outcomes and comprehension,deeper than Knowledge
+Опыт,Experience,practitioner background and expertise,also can mean experiment in sci context
+Практикующий,Practitioner,domain expert in active practice,e.g. DDD practitioner
+Систематический,Systematic,describing methodical process approach,adj; methodical/structured also valid
+Дисциплинированный,Disciplined,describing rigorous engineering practice,adj; also rigorous in some contexts
+Проактивный,Proactive,describing anticipatory risk management,adj; widely adopted as-is
+Траектория,Trajectory,describing path of system or project evolution,"also ""path"" in some contexts"
+Прогресс,Progress,tracking advancement toward goals,universal term
+Оценка,Assessment,evaluating system or process state,"also ""estimation"" in planning contexts"
+Профиль,Profile,describing characteristic configuration or pattern,"context-dependent; also ""baseline"""
+Траектория развития,Development Trajectory,describing planned growth or evolution path,"also ""growth path"" or ""roadmap"""
+Итерация,Iteration,agile development cycle unit,standard agile term
+Спринт,Sprint,time-boxed agile development cycle,Scrum-specific term
+Ретроспектива,Retrospective,agile ceremony after iteration ends,standard Scrum ceremony
+Дорожная карта,Roadmap,strategic planning timeline document,compound noun; no hyphen preferred
+Веха,Milestone,marking key project checkpoint,standard PM term
+Инцидент,Incident,unplanned event disrupting service,ITIL/SRE standard term
+Постмортем,Postmortem,analysis after incident or failure,"also ""post-incident review"""
+Операция,Operation,unit of work or system action,"context-dependent; also ""procedure"""
+Мониторинг,Monitoring,observing system health and metrics,standard SRE/ops term
+Наблюдаемость,Observability,measuring system internal state externally,SRE term; logs+metrics+traces
+Персона,Persona,Digital twin decomposition,IWE-specific declarative model
+Память,Memory,Event sourcing pattern,Observed events + derived aggregates
+Проекция,Projection,Runtime compilation,IWE-specific runtime adaptation
+Различение: Персона / Память / Контекст,Distinction: Persona/Memory/Context,Ontological decomposition,IWE-specific framework
+Слот exocortex/CLAUDE.md,Exocortex slot,Workspace backup location,IWE-specific governance separation
+Состояние гонки в диспетчере,Dispatcher race condition,Git reset after agent work,IWE-specific headless dispatch
+Принцип BYOB,BYOB principle,Infrastructure ownership,Bring Your Own Base
+Контур IWE,IWE perimeter,Pilot control boundary,IWE-specific control zone
+Машина IWE,IWE machine,Infrastructure substrate,IWE-specific platform instance
+Контракт хоста для IWE,Host contract,Platform requirements layer,IWE-specific interface spec
+Адаптер Claude Code,Claude Code adapter,Reference implementation,IWE component mapping
+Headless-адаптер,Headless adapter,Agent inbox runtime,IWE dispatcher implementation
+Культура безопасности пилота,Pilot security culture,Data protection habits,IWE-specific practice framework
+Резервная копия,Backup,Data persistence method,IWE-specific critical data
+Шифрование,Encryption,Data protection method,Standard security technique
+Авто-триггер субагент-ревью,Auto-trigger sub-agent review,CI section creation,IWE-specific automation
+Dual-mode setup script,Dual-mode setup script,Environment configuration,SETUP_CI flag support
+Диагностика устаревания ЦД,Digital twin staleness diagnosis,State verification,IWE-specific freshness check
+Замена терминологии,Multi-pass terminology replacement,Semantic consistency,IWE-specific peer verification
+Семантика-сначала,Semantics-first integration,Layered runtime integration,IWE-specific sequencing priority
+bearer-заголовок как третий auth-mode,Bearer Header Authentication Mode,authentication protocol extension,backward-compatible multi-channel auth
+Совместимость нескольких драйверов БД через duck-typing коннекта,Database Driver Compatibility Duck Typing,database abstraction layer,heterogeneous environment support
+Онбординг платформы — зонтичное обещание,Platform Onboarding Umbrella Promise,platform adoption framework,two-axis maturation model
+Карточки практик саморазвития,Self-Development Practice Cards,professional development framework,8 practices × 4 mastery levels
+Атрофия мышления при ежедневной работе с ИИ,Cognitive Atrophy With Daily AI Use,professional development risk,IWE-specific cognitive concern
+Матрица нормативных состояний по ступеням,Normative State Matrix By Level,maturity framework definition,target state specification
+3 контекста стиля жизни,Three Lifestyle Development Contexts,personal development model,learning beyond formal education
+Ролевая траектория созидателя,Creator Role Trajectory Model,professional development path,five-role progression framework
+Уровни деятельностного охвата созидателя,Creator Activity Scope Levels,professional development scale,system mastery scale
+Карта роста созидателя,Creator Growth Map,professional development framework,3×2 matrix plus contextual factors
