@@ -72,7 +72,8 @@ SELECT
   ),
   COUNT(*) FILTER (WHERE status = 'active'),
   COUNT(*) FILTER (WHERE status = 'active' AND is_translatable = TRUE),
-  COUNT(*) FILTER (WHERE status = 'active' AND is_translatable = TRUE AND name_en IS NOT NULL)
+  COUNT(*) FILTER (WHERE status = 'active' AND is_translatable = TRUE AND name_en IS NOT NULL),
+  'manual'
 FROM concept_graph.concepts
 WHERE status = 'active'
 ON CONFLICT (id) DO NOTHING;
@@ -82,7 +83,7 @@ DECLARE
   baseline NUMERIC(5,2);
 BEGIN
   SELECT pct_with_en INTO baseline FROM concept_graph.coverage_baseline WHERE id = 1;
-  RAISE NOTICE 'coverage_baseline seeded: %% coverage', baseline;
+  RAISE NOTICE 'coverage_baseline seeded: % coverage', baseline;
 END $$;
 
 COMMIT;
