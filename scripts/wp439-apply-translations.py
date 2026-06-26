@@ -7,10 +7,14 @@ Translates Russian concept names to English using:
   2. Claude Haiku via OpenRouter or Anthropic — for unknown terms (~$2-3 for 2710 orphans)
 
 Modes (mutually exclusive):
-  --probe        Print distribution stats for name_en columns (read-only)
-  --reclassify   Batch UPDATE: unknown + has_en → source='manual', status='unverified'
-  --pilot N      Translate first N orphans from concept_translation_orphans
-  --bulk         Translate ALL orphans (~2710 concepts)
+  --probe           Print distribution stats for name_en columns (read-only)
+  --reclassify      Batch UPDATE: unknown + has_en → source='manual', status='pending'
+  --pilot N         Translate first N orphans from concept_translation_orphans
+  --bulk            Translate ALL orphans (~2710 concepts)
+  --review-manual   Accept all manual+pending by FPF logic (no LLM, no cost)
+                    FPF sections (A.N) + U.* → source='fpf'
+                    All others → source='manual'
+                    Both → status='ok'
 
 Flags:
   --dry-run      Show what would happen, no DB writes
@@ -21,6 +25,8 @@ Usage:
   python3 scripts/wp439-apply-translations.py --reclassify --dry-run
   python3 scripts/wp439-apply-translations.py --pilot 10
   python3 scripts/wp439-apply-translations.py --bulk --yes
+  python3 scripts/wp439-apply-translations.py --review-manual --dry-run
+  python3 scripts/wp439-apply-translations.py --review-manual
 
 Run --reclassify before --pilot/--bulk to avoid re-translating already-named concepts.
 """
@@ -416,6 +422,83 @@ def translate_batch(
     print(f"\n[translate] Done: ok={ok} errors={errors} total={total}")
 
 
+# ---- Review manual+pending by FPF provenance ----
+
+_FPF_SECTION_RE = re.compile(r"^[A-Z]\.\d")   # A.1, A.12, B.3 — FPF doc sections
+_U_CONCEPT_RE = re.compile(r"^U\.[A-Z]")       # U.Method, U.Entity — FPF universal concepts
+
+
+def _fpf_source(code: Optional[str]) -> str:
+    """Return 'fpf' if code is a FPF section or U.* concept, else 'manual'."""
+    if not code:
+        return "manual"
+    if _FPF_SECTION_RE.match(code) or _U_CONCEPT_RE.match(code):
+        return "fpf"
+    return "manual"
+
+
+def review_manual(conn: "psycopg2.extensions.connection", dry_run: bool) -> None:
+    """Accept all manual+pending concepts by FPF provenance logic (no LLM, no cost).
+
+    FPF sections (A.N) and U.* concepts → source='fpf', status='ok'
+    All others (AS.*, _T.*, etc.)       → source='manual', status='ok'
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT id, code, COALESCE(name_ru, name) AS name_ru, name_en
+            FROM concept_graph.concepts
+            WHERE name_en_source = 'manual' AND name_en_status = 'pending'
+            ORDER BY code
+        """)
+        rows = cur.fetchall()
+
+    total = len(rows)
+    print(f"\n[review-manual] {total} manual+pending concepts (dry_run={dry_run})")
+    if total == 0:
+        print("[review-manual] Nothing to review.")
+        return
+
+    fpf_ids: list = []
+    manual_ids: list = []
+    for r in rows:
+        if _fpf_source(r["code"]) == "fpf":
+            fpf_ids.append(r["id"])
+        else:
+            manual_ids.append(r["id"])
+
+    print(f"  FPF sections/U.* → source='fpf', status='ok': {len(fpf_ids)}")
+    print(f"  Application codes → source='manual', status='ok': {len(manual_ids)}")
+
+    if dry_run:
+        print("[dry-run] No DB writes. Sample FPF (5):")
+        for r in [r for r in rows if _fpf_source(r["code"]) == "fpf"][:5]:
+            print(f"  {r['code']} | {r['name_en']}")
+        print("Sample manual (5):")
+        for r in [r for r in rows if _fpf_source(r["code"]) == "manual"][:5]:
+            print(f"  {r['code']} | {r['name_ru']} | {r['name_en']}")
+        return
+
+    with conn.cursor() as cur:
+        if fpf_ids:
+            cur.execute(
+                """UPDATE concept_graph.concepts
+                   SET name_en_source = 'fpf', name_en_status = 'ok'
+                   WHERE id = ANY(%s)""",
+                (fpf_ids,),
+            )
+            print(f"[review-manual] SET source='fpf', status='ok': {cur.rowcount} rows")
+        if manual_ids:
+            cur.execute(
+                """UPDATE concept_graph.concepts
+                   SET name_en_status = 'ok'
+                   WHERE id = ANY(%s)""",
+                (manual_ids,),
+            )
+            print(f"[review-manual] SET status='ok': {cur.rowcount} rows")
+    conn.commit()
+    print(f"[review-manual] Done. {total} rows accepted.")
+
+
 # ---- Entry point ----
 
 
@@ -430,10 +513,15 @@ def main() -> None:
     mode.add_argument(
         "--reclassify",
         action="store_true",
-        help="UPDATE unknown+has_en → manual/unverified",
+        help="UPDATE unknown+has_en → manual/pending",
     )
     mode.add_argument("--pilot", type=int, metavar="N", help="Translate first N orphans")
     mode.add_argument("--bulk", action="store_true", help="Translate ALL orphans")
+    mode.add_argument(
+        "--review-manual",
+        action="store_true",
+        help="Accept manual+pending by FPF provenance (no LLM, no cost)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="No DB writes")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation for --bulk")
     args = parser.parse_args()
@@ -453,6 +541,8 @@ def main() -> None:
             glossary = load_glossary()
             llm = _make_llm_call()
             translate_batch(conn, llm, glossary, limit=args.pilot, dry_run=args.dry_run)
+        elif args.review_manual:
+            review_manual(conn, dry_run=args.dry_run)
         else:  # --bulk
             glossary = load_glossary()
             llm = _make_llm_call()
