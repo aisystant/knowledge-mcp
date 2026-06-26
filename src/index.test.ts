@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
-import { chunkLargeFile, contentHash } from "../scripts/ingest.js";
+import { chunkLargeFile, systemChunkFile, contentHash } from "../scripts/ingest.js";
 import { neon } from "@neondatabase/serverless";
 
 vi.mock("@neondatabase/serverless", () => ({
@@ -94,6 +94,27 @@ describe("chunkLargeFile", () => {
     const chunks = chunkLargeFile(content, "path/to/file.md");
     const s1 = chunks.find((c) => c.filename === "path/to/file.md::S1");
     expect(s1).toBeDefined();
+  });
+});
+
+// --- systemChunkFile ---
+
+describe("systemChunkFile", () => {
+  it("splits content into sentence-aware chunks", async () => {
+    const content = `# Title\n\nFirst paragraph with two sentences. Second sentence here.\n\n## Section A\n\nSection A first sentence. Section A second sentence.\n\n## Section B\n\nSection B content.`;
+    const chunks = await systemChunkFile(content, "test.md");
+    expect(chunks.length).toBeGreaterThanOrEqual(1);
+    expect(chunks[0].filename).toMatch(/^test\.md::chunk\d+$/);
+  });
+
+  it("produces smaller chunks than legacy for large content", async () => {
+    const content = `# Title\n\n${Array.from({ length: 50 }, (_, i) => `Sentence ${i + 1} in the document provides some content for testing chunk boundaries.`).join(" ")}`;
+    const legacyChunks = chunkLargeFile(content, "doc.md");
+    const systemChunks = await systemChunkFile(content, "doc.md");
+    expect(systemChunks.length).toBeGreaterThanOrEqual(legacyChunks.length);
+    const legacyTotal = legacyChunks.reduce((sum, c) => sum + c.content.length, 0);
+    const systemTotal = systemChunks.reduce((sum, c) => sum + c.content.length, 0);
+    expect(systemTotal).toBeGreaterThanOrEqual(legacyTotal * 0.9);
   });
 });
 
