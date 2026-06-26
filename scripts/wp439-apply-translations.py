@@ -99,6 +99,21 @@ def load_glossary() -> Dict[str, str]:
 # ---- LLM client ----
 
 
+_CODE_RE = re.compile(r"^[A-Z]{1,6}(\.[A-Z0-9]+)+$")
+_REFUSAL_PHRASES = ("i need", "i don't", "i do not", "could you", "please provide", "refers to")
+
+
+def _is_code_reference(name: Optional[str]) -> bool:
+    """Return True for section-code names like A.0, MIM.BC, AS.FM.012 — no translation needed."""
+    return not name or bool(_CODE_RE.match(name.strip()))
+
+
+def _is_refusal(text: str) -> bool:
+    """Return True if the LLM returned an explanation instead of a term."""
+    lower = text.lower()
+    return len(text.split()) > 10 or any(p in lower for p in _REFUSAL_PHRASES)
+
+
 SYSTEM_PROMPT = (
     "You are a precise translator of Russian systems-thinking terminology to English. "
     "Return ONLY the English term — no explanations, no punctuation, no quotes."
@@ -117,21 +132,24 @@ def _make_llm_call() -> "Callable[[str], str]":
     openai_key = _key("OPENAI_API_KEY")
 
     if openrouter_key:
-        import anthropic
-        client = anthropic.Anthropic(
+        import openai as _openai
+        client = _openai.OpenAI(
             base_url="https://openrouter.ai/api/v1", api_key=openrouter_key
         )
-        model = "anthropic/claude-haiku-4-5-20251001"
+        model = "anthropic/claude-haiku-4.5"
         print("[api] Using OpenRouter (cheaper for bulk)")
 
-        def _call_anthropic(prompt: str) -> str:
-            resp = client.messages.create(
-                model=model, max_tokens=60, system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": prompt}],
+        def _call_openrouter(prompt: str) -> str:
+            resp = client.chat.completions.create(
+                model=model, max_tokens=60,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
             )
-            return resp.content[0].text.strip()
+            return resp.choices[0].message.content.strip()
 
-        return _call_anthropic
+        return _call_openrouter
 
     if anthropic_key:
         import anthropic
@@ -326,13 +344,29 @@ def translate_batch(
 
     ok = errors = 0
     for i, row in enumerate(rows, 1):
-        name_ru = row["name_ru"] or row["code"]
+        name_ru_orig = row["name_ru"]
+        name_ru = name_ru_orig or row["code"]
 
-        if name_ru in glossary:
+        # No Russian name → use code identifier as-is (file paths, Pack identifiers)
+        if name_ru_orig is None:
+            name_en = name_ru
+            en_source, en_status = "manual", "ok"
+            if dry_run:
+                print(f"  [{i}/{total}] {name_ru} → {name_en} (no-name, dry-run)")
+                ok += 1
+                continue
+        elif name_ru in glossary:
             name_en = glossary[name_ru]
             en_source, en_status = "glossary", "ok"
             if dry_run:
                 print(f"  [{i}/{total}] {name_ru} → {name_en} (glossary, dry-run)")
+                ok += 1
+                continue
+        elif _is_code_reference(name_ru):
+            name_en = name_ru  # section codes need no translation (A.0, B.1.2, etc.)
+            en_source, en_status = "manual", "ok"
+            if dry_run:
+                print(f"  [{i}/{total}] {name_ru} → {name_en} (code, dry-run)")
                 ok += 1
                 continue
         else:
@@ -353,6 +387,10 @@ def translate_batch(
                 )
             except Exception as exc:
                 print(f"  [{i}/{total}] ERROR '{name_ru}': {exc}", file=sys.stderr)
+                errors += 1
+                continue
+            if _is_refusal(name_en):
+                print(f"  [{i}/{total}] SKIP '{name_ru}': LLM returned refusal", file=sys.stderr)
                 errors += 1
                 continue
             en_source, en_status = "llm", "pending"
