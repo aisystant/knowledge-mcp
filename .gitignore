@@ -5,3 +5,4 @@ dist/
 output/
 staging/
 wp439-review-rejected-sample.csv
+.venv-chunker/
