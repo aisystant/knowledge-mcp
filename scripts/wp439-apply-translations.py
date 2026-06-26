@@ -32,7 +32,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import psycopg2
 import psycopg2.extras
@@ -99,38 +99,84 @@ def load_glossary() -> Dict[str, str]:
 # ---- LLM client ----
 
 
-def _make_client() -> Tuple[Any, str]:
-    """Return (anthropic_client, model_name). Prefers OpenRouter for lower bulk cost."""
-    import anthropic  # lazy import — not needed for --probe/--reclassify
+SYSTEM_PROMPT = (
+    "You are a precise translator of Russian systems-thinking terminology to English. "
+    "Return ONLY the English term — no explanations, no punctuation, no quotes."
+)
 
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+
+def _make_llm_call() -> "Callable[[str], str]":
+    """Return a callable (user_prompt) -> English term. Tries keys in priority order."""
+    dev_vars = _load_dev_vars()
+
+    def _key(name: str) -> Optional[str]:
+        return os.environ.get(name) or dev_vars.get(name) or None
+
+    openrouter_key = _key("OPENROUTER_API_KEY")
+    anthropic_key = _key("ANTHROPIC_API_KEY")
+    openai_key = _key("OPENAI_API_KEY")
+
     if openrouter_key:
-        print("[api] Using OpenRouter (cheaper for bulk)")
-        return (
-            anthropic.Anthropic(
-                base_url="https://openrouter.ai/api/v1",
-                api_key=openrouter_key,
-            ),
-            "anthropic/claude-haiku-4-5-20251001",
+        import anthropic
+        client = anthropic.Anthropic(
+            base_url="https://openrouter.ai/api/v1", api_key=openrouter_key
         )
+        model = "anthropic/claude-haiku-4-5-20251001"
+        print("[api] Using OpenRouter (cheaper for bulk)")
 
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+        def _call_anthropic(prompt: str) -> str:
+            resp = client.messages.create(
+                model=model, max_tokens=60, system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return resp.content[0].text.strip()
+
+        return _call_anthropic
+
     if anthropic_key:
+        import anthropic
+        client = anthropic.Anthropic(api_key=anthropic_key)
+        model = "claude-haiku-4-5-20251001"
         print("[api] Using Anthropic API")
-        return anthropic.Anthropic(api_key=anthropic_key), "claude-haiku-4-5-20251001"
 
-    sys.exit("ERROR: set OPENROUTER_API_KEY or ANTHROPIC_API_KEY before translating")
+        def _call_anthropic(prompt: str) -> str:
+            resp = client.messages.create(
+                model=model, max_tokens=60, system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return resp.content[0].text.strip()
+
+        return _call_anthropic
+
+    if openai_key:
+        import openai as _openai
+        client = _openai.OpenAI(api_key=openai_key)
+        model = "gpt-4o-mini"
+        print("[api] Using OpenAI API (gpt-4o-mini)")
+
+        def _call_openai(prompt: str) -> str:
+            resp = client.chat.completions.create(
+                model=model, max_tokens=60,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            return resp.choices[0].message.content.strip()
+
+        return _call_openai
+
+    sys.exit("ERROR: set OPENROUTER_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY before translating")
 
 
 def _translate_one(
-    client: Any,
-    model: str,
+    llm: "Callable[[str], str]",
     name_ru: str,
     kind_label: Optional[str],
     parent_code: Optional[str],
     glossary: Dict[str, str],
 ) -> str:
-    """Translate a single concept name to English via Claude Haiku."""
+    """Translate a single concept name to English."""
     glossary_sample = "\n".join(
         f"  {ru} → {en}" for ru, en in list(glossary.items())[:20]
     )
@@ -151,12 +197,7 @@ def _translate_one(
         f"- Match glossary style exactly for known terms\n"
         f"- No explanations, no punctuation, no quotes"
     )
-    resp = client.messages.create(
-        model=model,
-        max_tokens=60,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return resp.content[0].text.strip()
+    return llm(prompt)
 
 
 # ---- Modes ----
@@ -233,27 +274,26 @@ def reclassify(conn: "psycopg2.extensions.connection", dry_run: bool) -> int:
         return 0
 
     if dry_run:
-        print("[dry-run] Would UPDATE → source='manual', status='unverified'")
+        print("[dry-run] Would UPDATE → source='manual', status='pending'")
         return count
 
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE concept_graph.concepts
             SET name_en_source = 'manual',
-                name_en_status = 'unverified'
+                name_en_status = 'pending'
             WHERE name_en_source = 'unknown'
               AND name_en IS NOT NULL
         """)
         affected = cur.rowcount
     conn.commit()
-    print(f"[reclassify] Updated {affected} rows → source='manual', status='unverified'")
+    print(f"[reclassify] Updated {affected} rows → source='manual', status='pending'")
     return affected
 
 
 def translate_batch(
     conn: "psycopg2.extensions.connection",
-    client: Any,
-    model: str,
+    llm: "Callable[[str], str]",
     glossary: Dict[str, str],
     limit: Optional[int],
     dry_run: bool,
@@ -290,7 +330,7 @@ def translate_batch(
 
         if name_ru in glossary:
             name_en = glossary[name_ru]
-            en_source, en_status = "glossary", "verified"
+            en_source, en_status = "glossary", "ok"
             if dry_run:
                 print(f"  [{i}/{total}] {name_ru} → {name_en} (glossary, dry-run)")
                 ok += 1
@@ -305,8 +345,7 @@ def translate_batch(
                 continue
             try:
                 name_en = _translate_one(
-                    client,
-                    model,
+                    llm,
                     name_ru,
                     kind_label=row["kind_label"],
                     parent_code=row.get("parent_code"),
@@ -316,7 +355,7 @@ def translate_batch(
                 print(f"  [{i}/{total}] ERROR '{name_ru}': {exc}", file=sys.stderr)
                 errors += 1
                 continue
-            en_source, en_status = "llm", "unverified"
+            en_source, en_status = "llm", "pending"
             time.sleep(0.2)  # avoid API rate-limit burst
 
         try:
@@ -374,12 +413,12 @@ def main() -> None:
             reclassify(conn, dry_run=args.dry_run)
         elif args.pilot is not None:
             glossary = load_glossary()
-            client, model = _make_client()
-            translate_batch(conn, client, model, glossary, limit=args.pilot, dry_run=args.dry_run)
+            llm = _make_llm_call()
+            translate_batch(conn, llm, glossary, limit=args.pilot, dry_run=args.dry_run)
         else:  # --bulk
             glossary = load_glossary()
-            client, model = _make_client()
-            translate_batch(conn, client, model, glossary, limit=None, dry_run=args.dry_run)
+            llm = _make_llm_call()
+            translate_batch(conn, llm, glossary, limit=None, dry_run=args.dry_run)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
