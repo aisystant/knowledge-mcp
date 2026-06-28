@@ -16,11 +16,11 @@
     "test:watch": "vitest"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20241230.0",
+    "@cloudflare/workers-types": "^4.20260628.1",
     "tsx": "^4.7.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.2",
-    "wrangler": "^3.99.0"
+    "wrangler": "^4.105.0"
   },
   "dependencies": {
     "@langchain/textsplitters": "^1.0.1",
