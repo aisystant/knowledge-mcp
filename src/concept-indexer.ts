@@ -16,7 +16,8 @@ import { glossaryLookup, translateWithLlm } from "./translation.js";
 
 export interface Env {
   KNOWLEDGE_DATABASE_URL: string;
-  OPENAI_API_KEY: string;
+  /** OpenAI key for embeddings. Optional — concept graph indexing skipped if absent. */
+  OPENAI_API_KEY?: string;
   /** OpenRouter key for concept name translation. Optional — translation skipped if absent. */
   OPENROUTER_API_KEY?: string;
   CONCEPT_GRAPH_DB_SCHEMA?: string;

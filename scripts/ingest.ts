@@ -32,7 +32,7 @@ import { readFileSync, readdirSync, statSync, existsSync } from "fs";
 import { join, relative, extname, dirname } from "path";
 import { createHash } from "crypto";
 import { fileURLToPath } from "url";
-import { neon } from "@neondatabase/serverless";
+import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -264,7 +264,7 @@ export async function systemChunkFile(
 
 async function ingestSource(
   config: SourceConfig,
-  sql: ReturnType<typeof neon>,
+  sql: NeonQueryFunction<false, false>,
   apiKey: string
 ): Promise<number> {
   const { source, source_type, path: basePath } = config;

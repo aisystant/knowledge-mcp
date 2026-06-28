@@ -47,6 +47,8 @@ type SqlClient = {
   <T = Record<string, unknown>>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T[]>;
   // Identifier injection: sql("schema.table") → marker for safe quoting
   (identifier: string): IdentifierMarker;
+  // Raw identifier interpolation (neon compatibility)
+  unsafe: (identifier: string) => IdentifierMarker;
 };
 
 /**

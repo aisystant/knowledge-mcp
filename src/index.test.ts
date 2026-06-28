@@ -12,10 +12,17 @@ vi.mock("@neondatabase/serverless", () => ({
 
 // withUserContext mock — used by enrichWithParentContent
 let mockWithUserContextImpl: ((sql: (s: TemplateStringsArray, ...v: unknown[]) => Promise<unknown[]>) => Promise<unknown[]>) | null = null;
+
+function makeMockSql(rows: unknown[]): (s: TemplateStringsArray, ...v: unknown[]) => Promise<unknown[]> {
+  const sql = (() => Promise.resolve(rows)) as (s: TemplateStringsArray, ...v: unknown[]) => Promise<unknown[]>;
+  (sql as any).unsafe = (value: string) => value;
+  return sql;
+}
+
 vi.mock("./rls.js", () => ({
   withUserContext: vi.fn(async (_dsn: string, _userId: string | null | undefined, fn: (sql: unknown) => Promise<unknown>) => {
     if (mockWithUserContextImpl) return mockWithUserContextImpl(fn as any);
-    return fn(() => Promise.resolve([]));
+    return fn(makeMockSql([]) as unknown);
   }),
 }));
 
@@ -306,7 +313,7 @@ describe("rerankWithLLM", () => {
 
 describe("enrichWithParentContent", () => {
   it("returns empty array for empty input", async () => {
-    const env = { KNOWLEDGE_DATABASE_URL: "fake", HEALTH_DATABASE_URL: "fake", OPENAI_API_KEY: "fake" } as Env;
+    const env = { KNOWLEDGE_DATABASE_URL: "fake", HEALTH_DATABASE_URL: "fake", OPENROUTER_API_KEY: "fake" } as Env;
     const out = await enrichWithParentContent(env, []);
     expect(out).toEqual([]);
   });
@@ -320,9 +327,9 @@ describe("enrichWithParentContent", () => {
         parent_content: "Full parent document content here",
       },
     ];
-    mockWithUserContextImpl = (fn) => fn((() => Promise.resolve(parentRows)) as any);
+    mockWithUserContextImpl = (fn) => fn(makeMockSql(parentRows) as any);
 
-    const env = { KNOWLEDGE_DATABASE_URL: "postgres://fake", HEALTH_DATABASE_URL: "postgres://fake", OPENAI_API_KEY: "fake" } as Env;
+    const env = { KNOWLEDGE_DATABASE_URL: "postgres://fake", HEALTH_DATABASE_URL: "postgres://fake", OPENROUTER_API_KEY: "fake" } as Env;
     const results: SearchResult[] = [
       makeResult({ id: 10, score: 0.9, filename: "doc.md::Section A", source: "PACK-digital-platform" }),
       makeResult({ id: 11, score: 0.8, filename: "other.md", source: "SPF" }),
@@ -339,9 +346,9 @@ describe("enrichWithParentContent", () => {
   });
 
   it("handles no parent rows gracefully", async () => {
-    mockWithUserContextImpl = (fn) => fn((() => Promise.resolve([])) as any);
+    mockWithUserContextImpl = (fn) => fn(makeMockSql([]) as any);
 
-    const env = { KNOWLEDGE_DATABASE_URL: "postgres://fake", HEALTH_DATABASE_URL: "postgres://fake", OPENAI_API_KEY: "fake" } as Env;
+    const env = { KNOWLEDGE_DATABASE_URL: "postgres://fake", HEALTH_DATABASE_URL: "postgres://fake", OPENROUTER_API_KEY: "fake" } as Env;
     const results: SearchResult[] = [
       makeResult({ id: 5, score: 0.7, filename: "standalone.md", source: "SPF" }),
     ];

@@ -33,6 +33,8 @@ export interface Env {
   /** Neon `health` БД (DB #8) для observability writes (graph_usage_events). Required. */
   HEALTH_DATABASE_URL: string;
   OPENROUTER_API_KEY: string;
+  /** OpenAI key for concept-indexer (WP-339). Optional — concept graph indexing skipped if absent. */
+  OPENAI_API_KEY?: string;
   ORY_URL?: string; // e.g. https://auth.system-school.ru/hydra — optional, JWT verification disabled if absent
   REINDEX_SECRET?: string; // Shared secret for /reindex endpoint (set via wrangler secret)
   // WP-268 Phase 3: Schema parameterization for database migrations
@@ -1573,17 +1575,17 @@ async function getGraphStats(env: Env) {
 async function getLearnerProgress(env: Env, userId: string, domain: string | undefined) {
   return withUserContext(activeDsn(env), userId, async (sql) => {
     // Overall stats
-    const [totalConcepts] = await sql`
+    const [totalConcepts] = await sql<{ cnt: number }>`
       SELECT COUNT(*)::int AS cnt FROM ${sql.unsafe(conceptsTable)}
       WHERE status = 'active' AND (${domain}::text IS NULL OR domain = ${domain})
     `;
-    const [masteredCount] = await sql`
+    const [masteredCount] = await sql<{ cnt: number }>`
       SELECT COUNT(*)::int AS cnt FROM ${sql.unsafe(masteryTable)} lm
       JOIN ${sql.unsafe(conceptsTable)} c ON c.id = lm.concept_id
       WHERE lm.user_id = ${userId} AND lm.mastery >= 0.5
         AND (${domain}::text IS NULL OR c.domain = ${domain})
     `;
-    const [totalAttempts] = await sql`
+    const [totalAttempts] = await sql<{ cnt: number }>`
       SELECT COALESCE(SUM(attempts), 0)::int AS cnt FROM ${sql.unsafe(masteryTable)}
       WHERE user_id = ${userId}
     `;
