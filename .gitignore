@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# uv
+# (uv.lock IS committed)
+
+# Nix / direnv
+.direnv/
+result
+result-*
