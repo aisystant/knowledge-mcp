@@ -1,18 +1,20 @@
 # knowledge-mcp
 
-Autonomous MCP server for the **shared platform knowledge base** — hybrid search
-(keyword + vector + LLM rerank) and a concept graph over the Pack methodology, guides,
-and DS process docs. Platform content is visible to every authenticated user
-(`account_id = NULL`); any per-user content is isolated by `account_id`.
+**Public, read-only** MCP server for the shared knowledge base — hybrid search
+(keyword + vector + LLM rerank) and a concept graph over our public Pack methodology,
+guides, and DS process docs.
+
+There is **no authentication**: anyone can connect this server directly. The gateway
+fronts it with auth for its aggregated view, but the server itself serves only public
+data and never touches per-user data.
 
 Runs on Python (MCP Streamable HTTP) on Google Cloud Run, backed by Cloud SQL
 PostgreSQL with pgvector + pg_trgm. (No INFRA.md yet — infra decisions are still open.)
 
-## Auth
+## Access
 
-Every `tools/call` requires a valid Ory JWT (Hydra JWKS, RS256). Identity is the `sub`
-claim; there is no `x-user-id` fallback. Platform knowledge is **free for authenticated
-users** (no subscription required); per-user content is filtered by `account_id`.
+Public, read-only. No auth, no per-user data, no subscription. (Per-user learner tools
+are NOT here — see "Not in this server" below.)
 
 ## Tools
 
@@ -23,41 +25,28 @@ users** (no subscription required); per-user content is filtered by `account_id`
 | `get_document` | A document in full, or just its heading outline, by filename. |
 | `list_sources` | Sources with their document counts. |
 | `list_documents` | Files within a source. |
-| `load_skill` | Load a `SKILL.md` from the exocortex template. |
 
 ### Concept graph
 | Tool | Purpose |
 |------|---------|
 | `concept_status` | Status of a concept (active / deprecated / superseded) and misconception flags. |
 | `concept_search_by_name` | Fuzzy concept lookup by name (trigram similarity). |
-| `concept_expand` | Breadth-first traversal over semantic edges from one or more concepts. |
-| `pack_traverse` | Breadth-first traversal from artifact nodes over pack edges. |
+| `graph_traverse` | Breadth-first traversal over the concept graph from seed concepts or artifacts, by edge type and depth. Replaces the legacy `concept_expand` + `pack_traverse`. |
 
-### Learner
-| Tool | Purpose |
-|------|---------|
-| `analyze_verbalization` | LLM-as-judge: which concepts of a topic a learner's text covers; updates mastery. |
-| `learner_progress` | A learner's concept-mastery progress, by domain. |
+## Not in this server (and why)
 
-> ⚠ `analyze_verbalization` and `learner_progress` must derive the learner identity from
-> the **JWT `sub`**, not from a tool argument (the TS originals took `user_id` as an
-> argument — a cross-user read/write hole). See `../OPEN-QUESTIONS.md`.
-
-### Feedback
-| Tool | Purpose |
-|------|---------|
-| `feedback` | Record a helpful / not-helpful signal on a retrieved document. |
-| `feedback_stats` | Aggregated feedback over the last N days. |
-
-### Under review (likely ops / analytics, not Guide-facing MCP tools)
-| Tool | Why under review |
-|------|------------------|
-| `reindex_source` | In the new design reindexing is event-driven (GitHub Actions on push) + a Postgres queue, so this is likely an internal/ops endpoint, not an authenticated Guide tool. The TS MCP tool was also unauthenticated. |
-| `graph_stats` | Graph-wide statistics (counts, orphans, suspicious edges) — observability; keep as a tool only if the Guide actually needs it. |
+- **Per-user / learner tools** — `analyze_verbalization`, `learner_progress`, and
+  per-user `feedback` need authentication and per-user writes, so they cannot live in a
+  public server. They belong to an authed "learner mastery" home (digital-twin / a
+  dedicated learner service — still to decide). See `../OPEN-QUESTIONS.md`.
+- **Ops / analytics** — `reindex_source` (reindexing is event-driven: GitHub Actions on
+  push + a Postgres queue), `graph_stats`, `feedback_stats` — internal endpoints, not
+  Guide-facing tools.
+- **`load_skill`** — redundant with `get_document`.
 
 ## Tests as contract
 
 There is no separate contract document. The tool list above is the promise; the tests
-under `tests/` are the executable specification (I/O shape, auth gating, per-user
-isolation). The implementation must pass them. Search-heavy tools need a seeded corpus —
-the test-seeding strategy is decided before those tests are written.
+under `tests/` are the executable specification (I/O shape, search relevance, graph
+traversal). Search-heavy tools need a seeded corpus — the test-seeding strategy is
+decided before those tests are written.
