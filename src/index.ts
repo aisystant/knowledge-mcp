@@ -256,10 +256,9 @@ async function keywordSearch(
 
   // WP-268: knowledge_chunk schema. Aliases preserve external API contract:
   //   legacy_id AS id, source_uri AS filename, source_kind AS source_type
-  // WP-7 Ф-L2-PRIVACY: explicit account_id filter — defense-in-depth alongside RLS (mvp/015).
-  //   account_id IS NULL = platform doc (visible to all)
-  //   account_id::text = app.user_id = personal doc (visible to owner)
-  //   NULLIF: если app.user_id не установлен — current_setting вернёт '' → NULL → видны только platform.
+  // WP-410 Ф-knowledge-cleanup: public knowledge-mcp serves PLATFORM docs only.
+  //   account_id IS NULL = platform doc (visible to all). Personal docs (account_id set)
+  //   are served exclusively by personal-knowledge-mcp, never here — even with a token.
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
     SELECT legacy_id AS id, source_uri AS filename, content, source, source_kind AS source_type,
            CASE
@@ -280,8 +279,7 @@ async function keywordSearch(
            OR (${entityPattern}::text IS NOT NULL AND source_uri ILIKE ${entityPattern}))
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_kind = ${stype})
-      AND (account_id IS NULL
-           OR account_id::text = NULLIF(current_setting('app.user_id', true), ''))
+      AND account_id IS NULL
     ORDER BY score DESC,
              CASE WHEN source_uri ILIKE ${pattern} THEN 0 ELSE 1 END,
              length(content) DESC
@@ -325,8 +323,7 @@ async function vectorSearch(
     WHERE embedding IS NOT NULL
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_kind = ${stype})
-      AND (account_id IS NULL
-           OR account_id::text = NULLIF(current_setting('app.user_id', true), ''))
+      AND account_id IS NULL
     ORDER BY embedding <=> ${vec}::vector
     LIMIT ${limit}
   `);
@@ -474,10 +471,8 @@ export async function enrichWithParentContent(env: Env, results: SearchResult[],
       AND (c.source_uri, c.source) IN (
         SELECT unnest(${filenames}::text[]), unnest(${sources}::text[])
       )
-      AND (p.account_id IS NULL
-           OR p.account_id::text = NULLIF(current_setting('app.user_id', true), ''))
-      AND (c.account_id IS NULL
-           OR c.account_id::text = NULLIF(current_setting('app.user_id', true), ''))
+      AND p.account_id IS NULL
+      AND c.account_id IS NULL
   `);
 
   const parentMap = new Map<string, { parent_filename: string; parent_content: string }>();
@@ -558,8 +553,7 @@ async function getDocument(
     FROM ${sql.unsafe(knowledgeChunkTable)}
     WHERE source_uri = ${filename}
       AND (${src}::text IS NULL OR source = ${src})
-      AND (account_id IS NULL
-           OR account_id::text = NULLIF(current_setting('app.user_id', true), ''))
+      AND account_id IS NULL
     LIMIT 1
   `);
 
@@ -620,8 +614,7 @@ async function listSources(
     SELECT source, source_kind AS source_type, COUNT(*)::int AS doc_count
     FROM ${sql.unsafe(knowledgeChunkTable)}
     WHERE (${stype}::text IS NULL OR source_kind = ${stype})
-      AND (account_id IS NULL
-           OR account_id::text = NULLIF(current_setting('app.user_id', true), ''))
+      AND account_id IS NULL
     GROUP BY source, source_kind
     ORDER BY source_kind, source
   `);
@@ -651,8 +644,7 @@ async function listDocuments(
     WHERE source_uri NOT LIKE '%::%'
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_kind = ${stype})
-      AND (account_id IS NULL
-           OR account_id::text = NULLIF(current_setting('app.user_id', true), ''))
+      AND account_id IS NULL
     ORDER BY source, source_uri
     LIMIT ${limit}
   `);
@@ -686,8 +678,7 @@ async function recordFeedback(
     const visible = await sql`
       SELECT 1 FROM ${sql.unsafe(knowledgeChunkTable)}
       WHERE legacy_id = ${documentId}
-        AND (account_id IS NULL
-             OR account_id::text = NULLIF(current_setting('app.user_id', true), ''))
+        AND account_id IS NULL
       LIMIT 1
     `;
     if (visible.length === 0) {
@@ -730,8 +721,7 @@ async function getFeedbackStats(
     FROM ${sql.unsafe(retrievalFeedbackTable)} f
     JOIN ${sql.unsafe(knowledgeChunkTable)} d ON d.legacy_id = f.document_id
     WHERE f.created_at >= NOW() - make_interval(days => ${days})
-      AND (d.account_id IS NULL
-           OR d.account_id::text = NULLIF(current_setting('app.user_id', true), ''))
+      AND d.account_id IS NULL
     GROUP BY f.document_id, d.source_uri, d.source
     ORDER BY total DESC, helpfulness_rate DESC
     LIMIT ${limit}
