@@ -62,7 +62,7 @@ export function qualifyTable(table: string, schema: string): string {
 
 /**
  * Knowledge schema tables
- * Tables: knowledge_chunk, retrieval_feedback, reindex_jobs, user_sources, github_installations
+ * Tables: knowledge_chunk, retrieval_feedback, reindex_jobs, user_sources, github_installations, documents
  */
 export const KNOWLEDGE_TABLES = {
   knowledge_chunk: (schema: string) => qualifyTable("knowledge_chunk", schema),
@@ -70,6 +70,9 @@ export const KNOWLEDGE_TABLES = {
   reindex_jobs: (schema: string) => qualifyTable("reindex_jobs", schema),
   user_sources: (schema: string) => qualifyTable("user_sources", schema),
   github_installations: (schema: string) => qualifyTable("github_installations", schema),
+  // WP-410 срез-2b: legacy per-user table (personal-knowledge-mcp), predates the WP-268
+  // knowledge_chunk migration — never migrated because it only ever held personal notes.
+  documents: (schema: string) => qualifyTable("documents", schema),
 };
 
 /**

@@ -3,6 +3,7 @@
 import { describe, it, expect } from "vitest";
 import {
   PRIVATE_TOOL_NAMES,
+  DUAL_MODE_TOOL_NAMES,
   isToolAllowedInMode,
   JwtScopeGuard,
   ScopeDeniedError,
@@ -14,11 +15,38 @@ describe("PRIVATE_TOOL_NAMES", () => {
     // dispatched toolName from tools/call. See private.ts comment on the slice-1 mismatch.
     expect(PRIVATE_TOOL_NAMES.has("write")).toBe(true);
     expect(PRIVATE_TOOL_NAMES.has("propose_capture")).toBe(true);
+    expect(PRIVATE_TOOL_NAMES.has("delete")).toBe(true);
+    expect(PRIVATE_TOOL_NAMES.has("memory_search")).toBe(true);
+    expect(PRIVATE_TOOL_NAMES.has("connect_source")).toBe(true);
   });
 
   it("does not mark public tools as private", () => {
     expect(PRIVATE_TOOL_NAMES.has("search")).toBe(false);
     expect(PRIVATE_TOOL_NAMES.has("get_document")).toBe(false);
+  });
+
+  // WP-410 срез-2b turn 7-8 (peer-session 2026-07-01-27): tools/list and tools/call must never
+  // drift apart — a name present in one MCP endpoint but not the other reproduces exactly the
+  // "list says available, call refuses" class of bug Kimi flagged. PRIVATE_TOOLS (index.ts,
+  // schemas for tools/list) and PRIVATE_TOOL_NAMES (this file, gate for tools/call) are two
+  // separate literals kept in sync by hand — this guard fails loudly the day someone forgets one.
+  it("is disjoint from DUAL_MODE_TOOL_NAMES (a tool is never both private-only and dual-mode)", () => {
+    for (const name of PRIVATE_TOOL_NAMES) {
+      expect(DUAL_MODE_TOOL_NAMES.has(name)).toBe(false);
+    }
+  });
+});
+
+describe("DUAL_MODE_TOOL_NAMES", () => {
+  it("declares search/get_document/list_sources — same tool name, different backend by mode", () => {
+    expect(DUAL_MODE_TOOL_NAMES.has("search")).toBe(true);
+    expect(DUAL_MODE_TOOL_NAMES.has("get_document")).toBe(true);
+    expect(DUAL_MODE_TOOL_NAMES.has("list_sources")).toBe(true);
+  });
+
+  it("does not include list_documents or memory_search (public-only / private-only respectively)", () => {
+    expect(DUAL_MODE_TOOL_NAMES.has("list_documents")).toBe(false);
+    expect(DUAL_MODE_TOOL_NAMES.has("memory_search")).toBe(false);
   });
 });
 
@@ -26,10 +54,21 @@ describe("isToolAllowedInMode", () => {
   it("refuses a private tool in public mode", () => {
     expect(isToolAllowedInMode("write", "public")).toBe(false);
     expect(isToolAllowedInMode("propose_capture", "public")).toBe(false);
+    expect(isToolAllowedInMode("delete", "public")).toBe(false);
+    expect(isToolAllowedInMode("memory_search", "public")).toBe(false);
+    expect(isToolAllowedInMode("connect_source", "public")).toBe(false);
   });
 
   it("allows a private tool in private mode", () => {
     expect(isToolAllowedInMode("write", "private")).toBe(true);
+    expect(isToolAllowedInMode("connect_source", "private")).toBe(true);
+  });
+
+  it("allows dual-mode tools in both modes — never refused, only re-routed by mode", () => {
+    for (const name of DUAL_MODE_TOOL_NAMES) {
+      expect(isToolAllowedInMode(name, "public")).toBe(true);
+      expect(isToolAllowedInMode(name, "private")).toBe(true);
+    }
   });
 
   it("allows public tools in both modes", () => {

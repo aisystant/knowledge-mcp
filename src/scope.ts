@@ -355,3 +355,35 @@ async function tryInsertViolation(opts: InsertViolationOpts): Promise<void> {
     }));
   }
 }
+
+/**
+ * Provision the two bridge scope rows for a newly connected source. Idempotent upsert —
+ * safe to call unconditionally on every connect so a revoked/lost scope row self-heals.
+ * Ported from personal-knowledge-mcp/src/scope.ts:337-362 (peer-session 2026-07-01-27, срез-2b) — as-is.
+ */
+export async function provisionBridgeScopes(
+  indicatorsSql: NeonSql,
+  userId: string,
+  source: string,
+): Promise<void> {
+  const allowedRepos = [source];
+  await indicatorsSql`
+    INSERT INTO agent_scopes_mvp
+      (scope_kind, agent_id, user_id, allowed_repos, allowed_paths, allowed_operations, granted_by)
+    VALUES
+      ('bridge', 'iwe_bridge:personal_write',
+       ${userId}::uuid, ${allowedRepos}::text[], ARRAY['docs/**','inbox/**','**/*.md'], ARRAY['write'], 'bridge_install'),
+      ('bridge', 'iwe_bridge:personal_propose_capture',
+       ${userId}::uuid, ${allowedRepos}::text[], ARRAY['inbox/**','**/*.md'], ARRAY['propose'], 'bridge_install')
+    ON CONFLICT (agent_id, user_id) DO UPDATE SET
+      allowed_repos = ARRAY(SELECT DISTINCT unnest(agent_scopes_mvp.allowed_repos || EXCLUDED.allowed_repos)),
+      allowed_paths = EXCLUDED.allowed_paths,
+      allowed_operations = EXCLUDED.allowed_operations,
+      revoked_at = NULL
+  `;
+  console.log(JSON.stringify({
+    phase: "bridge_scopes_provisioned",
+    user_id: userId,
+    source,
+  }));
+}

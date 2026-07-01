@@ -9,6 +9,7 @@
 
 import { neon } from "@neondatabase/serverless";
 import { getKnowledgeSchema, KNOWLEDGE_TABLES } from "../utils/db.js";
+import { provisionBridgeScopes } from "../scope.js";
 
 export interface PersonalEnv {
   // Optional at the Env-interface level (only bound when MCP_MODE=private) — required at
@@ -17,6 +18,9 @@ export interface PersonalEnv {
   GITHUB_APP_ID?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
   KNOWLEDGE_DB_SCHEMA?: string;
+  OPENROUTER_API_KEY?: string;
+  /** Neon `indicators` DB. Required for provisionBridgeScopes (connect_source) — same DSN as PrivateGuard's authorize(). */
+  INDICATORS_DATABASE_URL?: string;
 }
 
 export interface UserSource {
@@ -226,4 +230,472 @@ export async function writeToGitHub(
 
   const result = (await putResp.json()) as { content: { sha: string; html_url: string } };
   return { success: true, sha: result.content.sha, url: result.content.html_url };
+}
+
+/**
+ * Delete a file from GitHub repo using Installation Token, and drop its index rows.
+ * Faithful port of personal-knowledge-mcp/src/index.ts:749-~800 (deleteFromGitHub).
+ */
+export async function deleteFromGitHub(
+  env: PersonalEnv,
+  ctx: UserContext,
+  source: string,
+  path: string,
+  message: string
+): Promise<{ success: boolean; error?: string }> {
+  const userSource = ctx.sources.find(s => s.source === source);
+  if (!userSource) return { success: false, error: `Unknown source: ${source}` };
+
+  const owner = userSource.githubOwner;
+  const repo = userSource.githubRepo;
+  const token = await getInstallationToken(env, owner);
+  if (!token) return { success: false, error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge` };
+
+  const fullPath = userSource.pathPrefix ? `${userSource.pathPrefix}${path}` : path;
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${fullPath}`;
+
+  const getResp = await fetch(apiUrl, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+  });
+  if (!getResp.ok) {
+    return { success: false, error: `File not found: ${path} in ${source}` };
+  }
+  const existing = (await getResp.json()) as { sha: string };
+
+  const delResp = await fetch(apiUrl, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge", "Content-Type": "application/json" },
+    body: JSON.stringify({ message, sha: existing.sha }),
+  });
+
+  if (!delResp.ok) {
+    const err = await delResp.text();
+    return { success: false, error: `GitHub API error ${delResp.status}: ${err}` };
+  }
+
+  if (!ctx.userId) {
+    return { success: false, error: "Invalid user context: missing userId" };
+  }
+  const sql = personalDb(env);
+  const schema = getKnowledgeSchema(env);
+  const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+  await sql`
+    DELETE FROM ${sql.unsafe(documentsTable)}
+    WHERE user_id = ${ctx.userId} AND source = ${source} AND (filename = ${path} OR filename LIKE ${path + "::%"})
+  `;
+
+  return { success: true };
+}
+
+// --- Personal search / read (WP-410 срез-2b, dual-mode private branch) ---
+// Faithful port of personal-knowledge-mcp/src/index.ts:176-585 (resolveGithubUrl, getEmbedding,
+// detectQueryType, keywordSearch, vectorSearch, searchDocuments, memorySearch, getDocument,
+// listSources) — reads env.DATABASE_URL (personal Neon DB), NOT env.KNOWLEDGE_DATABASE_URL
+// (public corpus, untouched by this file). No behavior change from the source.
+
+const EMBEDDING_MODEL = "openai/text-embedding-3-small";
+const VECTOR_CONFIDENCE_THRESHOLD = 0.6;
+const OPENAI_MAX_ATTEMPTS = 4;
+const OPENAI_BASE_DELAY_MS = 500;
+const OPENAI_MAX_DELAY_MS = 10_000;
+
+export type PersonalSearchResult = {
+  filename: string;
+  content: string;
+  source: string;
+  source_type: string;
+  score: number;
+  github_url: string | null;
+};
+export type PersonalMemorySearchResult = PersonalSearchResult & { updated_at: string; age_days: number };
+
+function personalGithubUrl(ctx: UserContext, source: string, filename: string): string | null {
+  const userSource = ctx.sources.find(s => s.source === source);
+  if (!userSource) return null;
+  const cleanFilename = filename.split("::")[0];
+  const prefix = userSource.pathPrefix ? `${userSource.pathPrefix}/` : "";
+  return `https://github.com/${userSource.githubOwner}/${userSource.githubRepo}/blob/main/${prefix}${cleanFilename}`;
+}
+
+async function personalGetEmbedding(apiKey: string, text: string): Promise<number[]> {
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt++) {
+    const response = await fetch("https://openrouter.ai/api/v1/embeddings", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ input: [text], model: EMBEDDING_MODEL, dimensions: 1024 }),
+    });
+
+    if (response.ok) {
+      const data = (await response.json()) as { data: { embedding: number[] }[] };
+      return data.data[0].embedding;
+    }
+
+    const errText = await response.text();
+    const isRetryable = response.status >= 500 || response.status === 429;
+    if (!isRetryable || attempt === OPENAI_MAX_ATTEMPTS) {
+      throw new Error(`OpenAI Embeddings error: ${response.status} ${errText}`);
+    }
+
+    const retryAfterHeader = response.headers.get("retry-after");
+    const retryAfterMs = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : 0;
+    const backoffMs = OPENAI_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+    const delay = Math.min(Math.max(retryAfterMs, backoffMs), OPENAI_MAX_DELAY_MS);
+    lastErr = new Error(`OpenAI ${response.status}: ${errText.slice(0, 200)}`);
+    await new Promise((r) => setTimeout(r, delay));
+  }
+  throw lastErr instanceof Error ? lastErr : new Error("OpenAI Embeddings retry exhausted");
+}
+
+type PersonalQueryType = "keyword" | "vector";
+
+export function detectPersonalQueryType(query: string): PersonalQueryType {
+  if (/[A-Z]{2,}\.\w+\.\d+/.test(query)) return "keyword";
+  if (query.length < 30 && /\.[A-Z]/.test(query)) return "keyword";
+  return "vector";
+}
+
+async function personalKeywordSearch(
+  env: PersonalEnv,
+  ctx: UserContext,
+  query: string,
+  source: string | undefined,
+  limit: number
+): Promise<PersonalSearchResult[]> {
+  const sql = personalDb(env);
+  const schema = getKnowledgeSchema(env);
+  const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+  const src = source ?? null;
+  const pattern = `%${query}%`;
+  const ftsQuery = query.replace(/-/g, " ");
+  const sourceNames = ctx.sourceNames;
+
+  const entityMatch = query.match(/[A-Z]{2,}\.\w+\.\d+/);
+  const entityPattern = entityMatch ? `%${entityMatch[0]}%` : null;
+  const sectionRest = entityMatch ? query.replace(entityMatch[0], "").replace(/[§#]/g, "").trim() : null;
+  const sectionPattern = sectionRest ? `%${sectionRest}%` : null;
+
+  const rows = await sql`
+    SELECT filename, content, source, source_type,
+           CASE
+             WHEN filename ILIKE ${pattern} THEN 1.0
+             WHEN ${entityPattern}::text IS NOT NULL
+                  AND filename ILIKE ${entityPattern}
+                  AND ${sectionPattern}::text IS NOT NULL
+                  AND content ILIKE ${sectionPattern} THEN 0.98
+             WHEN filename ILIKE ${entityPattern} AND ${entityPattern}::text IS NOT NULL THEN 0.95
+             WHEN content ILIKE ${pattern} THEN 0.90
+             WHEN search_vector @@ plainto_tsquery('simple', ${ftsQuery}) THEN 0.8
+             ELSE 0.5
+           END AS score
+    FROM ${sql.unsafe(documentsTable)}
+    WHERE (content ILIKE ${pattern}
+           OR filename ILIKE ${pattern}
+           OR search_vector @@ plainto_tsquery('simple', ${ftsQuery})
+           OR (${entityPattern}::text IS NOT NULL AND filename ILIKE ${entityPattern}))
+      AND user_id = ${ctx.userId}
+      AND source = ANY(${sourceNames})
+      AND (${src}::text IS NULL OR source = ${src})
+    ORDER BY score DESC,
+             CASE WHEN filename ILIKE ${pattern} THEN 0 ELSE 1 END,
+             length(content) DESC
+    LIMIT ${limit}
+  `;
+
+  return rows.map((r) => ({
+    filename: r.filename as string,
+    content: r.content as string,
+    source: (r.source as string) || "",
+    source_type: (r.source_type as string) || "",
+    score: r.score as number,
+    github_url: personalGithubUrl(ctx, (r.source as string) || "", r.filename as string),
+  }));
+}
+
+async function personalVectorSearch(
+  env: PersonalEnv,
+  ctx: UserContext,
+  query: string,
+  source: string | undefined,
+  limit: number
+): Promise<PersonalSearchResult[]> {
+  const embedding = await personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query);
+  const vec = `[${embedding.join(",")}]`;
+  const sql = personalDb(env);
+  const schema = getKnowledgeSchema(env);
+  const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+  const src = source ?? null;
+  const sourceNames = ctx.sourceNames;
+
+  const rows = await sql`
+    SELECT filename, content, source, source_type,
+           1 - (embedding <=> ${vec}::vector) AS score
+    FROM ${sql.unsafe(documentsTable)}
+    WHERE user_id = ${ctx.userId}
+      AND source = ANY(${sourceNames})
+      AND (${src}::text IS NULL OR source = ${src})
+    ORDER BY embedding <=> ${vec}::vector
+    LIMIT ${limit}
+  `;
+
+  return rows.map((r) => ({
+    filename: r.filename as string,
+    content: r.content as string,
+    source: (r.source as string) || "",
+    source_type: (r.source_type as string) || "",
+    score: r.score as number,
+    github_url: personalGithubUrl(ctx, (r.source as string) || "", r.filename as string),
+  }));
+}
+
+/** Private-mode `search`: personal corpus only (env.DATABASE_URL), scoped to ctx.sourceNames. */
+export async function personalSearchDocuments(
+  env: PersonalEnv,
+  ctx: UserContext,
+  query: string,
+  source: string | undefined,
+  limit: number = 5
+): Promise<PersonalSearchResult[]> {
+  const queryType = detectPersonalQueryType(query);
+
+  if (queryType === "keyword") {
+    const kwResults = await personalKeywordSearch(env, ctx, query, source, limit);
+    if (kwResults.length > 0) return kwResults;
+  }
+
+  const vectorResults = await personalVectorSearch(env, ctx, query, source, limit);
+
+  if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
+    const kwFallback = await personalKeywordSearch(env, ctx, query, source, limit);
+    if (kwFallback.length > 0) {
+      const seen = new Map<string, PersonalSearchResult>();
+      for (const r of [...kwFallback, ...vectorResults]) {
+        const existing = seen.get(r.filename);
+        if (!existing || r.score > existing.score) seen.set(r.filename, r);
+      }
+      return [...seen.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+    }
+  }
+
+  return vectorResults;
+}
+
+/** Private-mode `memory_search`: recency-weighted personal search. No public equivalent. */
+export async function personalMemorySearch(
+  env: PersonalEnv,
+  ctx: UserContext,
+  query: string,
+  recencyDays: number | undefined,
+  limit: number = 5
+): Promise<PersonalMemorySearchResult[]> {
+  const embedding = await personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query);
+  const vec = `[${embedding.join(",")}]`;
+  const sql = personalDb(env);
+  const schema = getKnowledgeSchema(env);
+  const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+  const sourceNames = ctx.sourceNames;
+  const cutoff = recencyDays ? new Date(Date.now() - recencyDays * 24 * 60 * 60 * 1000).toISOString() : null;
+
+  const rows = await sql`
+    SELECT filename, content, source, source_type, updated_at,
+           1 - (embedding <=> ${vec}::vector) AS base_score
+    FROM ${sql.unsafe(documentsTable)}
+    WHERE user_id = ${ctx.userId}
+      AND source = ANY(${sourceNames})
+      AND (${cutoff}::timestamptz IS NULL OR updated_at >= ${cutoff}::timestamptz)
+    ORDER BY embedding <=> ${vec}::vector
+    LIMIT ${limit * 3}
+  `;
+
+  const now = Date.now();
+  return rows
+    .map((r) => {
+      const ageDays = (now - new Date(r.updated_at as string).getTime()) / (1000 * 60 * 60 * 24);
+      const decayFactor = ageDays <= 14 ? 1.0 : ageDays <= 30 ? 0.7 : 0.4;
+      return {
+        filename: r.filename as string,
+        content: r.content as string,
+        source: (r.source as string) || "",
+        source_type: (r.source_type as string) || "",
+        score: (r.base_score as number) * decayFactor,
+        github_url: personalGithubUrl(ctx, (r.source as string) || "", r.filename as string),
+        updated_at: r.updated_at as string,
+        age_days: Math.round(ageDays),
+      };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+}
+
+/** Private-mode `get_document`: personal corpus only. */
+export async function personalGetDocument(
+  env: PersonalEnv,
+  ctx: UserContext,
+  filename: string,
+  source?: string
+): Promise<{ filename: string; content: string; source: string; source_type: string; github_url: string | null } | null> {
+  const sql = personalDb(env);
+  const schema = getKnowledgeSchema(env);
+  const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+  const src = source ?? null;
+  const sourceNames = ctx.sourceNames;
+  const baseName = filename.includes("::") ? filename.split("::")[0] : filename;
+  const chunkPrefix = `${baseName}::%`;
+
+  const rows = await sql`
+    SELECT filename, content, source, source_type
+    FROM ${sql.unsafe(documentsTable)}
+    WHERE (filename = ${filename} OR filename LIKE ${chunkPrefix})
+      AND user_id = ${ctx.userId}
+      AND source = ANY(${sourceNames})
+      AND (${src}::text IS NULL OR source = ${src})
+    ORDER BY
+      CASE WHEN filename = ${filename} THEN 0 ELSE 1 END,
+      filename
+    LIMIT 1
+  `;
+
+  if (!rows.length) return null;
+  const r = rows[0];
+  return {
+    filename: r.filename as string,
+    content: r.content as string,
+    source: (r.source as string) || "",
+    source_type: (r.source_type as string) || "",
+    github_url: personalGithubUrl(ctx, (r.source as string) || "", r.filename as string),
+  };
+}
+
+/** Private-mode `list_sources`: personal corpus only. */
+export async function personalListSources(
+  env: PersonalEnv,
+  ctx: UserContext
+): Promise<{ source: string; source_type: string; doc_count: number }[]> {
+  const sql = personalDb(env);
+  const sourceNames = ctx.sourceNames;
+  const docsTable = KNOWLEDGE_TABLES.documents(getKnowledgeSchema(env));
+
+  const rows = await sql`
+    SELECT source, source_type, COUNT(*)::int AS doc_count
+    FROM ${sql.unsafe(docsTable)}
+    WHERE user_id = ${ctx.userId}
+      AND source = ANY(${sourceNames})
+    GROUP BY source, source_type
+    ORDER BY source_type, source
+  `;
+
+  return rows.map((r) => ({
+    source: (r.source as string) || "",
+    source_type: (r.source_type as string) || "",
+    doc_count: r.doc_count as number,
+  }));
+}
+
+// --- connect_source (WP-410 срез-2b) ---
+// Faithful port of personal-knowledge-mcp/src/index.ts:2704-~2793 (connectSource), MINUS the
+// reindex trigger (Step 3 of the original): pilot decision 2026-07-01 (peer-session
+// 2026-07-01-27) defers the whole reindex pipeline (queue producer/consumer, GitHub tree walk,
+// embeddings, watchdog cron) to Деплой-2, so newly-connected sources aren't indexed until then.
+// provisionBridgeScopes (Step 2 of the original) is NOT deferred — it is the reason connect_source
+// is in Деплой-1 at all (WP-410 explicit requirement).
+export interface ConnectSourceResult {
+  source: string;
+  status: "newly_connected" | "reactivated" | "already_connected" | "error";
+  scope_provisioning: "ok" | "failed" | "skipped";
+  reindex_triggered: false;
+  message?: string;
+  error?: string;
+}
+
+export async function connectSource(
+  env: PersonalEnv,
+  userId: string,
+  source: string
+): Promise<ConnectSourceResult> {
+  const sql = personalDb(env);
+  const schema = getKnowledgeSchema(env);
+  const githubInstallationsTable = KNOWLEDGE_TABLES.github_installations(schema);
+  const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
+
+  const installRows = await sql`
+    SELECT github_username, repos FROM ${sql.unsafe(githubInstallationsTable)}
+    WHERE user_id = ${userId}
+    LIMIT 1
+  `;
+  if (installRows.length === 0) {
+    return {
+      source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
+      error: "GitHub App не подключён. Сначала выполни github_connect и установи App.",
+    };
+  }
+  const repos = (installRows[0].repos as string[]) || [];
+  const githubUsername = installRows[0].github_username as string;
+  if (!repos.includes(source)) {
+    return {
+      source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
+      error: `Репо '${source}' не входит в твою GitHub App installation. Доступные: ${repos.join(", ")}.`,
+    };
+  }
+
+  const currentRows = await sql`
+    SELECT active FROM ${sql.unsafe(userSourcesTable)}
+    WHERE user_id = ${userId} AND source = ${source}
+    LIMIT 1
+  `;
+  const wasActive = currentRows.length > 0 ? (currentRows[0].active as boolean) : null;
+
+  let resultStatus: "newly_connected" | "reactivated" | "already_connected";
+  if (wasActive === null) {
+    await sql`
+      INSERT INTO ${sql.unsafe(userSourcesTable)} (user_id, source, github_owner, github_repo, source_type, active)
+      VALUES (${userId}, ${source}, ${githubUsername}, ${source}, ${inferSourceType(source)}, true)
+      ON CONFLICT (user_id, source) DO UPDATE SET active = true,
+        github_owner = EXCLUDED.github_owner, github_repo = EXCLUDED.github_repo
+    `;
+    resultStatus = "newly_connected";
+  } else if (wasActive === false) {
+    await sql`
+      UPDATE ${sql.unsafe(userSourcesTable)} SET active = true
+      WHERE user_id = ${userId} AND source = ${source}
+    `;
+    resultStatus = "reactivated";
+  } else {
+    resultStatus = "already_connected";
+  }
+
+  // WP-410: provision bridge write-scopes in-process — unconditional on every connect so a
+  // revoked/lost scope row self-heals on re-connect (idempotent upsert).
+  let scopeProvisioning: "ok" | "failed" | "skipped" = "skipped";
+  if (env.INDICATORS_DATABASE_URL) {
+    try {
+      await provisionBridgeScopes(neon(env.INDICATORS_DATABASE_URL), userId, source);
+      scopeProvisioning = "ok";
+    } catch (err) {
+      scopeProvisioning = "failed";
+      console.error(JSON.stringify({
+        phase: "bridge_scopes_provision_failed",
+        severity: "error",
+        user_id_prefix: userId.slice(0, 8),
+        source,
+        error: err instanceof Error ? err.message : String(err),
+      }));
+    }
+  }
+
+  return {
+    source,
+    status: resultStatus,
+    scope_provisioning: scopeProvisioning,
+    reindex_triggered: false,
+    message: scopeProvisioning === "failed"
+      ? "репо подключён для чтения, но запись пока не разрешена — повтори connect_source"
+      : "репо подключено. Переиндексация появится в следующем релизе — уже загруженные документы доступны сейчас.",
+  };
+}
+
+// Mirror knowledge-mcp/migrations/008-unique-per-user.sql:resolveSourceType.
+function inferSourceType(source: string): "pack" | "guides" | "ds" {
+  if (source.startsWith("PACK-") || source === "SPF" || source === "FPF" || source === "ZP") return "pack";
+  if (source.startsWith("docs-") || source.endsWith("-docs")) return "guides";
+  return "ds";
 }

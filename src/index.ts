@@ -24,9 +24,18 @@ import {
 } from "./utils/db.js";
 import { reindexConceptsForFiles } from "./concept-indexer.js";
 import { resolveMode, type McpMode } from "./mode.js";
-import { isToolAllowedInMode, JwtScopeGuard, ScopeDeniedError, PRIVATE_TOOL_NAMES } from "./layers/private.js";
+import { isToolAllowedInMode, JwtScopeGuard, ScopeDeniedError, PRIVATE_TOOL_NAMES, DUAL_MODE_TOOL_NAMES } from "./layers/private.js";
 import { verifyJwtLocally } from "./auth.js";
-import { resolveUserContext, writeToGitHub } from "./layers/personal.js";
+import {
+  resolveUserContext,
+  writeToGitHub,
+  deleteFromGitHub,
+  personalSearchDocuments,
+  personalGetDocument,
+  personalListSources,
+  personalMemorySearch,
+  connectSource,
+} from "./layers/personal.js";
 
 // --- Types ---
 
@@ -1917,11 +1926,48 @@ const PRIVATE_TOOLS = [
       required: ["content"],
     },
   },
+  {
+    name: "delete",
+    description: "Delete a file from a personal knowledge repo via GitHub.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: { type: "string", description: "Target repo (source name)" },
+        path: { type: "string", description: "File path relative to repo root" },
+        message: { type: "string", description: "Commit message (default: 'Delete via Aisystant MCP')" },
+      },
+      required: ["source", "path"],
+    },
+  },
+  {
+    name: "memory_search",
+    description: "Recency-weighted search over personal notes — favors recently updated documents over pure relevance.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search query" },
+        recency_days: { type: "number", description: "Only consider documents updated within this many days" },
+        limit: { type: "number", description: "Max results (default 5)" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "connect_source",
+    description: "Connect a GitHub repo (already installed via the Aisystant Knowledge GitHub App) as a personal knowledge source. Reindexing of newly connected sources ships in a follow-up release — already-indexed content is searchable immediately.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: { type: "string", description: "Repo name, as it appears in the GitHub App installation" },
+      },
+      required: ["source"],
+    },
+  },
 ];
 
 // --- MCP handler ---
 
-async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public", rawRequest?: Request): Promise<McpResponse> {
+export async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public", rawRequest?: Request): Promise<McpResponse> {
   const { id, method, params } = request;
 
   try {
@@ -1976,22 +2022,38 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, 
           const ctx = await resolveUserContext(env, principal.userId);
           const meta = (params as { _meta?: Record<string, unknown> })._meta;
           const requestId = typeof meta?.request_id === "string" ? meta.request_id : undefined;
-          const canonicalToolName = toolName === "write" ? "personal_write" : "personal_propose_capture";
 
-          try {
-            await guard.authorize(principal, {
-              toolName: canonicalToolName,
-              args,
-              requestId,
-              activeSources: ctx.sourceNames,
-              indicatorsDatabaseUrl: env.INDICATORS_DATABASE_URL,
-              scopeGuardMode: env.SCOPE_GUARD_MODE,
-            });
-          } catch (err) {
-            if (err instanceof ScopeDeniedError) {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ error: err.denyResponse }) }], isError: true } };
+          // write / propose_capture / delete go through the bridge write-scope check.
+          // `delete` reuses the "personal_write" canonical scope (WP-410 срез-2b, peer-session
+          // 2026-07-01-27): the original personal-knowledge-mcp never scope-checked delete at
+          // all — the boundary used to be the gateway, not in-process. Now that write/
+          // propose_capture get an in-process authorize() call, leaving delete unguarded would
+          // be a NEW asymmetry, not a preserved one. There is no dedicated "delete" scope type
+          // in agent_scopes_mvp; reusing personal_write's write-operation grant is the minimal
+          // fix (same repo/path scope that already governs writes to this source).
+          const SCOPE_CHECKED_TOOLS: Readonly<Record<string, string>> = {
+            write: "personal_write",
+            propose_capture: "personal_propose_capture",
+            delete: "personal_write",
+          };
+          const canonicalToolName = SCOPE_CHECKED_TOOLS[toolName];
+
+          if (canonicalToolName) {
+            try {
+              await guard.authorize(principal, {
+                toolName: canonicalToolName,
+                args,
+                requestId,
+                activeSources: ctx.sourceNames,
+                indicatorsDatabaseUrl: env.INDICATORS_DATABASE_URL,
+                scopeGuardMode: env.SCOPE_GUARD_MODE,
+              });
+            } catch (err) {
+              if (err instanceof ScopeDeniedError) {
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ error: err.denyResponse }) }], isError: true } };
+              }
+              throw err;
             }
-            throw err;
           }
 
           if (toolName === "write") {
@@ -2008,27 +2070,109 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, 
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(writeResult, null, 2) }] } };
           }
 
-          // propose_capture
-          const content = args.content as string;
-          const suggestedSource = (args.suggested_source as string) || ctx.sourceNames[0];
-          const suggestedPath = (args.suggested_path as string) || `inbox/${new Date().toISOString().slice(0, 10)}-capture.md`;
-          return {
-            jsonrpc: "2.0",
-            id,
-            result: {
-              content: [{
-                type: "text",
-                text: JSON.stringify({
-                  action: "propose_capture",
-                  source: suggestedSource,
-                  path: suggestedPath,
-                  content_preview: content.slice(0, 500) + (content.length > 500 ? "..." : ""),
-                  content_length: content.length,
-                  hint: "Call 'write' with these parameters to confirm the capture.",
-                }, null, 2),
-              }],
-            },
-          };
+          if (toolName === "propose_capture") {
+            const content = args.content as string;
+            const suggestedSource = (args.suggested_source as string) || ctx.sourceNames[0];
+            const suggestedPath = (args.suggested_path as string) || `inbox/${new Date().toISOString().slice(0, 10)}-capture.md`;
+            return {
+              jsonrpc: "2.0",
+              id,
+              result: {
+                content: [{
+                  type: "text",
+                  text: JSON.stringify({
+                    action: "propose_capture",
+                    source: suggestedSource,
+                    path: suggestedPath,
+                    content_preview: content.slice(0, 500) + (content.length > 500 ? "..." : ""),
+                    content_length: content.length,
+                    hint: "Call 'write' with these parameters to confirm the capture.",
+                  }, null, 2),
+                }],
+              },
+            };
+          }
+
+          if (toolName === "delete") {
+            const source = args.source as string;
+            const path = args.path as string;
+            const message = (args.message as string) || "Delete via Aisystant MCP";
+
+            if (!ctx.sourceNames.includes(source)) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
+            }
+
+            const deleteResult = await deleteFromGitHub(env, ctx, source, path, message);
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(deleteResult, null, 2) }] } };
+          }
+
+          if (toolName === "memory_search") {
+            const results = await personalMemorySearch(
+              env,
+              ctx,
+              args.query as string,
+              args.recency_days as number | undefined,
+              (args.limit as number) || 5
+            );
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] } };
+          }
+
+          if (toolName === "connect_source") {
+            const connectResult = await connectSource(env, principal.userId, args.source as string);
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(connectResult, null, 2) }] } };
+          }
+
+          // Defensive: every name in PRIVATE_TOOL_NAMES must have a dispatch branch above —
+          // reaching here means the two were extended out of sync (see tools/list symmetry note).
+          return { jsonrpc: "2.0", id, error: { code: -32601, message: `Private tool "${toolName}" has no dispatch handler` } };
+        }
+
+        // WP-410 срез-2b: dual-mode tools (exist in both modes, different backend). In private
+        // mode, route to the personal-corpus implementation and return BEFORE the public-mode
+        // code below — the public `searchDocuments`/`getDocument`/`listSources` functions and
+        // their account_id IS NULL filtering are untouched by this branch (regression-test §Б.4:
+        // 0 diff in their bodies). In public mode this whole block is skipped (mode !== "private").
+        if (mode === "private" && DUAL_MODE_TOOL_NAMES.has(toolName)) {
+          if (!rawRequest) {
+            return { jsonrpc: "2.0", id, error: { code: -32001, message: "Private tool requires request context" } };
+          }
+          const guard = new JwtScopeGuard(env.ORY_URL);
+          const principal = await guard.authenticate(rawRequest);
+          if (!principal) {
+            return {
+              jsonrpc: "2.0", id,
+              result: {
+                content: [{ type: "text", text: JSON.stringify({
+                  error: { code: -32001, message: "unauthenticated", data: { reason: "unauthenticated", attempted_tool: toolName } },
+                }) }],
+                isError: true,
+              },
+            };
+          }
+          const ctx = await resolveUserContext(env, principal.userId);
+
+          if (toolName === "search") {
+            const results = await personalSearchDocuments(
+              env,
+              ctx,
+              args.query as string,
+              args.source as string | undefined,
+              (args.limit as number) || 5
+            );
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] } };
+          }
+
+          if (toolName === "get_document") {
+            const doc = await personalGetDocument(env, ctx, args.filename as string, args.source as string | undefined);
+            if (!doc) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Document not found" }], isError: true } };
+            }
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: doc.content }] } };
+          }
+
+          // list_sources
+          const sources = await personalListSources(env, ctx);
+          return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(sources, null, 2) }] } };
         }
 
         if (toolName === "search") {

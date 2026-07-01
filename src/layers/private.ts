@@ -33,11 +33,27 @@ export interface Principal {
 export const PRIVATE_TOOL_NAMES: ReadonlySet<string> = new Set([
   "write",
   "propose_capture",
+  "delete",
+  "memory_search",
+  "connect_source",
+]);
+
+/**
+ * Tools that exist in BOTH modes with a different backend (public corpus vs personal Neon
+ * DB) — unlike PRIVATE_TOOL_NAMES, these are never refused; `isToolAllowedInMode` always
+ * returns true for them. The dispatcher checks this set BEFORE its public-mode handler to
+ * route to the private implementation without touching the public code path at all.
+ */
+export const DUAL_MODE_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "search",
+  "get_document",
+  "list_sources",
 ]);
 
 /**
  * Whether a tool may be invoked in the given mode. Private-only tools are refused in
- * public mode (they carry no public data path); everything else is allowed.
+ * public mode (they carry no public data path); everything else (public tools and
+ * dual-mode tools) is allowed.
  */
 export function isToolAllowedInMode(toolName: string, mode: McpMode): boolean {
   return !(mode === "public" && PRIVATE_TOOL_NAMES.has(toolName));

@@ -20,6 +20,7 @@ import {
   checkBridgeWriteScope,
   shouldBlockOnScope,
   BRIDGE_WRITE_TOOLS,
+  provisionBridgeScopes,
 } from "./scope.js";
 
 // --- neon sql mock: routes by query text (SELECT → scope rows, INSERT → []) ---
@@ -201,5 +202,26 @@ describe("shouldBlockOnScope: enforce fail-open classification (WP-410, peer-ses
 
   it("ok never blocks", () => {
     expect(shouldBlockOnScope("ok")).toBe(false);
+  });
+});
+
+describe("provisionBridgeScopes (WP-410 срез-2b, connect_source)", () => {
+  it("upserts both bridge scope rows for the given user/source", async () => {
+    const calls: { strings: string; values: unknown[] }[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const recordingSql: any = (strings: TemplateStringsArray, ...values: unknown[]) => {
+      calls.push({ strings: strings.join("?"), values });
+      return Promise.resolve([]);
+    };
+
+    await provisionBridgeScopes(recordingSql, "user-1", "DS-my-strategy");
+
+    expect(calls).toHaveLength(1);
+    const [{ strings, values }] = calls;
+    expect(strings).toContain("INSERT INTO agent_scopes_mvp");
+    expect(strings).toContain("ON CONFLICT (agent_id, user_id) DO UPDATE SET");
+    // Interpolated values, in template order: userId, allowedRepos, userId, allowedRepos.
+    expect(values).toContain("user-1");
+    expect(values).toContainEqual(["DS-my-strategy"]);
   });
 });
