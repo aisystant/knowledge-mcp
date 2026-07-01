@@ -13,7 +13,6 @@
  */
 
 import { neon } from "@neondatabase/serverless";
-import { createRemoteJWKSet, jwtVerify } from "jose";
 import { withUserContext } from "./rls.js";
 import {
   getKnowledgeSchema,
@@ -25,7 +24,9 @@ import {
 } from "./utils/db.js";
 import { reindexConceptsForFiles } from "./concept-indexer.js";
 import { resolveMode, type McpMode } from "./mode.js";
-import { isToolAllowedInMode } from "./layers/private.js";
+import { isToolAllowedInMode, JwtScopeGuard, ScopeDeniedError, PRIVATE_TOOL_NAMES } from "./layers/private.js";
+import { verifyJwtLocally } from "./auth.js";
+import { resolveUserContext, writeToGitHub } from "./layers/personal.js";
 
 // --- Types ---
 
@@ -46,6 +47,17 @@ export interface Env {
   // WP-410 Q1: operating mode. unset/"public" → public corpus only; "private" → Ory JWT + personal
   // corpus (slice 2). Unknown non-empty value → HTTP 500 fail-closed. See src/mode.ts, ADR-IWE-018.
   MCP_MODE?: string;
+  // WP-410 срез-2b: private-mode data layer, carried over from personal-knowledge-mcp with the
+  // same binding names it already runs under on the personal-knowledge-mcp worker (inherit-secrets
+  // cut-over — see ADR-mcp-unification-q1, security-gate-b73-private-port.md §6).
+  /** Personal Neon DB (user_sources, per-user content). Required when MCP_MODE=private. */
+  DATABASE_URL?: string;
+  /** Neon `indicators` DB (agent_scopes_mvp / agent_scope_violations) for the bridge scope guard. */
+  INDICATORS_DATABASE_URL?: string;
+  /** "off" (default) | "shadow" (compute+log, never block) | "enforce" (block on deny). */
+  SCOPE_GUARD_MODE?: string;
+  GITHUB_APP_ID?: string;
+  GITHUB_APP_PRIVATE_KEY?: string;
 }
 
 function activeDsn(env: Env): string {
@@ -79,34 +91,6 @@ interface ReindexFile {
 interface ReindexRequest {
   source: string;
   files: ReindexFile[];
-}
-
-// --- JWT verification (B4.21) ---
-
-const _jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
-
-function getJwks(oryUrl: string): ReturnType<typeof createRemoteJWKSet> {
-  if (!_jwksCache.has(oryUrl)) {
-    // ORY_URL is the Hydra base URL (e.g. https://auth.system-school.ru/hydra)
-    // JWKS is served at <oryUrl>/.well-known/jwks.json — same pattern as gateway-mcp
-    const jwksUrl = new URL(`${oryUrl}/.well-known/jwks.json`);
-    _jwksCache.set(oryUrl, createRemoteJWKSet(jwksUrl));
-  }
-  return _jwksCache.get(oryUrl)!;
-}
-
-async function verifyJwtLocally(oryUrl: string, token: string): Promise<string | null> {
-  try {
-    const jwks = getJwks(oryUrl);
-    const issuer = oryUrl.endsWith("/") ? oryUrl : oryUrl + "/";
-    const { payload } = await jwtVerify(token, jwks, {
-      issuer,
-      algorithms: ["RS256"],
-    });
-    return payload.sub ?? null;
-  } catch {
-    return null;
-  }
 }
 
 // --- Config ---
@@ -1900,9 +1884,44 @@ const TOOLS = [
   },
 ];
 
+// Private-only tools (WP-410 срез-2b) — only surfaced in tools/list when MCP_MODE=private.
+// Ported from personal-knowledge-mcp/src/index.ts getTools() write/propose_capture entries.
+// No per-user `source` enum here (unlike the original getTools(ctx)): knowledge-mcp's tool
+// list is a static const, not rebuilt per-request; source is validated at runtime instead
+// (isToolAllowedInMode + ctx.sourceNames check in the handler) — same enforcement, no schema hint.
+const PRIVATE_TOOLS = [
+  {
+    name: "write",
+    description: "Write a file to a personal knowledge repo via GitHub. Creates or updates the file and triggers reindexing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: { type: "string", description: "Target repo (source name)" },
+        path: { type: "string", description: "File path relative to repo root (e.g. 'notes/my-note.md')" },
+        content: { type: "string", description: "File content (markdown)" },
+        message: { type: "string", description: "Commit message (default: 'Update via Aisystant MCP')" },
+      },
+      required: ["source", "path", "content"],
+    },
+  },
+  {
+    name: "propose_capture",
+    description: "Propose capturing knowledge to a personal repo. Returns a preview of what would be written. Call 'write' to confirm.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        content: { type: "string", description: "Knowledge content to capture" },
+        suggested_source: { type: "string", description: "Suggested target repo" },
+        suggested_path: { type: "string", description: "Suggested file path" },
+      },
+      required: ["content"],
+    },
+  },
+];
+
 // --- MCP handler ---
 
-async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public"): Promise<McpResponse> {
+async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public", rawRequest?: Request): Promise<McpResponse> {
   const { id, method, params } = request;
 
   try {
@@ -1919,19 +1938,96 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, 
         };
 
       case "tools/list":
-        return { jsonrpc: "2.0", id, result: { tools: TOOLS } };
+        return { jsonrpc: "2.0", id, result: { tools: mode === "private" ? [...TOOLS, ...PRIVATE_TOOLS] : TOOLS } };
 
       case "tools/call": {
         const toolName = (params as { name: string }).name;
         const args = (params as { arguments: Record<string, unknown> }).arguments || {};
 
         // WP-410 Q1: private-only tools carry no public data path. Refuse them in public
-        // mode before dispatch. Slice 2 wires the PrivateGuard for the private-mode path.
+        // mode before dispatch.
         if (!isToolAllowedInMode(toolName, mode)) {
           return {
             jsonrpc: "2.0",
             id,
             error: { code: -32601, message: `Tool "${toolName}" is not available in public mode` },
+          };
+        }
+
+        // WP-410 срез-2b: private tools go through PrivateGuard before dispatch.
+        if (PRIVATE_TOOL_NAMES.has(toolName)) {
+          if (!rawRequest) {
+            return { jsonrpc: "2.0", id, error: { code: -32001, message: "Private tool requires request context" } };
+          }
+          const guard = new JwtScopeGuard(env.ORY_URL);
+          const principal = await guard.authenticate(rawRequest);
+          if (!principal) {
+            return {
+              jsonrpc: "2.0", id,
+              result: {
+                content: [{ type: "text", text: JSON.stringify({
+                  error: { code: -32001, message: "unauthenticated", data: { reason: "unauthenticated", attempted_tool: toolName } },
+                }) }],
+                isError: true,
+              },
+            };
+          }
+
+          const ctx = await resolveUserContext(env, principal.userId);
+          const meta = (params as { _meta?: Record<string, unknown> })._meta;
+          const requestId = typeof meta?.request_id === "string" ? meta.request_id : undefined;
+          const canonicalToolName = toolName === "write" ? "personal_write" : "personal_propose_capture";
+
+          try {
+            await guard.authorize(principal, {
+              toolName: canonicalToolName,
+              args,
+              requestId,
+              activeSources: ctx.sourceNames,
+              indicatorsDatabaseUrl: env.INDICATORS_DATABASE_URL,
+              scopeGuardMode: env.SCOPE_GUARD_MODE,
+            });
+          } catch (err) {
+            if (err instanceof ScopeDeniedError) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ error: err.denyResponse }) }], isError: true } };
+            }
+            throw err;
+          }
+
+          if (toolName === "write") {
+            const source = args.source as string;
+            const path = args.path as string;
+            const content = args.content as string;
+            const message = (args.message as string) || "Update via Aisystant MCP";
+
+            if (!ctx.sourceNames.includes(source)) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
+            }
+
+            const writeResult = await writeToGitHub(env, ctx, source, path, content, message);
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(writeResult, null, 2) }] } };
+          }
+
+          // propose_capture
+          const content = args.content as string;
+          const suggestedSource = (args.suggested_source as string) || ctx.sourceNames[0];
+          const suggestedPath = (args.suggested_path as string) || `inbox/${new Date().toISOString().slice(0, 10)}-capture.md`;
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  action: "propose_capture",
+                  source: suggestedSource,
+                  path: suggestedPath,
+                  content_preview: content.slice(0, 500) + (content.length > 500 ? "..." : ""),
+                  content_length: content.length,
+                  hint: "Call 'write' with these parameters to confirm the capture.",
+                }, null, 2),
+              }],
+            },
           };
         }
 
@@ -2707,7 +2803,7 @@ export default {
       }
 
       const body = (await request.json()) as McpRequest;
-      const response = await handleMcpRequest(body, env, userId, mode);
+      const response = await handleMcpRequest(body, env, userId, mode, request);
       const responseHeaders: Record<string, string> = {
         ...corsHeaders,
         "Content-Type": "application/json",
