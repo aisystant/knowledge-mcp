@@ -38,6 +38,7 @@ import {
   disconnectSource,
   purgeSource,
 } from "./layers/personal.js";
+import { handleQueue, type ReindexBatchMessage } from "./layers/reindex.js";
 
 // --- Types ---
 
@@ -69,6 +70,9 @@ export interface Env {
   SCOPE_GUARD_MODE?: string;
   GITHUB_APP_ID?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
+  // WP-410 срез-2b Деплой-2 группа Б: reindex queue producer/consumer binding, same queue name
+  // ("reindex") the personal-knowledge-mcp worker already runs under (inherit-secrets cut-over).
+  REINDEX_QUEUE?: Queue<ReindexBatchMessage>;
 }
 
 function activeDsn(env: Env): string {
@@ -3075,20 +3079,16 @@ export default {
     ctx.waitUntil(runHeartbeat(env));
   },
 
-  // WP-410 срез-2b Деплой-1: the personal-knowledge-mcp worker already has a reindex queue
-  // consumer bound (from its pre-cutover config) — Cloudflare refuses to deploy any script
-  // without a `queue()` export while that binding exists. The full reindex pipeline (batch
-  // processing, embeddings, DB writes) is deferred to Деплой-2 (pilot decision 2026-07-01); this
-  // stub only acks in-flight messages left over from before the cutover — no DB writes, no side
-  // effects. connect_source in Деплой-1 never enqueues new messages (reindex_triggered: false
-  // always), so no NEW message should reach this after cutover.
-  async queue(batch: { messages: unknown[] }): Promise<void> {
-    console.warn(JSON.stringify({
-      phase: "reindex_queue_deferred",
-      severity: "warning",
-      batch_size: batch.messages.length,
-      note: "reindex pipeline not yet ported to unified codebase — see Деплой-2 (WP-410 срез-2b)",
-    }));
+  // WP-410 срез-2b Деплой-2 группа Б: real consumer, ported from personal-knowledge-mcp
+  // (see ./layers/reindex.ts). Only private-mode deploys bind REINDEX_QUEUE at all (public
+  // knowledge-mcp's wrangler.toml has no [[queues]] section) — the mode check is defensive,
+  // matching the scheduled() heartbeat-skip pattern above, not an expected runtime path.
+  async queue(batch: MessageBatch<ReindexBatchMessage>, env: Env): Promise<void> {
+    if (resolveMode(env.MCP_MODE) !== "private") {
+      console.warn(JSON.stringify({ phase: "reindex_queue_skipped_public_mode", batch_size: batch.messages.length }));
+      return;
+    }
+    await handleQueue(batch, env);
   },
 };
 

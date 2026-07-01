@@ -12,15 +12,18 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 KNOWLEDGE_DB_SCHEMA = "knowledge"
 
-# Деплой-2 (not yet ported — reindex pipeline deferred by pilot decision 2026-07-01):
-# [[queues.producers]]
-# queue = "reindex"
-# binding = "REINDEX_QUEUE"
-# [[queues.consumers]]
-# queue = "reindex"
-# max_batch_size = 10
-# max_batch_timeout = 5
-# max_retries = 3
-# dead_letter_queue = "reindex-dlq"
+# Деплой-2 группа Б (peer-session 2026-07-01-34): consumer/producer live — the queue and its
+# DLQ already exist in the account (verified via `wrangler queues info`, both created 2026-04-18).
+[[queues.producers]]
+queue = "reindex"
+binding = "REINDEX_QUEUE"
+[[queues.consumers]]
+queue = "reindex"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 3
+dead_letter_queue = "reindex-dlq"
+
+# Деплой-2 группа В (not yet ported — cron watchdog + connect_source trigger deferred):
 # [triggers]
 # crons = ["*/5 * * * *"]

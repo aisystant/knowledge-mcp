@@ -37,7 +37,8 @@ export interface UserContext {
   sourceNames: string[];
 }
 
-function personalDb(env: PersonalEnv) {
+// Exported for reuse by ./reindex.ts (WP-410 Деплой-2 группа Б) — same personal Neon DB.
+export function personalDb(env: PersonalEnv) {
   if (!env.DATABASE_URL) {
     throw new Error("DATABASE_URL is required for private-mode personal data access");
   }
@@ -152,7 +153,8 @@ async function createGitHubAppJWT(appId: string, privateKeyPem: string): Promise
 /**
  * Get Installation Access Token for a specific repo owner.
  */
-async function getInstallationToken(env: PersonalEnv, owner: string): Promise<string | null> {
+// Exported for reuse by ./reindex.ts (WP-410 Деплой-2 группа Б) — same GitHub App auth.
+export async function getInstallationToken(env: PersonalEnv, owner: string): Promise<string | null> {
   if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY) return null;
 
   const jwt = await createGitHubAppJWT(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY);
@@ -317,7 +319,8 @@ function personalGithubUrl(ctx: UserContext, source: string, filename: string): 
   return `https://github.com/${userSource.githubOwner}/${userSource.githubRepo}/blob/main/${prefix}${cleanFilename}`;
 }
 
-async function personalGetEmbedding(apiKey: string, text: string): Promise<number[]> {
+// Exported for reuse by ./reindex.ts (WP-410 Деплой-2 группа Б) — same embedding call.
+export async function personalGetEmbedding(apiKey: string, text: string): Promise<number[]> {
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt++) {
     const response = await fetch("https://openrouter.ai/api/v1/embeddings", {
