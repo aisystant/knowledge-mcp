@@ -1,0 +1,26 @@
+name = "personal-knowledge-mcp"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Cut-over target for WP-410 срез-2b Деплой-1 (peer-session 2026-07-01-27): this config points
+# the SAME unified codebase (knowledge-mcp) at the EXISTING personal-knowledge-mcp worker. All
+# secrets (DATABASE_URL, GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY, INDICATORS_DATABASE_URL,
+# OPENROUTER_API_KEY, ORY_URL, SCOPE_GUARD_MODE) are already bound to this worker and are NOT
+# touched by `wrangler deploy` — inherit-secrets cut-over, no `wrangler secret put` needed.
+# MCP_MODE=private is set separately via `wrangler secret put MCP_MODE` after this deploy.
+[vars]
+KNOWLEDGE_DB_SCHEMA = "knowledge"
+
+# Деплой-2 (not yet ported — reindex pipeline deferred by pilot decision 2026-07-01):
+# [[queues.producers]]
+# queue = "reindex"
+# binding = "REINDEX_QUEUE"
+# [[queues.consumers]]
+# queue = "reindex"
+# max_batch_size = 10
+# max_batch_timeout = 5
+# max_retries = 3
+# dead_letter_queue = "reindex-dlq"
+# [triggers]
+# crons = ["*/5 * * * *"]
