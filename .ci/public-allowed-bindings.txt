@@ -1,0 +1,22 @@
+# Public-build binding allowlist — WP-410 Q1 drift guard (ADR-IWE-018).
+#
+# Purpose: the unified codebase runs in two modes (MCP_MODE=public|private). The PUBLIC
+# deployment must never gain a private-only binding (e.g. a personal-corpus DSN or the
+# indicators DB). This is an ALLOWLIST, not a blocklist: CI fails if the public build's
+# environment bindings contain any name not listed here.
+#
+# Source of truth for names the code reads: the Env interface in src/index.ts.
+# Slice 2 adds private-only bindings; those go to the private deployment, NOT here.
+#
+# One binding name per line; blank lines and lines starting with '#' are ignored.
+
+KNOWLEDGE_DATABASE_URL
+HEALTH_DATABASE_URL
+OPENROUTER_API_KEY
+OPENAI_API_KEY
+ORY_URL
+REINDEX_SECRET
+KNOWLEDGE_DB_SCHEMA
+CONCEPT_GRAPH_DB_SCHEMA
+HEALTH_DB_SCHEMA
+MCP_MODE

@@ -24,6 +24,8 @@ import {
   HEALTH_TABLES,
 } from "./utils/db.js";
 import { reindexConceptsForFiles } from "./concept-indexer.js";
+import { resolveMode, type McpMode } from "./mode.js";
+import { isToolAllowedInMode } from "./layers/private.js";
 
 // --- Types ---
 
@@ -41,6 +43,9 @@ export interface Env {
   KNOWLEDGE_DB_SCHEMA?: string; // Default: "knowledge"
   CONCEPT_GRAPH_DB_SCHEMA?: string; // Default: "concept_graph"
   HEALTH_DB_SCHEMA?: string; // Default: "health"
+  // WP-410 Q1: operating mode. unset/"public" → public corpus only; "private" → Ory JWT + personal
+  // corpus (slice 2). Unknown non-empty value → HTTP 500 fail-closed. See src/mode.ts, ADR-IWE-018.
+  MCP_MODE?: string;
 }
 
 function activeDsn(env: Env): string {
@@ -1897,7 +1902,7 @@ const TOOLS = [
 
 // --- MCP handler ---
 
-async function handleMcpRequest(request: McpRequest, env: Env, userId?: string): Promise<McpResponse> {
+async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public"): Promise<McpResponse> {
   const { id, method, params } = request;
 
   try {
@@ -1919,6 +1924,16 @@ async function handleMcpRequest(request: McpRequest, env: Env, userId?: string):
       case "tools/call": {
         const toolName = (params as { name: string }).name;
         const args = (params as { arguments: Record<string, unknown> }).arguments || {};
+
+        // WP-410 Q1: private-only tools carry no public data path. Refuse them in public
+        // mode before dispatch. Slice 2 wires the PrivateGuard for the private-mode path.
+        if (!isToolAllowedInMode(toolName, mode)) {
+          return {
+            jsonrpc: "2.0",
+            id,
+            error: { code: -32601, message: `Tool "${toolName}" is not available in public mode` },
+          };
+        }
 
         if (toolName === "search") {
           const results = await searchDocuments(
@@ -2663,6 +2678,17 @@ export default {
     if (url.pathname === "/mcp" && request.method === "POST") {
       const traceId = request.headers.get("x-trace-id") || undefined;
 
+      // WP-410 Q1: resolve operating mode. Unknown MCP_MODE → fail-closed HTTP 500.
+      let mode: McpMode;
+      try {
+        mode = resolveMode(env.MCP_MODE);
+      } catch (err) {
+        console.error("[mcp] MCP_MODE misconfigured:", err instanceof Error ? err.message : err);
+        return new Response(JSON.stringify({ error: "Server misconfigured: invalid MCP_MODE" }), {
+          status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
       // JWT verification (B4.21): verify Bearer token locally.
       // If Authorization header is present → MUST be a valid JWT; no x-user-id fallback
       // (prevents spoofing userId with an expired/invalid token + custom x-user-id).
@@ -2681,7 +2707,7 @@ export default {
       }
 
       const body = (await request.json()) as McpRequest;
-      const response = await handleMcpRequest(body, env, userId);
+      const response = await handleMcpRequest(body, env, userId, mode);
       const responseHeaders: Record<string, string> = {
         ...corsHeaders,
         "Content-Type": "application/json",
