@@ -3011,9 +3011,32 @@ export default {
     return new Response("Not found", { status: 404, headers: corsHeaders });
   },
 
-  // WP-339 Ф5+Ф6: Daily heartbeat cron — drift check + targeted reindex
+  // WP-339 Ф5+Ф6: Daily heartbeat cron — drift check + targeted reindex against the PUBLIC
+  // corpus (env.KNOWLEDGE_DATABASE_URL, not bound on the private-mode personal-knowledge-mcp
+  // worker). Skip entirely in private mode (WP-410 срез-2b) — running it there would throw on
+  // every fire against a binding that doesn't exist on that worker.
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (resolveMode(env.MCP_MODE) === "private") {
+      console.warn(JSON.stringify({ phase: "heartbeat_skipped_private_mode" }));
+      return;
+    }
     ctx.waitUntil(runHeartbeat(env));
+  },
+
+  // WP-410 срез-2b Деплой-1: the personal-knowledge-mcp worker already has a reindex queue
+  // consumer bound (from its pre-cutover config) — Cloudflare refuses to deploy any script
+  // without a `queue()` export while that binding exists. The full reindex pipeline (batch
+  // processing, embeddings, DB writes) is deferred to Деплой-2 (pilot decision 2026-07-01); this
+  // stub only acks in-flight messages left over from before the cutover — no DB writes, no side
+  // effects. connect_source in Деплой-1 never enqueues new messages (reindex_triggered: false
+  // always), so no NEW message should reach this after cutover.
+  async queue(batch: { messages: unknown[] }): Promise<void> {
+    console.warn(JSON.stringify({
+      phase: "reindex_queue_deferred",
+      severity: "warning",
+      batch_size: batch.messages.length,
+      note: "reindex pipeline not yet ported to unified codebase — see Деплой-2 (WP-410 срез-2b)",
+    }));
   },
 };
 
