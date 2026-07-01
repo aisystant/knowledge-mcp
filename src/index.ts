@@ -35,6 +35,8 @@ import {
   personalListSources,
   personalMemorySearch,
   connectSource,
+  disconnectSource,
+  purgeSource,
 } from "./layers/personal.js";
 
 // --- Types ---
@@ -1963,6 +1965,29 @@ const PRIVATE_TOOLS = [
       required: ["source"],
     },
   },
+  {
+    name: "disconnect_source",
+    description: "Отключить личный репозиторий от индекса (lazy: active=false). Документы и embeddings остаются в БД — повторный connect_source не требует полного reindex. Push'и из этого репо после отключения игнорируются. Для полного удаления данных используй purge_source.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: { type: "string", description: "Подключённый репозиторий (из list_sources)." },
+      },
+      required: ["source"],
+    },
+  },
+  {
+    name: "purge_source",
+    description: "GDPR hard delete: полностью удалить все данные репозитория из личной базы знаний (documents, reindex_jobs, запись user_source). Необратимо. Для мягкого отключения с сохранением данных используй disconnect_source.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: { type: "string", description: "Репозиторий для удаления." },
+        confirm: { type: "boolean", description: "Обязательно true — подтверждение необратимого удаления." },
+      },
+      required: ["source", "confirm"],
+    },
+  },
 ];
 
 // --- MCP handler ---
@@ -2023,18 +2048,23 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
           const meta = (params as { _meta?: Record<string, unknown> })._meta;
           const requestId = typeof meta?.request_id === "string" ? meta.request_id : undefined;
 
-          // write / propose_capture / delete go through the bridge write-scope check.
-          // `delete` reuses the "personal_write" canonical scope (WP-410 срез-2b, peer-session
-          // 2026-07-01-27): the original personal-knowledge-mcp never scope-checked delete at
-          // all — the boundary used to be the gateway, not in-process. Now that write/
-          // propose_capture get an in-process authorize() call, leaving delete unguarded would
-          // be a NEW asymmetry, not a preserved one. There is no dedicated "delete" scope type
-          // in agent_scopes_mvp; reusing personal_write's write-operation grant is the minimal
-          // fix (same repo/path scope that already governs writes to this source).
+          // write / propose_capture / delete / disconnect_source / purge_source go through
+          // the bridge write-scope check. `delete`/`disconnect_source`/`purge_source` reuse
+          // the "personal_write" canonical scope (WP-410 срез-2b, peer-session 2026-07-01-27
+          // for delete; peer-session 2026-07-01-29 Деплой-2 group А for disconnect/purge): the
+          // original personal-knowledge-mcp never scope-checked these admin tools at all — any
+          // authenticated user could disconnect/purge ANY source (escalated + confirmed with
+          // Kimi turn 3, session 2026-07-01-29). There is no dedicated scope type for these
+          // ops in agent_scopes_mvp; reusing personal_write's write-operation grant on the
+          // target repo is the minimal fix. checkBridgeWriteScope skips path-matching when no
+          // `path` arg is present (disconnect_source/purge_source args carry no path), so this
+          // degrades cleanly to a source-scope + write-operation check.
           const SCOPE_CHECKED_TOOLS: Readonly<Record<string, string>> = {
             write: "personal_write",
             propose_capture: "personal_propose_capture",
             delete: "personal_write",
+            disconnect_source: "personal_write",
+            purge_source: "personal_write",
           };
           const canonicalToolName = SCOPE_CHECKED_TOOLS[toolName];
 
@@ -2120,6 +2150,28 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
           if (toolName === "connect_source") {
             const connectResult = await connectSource(env, principal.userId, args.source as string);
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(connectResult, null, 2) }] } };
+          }
+
+          if (toolName === "disconnect_source") {
+            const source = (args.source as string)?.trim();
+            if (!source) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Error: source required" }], isError: true } };
+            }
+            const disconnectResult = await disconnectSource(env, principal.userId, source);
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(disconnectResult, null, 2) }], isError: !!disconnectResult.error } };
+          }
+
+          if (toolName === "purge_source") {
+            const source = (args.source as string)?.trim();
+            const confirm = args.confirm as boolean;
+            if (!source) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Error: source required" }], isError: true } };
+            }
+            if (!confirm) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Error: confirm must be true — это необратимое удаление всех данных репозитория." }], isError: true } };
+            }
+            const purgeResult = await purgeSource(env, principal.userId, source);
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(purgeResult, null, 2) }], isError: !!purgeResult.error } };
           }
 
           // Defensive: every name in PRIVATE_TOOL_NAMES must have a dispatch branch above —

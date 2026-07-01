@@ -29,6 +29,8 @@ import {
   deleteFromGitHub,
   personalListSources,
   personalGetDocument,
+  disconnectSource,
+  purgeSource,
   type UserContext,
   type PersonalEnv,
 } from "./personal.js";
@@ -139,5 +141,55 @@ describe("connectSource", () => {
     expect(result.status).toBe("reactivated");
     expect(result.scope_provisioning).toBe("skipped");
     expect(result.reindex_triggered).toBe(false);
+  });
+});
+
+// Деплой-2 группа А (peer-session 2026-07-01-29): faithful port from
+// personal-knowledge-mcp/src/index.ts disconnectSource/purgeSource.
+describe("disconnectSource", () => {
+  it("reports already_disconnected with 0 kept docs when the source was never connected", async () => {
+    queryQueue.push([]); // currentRows — no row found
+    const result = await disconnectSource(ENV, "user-1", "DS-my-strategy");
+    expect(result.status).toBe("already_disconnected");
+    expect(result.documents_kept).toBe(0);
+    expect(result.error).toContain("не подключён");
+  });
+
+  it("reports already_disconnected with kept doc count when the source is already inactive", async () => {
+    queryQueue.push([{ active: false }]); // currentRows
+    queryQueue.push([{ cnt: 4 }]); // documents count
+    const result = await disconnectSource(ENV, "user-1", "DS-my-strategy");
+    expect(result.status).toBe("already_disconnected");
+    expect(result.documents_kept).toBe(4);
+  });
+
+  it("flips active=false and keeps documents when disconnecting an active source", async () => {
+    queryQueue.push([{ active: true }]); // currentRows
+    queryQueue.push([]); // UPDATE user_sources
+    queryQueue.push([{ cnt: 12 }]); // documents count after update
+    const result = await disconnectSource(ENV, "user-1", "DS-my-strategy");
+    expect(result.status).toBe("disconnected");
+    expect(result.documents_kept).toBe(12);
+  });
+});
+
+describe("purgeSource", () => {
+  it("reports not_found when the source has no user_sources row", async () => {
+    queryQueue.push([]); // sourceRows — no match
+    const result = await purgeSource(ENV, "user-1", "DS-my-strategy");
+    expect(result.status).toBe("not_found");
+    expect(result.documents_deleted).toBe(0);
+    expect(result.jobs_deleted).toBe(0);
+  });
+
+  it("deletes documents, reindex_jobs, and the user_sources row (irreversible)", async () => {
+    queryQueue.push([{ source: "DS-my-strategy" }]); // sourceRows — found
+    queryQueue.push([{ cnt: 7 }]); // documents DELETE...RETURNING count
+    queryQueue.push([{ cnt: 2 }]); // reindex_jobs DELETE...RETURNING count
+    queryQueue.push([]); // final DELETE user_sources
+    const result = await purgeSource(ENV, "user-1", "DS-my-strategy");
+    expect(result.status).toBe("purged");
+    expect(result.documents_deleted).toBe(7);
+    expect(result.jobs_deleted).toBe(2);
   });
 });

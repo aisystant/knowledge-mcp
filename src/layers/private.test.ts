@@ -18,6 +18,9 @@ describe("PRIVATE_TOOL_NAMES", () => {
     expect(PRIVATE_TOOL_NAMES.has("delete")).toBe(true);
     expect(PRIVATE_TOOL_NAMES.has("memory_search")).toBe(true);
     expect(PRIVATE_TOOL_NAMES.has("connect_source")).toBe(true);
+    // Деплой-2 группа А (peer-session 2026-07-01-29): admin tools ported with authorize gate.
+    expect(PRIVATE_TOOL_NAMES.has("disconnect_source")).toBe(true);
+    expect(PRIVATE_TOOL_NAMES.has("purge_source")).toBe(true);
   });
 
   it("does not mark public tools as private", () => {

@@ -699,3 +699,122 @@ function inferSourceType(source: string): "pack" | "guides" | "ds" {
   if (source.startsWith("docs-") || source.endsWith("-docs")) return "guides";
   return "ds";
 }
+
+// --- WP-410 Деплой-2 группа А: admin tools ported from personal-knowledge-mcp/src/index.ts ---
+
+export interface DisconnectResult {
+  source: string;
+  status: "disconnected" | "already_disconnected";
+  documents_kept: number;
+  error?: string;
+}
+
+/**
+ * Lazy disconnect: UPDATE user_sources.active=false. Documents/embeddings kept —
+ * re-activate via connectSource does not require a full reindex.
+ * Faithful port of personal-knowledge-mcp/src/index.ts:2825 disconnectSource.
+ */
+export async function disconnectSource(
+  env: PersonalEnv,
+  userId: string,
+  source: string
+): Promise<DisconnectResult> {
+  const sql = personalDb(env);
+  const schema = getKnowledgeSchema(env);
+  const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
+  const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+
+  const currentRows = await sql`
+    SELECT active FROM ${sql.unsafe(userSourcesTable)}
+    WHERE user_id = ${userId} AND source = ${source}
+    LIMIT 1
+  `;
+  if (currentRows.length === 0) {
+    return { source, status: "already_disconnected", documents_kept: 0,
+      error: `Source '${source}' не подключён. Проверь list_sources.` };
+  }
+  const wasActive = currentRows[0].active as boolean;
+  if (!wasActive) {
+    const docRows = await sql`
+      SELECT COUNT(*)::int AS cnt FROM ${sql.unsafe(documentsTable)}
+      WHERE user_id = ${userId} AND source = ${source}
+    `;
+    return { source, status: "already_disconnected", documents_kept: (docRows[0].cnt as number) ?? 0 };
+  }
+
+  await sql`
+    UPDATE ${sql.unsafe(userSourcesTable)} SET active = false
+    WHERE user_id = ${userId} AND source = ${source}
+  `;
+  const docRows = await sql`
+    SELECT COUNT(*)::int AS cnt FROM ${sql.unsafe(documentsTable)}
+    WHERE user_id = ${userId} AND source = ${source}
+  `;
+  return { source, status: "disconnected", documents_kept: (docRows[0].cnt as number) ?? 0 };
+}
+
+export interface PurgeResult {
+  source: string;
+  status: "purged" | "not_found";
+  documents_deleted: number;
+  jobs_deleted: number;
+  error?: string;
+}
+
+/**
+ * GDPR hard delete: removes documents, reindex_jobs, and the user_sources row for a
+ * source. Irreversible — caller (dispatcher) must require an explicit confirm=true.
+ * Faithful port of personal-knowledge-mcp/src/index.ts:2868 purgeSource.
+ */
+export async function purgeSource(
+  env: PersonalEnv,
+  userId: string,
+  source: string
+): Promise<PurgeResult> {
+  const sql = personalDb(env);
+  const schema = getKnowledgeSchema(env);
+  const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
+  const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+  const reindexJobsTable = KNOWLEDGE_TABLES.reindex_jobs(schema);
+
+  const sourceRows = await sql`
+    SELECT source FROM ${sql.unsafe(userSourcesTable)}
+    WHERE user_id = ${userId} AND source = ${source}
+    LIMIT 1
+  `;
+  if (sourceRows.length === 0) {
+    return { source, status: "not_found", documents_deleted: 0, jobs_deleted: 0,
+      error: `Source '${source}' не найден. Проверь list_sources.` };
+  }
+
+  const [docResult, jobResult] = await Promise.all([
+    sql`
+      WITH deleted AS (
+        DELETE FROM ${sql.unsafe(documentsTable)}
+        WHERE user_id = ${userId} AND source = ${source}
+        RETURNING id
+      )
+      SELECT COUNT(*)::int AS cnt FROM deleted
+    `,
+    sql`
+      WITH deleted AS (
+        DELETE FROM ${sql.unsafe(reindexJobsTable)}
+        WHERE user_id = ${userId} AND source = ${source}
+        RETURNING id
+      )
+      SELECT COUNT(*)::int AS cnt FROM deleted
+    `,
+  ]);
+
+  await sql`
+    DELETE FROM ${sql.unsafe(userSourcesTable)}
+    WHERE user_id = ${userId} AND source = ${source}
+  `;
+
+  return {
+    source,
+    status: "purged",
+    documents_deleted: (docResult[0].cnt as number) ?? 0,
+    jobs_deleted: (jobResult[0].cnt as number) ?? 0,
+  };
+}

@@ -36,6 +36,8 @@ export const PRIVATE_TOOL_NAMES: ReadonlySet<string> = new Set([
   "delete",
   "memory_search",
   "connect_source",
+  "disconnect_source",
+  "purge_source",
 ]);
 
 /**
