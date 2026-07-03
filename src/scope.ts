@@ -157,6 +157,14 @@ export async function checkBridgeWriteScope(opts: {
   requireDeclaredAgentId?: boolean; // prod = true (mirrors bridge-scope server.ts:98)
   activeSources?: string[];         // user's active sources (UserContext.sourceNames)
   indicatorsSql: NeonSql;
+  // WP-410 Pre-Close checklist (session 2026-07-03-18): true for path-scoped ops (write/delete —
+  // always carry a path). false for source-scoped admin ops (disconnect_source/purge_source,
+  // reusing the personal_write canonical grant — their args carry no path by design). Default
+  // true preserves prior behavior for the two BRIDGE_WRITE_TOOLS canonical names. Without this,
+  // the peer-pilot fallback's `if (!path) deny` fires before the ownership check ever runs,
+  // permanently denying disconnect/purge on the caller's OWN source for any client that doesn't
+  // declare _meta.agent_id.
+  requiresPath?: boolean;
 }): Promise<ScopeCheckResult> {
   const {
     toolName, source, path, hasConflict,
@@ -164,6 +172,7 @@ export async function checkBridgeWriteScope(opts: {
     requireDeclaredAgentId,
     activeSources,
     indicatorsSql,
+    requiresPath = true,
   } = opts;
 
   if (!BRIDGE_WRITE_TOOLS.has(toolName)) {
@@ -174,23 +183,25 @@ export async function checkBridgeWriteScope(opts: {
   let agentId = declaredAgentId ?? expectedAgentId;
   let isPeerPilotFallback = false;
   let isOwnDataWiden = false;
+  let isContinuationDefault = false;
 
   if (requireDeclaredAgentId && (!declaredAgentId || declaredAgentId.length === 0)) {
     isPeerPilotFallback = true;
     agentId = PEER_PILOT_AGENT_ID;
 
-    if (!path) {
+    if (requiresPath && !path) {
       await tryInsertViolation({ indicatorsSql, agentId, userId, reason: "path_not_allowed", attemptedTool: toolName, attemptedRepo: source, requestId });
       return deny("scope denied: path required for peer-pilot helper", "path_not_allowed", toolName);
     }
-    const safePath = normalizePath(path);
+    const safePath = path ? normalizePath(path) : undefined;
 
-    if (hasDotfileSegment(safePath)) {
+    if (safePath && hasDotfileSegment(safePath)) {
       await tryInsertViolation({ indicatorsSql, agentId, userId, reason: "path_not_allowed", attemptedTool: toolName, attemptedRepo: source, attemptedPath: safePath, requestId });
       return deny(`scope denied: path '${safePath}' targets a dotfile directory`, "path_not_allowed", toolName, undefined, safePath);
     }
 
-    const isContinuationDefault =
+    isContinuationDefault =
+      !!safePath &&
       source === PEER_PILOT_ALLOWED_SOURCE &&
       safePath.startsWith(PEER_PILOT_ALLOWED_PATH_PREFIX);
 
@@ -236,7 +247,35 @@ export async function checkBridgeWriteScope(opts: {
     }>;
 
     if (rows.length === 0) {
-      denyReason = "scope_not_found";
+      // Self-heal (WP-410 Pre-Close checklist, session 2026-07-03-18 — restores commit 051edf7,
+      // dropped when this file was ported from personal-knowledge-mcp/src/scope.ts before that
+      // fix landed there). The caller already proved ownership to reach here — own-data-widen
+      // (source is one of their real active/connected sources) or the known-safe continuation-
+      // default path — but no fallback row has ever been provisioned for them (e.g. their source
+      // was connected before this fallback identity existed). Provision now instead of denying
+      // forever; mirrors connect_source's own idempotent upsert.
+      if (isPeerPilotFallback && (isOwnDataWiden || isContinuationDefault) && source) {
+        try {
+          await provisionBridgeScopes(indicatorsSql, userId, source);
+          scopeRow = {
+            allowed_repos: [source],
+            allowed_paths: ["docs/**", "inbox/**", "**/*.md"],
+            allowed_operations: ["write", "propose"],
+            taint_level: 0,
+          };
+        } catch (err) {
+          console.error(JSON.stringify({
+            phase: "peer_pilot_self_heal_failed",
+            severity: "error",
+            user_id_prefix: userId.slice(0, 8),
+            source,
+            error: err instanceof Error ? err.message : String(err),
+          }));
+          denyReason = "scope_not_found";
+        }
+      } else {
+        denyReason = "scope_not_found";
+      }
     } else {
       const row = rows[0];
       if (row.revoked_at !== null) {
@@ -258,7 +297,12 @@ export async function checkBridgeWriteScope(opts: {
 
   if (denyReason !== null || scopeRow === null) {
     const reason = denyReason ?? "scope_not_found";
-    await tryInsertViolation({ indicatorsSql, agentId, userId, reason, attemptedTool: toolName, requestId });
+    // attemptedRepo/attemptedPath were missing here before (WP-410 Pre-Close checklist, session
+    // 2026-07-03-18) — every other deny call site in this file logs them; this one didn't,
+    // leaving scope_not_found/scope_revoked/scope_expired violations impossible to diagnose from
+    // agent_scope_violations alone (source/path always came back empty regardless of what was
+    // actually attempted).
+    await tryInsertViolation({ indicatorsSql, agentId, userId, reason, attemptedTool: toolName, attemptedRepo: source, attemptedPath: path ? normalizePath(path) : undefined, requestId });
     return deny(`scope denied: ${reason}`, reason, toolName);
   }
 
@@ -357,9 +401,20 @@ async function tryInsertViolation(opts: InsertViolationOpts): Promise<void> {
 }
 
 /**
- * Provision the two bridge scope rows for a newly connected source. Idempotent upsert —
- * safe to call unconditionally on every connect so a revoked/lost scope row self-heals.
- * Ported from personal-knowledge-mcp/src/scope.ts:337-362 (peer-session 2026-07-01-27, срез-2b) — as-is.
+ * Provision the bridge scope rows for a newly connected source: the two declared-agent rows
+ * plus the peer-pilot fallback row. Idempotent upsert — safe to call unconditionally on every
+ * connect so a revoked/lost scope row self-heals.
+ *
+ * WP-410 Pre-Close checklist (session 2026-07-03-18): the fallback row (third VALUES tuple,
+ * agent_id = PEER_PILOT_AGENT_ID) was missing from this port — restored from
+ * personal-knowledge-mcp/src/scope.ts:373-399 (which itself documents WHY: "without the fallback
+ * row, any caller that omits _meta.agent_id ... hits scope_not_found forever regardless of how
+ * many times a source is (re)connected"). Without it, checkBridgeWriteScope's own self-heal
+ * branch (above) can never converge — it looks up `WHERE agent_id = PEER_PILOT_AGENT_ID`, but
+ * this function was only ever writing the two `iwe_bridge:*` rows, so every fallback-identity
+ * call re-provisions from scratch instead of finding the row from its own prior write (cold-review
+ * finding, not a security hole — the ownership gate still re-runs correctly each time, this was a
+ * "silently never converges" bug, not a privilege issue).
  */
 export async function provisionBridgeScopes(
   indicatorsSql: NeonSql,
@@ -374,7 +429,9 @@ export async function provisionBridgeScopes(
       ('bridge', 'iwe_bridge:personal_write',
        ${userId}::uuid, ${allowedRepos}::text[], ARRAY['docs/**','inbox/**','**/*.md'], ARRAY['write'], 'bridge_install'),
       ('bridge', 'iwe_bridge:personal_propose_capture',
-       ${userId}::uuid, ${allowedRepos}::text[], ARRAY['inbox/**','**/*.md'], ARRAY['propose'], 'bridge_install')
+       ${userId}::uuid, ${allowedRepos}::text[], ARRAY['inbox/**','**/*.md'], ARRAY['propose'], 'bridge_install'),
+      ('bridge', ${PEER_PILOT_AGENT_ID},
+       ${userId}::uuid, ${allowedRepos}::text[], ARRAY['docs/**','inbox/**','**/*.md'], ARRAY['write','propose'], 'bridge_install')
     ON CONFLICT (agent_id, user_id) DO UPDATE SET
       allowed_repos = ARRAY(SELECT DISTINCT unnest(agent_scopes_mvp.allowed_repos || EXCLUDED.allowed_repos)),
       allowed_paths = EXCLUDED.allowed_paths,

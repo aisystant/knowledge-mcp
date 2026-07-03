@@ -2091,9 +2091,17 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
           // authenticated user could disconnect/purge ANY source (escalated + confirmed with
           // Kimi turn 3, session 2026-07-01-29). There is no dedicated scope type for these
           // ops in agent_scopes_mvp; reusing personal_write's write-operation grant on the
-          // target repo is the minimal fix. checkBridgeWriteScope skips path-matching when no
-          // `path` arg is present (disconnect_source/purge_source args carry no path), so this
-          // degrades cleanly to a source-scope + write-operation check.
+          // target repo is the minimal fix.
+          //
+          // requiresPath below: disconnect_source/purge_source args carry no path (they operate
+          // on a whole source, not a file). WP-410 Pre-Close checklist (session 2026-07-03-18)
+          // found the prior claim here ("skips path-matching, degrades cleanly to a source-scope
+          // check") was WRONG for the peer-pilot fallback identity — checkBridgeWriteScope denied
+          // on `!path` before ever reaching the source-ownership check, permanently blocking
+          // disconnect/purge on the caller's OWN source for any client without a declared
+          // _meta.agent_id. Fixed in scope.ts; requiresPath: false here is what makes the fix
+          // apply to these two tools specifically (write/delete keep the default `true` — they
+          // always carry a real path and should still be denied without one).
           const SCOPE_CHECKED_TOOLS: Readonly<Record<string, string>> = {
             write: "personal_write",
             propose_capture: "personal_propose_capture",
@@ -2101,6 +2109,7 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             disconnect_source: "personal_write",
             purge_source: "personal_write",
           };
+          const PATH_NOT_REQUIRED_TOOLS: ReadonlySet<string> = new Set(["disconnect_source", "purge_source"]);
           const canonicalToolName = SCOPE_CHECKED_TOOLS[toolName];
 
           if (canonicalToolName) {
@@ -2112,6 +2121,7 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
                 activeSources: ctx.sourceNames,
                 indicatorsDatabaseUrl: env.INDICATORS_DATABASE_URL,
                 scopeGuardMode: env.SCOPE_GUARD_MODE,
+                requiresPath: !PATH_NOT_REQUIRED_TOOLS.has(toolName),
               });
             } catch (err) {
               if (err instanceof ScopeDeniedError) {

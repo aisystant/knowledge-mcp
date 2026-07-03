@@ -96,6 +96,9 @@ export interface AuthorizeOpts {
   /** Neon `indicators` DB connection string. Only read when scopeGuardMode != "off". */
   indicatorsDatabaseUrl: string | undefined;
   scopeGuardMode: string | undefined; // "off" | "shadow" | "enforce" — mirrors env.SCOPE_GUARD_MODE
+  /** false for source-scoped admin ops (disconnect_source/purge_source — no path arg by design).
+   * Default true. See checkBridgeWriteScope's requiresPath doc (WP-410 Pre-Close checklist). */
+  requiresPath?: boolean;
 }
 
 /**
@@ -145,6 +148,7 @@ export class JwtScopeGuard implements PrivateGuard {
         requireDeclaredAgentId: true,
         activeSources: opts.activeSources,
         indicatorsSql: neon(opts.indicatorsDatabaseUrl),
+        requiresPath: opts.requiresPath,
       });
     } catch (err) {
       console.error(JSON.stringify({
