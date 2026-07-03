@@ -22,8 +22,12 @@ describe("PRIVATE_TOOL_NAMES", () => {
     expect(PRIVATE_TOOL_NAMES.has("disconnect_source")).toBe(true);
     expect(PRIVATE_TOOL_NAMES.has("purge_source")).toBe(true);
     // Деплой-2 группа В (peer-session 2026-07-03-11): manual reindex trigger + status poll.
-    expect(PRIVATE_TOOL_NAMES.has("personal_reindex_source")).toBe(true);
-    expect(PRIVATE_TOOL_NAMES.has("personal_reindex_status")).toBe(true);
+    // Unprefixed dispatched names — gateway-mcp adds "personal_" itself. A "personal_"-prefixed
+    // dispatched name here would double up and route to the wrong backend tool (canary finding).
+    expect(PRIVATE_TOOL_NAMES.has("reindex")).toBe(true);
+    expect(PRIVATE_TOOL_NAMES.has("reindex_status")).toBe(true);
+    expect(PRIVATE_TOOL_NAMES.has("personal_reindex_source")).toBe(false);
+    expect(PRIVATE_TOOL_NAMES.has("personal_reindex_status")).toBe(false);
   });
 
   it("does not mark public tools as private", () => {

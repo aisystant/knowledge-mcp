@@ -1972,8 +1972,15 @@ const PRIVATE_TOOLS = [
     },
   },
   {
-    name: "personal_reindex_source",
-    description: "Manually (re)trigger an async reindex of an already-connected personal source. Not needed for newly connected sources — connect_source does this automatically. Use for stuck/stale content, or after a bulk edit in the source repo. Returns a job_id; poll personal_reindex_status with it.",
+    // WP-410 группа В (session 2026-07-03-11 canary): dispatched name is UNPREFIXED, matching
+    // every other private tool (write/delete/connect_source/...) — gateway-mcp's routeToolCall
+    // mechanically strips "personal_" from the caller-facing name to get this name (see
+    // gateway-mcp src/index.ts:1468-1478). Naming this "personal_reindex_source" instead (first
+    // draft of this session) meant a call to gateway's "personal_reindex_source" stripped down
+    // to backend name "reindex_source" — the OLD PUBLIC tool below, wrong DB for personal data.
+    // Caught by the live canary, not by review or tests (neither exercises the gateway hop).
+    name: "reindex",
+    description: "Manually (re)trigger an async reindex of an already-connected personal source. Not needed for newly connected sources — connect_source does this automatically. Use for stuck/stale content, or after a bulk edit in the source repo. Returns a job_id; poll personal_reindex_status with it. (Exposed by the gateway as personal_reindex.)",
     inputSchema: {
       type: "object",
       properties: {
@@ -1983,12 +1990,12 @@ const PRIVATE_TOOLS = [
     },
   },
   {
-    name: "personal_reindex_status",
-    description: "Poll the status of a reindex job started by connect_source or personal_reindex_source.",
+    name: "reindex_status",
+    description: "Poll the status of a reindex job started by connect_source or personal_reindex. (Exposed by the gateway as personal_reindex_status.)",
     inputSchema: {
       type: "object",
       properties: {
-        job_id: { type: "string", description: "job_id returned by connect_source or personal_reindex_source" },
+        job_id: { type: "string", description: "job_id returned by connect_source or personal_reindex" },
       },
       required: ["job_id"],
     },
@@ -2182,7 +2189,7 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             // is a no-op repeat call (e.g. a retry-happy client) — reindexing it every time would
             // re-walk + re-embed the whole repo on every call, guarded only by startReindexJob's
             // 60s cooldown (cold-review finding, session 2026-07-03-11). A user who genuinely
-            // wants to force a re-reindex of an already-connected source has personal_reindex_source.
+            // wants to force a re-reindex of an already-connected source has reindex (gateway: personal_reindex).
             if (
               (connectResult.status === "newly_connected" || connectResult.status === "reactivated") &&
               connectResult.scope_provisioning === "ok"
@@ -2205,7 +2212,7 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(connectResult, null, 2) }] } };
           }
 
-          if (toolName === "personal_reindex_source") {
+          if (toolName === "reindex") {
             const source = (args.source as string)?.trim();
             if (!source) {
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Error: source required" }], isError: true } };
@@ -2217,7 +2224,7 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(reindexResult, null, 2) }], isError: reindexResult.status === "failed" } };
           }
 
-          if (toolName === "personal_reindex_status") {
+          if (toolName === "reindex_status") {
             const jobId = (args.job_id as string)?.trim();
             if (!jobId) {
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Error: job_id required" }], isError: true } };

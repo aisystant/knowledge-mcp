@@ -38,8 +38,11 @@ export const PRIVATE_TOOL_NAMES: ReadonlySet<string> = new Set([
   "connect_source",
   "disconnect_source",
   "purge_source",
-  "personal_reindex_source",
-  "personal_reindex_status",
+  // Dispatched names are unprefixed like every other private tool here — gateway-mcp adds
+  // "personal_" itself (routeToolCall strips it to get the backend name). A "personal_"-prefixed
+  // dispatched name would collide after the gateway's strip (see index.ts comment on "reindex").
+  "reindex",
+  "reindex_status",
 ]);
 
 /**
