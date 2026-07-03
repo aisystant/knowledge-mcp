@@ -21,6 +21,8 @@ export interface PersonalEnv {
   OPENROUTER_API_KEY?: string;
   /** Neon `indicators` DB. Required for provisionBridgeScopes (connect_source) — same DSN as PrivateGuard's authorize(). */
   INDICATORS_DATABASE_URL?: string;
+  /** Watchdog stale-job threshold override, minutes. Default 30 (see reindex.ts). Деплой-2 группа В. */
+  WATCHDOG_STALE_MINUTES?: string;
 }
 
 export interface UserSource {
@@ -595,17 +597,20 @@ export async function personalListSources(
 }
 
 // --- connect_source (WP-410 срез-2b) ---
-// Faithful port of personal-knowledge-mcp/src/index.ts:2704-~2793 (connectSource), MINUS the
-// reindex trigger (Step 3 of the original): pilot decision 2026-07-01 (peer-session
-// 2026-07-01-27) defers the whole reindex pipeline (queue producer/consumer, GitHub tree walk,
-// embeddings, watchdog cron) to Деплой-2, so newly-connected sources aren't indexed until then.
-// provisionBridgeScopes (Step 2 of the original) is NOT deferred — it is the reason connect_source
+// Faithful port of personal-knowledge-mcp/src/index.ts:2704-~2793 (connectSource). The reindex
+// trigger (Step 3 of the original) is wired by the caller (../index.ts), not here — startReindexJob
+// lives in ./reindex.js, which itself imports from this module, so calling it from here would be
+// a circular import. connectSource() only reports scope-provisioning outcome; ../index.ts calls
+// startReindexJob() right after when scope_provisioning === "ok" and fills in reindex_triggered.
+// provisionBridgeScopes (Step 2 of the original) is done in-process here — the reason connect_source
 // is in Деплой-1 at all (WP-410 explicit requirement).
 export interface ConnectSourceResult {
   source: string;
   status: "newly_connected" | "reactivated" | "already_connected" | "error";
   scope_provisioning: "ok" | "failed" | "skipped";
-  reindex_triggered: false;
+  reindex_triggered: boolean;
+  /** Set by the caller alongside reindex_triggered; poll with personal_reindex_status. */
+  reindex_job_id?: string;
   message?: string;
   error?: string;
 }
@@ -689,10 +694,12 @@ export async function connectSource(
     source,
     status: resultStatus,
     scope_provisioning: scopeProvisioning,
+    // Caller (../index.ts) overwrites reindex_triggered + message with the real outcome
+    // when scope_provisioning === "ok" (calls startReindexJob right after this returns).
     reindex_triggered: false,
     message: scopeProvisioning === "failed"
       ? "репо подключён для чтения, но запись пока не разрешена — повтори connect_source"
-      : "репо подключено. Переиндексация появится в следующем релизе — уже загруженные документы доступны сейчас.",
+      : "репо подключено, права на запись выданы.",
   };
 }
 

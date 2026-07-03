@@ -21,6 +21,9 @@ describe("PRIVATE_TOOL_NAMES", () => {
     // Деплой-2 группа А (peer-session 2026-07-01-29): admin tools ported with authorize gate.
     expect(PRIVATE_TOOL_NAMES.has("disconnect_source")).toBe(true);
     expect(PRIVATE_TOOL_NAMES.has("purge_source")).toBe(true);
+    // Деплой-2 группа В (peer-session 2026-07-03-11): manual reindex trigger + status poll.
+    expect(PRIVATE_TOOL_NAMES.has("personal_reindex_source")).toBe(true);
+    expect(PRIVATE_TOOL_NAMES.has("personal_reindex_status")).toBe(true);
   });
 
   it("does not mark public tools as private", () => {

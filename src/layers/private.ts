@@ -38,6 +38,8 @@ export const PRIVATE_TOOL_NAMES: ReadonlySet<string> = new Set([
   "connect_source",
   "disconnect_source",
   "purge_source",
+  "personal_reindex_source",
+  "personal_reindex_status",
 ]);
 
 /**

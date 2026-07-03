@@ -38,7 +38,7 @@ import {
   disconnectSource,
   purgeSource,
 } from "./layers/personal.js";
-import { handleQueue, type ReindexBatchMessage } from "./layers/reindex.js";
+import { handleQueue, handleWatchdog, startReindexJob, getReindexJobStatus, type ReindexBatchMessage } from "./layers/reindex.js";
 
 // --- Types ---
 
@@ -73,6 +73,8 @@ export interface Env {
   // WP-410 срез-2b Деплой-2 группа Б: reindex queue producer/consumer binding, same queue name
   // ("reindex") the personal-knowledge-mcp worker already runs under (inherit-secrets cut-over).
   REINDEX_QUEUE?: Queue<ReindexBatchMessage>;
+  /** Watchdog stale-job threshold override, minutes. Default 30 (see reindex.ts). Деплой-2 группа В. */
+  WATCHDOG_STALE_MINUTES?: string;
 }
 
 function activeDsn(env: Env): string {
@@ -1960,13 +1962,35 @@ const PRIVATE_TOOLS = [
   },
   {
     name: "connect_source",
-    description: "Connect a GitHub repo (already installed via the Aisystant Knowledge GitHub App) as a personal knowledge source. Reindexing of newly connected sources ships in a follow-up release — already-indexed content is searchable immediately.",
+    description: "Connect a GitHub repo (already installed via the Aisystant Knowledge GitHub App) as a personal knowledge source. Triggers an async reindex of the repo — poll personal_reindex_status with the returned job_id.",
     inputSchema: {
       type: "object",
       properties: {
         source: { type: "string", description: "Repo name, as it appears in the GitHub App installation" },
       },
       required: ["source"],
+    },
+  },
+  {
+    name: "personal_reindex_source",
+    description: "Manually (re)trigger an async reindex of an already-connected personal source. Not needed for newly connected sources — connect_source does this automatically. Use for stuck/stale content, or after a bulk edit in the source repo. Returns a job_id; poll personal_reindex_status with it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: { type: "string", description: "Connected repo name (from list_sources)" },
+      },
+      required: ["source"],
+    },
+  },
+  {
+    name: "personal_reindex_status",
+    description: "Poll the status of a reindex job started by connect_source or personal_reindex_source.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "job_id returned by connect_source or personal_reindex_source" },
+      },
+      required: ["job_id"],
     },
   },
   {
@@ -2153,7 +2177,56 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
 
           if (toolName === "connect_source") {
             const connectResult = await connectSource(env, principal.userId, args.source as string);
+            // WP-410 Деплой-2 группа В: trigger reindex only for a source that actually just
+            // changed state (newly_connected/reactivated) AND has write access. "already_connected"
+            // is a no-op repeat call (e.g. a retry-happy client) — reindexing it every time would
+            // re-walk + re-embed the whole repo on every call, guarded only by startReindexJob's
+            // 60s cooldown (cold-review finding, session 2026-07-03-11). A user who genuinely
+            // wants to force a re-reindex of an already-connected source has personal_reindex_source.
+            if (
+              (connectResult.status === "newly_connected" || connectResult.status === "reactivated") &&
+              connectResult.scope_provisioning === "ok"
+            ) {
+              const reindexResult = await startReindexJob(env, principal.userId, connectResult.source);
+              connectResult.reindex_triggered = reindexResult.status === "running";
+              connectResult.reindex_job_id = reindexResult.job_id || undefined;
+              connectResult.message = reindexResult.status === "failed"
+                ? `репо подключено, права на запись выданы, но переиндексация не запустилась: ${reindexResult.message}`
+                : reindexResult.message;
+              if (reindexResult.status === "failed") {
+                console.error(JSON.stringify({
+                  phase: "connect_source_reindex_failed",
+                  user_id_prefix: principal.userId.slice(0, 8),
+                  source: connectResult.source,
+                  reason: reindexResult.message,
+                }));
+              }
+            }
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(connectResult, null, 2) }] } };
+          }
+
+          if (toolName === "personal_reindex_source") {
+            const source = (args.source as string)?.trim();
+            if (!source) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Error: source required" }], isError: true } };
+            }
+            if (!ctx.sourceNames.includes(source)) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
+            }
+            const reindexResult = await startReindexJob(env, principal.userId, source);
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(reindexResult, null, 2) }], isError: reindexResult.status === "failed" } };
+          }
+
+          if (toolName === "personal_reindex_status") {
+            const jobId = (args.job_id as string)?.trim();
+            if (!jobId) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Error: job_id required" }], isError: true } };
+            }
+            const status = await getReindexJobStatus(env, principal.userId, jobId);
+            if (!status) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: no job ${jobId} found for this user` }], isError: true } };
+            }
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(status, null, 2) }] } };
           }
 
           if (toolName === "disconnect_source") {
@@ -3067,13 +3140,15 @@ export default {
     return new Response("Not found", { status: 404, headers: corsHeaders });
   },
 
-  // WP-339 Ф5+Ф6: Daily heartbeat cron — drift check + targeted reindex against the PUBLIC
-  // corpus (env.KNOWLEDGE_DATABASE_URL, not bound on the private-mode personal-knowledge-mcp
-  // worker). Skip entirely in private mode (WP-410 срез-2b) — running it there would throw on
-  // every fire against a binding that doesn't exist on that worker.
+  // WP-339 Ф5+Ф6 (public deploy) / WP-410 срез-2b Деплой-2 группа В (private deploy): the same
+  // cron trigger fires a different job depending which wrangler config it was deployed with —
+  // public knowledge-mcp's wrangler.toml has no [triggers] section (it never fires here at all);
+  // private personal-knowledge-mcp's wrangler.private.toml runs this every 15 min and needs the
+  // reindex watchdog, not the public drift-check heartbeat (which needs KNOWLEDGE_DATABASE_URL,
+  // not bound on that deploy).
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     if (resolveMode(env.MCP_MODE) === "private") {
-      console.warn(JSON.stringify({ phase: "heartbeat_skipped_private_mode" }));
+      ctx.waitUntil(handleWatchdog(env));
       return;
     }
     ctx.waitUntil(runHeartbeat(env));

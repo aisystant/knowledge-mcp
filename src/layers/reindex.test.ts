@@ -12,6 +12,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 let queryQueue: (unknown[] | Error)[] = [];
+let sqlCalls: unknown[][] = [];
 
 function nextSqlResult(): unknown[] {
   const next = queryQueue.shift();
@@ -21,6 +22,7 @@ function nextSqlResult(): unknown[] {
 
 function makeMockSql() {
   const sql = ((..._args: unknown[]) => {
+    sqlCalls.push(_args);
     try {
       return Promise.resolve(nextSqlResult());
     } catch (err) {
@@ -57,6 +59,7 @@ import {
 
 beforeEach(() => {
   queryQueue = [];
+  sqlCalls = [];
 });
 
 const ENV: ReindexEnv = {
@@ -221,6 +224,21 @@ describe("handleWatchdog", () => {
   it("marks stale running jobs failed", async () => {
     queryQueue.push([{ id: "job-1", user_id: USER_ID, source: "DS-my-strategy", completed_batches: 1, expected_batches: 3 }]);
     await expect(handleWatchdog(ENV)).resolves.toBeUndefined();
+  });
+
+  it("uses 30 minutes as the default stale threshold, not the old 60", async () => {
+    queryQueue.push([]);
+    await handleWatchdog(ENV);
+    // args: [strings, sql.unsafe(tableName), staleMinutes] — table name is interpolated first.
+    const [, , staleMinutes] = sqlCalls[sqlCalls.length - 1] as [unknown, string, number];
+    expect(staleMinutes).toBe(30);
+  });
+
+  it("honors WATCHDOG_STALE_MINUTES override", async () => {
+    queryQueue.push([]);
+    await handleWatchdog({ ...ENV, WATCHDOG_STALE_MINUTES: "45" });
+    const [, , staleMinutes] = sqlCalls[sqlCalls.length - 1] as [unknown, string, number];
+    expect(staleMinutes).toBe(45);
   });
 });
 

@@ -113,7 +113,7 @@ describe("connectSource", () => {
     expect(result.error).toContain("не входит");
   });
 
-  it("connects a new source, provisions bridge scopes, and never triggers reindex (deferred to Деплой-2)", async () => {
+  it("connects a new source, provisions bridge scopes; reindex trigger is the caller's job (index.ts, группа В)", async () => {
     queryQueue.push([{ github_username: "TserenTserenov", repos: ["DS-my-strategy"] }]); // installRows
     queryQueue.push([]); // currentRows — no existing row → newly_connected
     queryQueue.push([]); // INSERT user_sources
@@ -127,8 +127,10 @@ describe("connectSource", () => {
 
     expect(result.status).toBe("newly_connected");
     expect(result.scope_provisioning).toBe("ok");
+    // connectSource() itself never calls startReindexJob (circular-import boundary with
+    // reindex.ts) — the caller in index.ts does that and overwrites these two fields.
     expect(result.reindex_triggered).toBe(false);
-    expect(result.message).toContain("следующем релизе");
+    expect(result.message).toContain("права на запись выданы");
   });
 
   it("skips scope provisioning (not fails the connect) when INDICATORS_DATABASE_URL is absent", async () => {

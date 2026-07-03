@@ -24,6 +24,8 @@ max_batch_timeout = 5
 max_retries = 3
 dead_letter_queue = "reindex-dlq"
 
-# Деплой-2 группа В (not yet ported — cron watchdog + connect_source trigger deferred):
-# [triggers]
-# crons = ["*/5 * * * *"]
+# Деплой-2 группа В (peer-session 2026-07-03-11): watchdog cron live. 15 min (not 5) —
+# handleWatchdog does one cheap conditional UPDATE, no need to fire 288x/day against an
+# empty table. Stale-job threshold tuned to 30 min to match (see reindex.ts).
+[triggers]
+crons = ["*/15 * * * *"]

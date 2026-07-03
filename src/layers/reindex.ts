@@ -6,11 +6,11 @@
 // personalGetDocument/personalListSources in ./personal.ts, which already own the search-side
 // half of this dual-mode split).
 //
-// handleWatchdog is ported but NOT wired to a cron trigger yet — activating scheduled() for
-// private mode + uncommenting [triggers] in wrangler.private.toml is Деплой-2 группа В.
-// startReindexJob has no caller yet either (connectSource still hardcodes reindex_triggered:
-// false, ./personal.ts:605,689) — group В also wires the trigger. See ADR-mcp-unification-q1,
-// inbox/WP-410/WP-410.md, peer-session sessions/2026-07/2026-07-01-34-wp410-slice2b-deploy2-groupb.
+// Деплой-2 группа В (peer-session 2026-07-03-11): handleWatchdog is wired to scheduled() in
+// ../index.ts (private mode) + [triggers] in wrangler.private.toml is live (*/15). startReindexJob
+// is called from ../index.ts's connect_source handler (not from connectSource() in ./personal.ts —
+// that would be a circular import, since this file already imports from personal.ts). See
+// ADR-mcp-unification-q1, inbox/WP-410/WP-410.md, sessions/2026-07/2026-07-01-34-wp410-slice2b-deploy2-groupb.
 
 import { getKnowledgeSchema, KNOWLEDGE_TABLES } from "../utils/db.js";
 import {
@@ -521,16 +521,21 @@ export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env:
   }
 }
 
-// --- Watchdog (faithful port of index.ts:3332-3389) — NOT wired to scheduled() yet ---
+// --- Watchdog (faithful port of index.ts:3332-3389, threshold retuned for Деплой-2 группа В) ---
+
+// Cron fires every 15 min (wrangler.private.toml [triggers]) — a 60-min stale threshold (carried
+// over from the old once-an-hour monolith cron) would let a stuck job sit unfixed for up to ~74
+// min. Two watchdog cycles + margin = 30 min. Override via WATCHDOG_STALE_MINUTES for tuning
+// without a redeploy of the threshold logic itself.
+const DEFAULT_WATCHDOG_STALE_MINUTES = 30;
 
 /**
- * Mark stale 'running' jobs failed (last_heartbeat_at older than 60 min). Causes of getting
- * stuck: whole batch landed in DLQ, worker died between ack and UPDATE, expected_batches never
- * matched. Without the watchdog such jobs stay 'running' forever.
+ * Mark stale 'running' jobs failed (last_heartbeat_at older than WATCHDOG_STALE_MINUTES).
+ * Causes of getting stuck: whole batch landed in DLQ, worker died between ack and UPDATE,
+ * expected_batches never matched. Without the watchdog such jobs stay 'running' forever.
  *
- * No caller yet — activating this behind a cron trigger is Деплой-2 группа В (scheduled() in
- * ../index.ts currently skips unconditionally in private mode; wrangler.private.toml [triggers]
- * stays commented until then).
+ * Wired to scheduled() in ../index.ts (private mode) via wrangler.private.toml [triggers]
+ * (Деплой-2 группа В).
  */
 export async function handleWatchdog(env: ReindexEnv): Promise<void> {
   if (!env.DATABASE_URL) {
@@ -539,6 +544,7 @@ export async function handleWatchdog(env: ReindexEnv): Promise<void> {
   }
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
+  const staleMinutes = Number(env.WATCHDOG_STALE_MINUTES) || DEFAULT_WATCHDOG_STALE_MINUTES;
   const started = Date.now();
   try {
     const stale = await sql`
@@ -548,13 +554,13 @@ export async function handleWatchdog(env: ReindexEnv): Promise<void> {
           errors = COALESCE(errors, '[]'::jsonb) || '[{"reason":"watchdog_stale_heartbeat"}]'::jsonb
       WHERE status = 'running'
         AND last_heartbeat_at IS NOT NULL
-        AND NOW() - last_heartbeat_at > INTERVAL '60 minutes'
+        AND NOW() - last_heartbeat_at > (${staleMinutes} * INTERVAL '1 minute')
       RETURNING id, user_id, source, completed_batches, expected_batches
     `;
     console.log(JSON.stringify({
       phase: "watchdog_ok",
       stale_count: stale.length,
-      stale_jobs: stale.map((r) => ({ id: r.id, user_id: r.user_id, source: r.source, completed: r.completed_batches, expected: r.expected_batches })),
+      stale_jobs: stale.map((r) => ({ id: r.id, user_id_prefix: (r.user_id as string).slice(0, 8), source: r.source, completed: r.completed_batches, expected: r.expected_batches })),
       elapsed_ms: Date.now() - started,
     }));
   } catch (err) {
