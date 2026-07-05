@@ -10,5 +10,6 @@ __pycache__/
 
 # Nix / direnv
 .direnv/
+.devenv/
 result
 result-*

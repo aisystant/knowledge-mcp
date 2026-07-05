@@ -5,6 +5,9 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     systems.url = "github:nix-systems/default";
     devenv.url = "github:cachix/devenv";
+    # Required by devenv's `languages.python.version` to pin a specific Python.
+    nixpkgs-python.url = "github:cachix/nixpkgs-python";
+    nixpkgs-python.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   nixConfig = {
