@@ -71,7 +71,8 @@ async def test_pack_traverse_from_artifact_reaches_defined_concept(mcp, seed, co
     await seed(
         collection=collection, owner="platform",
         concepts=[
-            {"code": "PACK-systems-art/pack/SA.D.001.md", "name": "SA.D.001", "node_type": "artifact"},
+            {"code": "PACK-systems-art/pack/SA.D.001.md", "name": "SA.D.001",
+             "node_type": "artifact"},
             {"code": "DP.SC.121", "name": "Axiomaticity", "node_type": "concept"},
         ],
         edges=[{"from": "PACK-systems-art/pack/SA.D.001.md", "to": "DP.SC.121",

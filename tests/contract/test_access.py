@@ -53,7 +53,9 @@ async def test_owner_sees_own_personal_collection(authed, seed, collection, user
     assert "secretmarker" in res.text.lower()
 
 
-async def test_other_user_cannot_see_someones_personal_collection(authed, seed, collection, user_id):
+async def test_other_user_cannot_see_someones_personal_collection(
+    authed, seed, collection, user_id
+):
     await seed(collection=collection, owner=user_id, documents=[PRIVATE_DOC])
     other = authed(user_id="00000000-0000-0000-0000-000000000000")
     res = await other.call("search", {"query": "secretmarker"})
