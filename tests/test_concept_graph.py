@@ -1,4 +1,4 @@
-"""Contract: concept-graph tools, prod-shaped.
+"""Concept-graph tools, prod-shaped.
 
 Tools: concept_status, concept_search_by_name, concept_expand, pack_traverse.
 

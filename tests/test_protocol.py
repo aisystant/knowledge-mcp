@@ -1,4 +1,4 @@
-"""Protocol contract: the tool surface and the public-by-default posture."""
+"""Protocol: the tool surface and the public-by-default posture."""
 
 RETRIEVAL_TOOLS = {"search", "get_document", "list_sources", "list_documents"}
 GRAPH_TOOLS = {"concept_status", "concept_search_by_name", "concept_expand", "pack_traverse"}

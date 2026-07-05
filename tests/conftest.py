@@ -1,4 +1,4 @@
-"""Black-box contract harness for knowledge-mcp.
+"""Black-box acceptance-test harness for knowledge-mcp.
 
 Tests drive the server through the real MCP Streamable HTTP transport
 (`tools/list`, `tools/call`). knowledge-mcp runs in one of two modes, from a

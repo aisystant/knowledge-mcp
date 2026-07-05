@@ -88,10 +88,10 @@ The graph is a heterogeneous set of nodes discriminated by `node_type`
 - **Agent scope-grants** — the old `scope.ts` bridge/grant machinery is a
   separate authorization concern and is not part of this read model.
 
-## Tests as contract
+## Tests as spec
 
-There is no separate contract document. The tool list above is the promise; the
-tests under `tests/contract/` are the executable specification:
+There is no separate spec document. The tool list above is the promise; the
+tests under `tests/` are the executable specification:
 
 - `test_protocol.py` — advertised tool surface; public-by-default posture.
 - `test_retrieval.py` — search / get_document / list, scoped by `source`.

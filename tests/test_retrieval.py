@@ -1,4 +1,4 @@
-"""Contract: retrieval over seeded PLATFORM collections.
+"""Retrieval over seeded PLATFORM collections.
 
 Assertions stay behavioural: a query for a distinctive term returns the doc that
 contains it; `source`/`source_type` scope results (provenance filter); documents

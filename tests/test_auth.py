@@ -1,4 +1,4 @@
-"""Contract: the AUTHED (ORY JWT) mode gate.
+"""The AUTHED (ORY JWT) mode gate.
 
 Same codebase, different startup mode. In authed mode every request must carry a
 valid Bearer token; the public server (fixture `mcp`) has no such gate. Token

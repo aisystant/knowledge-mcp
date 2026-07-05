@@ -1,4 +1,4 @@
-"""Contract: per-collection access.
+"""Per-collection access.
 
 One owner per collection; ``platform`` is the public owner. The rule enforced on
 every request is: ``owner == platform  OR  owner == caller``. There is no group
