@@ -1,0 +1,23 @@
+name: tests
+
+on:
+  push:
+    branches: [python-gcp]
+  pull_request:
+    branches: [python-gcp]
+
+jobs:
+  contract-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs Nix, enables flakes, and marks the runner user as trusted so the
+      # flake's substituters (devenv.cachix.org) are honoured with --accept-flake-config.
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Lint
+        run: nix develop --impure --accept-flake-config -c ruff check src/ tests/
+
+      - name: Contract tests
+        run: nix develop --impure --accept-flake-config -c scripts/test.sh -q
