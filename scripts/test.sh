@@ -19,4 +19,15 @@ for _ in $(seq 1 60); do
 done
 pg_isready -h 127.0.0.1 -p 5432 -q || { echo "postgres did not start" >&2; exit 1; }
 
-exec uv run pytest "$@"
+# Clean slate every run: drop everything (incl. yoyo's tracking) so migrations
+# re-apply from zero and no data leaks between runs.
+echo "resetting database..."
+psql "$DATABASE_URL" -q -c 'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;'
+
+echo "applying migrations (yoyo)..."
+# yoyo wants the postgresql:// scheme; DATABASE_URL uses the postgres:// alias.
+yoyo_db=$(printf '%s' "${DATABASE_URL:-postgres://127.0.0.1:5432/knowledge}" \
+  | sed 's,^postgres://,postgresql://,')
+uv run --group migrations yoyo apply --batch --database "$yoyo_db" ./migrations
+
+exec uv run --group migrations pytest "$@"

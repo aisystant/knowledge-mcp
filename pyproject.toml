@@ -19,6 +19,12 @@ dev = [
     "httpx>=0.27.0",
     "ruff>=0.8.0",
 ]
+# Migration tooling only — kept out of the server runtime image. yoyo applies
+# SQL migrations synchronously (via psycopg2), before the service serves.
+migrations = [
+    "yoyo-migrations>=8.2",
+    "psycopg2-binary>=2.9",
+]
 
 [build-system]
 requires = ["hatchling"]
