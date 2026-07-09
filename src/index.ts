@@ -113,6 +113,7 @@ interface ReindexRequest {
 // --- Config ---
 
 const EMBEDDING_MODEL = "openai/text-embedding-3-small";
+const EMBEDDING_TIMEOUT_MS = 8000;
 const VECTOR_CONFIDENCE_THRESHOLD = 0.6;
 const CHUNK_CHAR_LIMIT = 10_000;
 
@@ -173,27 +174,43 @@ export function resolveGithubUrl(source: string, filename: string): string | nul
 
 // --- Helpers ---
 
-async function getEmbedding(apiKey: string, text: string): Promise<number[]> {
-  const response = await fetch("https://openrouter.ai/api/v1/embeddings", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      input: [text],
-      model: EMBEDDING_MODEL,
-      dimensions: 1024,
-    }),
-  });
+async function fetchEmbeddingOnce(apiKey: string, text: string): Promise<number[]> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), EMBEDDING_TIMEOUT_MS);
+  try {
+    const response = await fetch("https://openrouter.ai/api/v1/embeddings", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        input: [text],
+        model: EMBEDDING_MODEL,
+        dimensions: 1024,
+      }),
+      signal: controller.signal,
+    });
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`OpenAI Embeddings error: ${response.status} ${errText}`);
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`OpenAI Embeddings error: ${response.status} ${errText}`);
+    }
+
+    const data = (await response.json()) as { data: { embedding: number[] }[] };
+    return data.data[0].embedding;
+  } finally {
+    clearTimeout(timeout);
   }
+}
 
-  const data = (await response.json()) as { data: { embedding: number[] }[] };
-  return data.data[0].embedding;
+// One retry: OpenRouter embeddings occasionally hangs past EMBEDDING_TIMEOUT_MS (issue #231).
+export async function getEmbedding(apiKey: string, text: string): Promise<number[]> {
+  try {
+    return await fetchEmbeddingOnce(apiKey, text);
+  } catch {
+    return await fetchEmbeddingOnce(apiKey, text);
+  }
 }
 
 function db(env: Env) {

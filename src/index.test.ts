@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import { chunkLargeFile, systemChunkFile, contentHash } from "../scripts/ingest.js";
 import { neon } from "@neondatabase/serverless";
@@ -306,6 +306,51 @@ describe("rerankWithLLM", () => {
 
     const out = await rerankWithLLM("fake-key", "query", results, 5);
     expect(out[0].score).toBe(0.7); // original
+  });
+});
+
+// --- getEmbedding ---
+
+function mockEmbeddingResponse(embedding: number[]) {
+  return {
+    ok: true,
+    json: async () => ({ data: [{ embedding }] }),
+  };
+}
+
+describe("getEmbedding", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("returns the embedding on first successful attempt", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockEmbeddingResponse([0.1, 0.2, 0.3]));
+    globalThis.fetch = fetchMock;
+
+    const out = await getEmbedding("fake-key", "test query");
+    expect(out).toEqual([0.1, 0.2, 0.3]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries once and succeeds when the first attempt fails", async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error("network error"))
+      .mockResolvedValueOnce(mockEmbeddingResponse([0.4, 0.5, 0.6]));
+    globalThis.fetch = fetchMock;
+
+    const out = await getEmbedding("fake-key", "test query");
+    expect(out).toEqual([0.4, 0.5, 0.6]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("throws after both attempts fail", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 500, text: async () => "server error" });
+    globalThis.fetch = fetchMock;
+
+    await expect(getEmbedding("fake-key", "test query")).rejects.toThrow("OpenAI Embeddings error: 500");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
 
