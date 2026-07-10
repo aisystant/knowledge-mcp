@@ -17,7 +17,6 @@ const mockQuery = vi.fn();
 const mockRelease = vi.fn();
 const mockConnect = vi.fn();
 const mockOn = vi.fn();
-const mockEnd = vi.fn();
 
 vi.mock("@neondatabase/serverless", () => ({
   neonConfig: {},
@@ -25,12 +24,11 @@ vi.mock("@neondatabase/serverless", () => ({
     // Нужен function (не стрелка) чтобы работать как конструктор
     (this as { connect: typeof mockConnect }).connect = mockConnect;
     (this as { on: typeof mockOn }).on = mockOn;
-    (this as { end: typeof mockEnd }).end = mockEnd;
   }),
 }));
 
 // Импортируем ПОСЛЕ настройки мока (top-level await)
-const { withUserContext } = await import("./rls.js");
+const { withUserContext, _resetPool } = await import("./rls.js");
 
 const DB_URL = "postgresql://test:test@localhost/test";
 const USER_A = "user-ory-uuid-a";
@@ -38,12 +36,12 @@ const USER_B = "user-ory-uuid-b";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  _resetPool();
   mockConnect.mockResolvedValue({
     query: mockQuery,
     release: mockRelease,
   });
   mockQuery.mockResolvedValue({ rows: [] });
-  mockEnd.mockResolvedValue(undefined);
 });
 
 // --- Тест 1: SET LOCAL устанавливается для userId ---
@@ -132,24 +130,9 @@ describe("withUserContext — изоляция userId", () => {
   });
 });
 
-// --- Test 4: pool doesn't outlive the request and doesn't crash the worker (issue #231) ---
+// --- Test 4: pool error handling doesn't crash the worker (issue #231) ---
 
-describe("withUserContext — pool lifecycle", () => {
-  it("закрывает пул после выполнения (не расшаривается между запросами)", async () => {
-    await withUserContext(DB_URL, USER_A, async () => []);
-    expect(mockEnd).toHaveBeenCalledOnce();
-  });
-
-  it("закрывает пул даже если fn бросает ошибку", async () => {
-    await expect(
-      withUserContext(DB_URL, USER_A, async () => {
-        throw new Error("ошибка");
-      })
-    ).rejects.toThrow();
-
-    expect(mockEnd).toHaveBeenCalledOnce();
-  });
-
+describe("withUserContext — pool error handling", () => {
   it("регистрирует обработчик ошибки простаивающего клиента, чтобы emit('error') не бросал необработанное исключение", async () => {
     await withUserContext(DB_URL, USER_A, async () => []);
 
@@ -161,5 +144,13 @@ describe("withUserContext — pool lifecycle", () => {
     // listener threw — that's how an idle dropped connection crashed the worker (an
     // unrelated in-flight request saw HTTP 500).
     expect(() => errorHandler(new Error("connection terminated unexpectedly"))).not.toThrow();
+  });
+
+  it("создаёт пул только один раз, переиспользует между вызовами", async () => {
+    await withUserContext(DB_URL, USER_A, async () => []);
+    await withUserContext(DB_URL, USER_A, async () => []);
+
+    const { Pool } = await import("@neondatabase/serverless");
+    expect(vi.mocked(Pool)).toHaveBeenCalledOnce();
   });
 });

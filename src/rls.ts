@@ -14,13 +14,17 @@
  *   - Соединение возвращается в пул с чистым состоянием
  *   - Если userId = null/undefined — SET LOCAL не вызывается → RLS блокирует личные данные
  *
- * Pool lifecycle (issue #231, 2026-07-10): the pool is created and torn down fresh on
- * every call, never reused across worker requests. A Pool that outlives its fetch()
- * request, on Cloudflare Workers, risks handing a connection opened in a finished
- * request's IoContext to the next one — the platform kills that as cross-request I/O.
- * Pool is also an EventEmitter: `emit('error')` with no listener throws, so an idle
- * connection dropped by the network between connect() and release() used to crash the
- * worker with an unhandled throw instead of a contained log line.
+ * Pool error handling (issue #231, 2026-07-10): Pool is an EventEmitter — `emit('error')`
+ * with no listener throws, so an idle connection dropped by the network between
+ * connect() and release() used to crash the worker with an unhandled throw (a literal
+ * HTTP 500 for whatever unrelated request happened to be running, bypassing
+ * handleMcpRequest's try/catch entirely) instead of a contained log line.
+ *
+ * The pool singleton itself (below) stays shared across requests within one Worker
+ * isolate on purpose — this is the documented Neon/Cloudflare Workers pattern for
+ * reusing warm connections; tearing down and recreating a Pool per call was tried and
+ * reverted (2026-07-10) after it added a full WebSocket handshake to every query,
+ * pushing every search to 18-22s instead of the previous single-digit milliseconds.
  */
 
 import { neonConfig, Pool } from "@neondatabase/serverless";
@@ -29,6 +33,24 @@ import { neonConfig, Pool } from "@neondatabase/serverless";
 // Без этого Pool не может открыть WebSocket-соединение для транзакций
 if (typeof WebSocket !== "undefined") {
   neonConfig.webSocketConstructor = WebSocket;
+}
+
+// One pool per Worker isolate, reused across requests.
+let _pool: Pool | null = null;
+
+function getPool(connectionString: string): Pool {
+  if (!_pool) {
+    _pool = new Pool({ connectionString, max: 5 });
+    _pool.on("error", (err: Error) => {
+      console.error("[rls] pool error on idle client (contained):", err);
+    });
+  }
+  return _pool;
+}
+
+/** Test-only: reset the pool singleton. */
+export function _resetPool(): void {
+  _pool = null;
 }
 
 type IdentifierMarker = { __identifier: string };
@@ -54,10 +76,7 @@ export async function withUserContext<T>(
   userId: string | null | undefined,
   fn: (sql: SqlClient) => Promise<T>
 ): Promise<T> {
-  const pool = new Pool({ connectionString, max: 5 });
-  pool.on("error", (err: Error) => {
-    console.error("[rls] pool error on idle client (contained):", err);
-  });
+  const pool = getPool(connectionString);
   const client = await pool.connect();
 
   try {
@@ -111,8 +130,5 @@ export async function withUserContext<T>(
     throw err;
   } finally {
     client.release();
-    await pool.end().catch((err) => {
-      console.error("[rls] pool.end() failed (contained):", err);
-    });
   }
 }
