@@ -13,6 +13,14 @@
  *   - SET LOCAL действует только внутри транзакции — при COMMIT/ROLLBACK сбрасывается
  *   - Соединение возвращается в пул с чистым состоянием
  *   - Если userId = null/undefined — SET LOCAL не вызывается → RLS блокирует личные данные
+ *
+ * Pool lifecycle (issue #231, 2026-07-10): the pool is created and torn down fresh on
+ * every call, never reused across worker requests. A Pool that outlives its fetch()
+ * request, on Cloudflare Workers, risks handing a connection opened in a finished
+ * request's IoContext to the next one — the platform kills that as cross-request I/O.
+ * Pool is also an EventEmitter: `emit('error')` with no listener throws, so an idle
+ * connection dropped by the network between connect() and release() used to crash the
+ * worker with an unhandled throw instead of a contained log line.
  */
 
 import { neonConfig, Pool } from "@neondatabase/serverless";
@@ -21,23 +29,6 @@ import { neonConfig, Pool } from "@neondatabase/serverless";
 // Без этого Pool не может открыть WebSocket-соединение для транзакций
 if (typeof WebSocket !== "undefined") {
   neonConfig.webSocketConstructor = WebSocket;
-}
-
-// Один пул на Worker instance (переиспользуется между запросами)
-// Экспортируется для сброса в тестах
-export let _pool: Pool | null = null;
-
-export function getPool(connectionString: string): Pool {
-  if (!_pool) {
-    _pool = new Pool({ connectionString, max: 5 });
-  }
-  return _pool;
-
-}
-
-/** Только для тестов: сбросить синглтон пула */
-export function _resetPool(): void {
-  _pool = null;
 }
 
 type IdentifierMarker = { __identifier: string };
@@ -63,7 +54,10 @@ export async function withUserContext<T>(
   userId: string | null | undefined,
   fn: (sql: SqlClient) => Promise<T>
 ): Promise<T> {
-  const pool = getPool(connectionString);
+  const pool = new Pool({ connectionString, max: 5 });
+  pool.on("error", (err: Error) => {
+    console.error("[rls] pool error on idle client (contained):", err);
+  });
   const client = await pool.connect();
 
   try {
@@ -117,5 +111,8 @@ export async function withUserContext<T>(
     throw err;
   } finally {
     client.release();
+    await pool.end().catch((err) => {
+      console.error("[rls] pool.end() failed (contained):", err);
+    });
   }
 }

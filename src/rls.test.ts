@@ -16,17 +16,21 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const mockQuery = vi.fn();
 const mockRelease = vi.fn();
 const mockConnect = vi.fn();
+const mockOn = vi.fn();
+const mockEnd = vi.fn();
 
 vi.mock("@neondatabase/serverless", () => ({
   neonConfig: {},
   Pool: vi.fn(function (this: unknown) {
     // Нужен function (не стрелка) чтобы работать как конструктор
     (this as { connect: typeof mockConnect }).connect = mockConnect;
+    (this as { on: typeof mockOn }).on = mockOn;
+    (this as { end: typeof mockEnd }).end = mockEnd;
   }),
 }));
 
 // Импортируем ПОСЛЕ настройки мока (top-level await)
-const { withUserContext, _resetPool } = await import("./rls.js");
+const { withUserContext } = await import("./rls.js");
 
 const DB_URL = "postgresql://test:test@localhost/test";
 const USER_A = "user-ory-uuid-a";
@@ -34,12 +38,12 @@ const USER_B = "user-ory-uuid-b";
 
 beforeEach(() => {
   vi.clearAllMocks();
-  _resetPool();
   mockConnect.mockResolvedValue({
     query: mockQuery,
     release: mockRelease,
   });
   mockQuery.mockResolvedValue({ rows: [] });
+  mockEnd.mockResolvedValue(undefined);
 });
 
 // --- Тест 1: SET LOCAL устанавливается для userId ---
@@ -125,5 +129,37 @@ describe("withUserContext — изоляция userId", () => {
     for (const args of setLocalArgs) {
       expect(args).not.toContain(USER_B);
     }
+  });
+});
+
+// --- Test 4: pool doesn't outlive the request and doesn't crash the worker (issue #231) ---
+
+describe("withUserContext — pool lifecycle", () => {
+  it("закрывает пул после выполнения (не расшаривается между запросами)", async () => {
+    await withUserContext(DB_URL, USER_A, async () => []);
+    expect(mockEnd).toHaveBeenCalledOnce();
+  });
+
+  it("закрывает пул даже если fn бросает ошибку", async () => {
+    await expect(
+      withUserContext(DB_URL, USER_A, async () => {
+        throw new Error("ошибка");
+      })
+    ).rejects.toThrow();
+
+    expect(mockEnd).toHaveBeenCalledOnce();
+  });
+
+  it("регистрирует обработчик ошибки простаивающего клиента, чтобы emit('error') не бросал необработанное исключение", async () => {
+    await withUserContext(DB_URL, USER_A, async () => []);
+
+    const errorCall = mockOn.mock.calls.find(([event]) => event === "error");
+    expect(errorCall).toBeDefined();
+
+    const errorHandler = errorCall![1] as (err: Error) => void;
+    // Before this handler existed, emitting "error" on the Pool (an EventEmitter) with no
+    // listener threw — that's how an idle dropped connection crashed the worker (an
+    // unrelated in-flight request saw HTTP 500).
+    expect(() => errorHandler(new Error("connection terminated unexpectedly"))).not.toThrow();
   });
 });
