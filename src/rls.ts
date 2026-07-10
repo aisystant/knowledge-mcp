@@ -14,17 +14,28 @@
  *   - Соединение возвращается в пул с чистым состоянием
  *   - Если userId = null/undefined — SET LOCAL не вызывается → RLS блокирует личные данные
  *
- * Pool error handling (issue #231, 2026-07-10): Pool is an EventEmitter — `emit('error')`
- * with no listener throws, so an idle connection dropped by the network between
- * connect() and release() used to crash the worker with an unhandled throw (a literal
- * HTTP 500 for whatever unrelated request happened to be running, bypassing
- * handleMcpRequest's try/catch entirely) instead of a contained log line.
+ * Pool lifecycle (issue #231, root-caused 2026-07-10 via live `wrangler tail`): a Pool
+ * must never outlive the request that created it. Two things were tried and rejected
+ * before landing here:
+ *   1. A single Pool singleton shared across ALL worker requests (the original code) —
+ *      confirmed via live trace to throw "Cannot perform I/O on behalf of a different
+ *      request": Cloudflare Workers ties a Pool's underlying connection to the IoContext
+ *      of the request that opened it, and kills any later, unrelated request that reuses
+ *      it through the shared singleton. This was the actual source of den317's ~30%
+ *      "Backend error: 500" reports.
+ *   2. A brand new Pool per withUserContext() call — safe, but every one of
+ *      searchDocuments()'s 2-4 sequential DB round-trips then paid its own fresh
+ *      WebSocket handshake, pushing every search from single-digit ms to 18-22s.
+ * Landed: withUserContext() takes an optional caller-supplied Pool (see
+ * createRequestPool() below) so a single request that needs several round-trips (e.g.
+ * search) can share one Pool for its own duration, while single-call sites still get a
+ * pool created and torn down just for them. Either way, no Pool is ever reused across
+ * two different incoming requests.
  *
- * The pool singleton itself (below) stays shared across requests within one Worker
- * isolate on purpose — this is the documented Neon/Cloudflare Workers pattern for
- * reusing warm connections; tearing down and recreating a Pool per call was tried and
- * reverted (2026-07-10) after it added a full WebSocket handshake to every query,
- * pushing every search to 18-22s instead of the previous single-digit milliseconds.
+ * Pool is also an EventEmitter: `emit('error')` with no listener throws, so an idle
+ * connection dropped by the network between connect() and release() used to crash the
+ * worker outright instead of logging. createRequestPool() attaches a listener so that
+ * can't happen either.
  */
 
 import { neonConfig, Pool } from "@neondatabase/serverless";
@@ -35,22 +46,17 @@ if (typeof WebSocket !== "undefined") {
   neonConfig.webSocketConstructor = WebSocket;
 }
 
-// One pool per Worker isolate, reused across requests.
-let _pool: Pool | null = null;
-
-function getPool(connectionString: string): Pool {
-  if (!_pool) {
-    _pool = new Pool({ connectionString, max: 5 });
-    _pool.on("error", (err: Error) => {
-      console.error("[rls] pool error on idle client (contained):", err);
-    });
-  }
-  return _pool;
-}
-
-/** Test-only: reset the pool singleton. */
-export function _resetPool(): void {
-  _pool = null;
+/**
+ * Create a Pool for a single incoming request. Caller owns its lifecycle: pass it to
+ * every withUserContext() call needed to serve that one request, then `await pool.end()`
+ * in a finally block. Never store the result outside the request that created it.
+ */
+export function createRequestPool(connectionString: string): Pool {
+  const pool = new Pool({ connectionString, max: 5 });
+  pool.on("error", (err: Error) => {
+    console.error("[rls] pool error on idle client (contained):", err);
+  });
+  return pool;
 }
 
 type IdentifierMarker = { __identifier: string };
@@ -70,13 +76,17 @@ type SqlClient = {
  * @param connectionString - DATABASE_URL
  * @param userId - Ory user UUID (или null для платформенных запросов)
  * @param fn - async функция, получающая тегированный шаблон sql
+ * @param sharedPool - опционально: пул, созданный и закрываемый вызывающей стороной
+ *   (см. createRequestPool) — для нескольких последовательных вызовов в рамках одного
+ *   запроса. Без него функция сама создаёт и закрывает пул на один этот вызов.
  */
 export async function withUserContext<T>(
   connectionString: string,
   userId: string | null | undefined,
-  fn: (sql: SqlClient) => Promise<T>
+  fn: (sql: SqlClient) => Promise<T>,
+  sharedPool?: Pool
 ): Promise<T> {
-  const pool = getPool(connectionString);
+  const pool = sharedPool ?? createRequestPool(connectionString);
   const client = await pool.connect();
 
   try {
@@ -130,5 +140,10 @@ export async function withUserContext<T>(
     throw err;
   } finally {
     client.release();
+    if (!sharedPool) {
+      await pool.end().catch((err) => {
+        console.error("[rls] pool.end() failed (contained):", err);
+      });
+    }
   }
 }

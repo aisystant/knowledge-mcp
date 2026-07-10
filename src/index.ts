@@ -12,8 +12,8 @@
  * - Vector low confidence (score < 0.6) → fallback to keyword + merge
  */
 
-import { neon } from "@neondatabase/serverless";
-import { withUserContext } from "./rls.js";
+import { neon, type Pool } from "@neondatabase/serverless";
+import { withUserContext, createRequestPool } from "./rls.js";
 import {
   getKnowledgeSchema,
   getConceptGraphSchema,
@@ -260,7 +260,8 @@ async function keywordSearch(
   source?: string,
   sourceType?: string,
   limit: number = 5,
-  userId?: string
+  userId?: string,
+  pool?: Pool
 ): Promise<SearchResult[]> {
   const src = source ?? null;
   const stype = sourceType ?? null;
@@ -307,7 +308,7 @@ async function keywordSearch(
              CASE WHEN source_uri ILIKE ${pattern} THEN 0 ELSE 1 END,
              length(content) DESC
     LIMIT ${limit}
-  `);
+  `, pool);
 
   return rows.map((r) => {
     const source = (r.source as string) || "";
@@ -330,7 +331,8 @@ async function vectorSearch(
   source?: string,
   sourceType?: string,
   limit: number = 5,
-  userId?: string
+  userId?: string,
+  pool?: Pool
 ): Promise<SearchResult[]> {
   const embedding = await getEmbedding(env.OPENROUTER_API_KEY, query);
   const vec = `[${embedding.join(",")}]`;
@@ -349,7 +351,7 @@ async function vectorSearch(
       AND account_id IS NULL
     ORDER BY embedding <=> ${vec}::vector
     LIMIT ${limit}
-  `);
+  `, pool);
 
   return rows.map((r) => {
     const source = (r.source as string) || "";
@@ -473,7 +475,7 @@ ${candidates.map((c) => `[${c.index}] ${c.filename}\n${c.snippet}`).join("\n\n")
 }
 
 /** Enrich search results with parent document content when available */
-export async function enrichWithParentContent(env: Env, results: SearchResult[], userId?: string): Promise<SearchResult[]> {
+export async function enrichWithParentContent(env: Env, results: SearchResult[], userId?: string, pool?: Pool): Promise<SearchResult[]> {
   if (results.length === 0) return results;
 
   // Batch-fetch parent info for all results that are chunks (have parent_id)
@@ -496,7 +498,7 @@ export async function enrichWithParentContent(env: Env, results: SearchResult[],
       )
       AND p.account_id IS NULL
       AND c.account_id IS NULL
-  `);
+  `, pool);
 
   const parentMap = new Map<string, { parent_filename: string; parent_content: string }>();
   for (const row of parentRows) {
@@ -524,41 +526,51 @@ async function searchDocuments(
   limit: number = 5,
   userId?: string
 ): Promise<SearchResult[]> {
-  const queryType = detectQueryType(query);
+  // One pool for this call's whole DB round-trip chain (up to 4 sequential queries below),
+  // never reused past it — see rls.ts createRequestPool() for why (issue #231).
+  const pool = createRequestPool(activeDsn(env));
 
-  if (queryType === "keyword") {
-    // Keyword-first: skip embedding generation (~200ms saved), no reranking needed
-    const kwResults = await keywordSearch(env, query, source, sourceType, limit, userId);
-    if (kwResults.length > 0) return enrichWithParentContent(env, kwResults, userId);
-    // Fallback to vector if keyword found nothing
-  }
+  try {
+    const queryType = detectQueryType(query);
 
-  // Vector path: fetch extra candidates for LLM reranking
-  const fetchLimit = Math.max(limit, RERANK_CANDIDATES);
-  const vectorResults = await vectorSearch(env, query, source, sourceType, fetchLimit, userId);
-
-  // Low-confidence fallback: if vector top score < threshold, try keyword
-  if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
-    const kwFallback = await keywordSearch(env, query, source, sourceType, limit, userId);
-    if (kwFallback.length > 0) {
-      // Merge: deduplicate by filename, keep highest score
-      const seen = new Map<string, SearchResult>();
-      for (const r of [...kwFallback, ...vectorResults]) {
-        const existing = seen.get(r.filename);
-        if (!existing || r.score > existing.score) {
-          seen.set(r.filename, r);
-        }
-      }
-      const merged = [...seen.values()].sort((a, b) => b.score - a.score);
-      // Rerank merged results
-      const reranked = await rerankWithLLM(env.OPENROUTER_API_KEY, query, merged, limit);
-      return enrichWithParentContent(env, reranked, userId);
+    if (queryType === "keyword") {
+      // Keyword-first: skip embedding generation (~200ms saved), no reranking needed
+      const kwResults = await keywordSearch(env, query, source, sourceType, limit, userId, pool);
+      if (kwResults.length > 0) return await enrichWithParentContent(env, kwResults, userId, pool);
+      // Fallback to vector if keyword found nothing
     }
-  }
 
-  // LLM rerank vector results → return top-K
-  const reranked = await rerankWithLLM(env.OPENROUTER_API_KEY, query, vectorResults, limit);
-  return enrichWithParentContent(env, reranked, userId);
+    // Vector path: fetch extra candidates for LLM reranking
+    const fetchLimit = Math.max(limit, RERANK_CANDIDATES);
+    const vectorResults = await vectorSearch(env, query, source, sourceType, fetchLimit, userId, pool);
+
+    // Low-confidence fallback: if vector top score < threshold, try keyword
+    if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
+      const kwFallback = await keywordSearch(env, query, source, sourceType, limit, userId, pool);
+      if (kwFallback.length > 0) {
+        // Merge: deduplicate by filename, keep highest score
+        const seen = new Map<string, SearchResult>();
+        for (const r of [...kwFallback, ...vectorResults]) {
+          const existing = seen.get(r.filename);
+          if (!existing || r.score > existing.score) {
+            seen.set(r.filename, r);
+          }
+        }
+        const merged = [...seen.values()].sort((a, b) => b.score - a.score);
+        // Rerank merged results
+        const reranked = await rerankWithLLM(env.OPENROUTER_API_KEY, query, merged, limit);
+        return await enrichWithParentContent(env, reranked, userId, pool);
+      }
+    }
+
+    // LLM rerank vector results → return top-K
+    const reranked = await rerankWithLLM(env.OPENROUTER_API_KEY, query, vectorResults, limit);
+    return await enrichWithParentContent(env, reranked, userId, pool);
+  } finally {
+    await pool.end().catch((err) => {
+      console.error("[search] pool.end() failed (contained):", err);
+    });
+  }
 }
 
 async function getDocument(

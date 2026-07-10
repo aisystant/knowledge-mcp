@@ -17,6 +17,7 @@ const mockQuery = vi.fn();
 const mockRelease = vi.fn();
 const mockConnect = vi.fn();
 const mockOn = vi.fn();
+const mockEnd = vi.fn();
 
 vi.mock("@neondatabase/serverless", () => ({
   neonConfig: {},
@@ -24,11 +25,12 @@ vi.mock("@neondatabase/serverless", () => ({
     // Нужен function (не стрелка) чтобы работать как конструктор
     (this as { connect: typeof mockConnect }).connect = mockConnect;
     (this as { on: typeof mockOn }).on = mockOn;
+    (this as { end: typeof mockEnd }).end = mockEnd;
   }),
 }));
 
 // Импортируем ПОСЛЕ настройки мока (top-level await)
-const { withUserContext, _resetPool } = await import("./rls.js");
+const { withUserContext, createRequestPool } = await import("./rls.js");
 
 const DB_URL = "postgresql://test:test@localhost/test";
 const USER_A = "user-ory-uuid-a";
@@ -36,12 +38,12 @@ const USER_B = "user-ory-uuid-b";
 
 beforeEach(() => {
   vi.clearAllMocks();
-  _resetPool();
   mockConnect.mockResolvedValue({
     query: mockQuery,
     release: mockRelease,
   });
   mockQuery.mockResolvedValue({ rows: [] });
+  mockEnd.mockResolvedValue(undefined);
 });
 
 // --- Тест 1: SET LOCAL устанавливается для userId ---
@@ -130,9 +132,9 @@ describe("withUserContext — изоляция userId", () => {
   });
 });
 
-// --- Test 4: pool error handling doesn't crash the worker (issue #231) ---
+// --- Test 4: pool lifecycle doesn't crash the worker or leak across requests (issue #231) ---
 
-describe("withUserContext — pool error handling", () => {
+describe("withUserContext — pool lifecycle", () => {
   it("регистрирует обработчик ошибки простаивающего клиента, чтобы emit('error') не бросал необработанное исключение", async () => {
     await withUserContext(DB_URL, USER_A, async () => []);
 
@@ -146,11 +148,24 @@ describe("withUserContext — pool error handling", () => {
     expect(() => errorHandler(new Error("connection terminated unexpectedly"))).not.toThrow();
   });
 
-  it("создаёт пул только один раз, переиспользует между вызовами", async () => {
+  it("без общего пула создаёт и закрывает свой собственный пул на каждый вызов (не переживает запрос)", async () => {
     await withUserContext(DB_URL, USER_A, async () => []);
     await withUserContext(DB_URL, USER_A, async () => []);
 
     const { Pool } = await import("@neondatabase/serverless");
-    expect(vi.mocked(Pool)).toHaveBeenCalledOnce();
+    expect(vi.mocked(Pool)).toHaveBeenCalledTimes(2);
+    expect(mockEnd).toHaveBeenCalledTimes(2);
+  });
+
+  it("с общим пулом (createRequestPool) переиспользует его между вызовами и не закрывает сам", async () => {
+    const { Pool } = await import("@neondatabase/serverless");
+    const sharedPool = createRequestPool(DB_URL);
+    vi.mocked(Pool).mockClear();
+
+    await withUserContext(DB_URL, USER_A, async () => [], sharedPool);
+    await withUserContext(DB_URL, USER_A, async () => [], sharedPool);
+
+    expect(vi.mocked(Pool)).not.toHaveBeenCalled(); // no new Pool created inside withUserContext
+    expect(mockEnd).not.toHaveBeenCalled(); // caller owns pool.end(), not withUserContext
   });
 });
