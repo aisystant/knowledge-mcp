@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, TOOLS } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import { chunkLargeFile, systemChunkFile, contentHash } from "../scripts/ingest.js";
 import { neon } from "@neondatabase/serverless";
@@ -430,10 +430,14 @@ describe("hashQuery", () => {
 // --- TOOLS array includes feedback tools ---
 
 describe("feedback tools registration", () => {
-  it("feedback tool is defined", async () => {
-    // Verify tool is in TOOLS array via MCP handler
-    // Since TOOLS is not exported, we verify the tool name strings exist in source
-    // Real integration test would call tools/list endpoint
-    expect(true).toBe(true); // placeholder — full test needs MCP handler
+  it("feedback tool is registered with its required input fields", () => {
+    const tool = TOOLS.find((t) => t.name === "feedback");
+    expect(tool).toBeDefined();
+    expect(tool!.inputSchema.required).toEqual(["document_id", "query", "helpfulness"]);
+  });
+
+  it("feedback_stats tool is registered", () => {
+    const tool = TOOLS.find((t) => t.name === "feedback_stats");
+    expect(tool).toBeDefined();
   });
 });

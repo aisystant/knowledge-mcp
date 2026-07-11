@@ -1684,7 +1684,7 @@ async function getLearnerProgress(env: Env, userId: string, domain: string | und
 
 // --- MCP tool definitions ---
 
-const TOOLS = [
+export const TOOLS = [
   {
     name: "search",
     description:

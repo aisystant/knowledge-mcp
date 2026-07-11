@@ -30,7 +30,7 @@
 
 import { readFileSync, readdirSync, statSync, existsSync } from "fs";
 import { join, relative, extname, dirname } from "path";
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
@@ -61,7 +61,7 @@ const SKIP_PATTERNS = [
 
 // --- Types ---
 
-interface SourceConfig {
+export interface SourceConfig {
   source: string;
   source_type: "pack" | "guides" | "ds" | "content";
   path: string;
@@ -262,7 +262,7 @@ export async function systemChunkFile(
 
 // --- Main ingestion (REFACTORED to public.knowledge_chunk) ---
 
-async function ingestSource(
+export async function ingestSource(
   config: SourceConfig,
   sql: NeonQueryFunction<false, false>,
   apiKey: string
@@ -372,104 +372,132 @@ async function ingestSource(
 
   console.log(`  Indexing ${toIndex.length} documents...`);
 
-  // Delete existing rows for changed parents (and their chunks) + standalone changed files
   const changedParents = dirtyParents;
   const standaloneChanged = toIndex.filter((d) => !d.parentFile && !d.isParent).map((d) => d.filename);
 
+  // Compute embeddings for every chunk BEFORE touching the DB. Delete+insert for a
+  // unit only happens once its replacement rows are fully ready in memory, so an
+  // interruption can never leave a document deleted without its replacement
+  // (WP-443 review: critical — DELETE→INSERT was not transactional).
+  const chunks = toIndex.filter((d) => !d.isParent);
+  const embeddingByFilename = new Map<string, number[]>();
+  for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+    const batch = chunks.slice(i, i + BATCH_SIZE);
+    const texts = batch.map((d) => d.content.slice(0, CHUNK_CHAR_LIMIT));
+    const embeddings = await getEmbeddings(apiKey, texts);
+    batch.forEach((doc, j) => embeddingByFilename.set(doc.filename, embeddings[j]));
+    if (i + BATCH_SIZE < chunks.length) {
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  }
+  console.log(`  ${chunks.length} embeddings computed`);
+
+  // documents (not toIndex) so a parent whose own content is unchanged but whose
+  // children were re-chunked can still be re-inserted after the cascade delete below.
+  const parentByFilename = new Map(documents.filter((d) => d.isParent).map((d) => [d.filename, d]));
+  let posCounter: Record<string, number> = {};
+  let indexed = 0;
+
+  const chunkInsert = (
+    doc: (typeof chunks)[number],
+    pos: number,
+    parentUuid: string | null
+  ) => sql`
+    INSERT INTO public.knowledge_chunk (
+      chunk_id, document_path, paragraph_pos, content_hash, hash,
+      source, source_uri, source_kind, collection_kind, account_id,
+      content, embedding, parent_chunk_id, indexed_at
+    )
+    VALUES (
+      ${`${doc.filename}::p${pos}`}, ${doc.filename}, ${pos}, ${doc.hash}, ${doc.hash},
+      ${source}, ${doc.filename}, ${source_type}, ${collectionKind}, ${accountId}::uuid,
+      ${doc.content}, ${`[${embeddingByFilename.get(doc.filename)!.join(",")}]`}::vector,
+      ${parentUuid}::uuid, NOW()
+    )
+    ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
+    DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding,
+      content_hash = EXCLUDED.content_hash, hash = EXCLUDED.hash,
+      parent_chunk_id = EXCLUDED.parent_chunk_id, indexed_at = EXCLUDED.indexed_at
+    RETURNING chunk_uuid
+  `;
+
+  // Serializes concurrent ingest runs against the same unit (source + parent/standalone
+  // file): the lock is transaction-scoped, so a second process's DELETE+INSERT for the
+  // same unit waits for the first to commit instead of interleaving with it.
+  const unitLock = (unitKey: string) => sql`SELECT pg_advisory_xact_lock(hashtext(${source + '::' + unitKey}))`;
+
+  const failedUnits: string[] = [];
+
   for (const parentFile of changedParents) {
-    // Delete parent + all its chunks (LIKE 'parent::%' и сам parent)
-    await sql`
+    const parent = parentByFilename.get(parentFile);
+    const ownChunks = chunks.filter((d) => d.parentFile === parentFile);
+    const deleteQuery = sql`
       DELETE FROM public.knowledge_chunk
       WHERE source = ${source}
         AND account_id IS NOT DISTINCT FROM ${accountId}::uuid
         AND (source_uri = ${parentFile} OR source_uri LIKE ${parentFile + '::%'})
     `;
-    console.log(`  Cleaned old parent + chunks for ${parentFile}`);
+
+    const inserts: ReturnType<typeof sql>[] = [];
+    const parentUuid = parent ? randomUUID() : null;
+    if (parent) {
+      inserts.push(sql`
+        INSERT INTO public.knowledge_chunk (
+          chunk_uuid, chunk_id, document_path, paragraph_pos, content_hash, hash,
+          source, source_uri, source_kind, collection_kind, account_id,
+          content, embedding, indexed_at
+        )
+        VALUES (
+          ${parentUuid}::uuid, ${`${parent.filename}::p0`}, ${parent.filename}, 0, ${parent.hash}, ${parent.hash},
+          ${source}, ${parent.filename}, ${source_type}, ${collectionKind}, ${accountId}::uuid,
+          ${parent.content}, NULL, NOW()
+        )
+      `);
+    }
+    for (const doc of ownChunks) {
+      const pos = (posCounter[parentFile] ?? 0) + 1;
+      posCounter[parentFile] = pos;
+      inserts.push(chunkInsert(doc, pos, parentUuid));
+    }
+
+    try {
+      await sql.transaction([unitLock(parentFile), deleteQuery, ...inserts]);
+    } catch (err) {
+      console.error(`  [ingest] unit "${parentFile}" failed, skipping: ${(err as Error).message}`);
+      failedUnits.push(parentFile);
+      continue;
+    }
+    indexed += ownChunks.length + (parent ? 1 : 0);
+    console.log(`  ${indexed}/${toIndex.length} indexed (unit: ${parentFile})`);
   }
-  // Delete changed standalone files
-  if (standaloneChanged.length > 0) {
-    await sql`
+
+  for (const filename of standaloneChanged) {
+    const doc = chunks.find((d) => d.filename === filename && !d.parentFile)!;
+    const deleteQuery = sql`
       DELETE FROM public.knowledge_chunk
       WHERE source = ${source}
         AND account_id IS NOT DISTINCT FROM ${accountId}::uuid
-        AND source_uri = ANY(${standaloneChanged}::text[])
+        AND source_uri = ${filename}
     `;
-  }
+    const pos = (posCounter[filename] ?? 0) + 1;
+    posCounter[filename] = pos;
 
-  // Phase 1: Insert parent documents (no embeddings — too large for meaningful vectors)
-  // Returns chunk_uuid for FK linkage to chunks.
-  const parents = toIndex.filter((d) => d.isParent);
-  const parentUuids = new Map<string, string>(); // filename -> chunk_uuid
-
-  for (const parent of parents) {
-    const chunkId = `${parent.filename}::p0`;
-    const result = await sql`
-      INSERT INTO public.knowledge_chunk (
-        chunk_id, document_path, paragraph_pos, content_hash, hash,
-        source, source_uri, source_kind, collection_kind, account_id,
-        content, embedding, indexed_at
-      )
-      VALUES (
-        ${chunkId}, ${parent.filename}, 0, ${parent.hash}, ${parent.hash},
-        ${source}, ${parent.filename}, ${source_type}, ${collectionKind}, ${accountId}::uuid,
-        ${parent.content}, NULL, NOW()
-      )
-      ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
-      DO NOTHING
-      RETURNING chunk_uuid
-    ` as { chunk_uuid: string }[];
-    if (result[0]) parentUuids.set(parent.filename, result[0].chunk_uuid);
-  }
-  if (parents.length > 0) {
-    console.log(`  ${parents.length} parent documents stored`);
-  }
-
-  // Phase 2: Insert chunks with embeddings and parent_chunk_id links
-  const chunks = toIndex.filter((d) => !d.isParent);
-  let indexed = 0;
-  let posCounter: Record<string, number> = {};
-
-  for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-    const batch = chunks.slice(i, i + BATCH_SIZE);
-    const texts = batch.map((d) => d.content.slice(0, CHUNK_CHAR_LIMIT));
-
-    const embeddings = await getEmbeddings(apiKey, texts);
-
-    for (let j = 0; j < batch.length; j++) {
-      const doc = batch[j];
-      const embeddingStr = `[${embeddings[j].join(",")}]`;
-      const groupKey = doc.parentFile ?? doc.filename;
-      const pos = (posCounter[groupKey] ?? 0) + 1; // chunks start at paragraph_pos = 1 (parent = 0)
-      posCounter[groupKey] = pos;
-
-      const chunkId = `${doc.filename}::p${pos}`;
-      const parentUuid = doc.parentFile ? parentUuids.get(doc.parentFile) ?? null : null;
-
-      await sql`
-        INSERT INTO public.knowledge_chunk (
-          chunk_id, document_path, paragraph_pos, content_hash, hash,
-          source, source_uri, source_kind, collection_kind, account_id,
-          content, embedding, parent_chunk_id, indexed_at
-        )
-        VALUES (
-          ${chunkId}, ${doc.filename}, ${pos}, ${doc.hash}, ${doc.hash},
-          ${source}, ${doc.filename}, ${source_type}, ${collectionKind}, ${accountId}::uuid,
-          ${doc.content}, ${embeddingStr}::vector, ${parentUuid}::uuid, NOW()
-        )
-        ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
-        DO NOTHING
-      `;
+    try {
+      await sql.transaction([unitLock(filename), deleteQuery, chunkInsert(doc, pos, null)]);
+    } catch (err) {
+      console.error(`  [ingest] unit "${filename}" failed, skipping: ${(err as Error).message}`);
+      failedUnits.push(filename);
+      continue;
     }
-
-    indexed += batch.length;
-    console.log(`  ${indexed}/${chunks.length} indexed`);
-
-    if (i + BATCH_SIZE < chunks.length) {
-      await new Promise((r) => setTimeout(r, 300));
-    }
+    indexed += 1;
+    console.log(`  ${indexed}/${toIndex.length} indexed`);
   }
 
-  return indexed + parents.length;
+  if (failedUnits.length > 0) {
+    console.error(`  [ingest] ${failedUnits.length} unit(s) failed for source "${source}": ${failedUnits.join(", ")}`);
+  }
+
+  return indexed;
 }
 
 // --- CLI ---
@@ -504,11 +532,20 @@ async function main() {
     const configs: SourceConfig[] = JSON.parse(readFileSync(configPath, "utf-8"));
     console.log(`Ingesting ${configs.length} sources from ${configPath}`);
     let total = 0;
+    const failedSources: string[] = [];
     for (const config of configs) {
       console.log(`\n[${config.source}] (${config.source_type})`);
-      total += await ingestSource(config, sql, env.OPENAI_API_KEY);
+      try {
+        total += await ingestSource(config, sql, env.OPENAI_API_KEY);
+      } catch (err) {
+        console.error(`  [ingest] source "${config.source}" failed, skipping: ${(err as Error).message}`);
+        failedSources.push(config.source);
+      }
     }
     console.log(`\nDone. Total indexed: ${total}`);
+    if (failedSources.length > 0) {
+      console.error(`Failed sources: ${failedSources.join(", ")}`);
+    }
   } else {
     const sourceIdx = args.indexOf("--source");
     const typeIdx = args.indexOf("--type");
