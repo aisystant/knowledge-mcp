@@ -33,7 +33,6 @@ import { join, relative, extname, dirname } from "path";
 import { createHash, randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
-import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -46,9 +45,6 @@ const BATCH_SIZE = 10;
 const CHUNK_CHAR_LIMIT = 10_000;
 const LARGE_FILE_THRESHOLD = CHUNK_CHAR_LIMIT;
 const VERY_LARGE_WARNING = 50_000;
-const CHUNKER_MODE = process.env.KNOWLEDGE_CHUNKER ?? "legacy";
-const SYSTEM_CHUNK_SIZE = 2_000;
-const SYSTEM_CHUNK_OVERLAP = 200;
 const SKIP_PATTERNS = [
   /node_modules/,
   /\.git\//,
@@ -241,25 +237,6 @@ export function chunkLargeFile(
   return chunks;
 }
 
-// --- System-native recursive chunker (WP-443) ---
-
-export async function systemChunkFile(
-  content: string,
-  filename: string
-): Promise<{ filename: string; content: string }[]> {
-  const splitter = new RecursiveCharacterTextSplitter({
-    chunkSize: SYSTEM_CHUNK_SIZE,
-    chunkOverlap: SYSTEM_CHUNK_OVERLAP,
-    separators: ["\n## ", "\n### ", "\n\n", ". ", " ", ""],
-  });
-
-  const docs = await splitter.createDocuments([content]);
-  return docs.map((doc, index) => ({
-    filename: `${filename}::chunk${index + 1}`,
-    content: doc.pageContent,
-  }));
-}
-
 // --- Main ingestion (REFACTORED to public.knowledge_chunk) ---
 
 export async function ingestSource(
@@ -291,9 +268,7 @@ export async function ingestSource(
     if (content.trim().length < 10) continue;
 
     if (content.length > LARGE_FILE_THRESHOLD) {
-      const chunks = CHUNKER_MODE === "system"
-        ? await systemChunkFile(content, file.relative)
-        : chunkLargeFile(content, file.relative);
+      const chunks = chunkLargeFile(content, file.relative);
       const parentHash = contentHash(content);
       const sizeKB = (content.length / 1024).toFixed(0);
       const warn = content.length > VERY_LARGE_WARNING ? " ⚠️  consider splitting" : "";

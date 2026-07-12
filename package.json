@@ -23,7 +23,6 @@
     "wrangler": "^4.105.0"
   },
   "dependencies": {
-    "@langchain/textsplitters": "^1.0.1",
     "@neondatabase/serverless": "^1.0.2",
     "jose": "^6.2.2"
   }
