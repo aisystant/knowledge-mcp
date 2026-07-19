@@ -54,6 +54,34 @@
     ]
   },
   {
+    "source": "PACK-agent-rules",
+    "source_type": "pack",
+    "path": "~/IWE/PACK-agent-rules",
+    "exclude": [
+      "images/",
+      "assets/",
+      ".git/"
+    ]
+  },
+  {
+    "source": "PACK-rhetoric",
+    "source_type": "pack",
+    "path": "~/IWE/PACK-rhetoric/pack",
+    "exclude": [
+      "images/",
+      "assets/"
+    ]
+  },
+  {
+    "source": "PACK-systems-art",
+    "source_type": "pack",
+    "path": "~/IWE/PACK-systems-art/pack",
+    "exclude": [
+      "images/",
+      "assets/"
+    ]
+  },
+  {
     "source": "DS-ecosystem-development",
     "source_type": "ds",
     "path": "~/IWE/DS-ecosystem-development",
