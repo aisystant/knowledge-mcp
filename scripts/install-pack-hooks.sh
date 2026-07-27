@@ -28,8 +28,14 @@ PACK_REPOS=(
   "PACK-autonomous-agents"
   "PACK-ecosystem"
   "PACK-verification"
-  "PACK-rhetoric"
   "PACK-systems-art"
+  # PACK-rhetoric НАРОЧНО исключён (2026-07-27): существующий [R4] ID-коллизий в pack-lint.sh
+  # сканирует базовый ID без учёта директории — RHE.ILL.NNN легитимно повторяется в разных
+  # illustrations/{metaphor,case,analogy,example,...}/ (похоже на дизайн per-type нумерации, не
+  # на реальный дубль). Первый живой прогон (хук никогда раньше не был установлен на этом репо)
+  # нашёл ~40 таких "коллизий" и заблокировал бы ЛЮБОЙ будущий коммит в репо (R4 без bypass,
+  # сканирует всё дерево, не только застейдженное). Решение — за пилотом: либо R4 становится
+  # directory-aware, либо подтверждается, что это реальные дубли. Не чинить молча (Drift Reporting).
 )
 
 INSTALLED=0
