@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# Установка pack-lint pre-commit hook во все Pack-репо.
-# see WP-242 Ф5
+# Установка pack-lint (WP-242 Ф5) + Ф6.2 placement-линтер (WP-429) hooks во все Pack-репо.
 # Использование: bash scripts/install-pack-hooks.sh [--dry-run]
+#
+# Tracked .githooks/ + core.hooksPath (паттерн WP-436 Ф4, DS-my-strategy/scripts/install-hooks.sh):
+# .git/hooks/ не версионируется — правки там не переживают переустановку/новый клон на другой
+# машине. .githooks/ коммитится в репо; core.hooksPath — локальная git-настройка, этот скрипт
+# её выставляет при каждом запуске (значит достаточно перезапустить установщик на новом клоне,
+# не переносить .git/hooks/ вручную).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LINT_SCRIPT="$SCRIPT_DIR/pack-lint.sh"
 IWE_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+LINT_SCRIPT_REL="DS-MCP/knowledge-mcp/scripts/pack-lint.sh"
+COMMIT_MSG_SCRIPT_REL="DS-MCP/knowledge-mcp/scripts/pack-commit-msg.sh"
 
 DRY_RUN=false
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -22,6 +28,8 @@ PACK_REPOS=(
   "PACK-autonomous-agents"
   "PACK-ecosystem"
   "PACK-verification"
+  "PACK-rhetoric"
+  "PACK-systems-art"
 )
 
 INSTALLED=0
@@ -29,8 +37,10 @@ SKIPPED=0
 
 for repo in "${PACK_REPOS[@]}"; do
   repo_path="$IWE_DIR/$repo"
-  hooks_dir="$repo_path/.git/hooks"
-  hook_file="$hooks_dir/pre-commit"
+  hooks_dir="$repo_path/.githooks"
+  hook_pre="$hooks_dir/pre-commit"
+  hook_msg="$hooks_dir/commit-msg"
+  backup_dir="$repo_path/.git/hook-backups"
 
   if [ ! -d "$repo_path/.git" ]; then
     echo "  ⏭️  $repo — git репо не найдено, пропускаем"
@@ -38,37 +48,59 @@ for repo in "${PACK_REPOS[@]}"; do
     continue
   fi
 
-  # Проверить: уже установлен?
-  if [ -f "$hook_file" ] && grep -q "pack-lint" "$hook_file" 2>/dev/null; then
+  already_installed=false
+  if [ -f "$hook_pre" ] && grep -q "pack-lint" "$hook_pre" 2>/dev/null \
+     && [ "$(git -C "$repo_path" config --get core.hooksPath 2>/dev/null || echo '')" = ".githooks" ]; then
+    already_installed=true
+  fi
+
+  if $already_installed; then
     echo "  ✅ $repo — уже установлен"
     SKIPPED=$((SKIPPED + 1))
     continue
   fi
 
   if $DRY_RUN; then
-    echo "  📝 $repo — установить hook (dry-run)"
+    echo "  📝 $repo — установить hooks (dry-run)"
     continue
   fi
 
-  # Если pre-commit уже есть (другое содержимое) — добавить вызов в конец
-  if [ -f "$hook_file" ]; then
-    echo "" >> "$hook_file"
-    echo "# pack-lint (WP-242)" >> "$hook_file"
-    echo 'bash "'"$LINT_SCRIPT"'"' >> "$hook_file"
-    echo "  📎 $repo — добавлен вызов pack-lint в существующий pre-commit"
-  else
-    cat > "$hook_file" << 'HOOK_EOF'
-#!/usr/bin/env bash
-# pre-commit hook — WP-242 Ф5
-HOOK_EOF
-    echo 'bash "'"$LINT_SCRIPT"'"' >> "$hook_file"
-    chmod +x "$hook_file"
-    echo "  ✅ $repo — hook создан"
+  mkdir -p "$hooks_dir" "$backup_dir"
+
+  if [ -f "$hook_pre" ]; then
+    cp "$hook_pre" "$backup_dir/pre-commit.backup.$(date +%s)"
+  fi
+  if [ -f "$hook_msg" ]; then
+    cp "$hook_msg" "$backup_dir/commit-msg.backup.$(date +%s)"
   fi
 
+  cat > "$hook_pre" <<PRECOMMIT
+#!/usr/bin/env bash
+# pre-commit hook — pack-lint (WP-242 Ф5) + Ф6.2 placement-линтер (WP-429)
+# tracked hook (.githooks/, паттерн WP-436) — вызывается через core.hooksPath.
+# auto-installed by install-pack-hooks.sh — не редактировать вручную, править SoT-скрипты.
+IWE="\${IWE_ROOT:-\$HOME/IWE}"
+bash "\$IWE/$LINT_SCRIPT_REL"
+PRECOMMIT
+  chmod +x "$hook_pre"
+
+  cat > "$hook_msg" <<COMMITMSGHOOK
+#!/usr/bin/env bash
+# commit-msg hook — Ф6.2 routing-bypass audit trail (WP-429)
+# tracked hook (.githooks/, паттерн WP-436) — вызывается через core.hooksPath.
+# auto-installed by install-pack-hooks.sh — не редактировать вручную, править SoT-скрипт.
+IWE="\${IWE_ROOT:-\$HOME/IWE}"
+bash "\$IWE/$COMMIT_MSG_SCRIPT_REL" "\$1"
+COMMITMSGHOOK
+  chmod +x "$hook_msg"
+
+  git -C "$repo_path" config core.hooksPath .githooks
+
+  echo "  ✅ $repo — hooks установлены (.githooks/pre-commit + commit-msg, core.hooksPath)"
   INSTALLED=$((INSTALLED + 1))
 done
 
 echo ""
 echo "Итого: установлено $INSTALLED, пропущено $SKIPPED"
-echo "Скрипт lint: $LINT_SCRIPT"
+echo "Lint: \$IWE_ROOT/$LINT_SCRIPT_REL"
+echo "Commit-msg: \$IWE_ROOT/$COMMIT_MSG_SCRIPT_REL"

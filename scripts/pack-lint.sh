@@ -17,6 +17,45 @@
 
 set -euo pipefail
 
+# --- [R0] Ф6.2 Placement-линтер (WP-429, БЛОКИРУЮЩАЯ, самый ранний шаг) ---
+# Проверяет застейдженные .md против routing.yaml (kind → директория → id_pattern →
+# frontmatter). Pack без routing.yaml или файл вне юрисдикции контракта — не блокирует
+# (см. f6_placement_linter.py). Обход: ALLOW_ROUTING_BYPASS=1, требует тег
+# [routing-bypass] в commit-msg (pack-commit-msg.sh проверяет маркер .git/ROUTING_BYPASS_USED).
+# see DRR-f6-routing-contract-linter.md (2026-07-24).
+R0_REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+R0_LINTER="$(dirname "${BASH_SOURCE[0]}")/../../../DS-my-strategy/inbox/WP-429/f6_placement_linter.py"
+if [ -f "$R0_LINTER" ] && command -v python3 >/dev/null 2>&1 && python3 -c "import yaml" >/dev/null 2>&1; then
+  R0_STAGED=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null | grep '\.md$' || true)
+  if [ -n "$R0_STAGED" ]; then
+    mapfile -t R0_STAGED_ARR <<< "$R0_STAGED"
+    set +e
+    R0_OUTPUT=$(cd "$R0_REPO_ROOT" && python3 "$R0_LINTER" --staged "${R0_STAGED_ARR[@]}" 2>&1)
+    R0_EXIT=$?
+    set -e
+    if [ "$R0_EXIT" -ne 0 ]; then
+      if [ "${ALLOW_ROUTING_BYPASS:-0}" = "1" ]; then
+        echo ""
+        echo "⚠️  [R0] Ф6.2 placement-линтер: нарушение размещения, ОБХОД применён (ALLOW_ROUTING_BYPASS=1):"
+        echo "$R0_OUTPUT"
+        touch "$R0_REPO_ROOT/.git/ROUTING_BYPASS_USED"
+        echo "   commit-msg потребует тег [routing-bypass]."
+      else
+        echo ""
+        echo "$R0_OUTPUT"
+        echo ""
+        echo "🚫 Коммит заблокирован ([R0] Ф6.2 placement-линтер, WP-429)."
+        echo "   Обход: ALLOW_ROUTING_BYPASS=1 git commit ... (требует тег [routing-bypass] в сообщении)."
+        exit 1
+      fi
+    fi
+  fi
+else
+  if [ ! -f "$R0_LINTER" ]; then
+    : # линтер физически недоступен на этой машине/клоне — молча пропустить (fail-open), не крашить
+  fi
+fi
+
 # --- [R4] Глобальная проверка ID-коллизий (БЛОКИРУЮЩАЯ, до early-exit) ---
 # Каждый базовый ID (DP.M.NNN, DP.D.NNN, DP.SC.NNN и т.д.) должен быть уникален в репо.
 # Источник: WP-7 Ф-PACK-COLLISIONS (18 мая 2026) — обнаружено 14 коллизий, вызванных
