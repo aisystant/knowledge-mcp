@@ -79,6 +79,27 @@ if [ -n "$COLLISIONS" ]; then
   exit 1
 fi
 
+# --- [R0.6] Touch-триггер: здоровье застейдженного routing.yaml (WP-429 Ф6.6) ---
+# Правка самого контракта размещения перевалидирует себя перед коммитом — та же
+# точка отказа, что инцидент DP.FM.296/301 (протухший путь в карте маршрутизации
+# молча ломает размещение). Health-check полного корпуса — недельный backstop
+# в week-close.after.md; этот триггер ловит порчу в момент правки, не через неделю.
+ROUTING_YAML_STAGED=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null | grep -E 'routing\.yaml$' || true)
+if [ -n "$ROUTING_YAML_STAGED" ]; then
+  ROUTING_HEALTH="$(dirname "$0")/f6_6_routing_map_health.py"
+  if [ -f "$ROUTING_HEALTH" ] && command -v python3 >/dev/null 2>&1; then
+    while IFS= read -r ry_file; do
+      [ -z "$ry_file" ] && continue
+      if ! python3 "$ROUTING_HEALTH" --check "$REPO_ROOT/$ry_file"; then
+        echo ""
+        echo "❌ pack-lint [R0.6]: $ry_file — протухший 'dir:' или невалидный 'id_pattern:'."
+        echo "🚫 Коммит заблокирован."
+        exit 1
+      fi
+    done <<< "$ROUTING_YAML_STAGED"
+  fi
+fi
+
 # --- [R5] Загрузка disjointness registry (если есть) ---
 DISJOINTNESS_FILE=""
 DISJOINT_PAIRS=""
