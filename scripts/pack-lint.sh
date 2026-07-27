@@ -18,33 +18,62 @@
 set -euo pipefail
 
 # --- [R4] Глобальная проверка ID-коллизий (БЛОКИРУЮЩАЯ, до early-exit) ---
-# Каждый базовый ID (DP.M.NNN, DP.D.NNN, DP.SC.NNN и т.д.) должен быть уникален в репо.
+# Каждый ID из frontmatter (`id:`) должен быть уникален в репо.
 # Источник: WP-7 Ф-PACK-COLLISIONS (18 мая 2026) — обнаружено 14 коллизий, вызванных
 # параллельной разработкой без проверки свободного номера.
+#
+# Восстановлено 2026-07-27 (после того же класса потери, что и весь Ф6.2 —
+# f6_placement_linter.py/install-pack-hooks.sh отсутствовали на диске несмотря на
+# карточку WP-429). До фикса R4 реконструировал ID по basename-regex
+# (`^[A-Z]+\.[A-Z]+\.[0-9]+`), который схлопывает легитимные буквенно/числовые
+# суффиксные варианты одной темы (`RHE.ILL.403-1`..`403-5`, `RHE.ILL.359a`/`359b`)
+# в общий базовый номер — источник ~40 ложных "коллизий" в PACK-rhetoric при первой
+# попытке установить hooks (заход 1). Читать реальный `id:` из frontmatter вместо
+# реконструкции по имени файла — тот же класс фикса, что PACK-rhetoric уже получил.
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
-# `|| true` в конце — защита от grep/awk exit 1 при пустом результате с set -e/pipefail
+R4_SKIP_PATTERN='(spec/|docs/|archive/|inbox/|\.git/|WORKPLAN|CHANGELOG|README|ONTOLOGY|ontology\.md|CLAUDE|CONTRIBUTING|STAGING|params\.yaml|REPO-TYPE|MAPSTRATEGIC|^_)'
+R4_ALLOWLIST="$REPO_ROOT/.pack-lint-id-allowlist"
+
+r4_get_id() {
+  awk '/^---$/{c++; if(c==2) exit} c==1 && /^id:/{gsub(/^id:[[:space:]]*/, ""); gsub(/"/, ""); print; exit}' "$1"
+}
+
+# `|| true` в конце — защита от find/awk exit 1 при пустом результате с set -e/pipefail
 COLLISIONS=$(find "$REPO_ROOT" -name "*.md" -type f 2>/dev/null \
-  | grep -v '/\.git/' \
-  | grep -v '/archive/' \
-  | grep -v '/inbox/' \
-  | xargs -n1 basename 2>/dev/null \
-  | grep -oE '^[A-Z]+\.[A-Z]+\.[0-9]+' \
+  | while read -r f; do
+      rel="${f#$REPO_ROOT/}"
+      echo "$rel" | grep -qE "$R4_SKIP_PATTERN" && continue
+      doc_id=$(r4_get_id "$f")
+      [ -n "$doc_id" ] && echo "$doc_id"
+    done \
   | sort | uniq -c | awk '$1>1{print $2}' || true)
+
+if [ -f "$R4_ALLOWLIST" ]; then
+  while IFS= read -r allowed_id; do
+    [ -z "$allowed_id" ] && continue
+    case "$allowed_id" in \#*) continue ;; esac
+    COLLISIONS=$(echo "$COLLISIONS" | grep -vxF "$allowed_id" || true)
+  done < "$R4_ALLOWLIST"
+fi
 
 if [ -n "$COLLISIONS" ]; then
   echo ""
-  echo "❌ pack-lint [R4]: обнаружены ID-коллизии (два файла с одинаковым базовым ID):"
+  echo "❌ pack-lint [R4]: обнаружены ID-коллизии (два файла с одинаковым 'id:' в frontmatter):"
   echo ""
   echo "$COLLISIONS" | while read coll_id; do
     echo "  [$coll_id]:"
-    find "$REPO_ROOT" -name "${coll_id}*.md" -type f 2>/dev/null \
-      | grep -v '/\.git/' | grep -v '/archive/' | grep -v '/inbox/' \
-      | sed "s|^${REPO_ROOT}/|    |"
+    find "$REPO_ROOT" -name "*.md" -type f 2>/dev/null | while read -r f; do
+      rel="${f#$REPO_ROOT/}"
+      echo "$rel" | grep -qE "$R4_SKIP_PATTERN" && continue
+      [ "$(r4_get_id "$f")" = "$coll_id" ] && echo "    $rel"
+    done
   done
   echo ""
   echo "Каждый ID должен быть уникален в репо (ссылки ломаются при дублях)."
   echo "Решение: переименовать один из файлов на следующий свободный ID того же типа,"
   echo "         обновить 'id:' внутри файла + slug-ссылки на него во всём IWE."
+  echo "Легитимное намеренное совпадение (напр. двуязычная пара canon/snapshot) —"
+  echo "         добавить ID в $REPO_ROOT/.pack-lint-id-allowlist."
   echo ""
   echo "🚫 Коммит заблокирован."
   exit 1
