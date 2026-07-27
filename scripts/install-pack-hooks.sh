@@ -55,7 +55,9 @@ for repo in "${PACK_REPOS[@]}"; do
   fi
 
   already_installed=false
-  if [ -f "$hook_pre" ] && grep -q "pack-lint" "$hook_pre" 2>/dev/null \
+  if [ -f "$hook_pre" ] && [ -f "$hook_msg" ] \
+     && grep -q "pack-lint" "$hook_pre" 2>/dev/null \
+     && grep -q "pack-commit-msg" "$hook_msg" 2>/dev/null \
      && [ "$(git -C "$repo_path" config --get core.hooksPath 2>/dev/null || echo '')" = ".githooks" ]; then
     already_installed=true
   fi

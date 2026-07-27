@@ -23,8 +23,20 @@ set -euo pipefail
 # (см. f6_placement_linter.py). Обход: ALLOW_ROUTING_BYPASS=1, требует тег
 # [routing-bypass] в commit-msg (pack-commit-msg.sh проверяет маркер .git/ROUTING_BYPASS_USED).
 # see DRR-f6-routing-contract-linter.md (2026-07-24).
+#
+# Линтер живёт РЯДОМ (не в DS-my-strategy/inbox/WP-429/) — независимое ревью 2026-07-27
+# нашло, что WP-инбоксы архивируются по закрытию WP (см. DS-my-strategy CLAUDE.md), а тогда
+# путь исчезает и гейт молча перестаёт работать на всех Pack-репо без единого сигнала.
 R0_REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
-R0_LINTER="$(dirname "${BASH_SOURCE[0]}")/../../../DS-my-strategy/inbox/WP-429/f6_placement_linter.py"
+R0_LINTER="$(dirname "${BASH_SOURCE[0]}")/f6_placement_linter.py"
+
+# Маркер обхода живёт только от ЭТОГО pre-commit до следующего commit-msg в рамках ОДНОГО
+# git commit. Если попытка коммита прервана до commit-msg (редактор упал/отменён), маркер
+# раньше оставался и ошибочно блокировал следующий, никак не связанный коммит (найдено и
+# воспроизведено независимым ревью 2026-07-27). Каждый pre-commit теперь сначала стирает
+# ЛЮБОЙ унаследованный маркер — переживает только маркер, который сам же и написал этот прогон.
+rm -f "$R0_REPO_ROOT/.git/ROUTING_BYPASS_USED"
+
 if [ -f "$R0_LINTER" ] && command -v python3 >/dev/null 2>&1 && python3 -c "import yaml" >/dev/null 2>&1; then
   R0_STAGED=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null | grep '\.md$' || true)
   if [ -n "$R0_STAGED" ]; then
@@ -36,7 +48,7 @@ if [ -f "$R0_LINTER" ] && command -v python3 >/dev/null 2>&1 && python3 -c "impo
     if [ "$R0_EXIT" -ne 0 ]; then
       if [ "${ALLOW_ROUTING_BYPASS:-0}" = "1" ]; then
         echo ""
-        echo "⚠️  [R0] Ф6.2 placement-линтер: нарушение размещения, ОБХОД применён (ALLOW_ROUTING_BYPASS=1):"
+        echo "⚠️  [R0] Ф6.2 placement-линтер: нарушение размещения (или сбой линтера — см. вывод), ОБХОД применён (ALLOW_ROUTING_BYPASS=1):"
         echo "$R0_OUTPUT"
         touch "$R0_REPO_ROOT/.git/ROUTING_BYPASS_USED"
         echo "   commit-msg потребует тег [routing-bypass]."
@@ -52,7 +64,7 @@ if [ -f "$R0_LINTER" ] && command -v python3 >/dev/null 2>&1 && python3 -c "impo
   fi
 else
   if [ ! -f "$R0_LINTER" ]; then
-    : # линтер физически недоступен на этой машине/клоне — молча пропустить (fail-open), не крашить
+    echo "⚠️  [R0] Ф6.2 placement-линтер: скрипт не найден ($R0_LINTER) — гейт НЕ проверяет размещение на этом клоне (fail-open, не молча)." >&2
   fi
 fi
 
