@@ -17,6 +17,22 @@
 
 set -euo pipefail
 
+# --- Общие хелперы (нужны [R0]/[R4], до early-exit) ---
+SKIP_PATHS_PATTERN='(spec/|docs/|archive/|inbox/|\.git/|WORKPLAN|CHANGELOG|README|ONTOLOGY|ontology\.md|CLAUDE|CONTRIBUTING|STAGING|params\.yaml|REPO-TYPE|MAPSTRATEGIC|^_)'
+
+# Извлечь frontmatter (содержимое между первыми ---)
+get_frontmatter() {
+  awk '/^---$/{c++; if(c==2) exit} c==1' "$1"
+}
+
+has_frontmatter() {
+  head -3 "$1" | grep -q '^---$'
+}
+
+get_id() {
+  get_frontmatter "$1" | awk '/^id:/{gsub(/^id:[[:space:]]*/, ""); gsub(/"/, ""); print; exit}'
+}
+
 # --- [R0] Ф6.2 Placement-линтер (WP-429, БЛОКИРУЮЩАЯ, самый ранний шаг) ---
 # Проверяет застейдженные .md против routing.yaml (kind → директория → id_pattern →
 # frontmatter). Pack без routing.yaml или файл вне юрисдикции контракта — не блокирует
@@ -69,33 +85,61 @@ else
 fi
 
 # --- [R4] Глобальная проверка ID-коллизий (БЛОКИРУЮЩАЯ, до early-exit) ---
-# Каждый базовый ID (DP.M.NNN, DP.D.NNN, DP.SC.NNN и т.д.) должен быть уникален в репо.
+# Каждый id: (полное значение поля во frontmatter) должен быть уникален в репо.
 # Источник: WP-7 Ф-PACK-COLLISIONS (18 мая 2026) — обнаружено 14 коллизий, вызванных
 # параллельной разработкой без проверки свободного номера.
+#
+# ИСПРАВЛЕНО 2026-07-27 (WP-429, независимая проверка на PACK-rhetoric нашла 2 класса
+# ложных срабатываний в исходной версии на basename-regex):
+#   (а) читаем id: ИЗ РЕАЛЬНОГО frontmatter (get_id), не реконструируем из имени файла —
+#       закрывает false positive на spec/-файлах с примером `id:` внутри текста
+#       (PACK-personal/spec/ids-and-references.md) — плюс теперь применяется тот же
+#       SKIP_PATHS_PATTERN, что и R1-R3 (раньше R4 фильтровал только archive/inbox/.git);
+#   (б) суффиксы, не умещавшиеся в старый basename-regex (кириллица, буквенные —
+#       RHE.ILL.041-conv, RHE.ILL.359a, числовые фрагменты RHE.ILL.183-1..6) больше не
+#       ложно схлопываются в общий базовый номер — сравнение по полному id: их различает.
+# Единственный оставшийся легитимный случай ОДИНАКОВОГО id на разных файлах — намеренная
+# двуязычная пара (canon/snapshot, см. LS.GENRE.guide/post) — не автоопределяется,
+# закрывается опциональным allowlist-файлом <repo>/.pack-lint-id-allowlist
+# (по одному id на строку, `#`-комментарии и пустые строки игнорируются; файл
+# отсутствует — поведение не меняется).
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+ALLOWLIST_FILE="$REPO_ROOT/.pack-lint-id-allowlist"
+
+# id<TAB>relative-path, по одной строке на файл с непустым id:
+ID_PATHS=$(find "$REPO_ROOT" -name "*.md" -type f 2>/dev/null | grep -v '/\.git/' | while IFS= read -r f; do
+  rel="${f#$REPO_ROOT/}"
+  if echo "$rel" | grep -qE "$SKIP_PATHS_PATTERN"; then
+    continue
+  fi
+  id=$(get_id "$f")
+  if [ -n "$id" ]; then
+    printf '%s\t%s\n' "$id" "$rel"
+  fi
+done)
+
 # `|| true` в конце — защита от grep/awk exit 1 при пустом результате с set -e/pipefail
-COLLISIONS=$(find "$REPO_ROOT" -name "*.md" -type f 2>/dev/null \
-  | grep -v '/\.git/' \
-  | grep -v '/archive/' \
-  | grep -v '/inbox/' \
-  | xargs -n1 basename 2>/dev/null \
-  | grep -oE '^[A-Z]+\.[A-Z]+\.[0-9]+' \
-  | sort | uniq -c | awk '$1>1{print $2}' || true)
+COLLISIONS=$(printf '%s\n' "$ID_PATHS" | cut -f1 | sort | uniq -c | awk '$1>1{print $2}' || true)
+
+if [ -n "$COLLISIONS" ] && [ -f "$ALLOWLIST_FILE" ]; then
+  COLLISIONS=$(printf '%s\n' "$COLLISIONS" \
+    | grep -vxFf <(grep -vE '^#|^[[:space:]]*$' "$ALLOWLIST_FILE") || true)
+fi
 
 if [ -n "$COLLISIONS" ]; then
   echo ""
-  echo "❌ pack-lint [R4]: обнаружены ID-коллизии (два файла с одинаковым базовым ID):"
+  echo "❌ pack-lint [R4]: обнаружены ID-коллизии (два файла с одинаковым id:):"
   echo ""
-  echo "$COLLISIONS" | while read coll_id; do
+  echo "$COLLISIONS" | while read -r coll_id; do
     echo "  [$coll_id]:"
-    find "$REPO_ROOT" -name "${coll_id}*.md" -type f 2>/dev/null \
-      | grep -v '/\.git/' | grep -v '/archive/' | grep -v '/inbox/' \
-      | sed "s|^${REPO_ROOT}/|    |"
+    printf '%s\n' "$ID_PATHS" | awk -F'\t' -v id="$coll_id" '$1==id{print "    "$2}'
   done
   echo ""
-  echo "Каждый ID должен быть уникален в репо (ссылки ломаются при дублях)."
+  echo "Каждый id: должен быть уникален в репо (ссылки ломаются при дублях)."
   echo "Решение: переименовать один из файлов на следующий свободный ID того же типа,"
   echo "         обновить 'id:' внутри файла + slug-ссылки на него во всём IWE."
+  echo "Намеренное совпадение (напр. двуязычная canon/snapshot пара) — добавить id"
+  echo "в $ALLOWLIST_FILE (по одной строке; создать файл при необходимости)."
   echo ""
   echo "🚫 Коммит заблокирован."
   exit 1
@@ -137,7 +181,7 @@ if [ -z "$CHANGED" ]; then
 fi
 
 # --- Константы ---
-SKIP_PATHS_PATTERN='(spec/|docs/|archive/|inbox/|\.git/|WORKPLAN|CHANGELOG|README|ONTOLOGY|ontology\.md|CLAUDE|CONTRIBUTING|STAGING|params\.yaml|REPO-TYPE|MAPSTRATEGIC|^_)'
+# SKIP_PATHS_PATTERN определён выше (нужен уже [R4]); get_frontmatter/has_frontmatter/get_id — тоже.
 
 WARNINGS=0
 FILES_CHECKED=0
@@ -145,19 +189,6 @@ FILES_SKIPPED=0
 REPORT=""
 
 # --- Вспомогательные функции ---
-
-# Извлечь frontmatter (содержимое между первыми ---)
-get_frontmatter() {
-  awk '/^---$/{c++; if(c==2) exit} c==1' "$1"
-}
-
-has_frontmatter() {
-  head -3 "$1" | grep -q '^---$'
-}
-
-get_id() {
-  get_frontmatter "$1" | awk '/^id:/{gsub(/^id:[[:space:]]*/, ""); gsub(/"/, ""); print; exit}'
-}
 
 # Проверить наличие related: с хотя бы одним ID (XX.TYPE.NNN или U.Something)
 has_related_ids() {

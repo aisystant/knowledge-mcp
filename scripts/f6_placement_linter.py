@@ -34,9 +34,19 @@ class Violation:
 def load_contracts(pack_root: Path) -> list[dict]:
     """Один Pack-репо может содержать несколько независимых доменов (напр. PACK-rhetoric:
     pack/language-style/ + pack/rhetoric/), каждый со своим routing.yaml — собираем все.
-    Пустой список — ни один домен ещё не мигрирован (WP-429 Ф6.1 остаток), не блокируем."""
+    Пустой список — ни один домен ещё не мигрирован (WP-429 Ф6.1 остаток), не блокируем.
+
+    Репо без каталога pack/ вообще (напр. PACK-agent-rules — плоская структура rules/ +
+    01-domain-contract/, WP-429 Ф6.1 2026-07-27) держат контракт на корне репо — fallback
+    ниже проверяется, ТОЛЬКО если pack/*/routing.yaml ничего не нашёл (для остальных 8
+    Pack с каталогом pack/ поведение не меняется)."""
+    contract_paths = sorted(pack_root.glob("pack/*/routing.yaml"))
+    if not contract_paths:
+        root_contract = pack_root / "routing.yaml"
+        if root_contract.is_file():
+            contract_paths = [root_contract]
     contracts = []
-    for contract_path in sorted(pack_root.glob("pack/*/routing.yaml")):
+    for contract_path in contract_paths:
         with open(contract_path, encoding="utf-8") as f:
             contracts.append(yaml.safe_load(f))
     return contracts
