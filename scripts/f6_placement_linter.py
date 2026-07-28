@@ -118,7 +118,10 @@ def check_file(repo_relative_path: str, pack_root: Path, contracts: list[dict]) 
     reasons = []
 
     expected_dir = spec.get("dir")
-    if expected_dir:
+    allow_dir_exceptions = spec.get("allow_dir_exceptions") or []
+    file_id = re.match(r"^[A-Za-z0-9.]+", basename)
+    file_id = file_id.group(0).rstrip(".") if file_id else None
+    if expected_dir and file_id not in allow_dir_exceptions:
         expected_dir_norm = expected_dir.rstrip("/") + "/"
         if not repo_relative_path.startswith(expected_dir_norm):
             reasons.append(f"ожидаемая директория '{expected_dir_norm}', файл лежит в '{repo_relative_path}'")
@@ -205,6 +208,24 @@ def run_self_test() -> bool:
         "no_contract_match": (contract, {"pack/fixture/02-domain-entities/README.md": "no frontmatter\n"},
                               "pack/fixture/02-domain-entities/README.md", True),  # None = not a violation
     }
+
+    allowlist_contract = (
+        "kinds:\n"
+        "  X.D:\n"
+        "    dir: pack/fixture/02-domain-entities/\n"
+        "    id_pattern: 'X\\.D\\.\\d{3}-[a-z0-9-]+\\.md$'\n"
+        "    frontmatter_check: null\n"
+        "    allow_dir_exceptions: ['X.D.002']\n"
+        "    storage: file\n"
+    )
+    allowlist_scenarios = {
+        "allowlisted_wrong_dir": (allowlist_contract, {"pack/fixture/wrong-dir/X.D.002-thing.md": good_fm},
+                                   "pack/fixture/wrong-dir/X.D.002-thing.md", True),
+        "non_allowlisted_wrong_dir": (allowlist_contract, {"pack/fixture/wrong-dir/X.D.003-thing.md":
+                                       "---\nid: X.D.003-thing\n---\nbody\n"},
+                                       "pack/fixture/wrong-dir/X.D.003-thing.md", False),
+    }
+    scenarios.update(allowlist_scenarios)
 
     for name, (contract_yaml, files, target, expect_ok) in scenarios.items():
         with tempfile.TemporaryDirectory(prefix="PACK-fixture-") as tmp:
