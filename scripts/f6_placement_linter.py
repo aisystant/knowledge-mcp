@@ -284,6 +284,7 @@ def main():
     pack_root = find_pack_root(Path.cwd())
     if not pack_root.name.startswith("PACK-"):
         # Not inside a Pack repo — nothing for this linter to do.
+        print("f6_placement_linter: cwd не внутри PACK-* — проверять нечего (no-op)", file=sys.stderr)
         sys.exit(0)
 
     files = all_files(pack_root) if args.check_all else staged_files(pack_root)
