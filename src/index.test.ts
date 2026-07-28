@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, TOOLS } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, TOOLS, extractTitle, buildPathTree } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import { chunkLargeFile, contentHash } from "../scripts/ingest.js";
 import { neon } from "@neondatabase/serverless";
@@ -65,6 +65,116 @@ describe("resolveGithubUrl", () => {
 
   it("returns null for unknown source", () => {
     expect(resolveGithubUrl("unknown-source", "file.md")).toBeNull();
+  });
+});
+
+// --- extractTitle (WP-5 backlog #31 — list_path) ---
+
+describe("extractTitle", () => {
+  it("extracts the first H1 heading", () => {
+    expect(extractTitle("# Digital Twin\n\nSome body text.")).toBe("Digital Twin");
+  });
+
+  it("finds H1 even when it is not the first line", () => {
+    expect(extractTitle("---\ntype: doc\n---\n\n# Real Title\n\nBody.")).toBe("Real Title");
+  });
+
+  it("ignores H2+ headings when no H1 is present", () => {
+    expect(extractTitle("## Section\n\nBody.")).toBeNull();
+  });
+
+  it("returns null for content without any heading", () => {
+    expect(extractTitle("Just plain text, no headings at all.")).toBeNull();
+  });
+
+  it("trims surrounding whitespace from the extracted title", () => {
+    expect(extractTitle("#   Spacey Title   \n")).toBe("Spacey Title");
+  });
+});
+
+// --- buildPathTree (WP-5 backlog #31 — list_path) ---
+
+describe("buildPathTree", () => {
+  it("returns files as-is when within depth", () => {
+    const docs = [
+      { source: "PACK-x", path: "pack/README.md", title: "Readme" },
+      { source: "PACK-x", path: "pack/index.md", title: "Index" },
+    ];
+    const tree = buildPathTree(docs, "pack/", 1);
+    // localeCompare sort (human-friendly, case-insensitive-first) — not raw ASCII.
+    expect(tree).toEqual([
+      { type: "file", source: "PACK-x", path: "pack/index.md", title: "Index" },
+      { type: "file", source: "PACK-x", path: "pack/README.md", title: "Readme" },
+    ]);
+  });
+
+  it("collapses paths deeper than depth into a single dir entry", () => {
+    const docs = [
+      { source: "PACK-x", path: "pack/02-domain-entities/DP.AGENT.001.md", title: "Agent" },
+      { source: "PACK-x", path: "pack/02-domain-entities/DP.AGENT.002.md", title: "Agent 2" },
+      { source: "PACK-x", path: "pack/03-roles/DP.ROLE.001.md", title: "Role" },
+    ];
+    const tree = buildPathTree(docs, "pack/", 1);
+    expect(tree).toEqual([
+      { type: "dir", source: "PACK-x", path: "pack/02-domain-entities", title: null },
+      { type: "dir", source: "PACK-x", path: "pack/03-roles", title: null },
+    ]);
+  });
+
+  it("mixes files and collapsed dirs at the same level", () => {
+    const docs = [
+      { source: "PACK-x", path: "pack/README.md", title: "Readme" },
+      { source: "PACK-x", path: "pack/02-domain-entities/DP.AGENT.001.md", title: "Agent" },
+    ];
+    const tree = buildPathTree(docs, "pack/", 1);
+    expect(tree).toEqual([
+      { type: "dir", source: "PACK-x", path: "pack/02-domain-entities", title: null },
+      { type: "file", source: "PACK-x", path: "pack/README.md", title: "Readme" },
+    ]);
+  });
+
+  it("dedupes multiple files under the same collapsed dir (same source)", () => {
+    const docs = [
+      { source: "PACK-x", path: "pack/a/one.md", title: "One" },
+      { source: "PACK-x", path: "pack/a/two.md", title: "Two" },
+      { source: "PACK-x", path: "pack/a/nested/three.md", title: "Three" },
+    ];
+    const tree = buildPathTree(docs, "pack/", 1);
+    expect(tree).toEqual([{ type: "dir", source: "PACK-x", path: "pack/a", title: null }]);
+  });
+
+  it("does NOT merge same-named dirs across different sources (cold review High finding)", () => {
+    const docs = [
+      { source: "PACK-x", path: "pack/02-domain-entities/DP.AGENT.001.md", title: "Agent" },
+      { source: "PACK-y", path: "pack/02-domain-entities/DP.OTHER.001.md", title: "Other" },
+    ];
+    const tree = buildPathTree(docs, "pack/", 1);
+    expect(tree).toEqual([
+      { type: "dir", source: "PACK-x", path: "pack/02-domain-entities", title: null },
+      { type: "dir", source: "PACK-y", path: "pack/02-domain-entities", title: null },
+    ]);
+  });
+
+  it("expands deeper when depth is increased", () => {
+    const docs = [{ source: "PACK-x", path: "pack/02-domain-entities/DP.AGENT.001.md", title: "Agent" }];
+    const tree = buildPathTree(docs, "pack/", 2);
+    expect(tree).toEqual([
+      { type: "file", source: "PACK-x", path: "pack/02-domain-entities/DP.AGENT.001.md", title: "Agent" },
+    ]);
+  });
+
+  it("works with no path prefix (source root)", () => {
+    const docs = [{ source: "PACK-x", path: "top-level.md", title: "Top" }];
+    const tree = buildPathTree(docs, "", 1);
+    expect(tree).toEqual([{ type: "file", source: "PACK-x", path: "top-level.md", title: "Top" }]);
+  });
+
+  it("clamps depth<=0 to 1 (function-level contract, independent of caller)", () => {
+    const docs = [{ source: "PACK-x", path: "pack/a/b/deep.md", title: "Deep" }];
+    const treeZero = buildPathTree(docs, "pack/", 0);
+    const treeOne = buildPathTree(docs, "pack/", 1);
+    expect(treeZero).toEqual(treeOne);
+    expect(treeZero).toEqual([{ type: "dir", source: "PACK-x", path: "pack/a", title: null }]);
   });
 });
 
@@ -418,5 +528,21 @@ describe("feedback tools registration", () => {
   it("feedback_stats tool is registered", () => {
     const tool = TOOLS.find((t) => t.name === "feedback_stats");
     expect(tool).toBeDefined();
+  });
+});
+
+// --- TOOLS array includes list_path (WP-5 backlog #31) ---
+
+describe("list_path tool registration", () => {
+  it("list_path tool is registered with source/path_prefix/depth properties", () => {
+    const tool = TOOLS.find((t) => t.name === "list_path");
+    expect(tool).toBeDefined();
+    expect(Object.keys(tool!.inputSchema.properties!)).toEqual(["source", "path_prefix", "depth"]);
+  });
+
+  it("does not duplicate list_documents (kept as a separate, unmodified tool)", () => {
+    const listDocs = TOOLS.find((t) => t.name === "list_documents");
+    expect(listDocs).toBeDefined();
+    expect(listDocs!.inputSchema.properties).not.toHaveProperty("path_prefix");
   });
 });

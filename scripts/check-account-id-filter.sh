@@ -13,8 +13,8 @@ import sys, re
 with open("src/index.ts") as f:
     lines = f.readlines()
 
-pattern = re.compile(r"(FROM|JOIN)\s+\$\{sql\(knowledgeChunkTable\)\}")
-write_pattern = re.compile(r"(INSERT INTO|DELETE FROM|UPDATE)\s+\$\{sql\(knowledgeChunkTable\)\}")
+pattern = re.compile(r"(FROM|JOIN)\s+\$\{sql\.unsafe\(knowledgeChunkTable\)\}")
+write_pattern = re.compile(r"(INSERT INTO|DELETE FROM|UPDATE)\s+\$\{sql\.unsafe\(knowledgeChunkTable\)\}")
 
 violations = []
 for i, line in enumerate(lines):
