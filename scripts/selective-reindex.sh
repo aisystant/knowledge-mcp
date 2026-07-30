@@ -51,7 +51,14 @@ START_TIME=$(date +%s)
 log "=== Selective Reindex Started ==="
 log "Sources requested: ${REQUESTED[*]}"
 
-# Резолвим source → path + source_type из sources.json
+# Резолвим source → path + source_type (+ user_id, если задан — WP-484 30.07,
+# peer-session with Codex, Ф27-2: personal sources carry user_id in
+# sources-personal.json, which caller sets $SOURCES_CONFIG to point at; platform
+# sources in the default sources.json have no such key). The 4th field is
+# printed unconditionally (empty string, not omitted) so `read` below always
+# sees 4 tab-separated fields — an omitted trailing field on an L2 (platform)
+# row would silently shift nothing here since it's already last, but making the
+# arity explicit avoids relying on that fact.
 RESOLVED=$(python3 - "${REQUESTED[@]}" << PYEOF
 import sys, json
 sources = json.load(open("$SOURCES_JSON"))
@@ -61,7 +68,7 @@ for name in requested:
     if name in source_map:
         s = source_map[name]
         path = s["path"].replace("~", "$HOME")
-        print(f"{s['source']}\t{s['source_type']}\t{path}")
+        print(f"{s['source']}\t{s['source_type']}\t{path}\t{s.get('user_id', '')}")
     else:
         print(f"ERROR\t{name}\tnot found in sources.json", file=sys.stderr)
         sys.exit(1)
@@ -74,12 +81,24 @@ PYEOF
 
 cd "$MCP_DIR"
 
-while IFS=$'\t' read -r SOURCE SOURCE_TYPE SOURCE_PATH; do
+FAILED_SOURCES=()
+while IFS=$'\t' read -r SOURCE SOURCE_TYPE SOURCE_PATH USER_ID; do
     log "→ Indexing: $SOURCE ($SOURCE_TYPE) from $SOURCE_PATH"
 
-    OUTPUT=$(npx tsx scripts/ingest.ts --source "$SOURCE" --type "$SOURCE_TYPE" --path "$SOURCE_PATH" 2>&1) || {
+    UID_ARGS=()
+    [ -n "$USER_ID" ] && UID_ARGS=(--user-id "$USER_ID")
+
+    # `set -u` (line 12) makes a bare "${UID_ARGS[@]}" on a genuinely empty
+    # array an unbound-variable error in bash — the L2 (platform) case, which
+    # is the common one, has no user_id and hit this on every single call
+    # (caught live by the smoke test, not by inspection: exit 1 on the FIRST
+    # source, before Ф27-2's own FAILED_SOURCES logic ever ran). The
+    # `${arr[@]+"${arr[@]}"}` form is the standard nounset-safe empty-array
+    # expansion — expands to nothing when UID_ARGS is empty instead of erroring.
+    OUTPUT=$(npx tsx scripts/ingest.ts --source "$SOURCE" --type "$SOURCE_TYPE" --path "$SOURCE_PATH" ${UID_ARGS[@]+"${UID_ARGS[@]}"} 2>&1) || {
         log "ERROR: ingest failed for $SOURCE"
         log "$OUTPUT"
+        FAILED_SOURCES+=("$SOURCE")
         continue
     }
 
@@ -99,3 +118,16 @@ log "=== Selective Reindex Complete ==="
 log "Sources: $TOTAL_SOURCES, Docs indexed: $TOTAL_INDEXED, Time: ${ELAPSED}s"
 
 echo "Reindex: $TOTAL_SOURCES источников, $TOTAL_INDEXED docs проиндексировано за ${ELAPSED} сек."
+
+# WP-484 30.07 (peer-session with Codex): a failed ingest.ts call used to just
+# `continue` to the next source — the loop always exited 0 even when every
+# single source failed (live incident: 3 of 6 day-close.sh sources failed this
+# way every night, silently, because the caller never checked this script's
+# exit code either — see the fix in day-close.sh's do_reindex()). Partial
+# progress on the OTHER sources is still real and already logged above; this
+# only changes whether the caller can tell "some/all failed" from "all OK".
+if [ "${#FAILED_SOURCES[@]}" -gt 0 ]; then
+    log "ERROR: ${#FAILED_SOURCES[@]} source(s) failed: ${FAILED_SOURCES[*]}"
+    echo "FAILED: ${FAILED_SOURCES[*]}" >&2
+    exit 1
+fi
