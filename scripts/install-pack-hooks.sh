@@ -55,31 +55,31 @@ for repo in "${PACK_REPOS[@]}"; do
   hook_dir="$repo_path/.githooks"
   mkdir -p "$hook_dir"
 
-  cat > "$hook_dir/pre-commit" << HOOK_EOF
+  cat > "$hook_dir/pre-commit" << 'HOOK_EOF'
 #!/usr/bin/env bash
 # pre-commit hook — pack-lint (WP-242 Ф5) + [R0] placement-линтер (WP-429 Ф6.2)
 # tracked hook (.githooks/, паттерн WP-436) — вызывается через core.hooksPath.
 # auto-installed by install-pack-hooks.sh — не редактировать вручную, править SoT-скрипты.
 set -uo pipefail
-IWE="\${IWE_ROOT:-\$HOME/IWE}"
+IWE="${IWE_ROOT:-$HOME/IWE}"
 EXIT_CODE=0
 
 # Маркер стирается безусловно в начале КАЖДОГО прогона — переживает только от
 # "своего" pre-commit до "своего" commit-msg в рамках ОДНОЙ попытки коммита.
 # Без этого унаследованный маркер от прерванной попытки (editor abort до
 # commit-msg) блокирует следующий, никак не связанный коммит требованием тега.
-rm -f "\$(git rev-parse --git-dir)/ROUTING_BYPASS_USED"
+rm -f "$(git rev-parse --git-dir)/ROUTING_BYPASS_USED"
 
-if [ -z "\${ALLOW_ROUTING_BYPASS:-}" ]; then
-  python3 "$PLACEMENT_LINTER" || EXIT_CODE=1
+if [ -z "${ALLOW_ROUTING_BYPASS:-}" ]; then
+  python3 "$IWE/DS-MCP/knowledge-mcp/scripts/f6_placement_linter.py" || EXIT_CODE=1
 else
-  touch "\$(git rev-parse --git-dir)/ROUTING_BYPASS_USED"
+  touch "$(git rev-parse --git-dir)/ROUTING_BYPASS_USED"
   echo "⚠️  [R0] placement-линтер пропущен: ALLOW_ROUTING_BYPASS=1 (требует тега [routing-bypass] в commit-msg)"
 fi
 
-bash "$LINT_SCRIPT" || EXIT_CODE=1
+bash "$IWE/DS-MCP/knowledge-mcp/scripts/pack-lint.sh" || EXIT_CODE=1
 
-exit \$EXIT_CODE
+exit $EXIT_CODE
 HOOK_EOF
   chmod +x "$hook_dir/pre-commit"
 
