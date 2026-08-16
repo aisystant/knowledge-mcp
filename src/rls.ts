@@ -1,8 +1,9 @@
 /**
  * RLS context wrapper — WP-212 B4.22-2
  *
- * Устанавливает SET LOCAL app.user_id внутри транзакции.
- * RLS-политики (migration 006) читают current_user_id() = current_setting('app.user_id', true).
+ * Устанавливает канонический RLS-ключ и временно зеркалит legacy-имена внутри транзакции
+ * (WP-515 Ф2, мост Варианта Б). RLS-политики читают current_user_id() = current_setting('app.user_id', true)
+ * до перевода на app.account_id.
  *
  * Использование:
  *   const results = await withUserContext(env.DATABASE_URL, userId, async (sql) => {
@@ -59,6 +60,17 @@ export function createRequestPool(connectionString: string): Pool {
   return pool;
 }
 
+// WP-515 Ф2: канонический ключ и временный мост к прежним соглашениям.
+// Порядок = порядок применения (первый пишется первым); RLS-политики читают
+// имена независимо, порядок set_config между собой не важен для них.
+const RLS_ACCOUNT_CONTEXT_GUCS = [
+  "app.account_id",
+  "app.current_account_id",
+  "app.user_id",
+  "app.current_user_id",
+  "app.current_user_identity",
+] as const;
+
 type IdentifierMarker = { __identifier: string };
 
 type SqlClient = {
@@ -71,7 +83,8 @@ type SqlClient = {
 };
 
 /**
- * Выполнить callback внутри транзакции с установленным app.user_id.
+ * Выполнить callback внутри транзакции с установленным каноническим RLS-контекстом
+ * и временным зеркалированием legacy-имён (WP-515 Ф2).
  *
  * @param connectionString - DATABASE_URL
  * @param userId - Ory user UUID (или null для платформенных запросов)
@@ -95,7 +108,9 @@ export async function withUserContext<T>(
     if (userId) {
       // set_config с is_local=true — эквивалент SET LOCAL, но принимает параметр
       // SET LOCAL не поддерживает $1 параметры в протоколе PostgreSQL
-      await client.query("SELECT set_config('app.user_id', $1, true)", [userId]);
+      for (const gucName of RLS_ACCOUNT_CONTEXT_GUCS) {
+        await client.query(`SELECT set_config('${gucName}', $1, true)`, [userId]);
+      }
     }
 
     // Обёртка для совместимости с кодом использующим тегированный шаблон.
