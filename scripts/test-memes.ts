@@ -52,6 +52,9 @@ for (const line of miscCatalog.split("\n").slice(0, 5)) {
 // 3. Call LLM
 console.log("\nCalling GPT-4o-mini...");
 
+// Prompt kept in sync with src/index.ts's analyzeVerbalization misconception
+// prompt by hand (WP-7, 2026-08-25) - no shared module between this script's
+// runtime and the Worker yet; see WP-7 card for the follow-up to extract one.
 const llmPrompt = `Ты — эксперт по выявлению подмен понятий (мемов) в текстах учеников.
 
 Текст ученика:
@@ -69,10 +72,23 @@ ${miscCatalog}
 - Ученик применяет понятие неправильно (wrong_application)
 - Ученик путает одно понятие с другим (wrong_concept)
 
-Ответь СТРОГО в JSON формате — массив номеров мемов из каталога:
-{"found": [0, 3, 7], "explanations": ["краткое пояснение для каждого найденного"]}
+Мем проявляется, ТОЛЬКО ЕСЛИ в тексте есть конкретная фраза или предложение, где
+ученик буквально приравнивает себя к роли или делает вывод из такого приравнивания
+(например: "я и есть моя роль", "без роли я никто", "потеря роли = потеря себя",
+"я не могу представить себя без этой роли"). Простое упоминание "моя роль — X"
+без такого явного приравнивания (например, "моя роль в проекте — технический лид,
+я отвечаю за архитектуру") НЕ является проявлением мема — это нейтральное описание
+обязанностей, а не философское утверждение о тождестве личности и роли. Тот же
+принцип для остальных мемов каталога: ищи саму описанную ошибку по конкретной
+цитате, не тематическое совпадение.
 
-Если мемов не обнаружено: {"found": [], "explanations": []}`;
+Перед ответом найди в тексте конкретную цитату, поддерживающую находку. Если такой
+цитаты нет — мем не найден, даже если тема разговора касается того же понятия.
+
+Ответь СТРОГО в JSON формате:
+{"found": [0, 3, 7], "quotes": ["точная цитата из текста для каждого найденного"], "explanations": ["краткое пояснение для каждого найденного"]}
+
+Если мемов не обнаружено: {"found": [], "quotes": [], "explanations": []}`;
 
 const response = await fetch("https://api.openai.com/v1/chat/completions", {
   method: "POST",
@@ -84,7 +100,7 @@ const response = await fetch("https://api.openai.com/v1/chat/completions", {
     model: "gpt-4o-mini",
     messages: [{ role: "user", content: llmPrompt }],
     temperature: 0.1,
-    max_tokens: 500,
+    max_tokens: 1500,
     response_format: { type: "json_object" },
   }),
 });
