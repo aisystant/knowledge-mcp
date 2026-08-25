@@ -113,6 +113,29 @@ describe("connectSource", () => {
     expect(result.error).toContain("не входит");
   });
 
+  // github-integration-service cf8c3cf: rows written before its sql.json() fix store repos
+  // as a jsonb *string* scalar (postgres.js quirk with JSON.stringify(x)::jsonb) instead of
+  // an array. A bare `as string[]` cast let a lookup miss crash on repos.join() — the same
+  // class of bug already fixed in personal-knowledge-mcp's connectSource, this is its "faithful
+  // port" (see file header), so it carries the same defect and the same fix.
+  it("self-heals a legacy string-encoded repos column instead of crashing", async () => {
+    queryQueue.push([{ github_username: "TserenTserenov", repos: '["DS-my-strategy","DS-other"]' }]);
+    queryQueue.push([]); // currentRows — no existing row → newly_connected
+    queryQueue.push([]); // INSERT user_sources
+
+    const result = await connectSource(ENV, "user-1", "DS-my-strategy");
+
+    expect(result.status).toBe("newly_connected");
+    expect(result.error).toBeUndefined();
+  });
+
+  it("reports a clean error, not a crash, when repos is a non-JSON string", async () => {
+    queryQueue.push([{ github_username: "TserenTserenov", repos: "not-json" }]);
+    const result = await connectSource(ENV, "user-1", "DS-my-strategy");
+    expect(result.status).toBe("error");
+    expect(result.error).toContain("нет ни одного");
+  });
+
   it("connects a new source, provisions bridge scopes; reindex trigger is the caller's job (index.ts, группа В)", async () => {
     queryQueue.push([{ github_username: "TserenTserenov", repos: ["DS-my-strategy"] }]); // installRows
     queryQueue.push([]); // currentRows — no existing row → newly_connected

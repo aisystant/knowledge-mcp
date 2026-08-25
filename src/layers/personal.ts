@@ -636,12 +636,31 @@ export async function connectSource(
       error: "GitHub App не подключён. Сначала выполни github_connect и установи App.",
     };
   }
-  const repos = (installRows[0].repos as string[]) || [];
+  // Rows written before github-integration-service's sql.json() fix (cf8c3cf) store repos
+  // as a jsonb *string* scalar instead of an array (postgres.js quirk with
+  // JSON.stringify(x)::jsonb) — a bare cast let a lookup miss crash on repos.join() instead
+  // of erroring cleanly (ported bug — same as personal-knowledge-mcp/src/index.ts
+  // connectSource, see comment above this function). Recover the legacy shape.
+  const rawRepos = installRows[0].repos;
+  let repos: string[];
+  if (Array.isArray(rawRepos)) {
+    repos = rawRepos as string[];
+  } else if (typeof rawRepos === "string") {
+    try {
+      const parsed = JSON.parse(rawRepos);
+      repos = Array.isArray(parsed) ? (parsed as string[]) : [];
+    } catch {
+      repos = [];
+    }
+  } else {
+    repos = [];
+  }
   const githubUsername = installRows[0].github_username as string;
   if (!repos.includes(source)) {
+    const available = repos.length > 0 ? repos.join(", ") : "нет ни одного";
     return {
       source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
-      error: `Репо '${source}' не входит в твою GitHub App installation. Доступные: ${repos.join(", ")}.`,
+      error: `Репо '${source}' не входит в твою GitHub App installation. Доступные: ${available}.`,
     };
   }
 
