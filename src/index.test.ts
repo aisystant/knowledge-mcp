@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, TOOLS, extractTitle, buildPathTree } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, TOOLS, extractTitle, buildPathTree } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import { chunkLargeFile, contentHash } from "../scripts/ingest.js";
 import { neon } from "@neondatabase/serverless";
@@ -10,8 +10,12 @@ vi.mock("@neondatabase/serverless", () => ({
   Pool: vi.fn(),
 }));
 
-// withUserContext mock — used by enrichWithParentContent
-let mockWithUserContextImpl: ((sql: (s: TemplateStringsArray, ...v: unknown[]) => Promise<unknown[]>) => Promise<unknown[]>) | null = null;
+// withUserContext mock — used by searchDocuments and enrichWithParentContent
+type MockSql = ReturnType<typeof makeMockSql>;
+type MockWithUserContextImpl = (fn: (sql: MockSql) => Promise<unknown>) => Promise<unknown>;
+
+let mockWithUserContextImpl: MockWithUserContextImpl | null = null;
+const mockPoolEnd = vi.fn().mockResolvedValue(undefined);
 
 function makeMockSql(rows: unknown[]): (s: TemplateStringsArray, ...v: unknown[]) => Promise<unknown[]> {
   const sql = (() => Promise.resolve(rows)) as (s: TemplateStringsArray, ...v: unknown[]) => Promise<unknown[]>;
@@ -20,11 +24,17 @@ function makeMockSql(rows: unknown[]): (s: TemplateStringsArray, ...v: unknown[]
 }
 
 vi.mock("./rls.js", () => ({
+  createRequestPool: vi.fn(() => ({ end: mockPoolEnd })),
   withUserContext: vi.fn(async (_dsn: string, _userId: string | null | undefined, fn: (sql: unknown) => Promise<unknown>) => {
     if (mockWithUserContextImpl) return mockWithUserContextImpl(fn as any);
     return fn(makeMockSql([]) as unknown);
   }),
 }));
+
+beforeEach(() => {
+  mockWithUserContextImpl = null;
+  mockPoolEnd.mockClear();
+});
 
 // --- detectQueryType ---
 
@@ -438,8 +448,135 @@ describe("getEmbedding", () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 500, text: async () => "server error" });
     globalThis.fetch = fetchMock;
 
-    await expect(getEmbedding("fake-key", "test query")).rejects.toThrow("OpenAI Embeddings error: 500");
+    await expect(getEmbedding("fake-key", "test query")).rejects.toThrow("Embedding service unavailable after retry (http_5xx)");
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+// --- searchDocuments embedding resilience ---
+
+describe("searchDocuments embedding resilience", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("returns keyword results after both embedding attempts fail", async () => {
+    const query = "как различать системы и их описания";
+    const apiKey = "private-api-key";
+    const providerBody = "provider diagnostic must stay private";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      text: async () => providerBody,
+    });
+    globalThis.fetch = fetchMock;
+
+    const keywordRow = {
+      id: 17,
+      filename: "about-systems.md",
+      content: "Система не совпадает со своим описанием.",
+      source: "docs-courses",
+      source_type: "course",
+      score: 0.9,
+    };
+    const rowBatches = [[keywordRow], []];
+    let dbCall = 0;
+    mockWithUserContextImpl = (fn) => fn(makeMockSql(rowBatches[dbCall++] ?? []));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const results = await searchDocuments(
+      {
+        KNOWLEDGE_DATABASE_URL: "postgres://knowledge",
+        HEALTH_DATABASE_URL: "postgres://health",
+        OPENROUTER_API_KEY: apiKey,
+      },
+      query,
+      "docs-courses",
+      undefined,
+      5
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(results).toEqual([{
+      ...keywordRow,
+      github_url: "https://github.com/aisystant/docs/blob/main/docs/ru/about-systems.md",
+    }]);
+    expect(mockPoolEnd).toHaveBeenCalledTimes(1);
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const logLine = warnSpy.mock.calls[0][0] as string;
+    expect(JSON.parse(logLine)).toEqual({
+      event: "knowledge_search_embedding_fallback",
+      reason: "http_5xx",
+      embedding_attempts: 2,
+      fallback: "keyword",
+      source_filter_present: true,
+      source_type_filter_present: false,
+    });
+    expect(logLine).not.toContain(query);
+    expect(logLine).not.toContain(apiKey);
+    expect(logLine).not.toContain(providerBody);
+  });
+
+  it("keeps the vector path when embedding succeeds", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockEmbeddingResponse([0.1, 0.2, 0.3]));
+    globalThis.fetch = fetchMock;
+
+    const vectorRow = {
+      id: 21,
+      filename: "semantic-result.md",
+      content: "Результат семантического поиска.",
+      source: "FPF",
+      source_type: "spec",
+      score: 0.88,
+    };
+    const rowBatches = [[vectorRow], []];
+    let dbCall = 0;
+    mockWithUserContextImpl = (fn) => fn(makeMockSql(rowBatches[dbCall++] ?? []));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const results = await searchDocuments(
+      {
+        KNOWLEDGE_DATABASE_URL: "postgres://knowledge",
+        HEALTH_DATABASE_URL: "postgres://health",
+        OPENROUTER_API_KEY: "api-key",
+      },
+      "как устроены системные уровни"
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(results[0]).toMatchObject({
+      filename: "semantic-result.md",
+      content: "Результат семантического поиска.",
+      score: 0.88,
+    });
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(mockPoolEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not mask database failures as embedding fallback", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockEmbeddingResponse([0.1, 0.2, 0.3]));
+    globalThis.fetch = fetchMock;
+    mockWithUserContextImpl = async () => {
+      throw new Error("database unavailable");
+    };
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    await expect(searchDocuments(
+      {
+        KNOWLEDGE_DATABASE_URL: "postgres://knowledge",
+        HEALTH_DATABASE_URL: "postgres://health",
+        OPENROUTER_API_KEY: "api-key",
+      },
+      "как устроены системные уровни"
+    )).rejects.toThrow("database unavailable");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(mockPoolEnd).toHaveBeenCalledTimes(1);
   });
 });
 

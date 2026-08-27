@@ -204,12 +204,39 @@ async function fetchEmbeddingOnce(apiKey: string, text: string): Promise<number[
   }
 }
 
+type EmbeddingFailureReason = "timeout" | "http_4xx" | "http_5xx" | "http_other" | "request_error";
+
+class EmbeddingUnavailableError extends Error {
+  constructor(readonly reason: EmbeddingFailureReason, cause: unknown) {
+    super(`Embedding service unavailable after retry (${reason})`, { cause });
+    this.name = "EmbeddingUnavailableError";
+  }
+}
+
+function classifyEmbeddingFailure(error: unknown): EmbeddingFailureReason {
+  if (error instanceof DOMException && error.name === "AbortError") return "timeout";
+
+  const message = error instanceof Error ? error.message : "";
+  const statusMatch = message.match(/^OpenAI Embeddings error: (\d{3})\b/);
+  if (statusMatch) {
+    if (statusMatch[1].startsWith("4")) return "http_4xx";
+    if (statusMatch[1].startsWith("5")) return "http_5xx";
+    return "http_other";
+  }
+
+  return "request_error";
+}
+
 // One retry: OpenRouter embeddings occasionally hangs past EMBEDDING_TIMEOUT_MS (issue #231).
 export async function getEmbedding(apiKey: string, text: string): Promise<number[]> {
   try {
     return await fetchEmbeddingOnce(apiKey, text);
   } catch {
-    return await fetchEmbeddingOnce(apiKey, text);
+    try {
+      return await fetchEmbeddingOnce(apiKey, text);
+    } catch (error) {
+      throw new EmbeddingUnavailableError(classifyEmbeddingFailure(error), error);
+    }
   }
 }
 
@@ -518,7 +545,7 @@ export async function enrichWithParentContent(env: Env, results: SearchResult[],
   });
 }
 
-async function searchDocuments(
+export async function searchDocuments(
   env: Env,
   query: string,
   source?: string,
@@ -542,7 +569,24 @@ async function searchDocuments(
 
     // Vector path: fetch extra candidates for LLM reranking
     const fetchLimit = Math.max(limit, RERANK_CANDIDATES);
-    const vectorResults = await vectorSearch(env, query, source, sourceType, fetchLimit, userId, pool);
+    let vectorResults: SearchResult[];
+    try {
+      vectorResults = await vectorSearch(env, query, source, sourceType, fetchLimit, userId, pool);
+    } catch (error) {
+      if (!(error instanceof EmbeddingUnavailableError)) throw error;
+
+      console.warn(JSON.stringify({
+        event: "knowledge_search_embedding_fallback",
+        reason: error.reason,
+        embedding_attempts: 2,
+        fallback: "keyword",
+        source_filter_present: source !== undefined,
+        source_type_filter_present: sourceType !== undefined,
+      }));
+
+      const fallbackResults = await keywordSearch(env, query, source, sourceType, limit, userId, pool);
+      return await enrichWithParentContent(env, fallbackResults, userId, pool);
+    }
 
     // Low-confidence fallback: if vector top score < threshold, try keyword
     if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
