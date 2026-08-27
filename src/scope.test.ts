@@ -212,70 +212,58 @@ describe("checkBridgeWriteScope: peer-pilot fallback (declaredAgentId missing + 
   });
 });
 
-// Records the scope-grant provisioning INSERT (self-heal) separately from the scope lookup and
-// the audit-violation log — routing by "SELECT" substring alone is NOT enough: the provisioning
-// INSERT's own ON CONFLICT clause contains a nested `SELECT DISTINCT unnest(...)`, so a naive
-// includes("SELECT") check misclassifies it as the lookup query. Route by table name instead.
-// Shared by the self-heal and requiresPath describe blocks below (WP-410 Pre-Close checklist,
-// session 2026-07-03-18).
-function makeSelfHealSql(opts: { provisionRejects?: boolean } = {}): {
+interface SelfHealCall {
+  statement: string;
+  values: unknown[];
+}
+
+// Route by table name: the self-heal INSERT contains its own nested SELECT in ON CONFLICT.
+function makeSelfHealSql(opts: {
+  initialRow?: Row;
+  provisionRejects?: boolean;
+  provisionReturnsRow?: boolean;
+  convergeAfterProvision?: boolean;
+} = {}): {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   sql: any;
-  provisionCalls: unknown[][];
+  provisionCalls: SelfHealCall[];
 } {
-  const provisionCalls: unknown[][] = [];
+  let fallbackProvisioned = false;
+  let fallbackSource = "DS-mine";
+  const provisionCalls: SelfHealCall[] = [];
+  const fallbackRow = () => okRow({
+    allowed_repos: [fallbackSource],
+    allowed_paths: ["docs/**", "inbox/**", "**/*.md"],
+    allowed_operations: ["write", "propose"],
+  });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const sql: any = (strings: TemplateStringsArray, ...values: unknown[]) => {
-    const text = strings.join(" ");
-    if (text.includes("FROM agent_scopes_mvp")) return Promise.resolve([]); // scope lookup: no row
-    if (text.includes("INSERT INTO agent_scopes_mvp")) {
+    const statement = strings.join(" ");
+    if (statement.includes("FROM agent_scopes_mvp")) {
+      if (opts.initialRow) return Promise.resolve([opts.initialRow]);
+      return Promise.resolve(opts.convergeAfterProvision && fallbackProvisioned ? [fallbackRow()] : []);
+    }
+    if (statement.includes("INSERT INTO agent_scopes_mvp")) {
+      provisionCalls.push({ statement, values });
       if (opts.provisionRejects) return Promise.reject(new Error("provision failed"));
-      provisionCalls.push(values);
-      return Promise.resolve([]);
+      if (opts.provisionReturnsRow === false) return Promise.resolve([]);
+      const allowedRepos = values.find((value): value is string[] => Array.isArray(value));
+      fallbackSource = allowedRepos?.[0] ?? fallbackSource;
+      fallbackProvisioned = true;
+      return Promise.resolve([fallbackRow()]);
     }
     return Promise.resolve([]); // agent_scope_violations audit log — not under test here
   };
   return { sql, provisionCalls };
 }
 
-// Stateful variant: SELECT starts empty, then returns a matching row once the fallback agent_id
-// has been provisioned — simulates a real DB across two sequential calls, to verify self-heal
-// actually converges (cold-review finding, session 2026-07-03-18: provisionBridgeScopes was
-// missing the PEER_PILOT_AGENT_ID row, so the SELECT here would have kept returning [] forever
-// even after "successful" self-heal, meaning every fallback call re-provisioned from scratch).
-function makeConvergingFallbackSql() {
-  let provisionedForFallback = false;
-  let provisionCallCount = 0;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const sql: any = (strings: TemplateStringsArray, ...values: unknown[]) => {
-    const text = strings.join(" ");
-    if (text.includes("FROM agent_scopes_mvp")) {
-      return Promise.resolve(provisionedForFallback ? [okRow({ allowed_repos: ["DS-mine"], allowed_operations: ["write", "propose"] })] : []);
-    }
-    if (text.includes("INSERT INTO agent_scopes_mvp")) {
-      provisionCallCount += 1;
-      if (values.includes("pilot-helper-in-environment")) provisionedForFallback = true;
-      return Promise.resolve([]);
-    }
-    return Promise.resolve([]);
-  };
-  return { sql, getProvisionCallCount: () => provisionCallCount };
-}
-
-// WP-410 Pre-Close checklist (session 2026-07-03-18): two regressions found by comparing this
-// file against personal-knowledge-mcp/src/scope.ts (the pre-unification original) — (1) the
-// self-heal branch (commit 051edf7) that provisions a fallback scope row on first proven-ownership
-// write was dropped during the port, so any user without a pre-existing row got permanently denied
-// (reproduces the original externally-reported bug); (2) `if (!path) deny` fired unconditionally
-// for the peer-pilot fallback, before the ownership check, so disconnect_source/purge_source
-// (which carry no path by design) could never succeed for a client without a declared agent_id.
-describe("checkBridgeWriteScope: peer-pilot self-heal (WP-410 Pre-Close checklist, restores 051edf7)", () => {
+describe("checkBridgeWriteScope: least-privilege peer-pilot self-heal", () => {
   it("own-data widen + no existing row → self-heals (provisions) and allows", async () => {
     const { sql, provisionCalls } = makeSelfHealSql();
     const r = await checkBridgeWriteScope({ ...base, agentId: undefined, source: "DS-mine", path: "notes/x.md", indicatorsSql: sql });
     expect(r.allow).toBe(true);
     expect(provisionCalls).toHaveLength(1);
-    expect(provisionCalls[0]).toContainEqual(["DS-mine"]); // allowedRepos, per provisionBridgeScopes' own test
+    expect(provisionCalls[0].values).toContainEqual(["DS-mine"]);
   });
 
   it("continuation default + no existing row → self-heals and allows", async () => {
@@ -292,6 +280,46 @@ describe("checkBridgeWriteScope: peer-pilot self-heal (WP-410 Pre-Close checklis
     expect(r.reason).toBe("scope_not_found");
   });
 
+  it("self-heal SQL touches only the pilot identity and never clears revocation", async () => {
+    const { sql, provisionCalls } = makeSelfHealSql();
+    const r = await checkBridgeWriteScope({ ...base, agentId: undefined, source: "DS-mine", path: "notes/x.md", indicatorsSql: sql });
+
+    expect(r.allow).toBe(true);
+    const [selfHeal] = provisionCalls;
+    expect(selfHeal.statement.match(/\('bridge'/g)).toHaveLength(1);
+    expect(selfHeal.statement).not.toContain("iwe_bridge:personal_write");
+    expect(selfHeal.statement).not.toContain("iwe_bridge:personal_propose_capture");
+    expect(selfHeal.statement).not.toContain("revoked_at = NULL");
+    expect(selfHeal.statement).toContain("agent_scopes_mvp.revoked_at IS NULL");
+    expect(selfHeal.statement).toContain("agent_scopes_mvp.expires_at > NOW()");
+    expect(selfHeal.statement).toContain("RETURNING allowed_repos");
+    expect(selfHeal.values).toContain("pilot-helper-in-environment");
+  });
+
+  it.each(["revoked", "expired", "concurrently changed"])(
+    "RETURNING empty for a %s fallback row → denies scope_not_found",
+    async () => {
+      const { sql, provisionCalls } = makeSelfHealSql({ provisionReturnsRow: false });
+      const r = await checkBridgeWriteScope({ ...base, agentId: undefined, source: "DS-mine", path: "notes/x.md", indicatorsSql: sql });
+
+      expect(r.allow).toBe(false);
+      expect(r.reason).toBe("scope_not_found");
+      expect(provisionCalls).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ["revoked", okRow({ revoked_at: "2026-08-27T00:00:00Z" }), "scope_revoked"],
+    ["expired", okRow({ expires_at: "2000-01-01T00:00:00Z" }), "scope_expired"],
+  ] as const)("an existing %s fallback row is not self-healed", async (_case, initialRow, reason) => {
+    const { sql, provisionCalls } = makeSelfHealSql({ initialRow });
+    const r = await checkBridgeWriteScope({ ...base, agentId: undefined, source: "DS-mine", path: "notes/x.md", indicatorsSql: sql });
+
+    expect(r.allow).toBe(false);
+    expect(r.reason).toBe(reason);
+    expect(provisionCalls).toHaveLength(0);
+  });
+
   it("source NOT owned + no existing row → still denies source_not_allowed, no self-heal attempted", async () => {
     const { sql, provisionCalls } = makeSelfHealSql();
     const r = await checkBridgeWriteScope({ ...base, agentId: undefined, source: "DS-other", path: "notes/x.md", indicatorsSql: sql });
@@ -300,15 +328,24 @@ describe("checkBridgeWriteScope: peer-pilot self-heal (WP-410 Pre-Close checklis
     expect(provisionCalls).toHaveLength(0);
   });
 
+  it("a missing declared-agent row stays missing and is never self-healed", async () => {
+    const { sql, provisionCalls } = makeSelfHealSql();
+    const r = await checkBridgeWriteScope({ ...base, agentId: BRIDGE_AGENT, indicatorsSql: sql });
+
+    expect(r.allow).toBe(false);
+    expect(r.reason).toBe("scope_not_found");
+    expect(provisionCalls).toHaveLength(0);
+  });
+
   it("second call after self-heal finds the provisioned row instead of re-provisioning", async () => {
-    const { sql, getProvisionCallCount } = makeConvergingFallbackSql();
+    const { sql, provisionCalls } = makeSelfHealSql({ convergeAfterProvision: true });
     const r1 = await checkBridgeWriteScope({ ...base, agentId: undefined, source: "DS-mine", path: "notes/a.md", indicatorsSql: sql });
     expect(r1.allow).toBe(true);
-    expect(getProvisionCallCount()).toBe(1);
+    expect(provisionCalls).toHaveLength(1);
 
     const r2 = await checkBridgeWriteScope({ ...base, agentId: undefined, source: "DS-mine", path: "notes/b.md", indicatorsSql: sql });
     expect(r2.allow).toBe(true);
-    expect(getProvisionCallCount()).toBe(1); // unchanged — second call found the row, didn't re-provision
+    expect(provisionCalls).toHaveLength(1); // unchanged — second call found the row
   });
 });
 
@@ -371,8 +408,8 @@ describe("shouldBlockOnScope: enforce fail-open classification (WP-410, peer-ses
   });
 });
 
-describe("provisionBridgeScopes (WP-410 срез-2b, connect_source)", () => {
-  it("upserts both bridge scope rows for the given user/source", async () => {
+describe("provisionBridgeScopes (WP-410 срез-2b, explicit connect_source)", () => {
+  it("retains broad explicit provisioning of all three bridge identities", async () => {
     const calls: { strings: string; values: unknown[] }[] = [];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const recordingSql: any = (strings: TemplateStringsArray, ...values: unknown[]) => {
@@ -386,7 +423,10 @@ describe("provisionBridgeScopes (WP-410 срез-2b, connect_source)", () => {
     const [{ strings, values }] = calls;
     expect(strings).toContain("INSERT INTO agent_scopes_mvp");
     expect(strings).toContain("ON CONFLICT (agent_id, user_id) DO UPDATE SET");
-    // Interpolated values, in template order: userId, allowedRepos, userId, allowedRepos.
+    expect(strings).toContain("iwe_bridge:personal_write");
+    expect(strings).toContain("iwe_bridge:personal_propose_capture");
+    expect(strings).toContain("revoked_at = NULL");
+    expect(values).toContain("pilot-helper-in-environment");
     expect(values).toContain("user-1");
     expect(values).toContainEqual(["DS-my-strategy"]);
   });
