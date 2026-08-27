@@ -25,6 +25,7 @@ vi.mock("@neondatabase/serverless", () => ({
 
 import {
   detectPersonalQueryType,
+  encodeGitHubContentsPath,
   connectSource,
   deleteFromGitHub,
   personalListSources,
@@ -49,6 +50,20 @@ function ctx(overrides: Partial<UserContext> = {}): UserContext {
     ...overrides,
   };
 }
+
+describe("encodeGitHubContentsPath", () => {
+  it("percent-encodes Cyrillic in each segment while preserving separators", () => {
+    expect(encodeGitHubContentsPath("docs/2026/05-август/файл.md")).toBe(
+      "docs/2026/05-%D0%B0%D0%B2%D0%B3%D1%83%D1%81%D1%82/%D1%84%D0%B0%D0%B9%D0%BB.md",
+    );
+  });
+
+  it("encodes spaces and URL control characters without escaping slashes", () => {
+    expect(encodeGitHubContentsPath("docs/a b/#tag?/100%.md")).toBe(
+      "docs/a%20b/%23tag%3F/100%25.md",
+    );
+  });
+});
 
 describe("detectPersonalQueryType", () => {
   it("routes entity codes to keyword", () => {

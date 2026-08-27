@@ -39,6 +39,11 @@ export interface UserContext {
   sourceNames: string[];
 }
 
+/** Encode a GitHub Contents API path without escaping directory separators. */
+export function encodeGitHubContentsPath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+
 // Exported for reuse by ./reindex.ts (WP-410 Деплой-2 группа Б) — same personal Neon DB.
 export function personalDb(env: PersonalEnv) {
   if (!env.DATABASE_URL) {
@@ -204,7 +209,8 @@ export async function writeToGitHub(
   if (!token) return { success: false, error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge` };
 
   const fullPath = userSource.pathPrefix ? `${userSource.pathPrefix}${path}` : path;
-  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${fullPath}`;
+  const encodedPath = encodeGitHubContentsPath(fullPath);
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
 
   // Check if file exists (need sha for update)
   let existingSha: string | undefined;
@@ -256,7 +262,8 @@ export async function deleteFromGitHub(
   if (!token) return { success: false, error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge` };
 
   const fullPath = userSource.pathPrefix ? `${userSource.pathPrefix}${path}` : path;
-  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${fullPath}`;
+  const encodedPath = encodeGitHubContentsPath(fullPath);
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
 
   const getResp = await fetch(apiUrl, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },

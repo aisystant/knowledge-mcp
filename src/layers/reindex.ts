@@ -18,6 +18,7 @@ import {
   personalDb,
   personalGetEmbedding,
   getInstallationToken,
+  encodeGitHubContentsPath,
   type PersonalEnv,
   type UserContext,
 } from "./personal.js";
@@ -105,9 +106,7 @@ async function readFromGitHub(
   if (!token) return null;
 
   const fullPath = userSource.pathPrefix ? `${userSource.pathPrefix}${path}` : path;
-  // GitHub Contents API requires each path segment URL-encoded. Raw spaces/parens/cyrillic
-  // break the request (WP-187 Ф-K.1.2 — observed on archive/strategy-sessions/*.md).
-  const encodedPath = fullPath.split("/").map(encodeURIComponent).join("/");
+  const encodedPath = encodeGitHubContentsPath(fullPath);
   const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`, {
     headers: {
       Authorization: `Bearer ${token}`,
