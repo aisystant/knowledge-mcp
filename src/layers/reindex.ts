@@ -107,10 +107,13 @@ async function readFromGitHub(
   const owner = userSource.githubOwner;
   const repo = userSource.githubRepo;
 
+  // Resolve both configured prefix and request path before auth or network I/O. A malformed
+  // source configuration must never reach the installation-token or Contents endpoints.
+  const fullPath = resolveSourcePath(userSource.pathPrefix, path).fullPath;
+
   const token = await getInstallationToken(env, owner);
   if (!token) return null;
 
-  const fullPath = resolveSourcePath(userSource.pathPrefix, path).fullPath;
   const resp = await fetch(githubContentsApiUrl(owner, repo, fullPath), {
     headers: {
       Authorization: `Bearer ${token}`,
@@ -275,6 +278,18 @@ export function relativeMarkdownPathsFromTree(
 async function listMdFilesViaTrees(env: ReindexEnv, ctx: UserContext, source: string): Promise<string[]> {
   const userSource = ctx.sources.find((s) => s.source === source);
   if (!userSource) return [];
+
+  // Validate the configured source boundary before token acquisition or GitHub metadata calls.
+  // Keep the canonical prefix for the later tree-boundary filter.
+  let normalizedPrefix: string;
+  try {
+    normalizedPrefix = userSource.pathPrefix
+      ? normalizeRepositoryPath(userSource.pathPrefix)
+      : "";
+  } catch {
+    return [];
+  }
+
   const token = await getInstallationToken(env, userSource.githubOwner);
   if (!token) return [];
 
@@ -304,7 +319,7 @@ async function listMdFilesViaTrees(env: ReindexEnv, ctx: UserContext, source: st
   if (treeJson.truncated) {
     console.warn(`listMdFilesViaTrees: tree truncated for ${source} (>100k entries)`);
   }
-  return relativeMarkdownPathsFromTree(treeJson.tree, userSource.pathPrefix);
+  return relativeMarkdownPathsFromTree(treeJson.tree, normalizedPrefix);
 }
 
 // --- Reindex jobs: producer + status (faithful port of index.ts:2495-2660) ---

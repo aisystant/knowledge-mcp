@@ -57,10 +57,12 @@ import {
   type ReindexEnv,
   type ReindexBatchMessage,
 } from "./reindex.js";
+import { getInstallationToken } from "./personal.js";
 
 beforeEach(() => {
   queryQueue = [];
   sqlCalls = [];
+  vi.mocked(getInstallationToken).mockClear();
 });
 
 const ENV: ReindexEnv = {
@@ -192,6 +194,23 @@ describe("personalReindexFiles", () => {
       "vault/docs/cafe%CC%81_%25%23%3F%20file.md",
       expect.objectContaining({ headers: expect.objectContaining({ Accept: "application/vnd.github.raw+json" }) }),
     );
+    globalThis.fetch = originalFetch;
+  });
+
+  it("rejects an invalid configured prefix before token acquisition or fetch", async () => {
+    queryQueue.push([sourceRow("../outside")]); // resolveUserContext
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn();
+
+    const result = await personalReindexFiles(ENV, {
+      source: "DS-my-strategy",
+      files: [{ path: "note.md", action: "modified" }],
+      user_id: USER_ID,
+    });
+
+    expect(result.errors[0]).toContain("escape the repository root");
+    expect(getInstallationToken).not.toHaveBeenCalled();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
     globalThis.fetch = originalFetch;
   });
 
@@ -329,6 +348,30 @@ describe("startReindexJob", () => {
 
     expect(result.message).toContain("No files");
     expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    expect(sendBatch).not.toHaveBeenCalled();
+    globalThis.fetch = originalFetch;
+  });
+
+  it("rejects an invalid tree prefix before token acquisition or GitHub fetch", async () => {
+    queryQueue.push([]); // no recent job
+    queryQueue.push([{ id: "job-invalid-prefix" }]); // INSERT reindex job
+    queryQueue.push([sourceRow("../outside")]); // resolveUserContext
+    queryQueue.push([]); // UPDATE running with zero files
+    queryQueue.push([]); // UPDATE succeeded
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn();
+    const sendBatch = vi.fn();
+    const env = {
+      ...ENV,
+      REINDEX_QUEUE: { sendBatch } as unknown as Queue<ReindexBatchMessage>,
+    };
+
+    const result = await startReindexJob(env, USER_ID, "DS-my-strategy");
+
+    expect(result.message).toContain("No files");
+    expect(getInstallationToken).not.toHaveBeenCalled();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
     expect(sendBatch).not.toHaveBeenCalled();
     globalThis.fetch = originalFetch;
   });
