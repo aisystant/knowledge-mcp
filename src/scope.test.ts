@@ -71,9 +71,10 @@ describe("scope: pure functions", () => {
     expect(normalizePath("lesson/foo/../../etc/passwd")).toBe("etc/passwd");
   });
 
-  it("normalizePath collapses slashes + strips leading slash + backslash", () => {
-    expect(normalizePath("/lesson//foo.md")).toBe("lesson/foo.md");
-    expect(normalizePath("lesson\\foo.md")).toBe("lesson/foo.md");
+  it("normalizePath rejects absolute, root-overflow, and backslash paths", () => {
+    expect(() => normalizePath("/lesson//foo.md")).toThrow("relative");
+    expect(() => normalizePath("../../lesson/foo.md")).toThrow("escape");
+    expect(() => normalizePath("lesson\\foo.md")).toThrow("use '/' separators");
   });
 
   it("hasDotfileSegment detects dotfile dirs", () => {
@@ -86,6 +87,12 @@ describe("scope: pure functions", () => {
     expect(matchesGlob("docs/deep/a.md", "docs/**")).toBe(true);
     expect(matchesGlob("secrets/a.md", "docs/**")).toBe(false);
     expect(matchesGlob("a.md", "**/*.md")).toBe(true);
+  });
+
+  it("matchesGlob treats ? and other regex characters as literals", () => {
+    const literal = "docs/август/cafe\u0301 #1%?.md";
+    expect(matchesGlob(literal, literal)).toBe(true);
+    expect(matchesGlob("docs/август/cafe\u0301 #1%X.md", literal)).toBe(false);
   });
 
   it("extractBridgeSourcePath: source priority + suggested fallback + conflict", () => {
@@ -141,6 +148,25 @@ describe("checkBridgeWriteScope: deny reasons", () => {
   it("path_not_allowed: path not in allowed_paths glob", async () => {
     const r = await checkBridgeWriteScope({ ...base, path: "secrets/x.md", agentId: BRIDGE_AGENT, indicatorsSql: makeSql([okRow()]) });
     expect(r.reason).toBe("path_not_allowed");
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["empty", ""],
+    ["NUL", "docs/a\0.md"],
+    ["absolute", "/docs/a.md"],
+    ["backslash", "docs\\a.md"],
+    ["root escape", "../../docs/a.md"],
+  ])("path_not_allowed: rejects %s before DB/audit access", async (_case, path) => {
+    let dbCalls = 0;
+    const indicatorsSql = (() => {
+      dbCalls++;
+      return Promise.resolve([]);
+    }) as ReturnType<typeof makeSql>;
+    const r = await checkBridgeWriteScope({ ...base, path, agentId: BRIDGE_AGENT, indicatorsSql });
+    expect(r.reason).toBe("path_not_allowed");
+    expect(r.denyResponse?.data.attempted_path).toBeUndefined();
+    expect(dbCalls).toBe(0);
   });
 
   it("invalid_agent_id: declared mismatch (no DB hit)", async () => {

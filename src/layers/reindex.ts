@@ -18,10 +18,15 @@ import {
   personalDb,
   personalGetEmbedding,
   getInstallationToken,
-  githubContentsApiUrl,
   type PersonalEnv,
   type UserContext,
 } from "./personal.js";
+import {
+  githubBranchApiUrl,
+  githubContentsApiUrl,
+  normalizeRepositoryPath,
+  resolveSourcePath,
+} from "../repository-path.js";
 
 export interface ReindexEnv extends PersonalEnv {
   /** Cloudflare Queue binding for the "reindex" queue. Required to enqueue/consume batches. */
@@ -105,7 +110,7 @@ async function readFromGitHub(
   const token = await getInstallationToken(env, owner);
   if (!token) return null;
 
-  const fullPath = userSource.pathPrefix ? `${userSource.pathPrefix}${path}` : path;
+  const fullPath = resolveSourcePath(userSource.pathPrefix, path).fullPath;
   const resp = await fetch(githubContentsApiUrl(owner, repo, fullPath), {
     headers: {
       Authorization: `Bearer ${token}`,
@@ -158,21 +163,33 @@ export async function personalReindexFiles(
   }
 
   for (const file of req.files) {
-    if (!file.path.endsWith(".md")) {
+    let normalizedPath: string;
+    try {
+      normalizedPath = normalizeRepositoryPath(file.path);
+    } catch (err) {
+      result.errors.push(`${file.path}: ${err instanceof Error ? err.message : "invalid path"}`);
+      continue;
+    }
+
+    if (!normalizedPath.endsWith(".md")) {
       result.skipped++;
       continue;
     }
 
     try {
+      const chunkPrefix = `${normalizedPath}::`;
       if (file.action === "removed") {
-        await sql`DELETE FROM ${sql.unsafe(documentsTable)} WHERE source = ${req.source} AND user_id = ${ctx.userId} AND (filename = ${file.path} OR filename LIKE ${file.path + "::%"})`;
+        await sql`DELETE FROM ${sql.unsafe(documentsTable)}
+          WHERE source = ${req.source} AND user_id = ${ctx.userId}
+            AND (filename = ${normalizedPath}
+              OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})`;
         result.deleted++;
         continue;
       }
 
-      const content = await readFromGitHub(env, ctx, req.source, file.path);
+      const content = await readFromGitHub(env, ctx, req.source, normalizedPath);
       if (!content) {
-        result.errors.push(`Cannot read ${file.path} from GitHub`);
+        result.errors.push(`Cannot read ${normalizedPath} from GitHub`);
         continue;
       }
 
@@ -182,15 +199,18 @@ export async function personalReindexFiles(
       }
 
       const hash = await contentHash(content);
-      const existing = await sql`SELECT hash FROM ${sql.unsafe(documentsTable)} WHERE filename = ${file.path} AND source = ${req.source} AND user_id = ${ctx.userId} LIMIT 1`;
+      const existing = await sql`SELECT hash FROM ${sql.unsafe(documentsTable)} WHERE filename = ${normalizedPath} AND source = ${req.source} AND user_id = ${ctx.userId} LIMIT 1`;
       if (existing.length > 0 && existing[0].hash === hash) {
         result.skipped++;
         continue;
       }
 
-      await sql`DELETE FROM ${sql.unsafe(documentsTable)} WHERE source = ${req.source} AND user_id = ${ctx.userId} AND (filename = ${file.path} OR filename LIKE ${file.path + "::%"})`;
+      await sql`DELETE FROM ${sql.unsafe(documentsTable)}
+        WHERE source = ${req.source} AND user_id = ${ctx.userId}
+          AND (filename = ${normalizedPath}
+            OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})`;
 
-      const chunks = chunkContent(file.path, content);
+      const chunks = chunkContent(normalizedPath, content);
 
       for (const chunk of chunks) {
         const embedding = await personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", chunk.content.slice(0, 8000));
@@ -233,6 +253,21 @@ interface GitHubTreeEntry {
   url?: string;
 }
 
+/** Restrict a recursive Git tree to the configured directory segment, then relativize it. */
+export function relativeMarkdownPathsFromTree(
+  tree: GitHubTreeEntry[],
+  pathPrefix: string,
+): string[] {
+  const normalizedPrefix = pathPrefix ? normalizeRepositoryPath(pathPrefix) : "";
+  const prefixBoundary = normalizedPrefix ? `${normalizedPrefix}/` : "";
+
+  return tree
+    .filter(entry => entry.type === "blob" && entry.path.endsWith(".md"))
+    .filter(entry => !prefixBoundary || entry.path.startsWith(prefixBoundary))
+    .map(entry => prefixBoundary ? entry.path.slice(prefixBoundary.length) : entry.path)
+    .filter(path => path.length > 0);
+}
+
 /**
  * List all .md files in a source repo via GitHub Trees API (recursive, single call).
  * Returns paths relative to pathPrefix (same shape as webhook ReindexFile).
@@ -248,9 +283,10 @@ async function listMdFilesViaTrees(env: ReindexEnv, ctx: UserContext, source: st
   });
   if (!repoResp.ok) return [];
   const repoJson = (await repoResp.json()) as { default_branch?: string };
-  const branch = repoJson.default_branch || "main";
+  const branch = repoJson.default_branch;
+  if (!branch) return [];
 
-  const branchResp = await fetch(`https://api.github.com/repos/${userSource.githubOwner}/${userSource.githubRepo}/branches/${branch}`, {
+  const branchResp = await fetch(githubBranchApiUrl(userSource.githubOwner, userSource.githubRepo, branch), {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
   });
   if (!branchResp.ok) return [];
@@ -258,21 +294,17 @@ async function listMdFilesViaTrees(env: ReindexEnv, ctx: UserContext, source: st
   const commitSha = branchJson.commit?.sha;
   if (!commitSha) return [];
 
-  const treeResp = await fetch(`https://api.github.com/repos/${userSource.githubOwner}/${userSource.githubRepo}/git/trees/${commitSha}?recursive=1`, {
+  const treeResp = await fetch(`https://api.github.com/repos/${userSource.githubOwner}/${userSource.githubRepo}/git/trees/${encodeURIComponent(commitSha)}?recursive=1`, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
   });
   if (!treeResp.ok) return [];
   const treeJson = (await treeResp.json()) as { tree?: GitHubTreeEntry[]; truncated?: boolean };
   if (!treeJson.tree) return [];
 
-  const prefix = userSource.pathPrefix || "";
   if (treeJson.truncated) {
     console.warn(`listMdFilesViaTrees: tree truncated for ${source} (>100k entries)`);
   }
-  return treeJson.tree
-    .filter((e) => e.type === "blob" && e.path.endsWith(".md") && (!prefix || e.path.startsWith(prefix)))
-    .map((e) => (prefix ? e.path.slice(prefix.length) : e.path))
-    .filter((p) => p.length > 0);
+  return relativeMarkdownPathsFromTree(treeJson.tree, userSource.pathPrefix);
 }
 
 // --- Reindex jobs: producer + status (faithful port of index.ts:2495-2660) ---

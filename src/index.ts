@@ -2114,7 +2114,7 @@ export const TOOLS = [
 const PRIVATE_TOOLS = [
   {
     name: "write",
-    description: "Write a file to a personal knowledge repo via GitHub. Creates or updates ordinary files. New publication Markdown under DS-Knowledge-Index-Tseren/docs/<year>/ is server-blocked: create it from that repository with scripts/new-post.py; if shell is unavailable, stop instead of using an ASCII/manual fallback.",
+    description: "Write a file to a personal knowledge repo via GitHub. Existing files and new ordinary/service Markdown are supported. A new publication-like file (frontmatter type: post or a channel filename) under TserenTserenov/DS-Knowledge-Index-Tseren docs/ is server-blocked: create it with scripts/new-post.py; if shell is unavailable, stop instead of using an ASCII/manual fallback.",
     inputSchema: {
       type: "object",
       properties: {

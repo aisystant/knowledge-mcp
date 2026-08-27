@@ -73,7 +73,7 @@ vi.mock("./layers/private.js", async (importOriginal) => {
 });
 
 const { handleMcpRequest } = await import("./index.js");
-const { personalSearchDocuments, personalGetDocument, personalListSources } = await import("./layers/personal.js");
+const { personalSearchDocuments, personalGetDocument, personalListSources, writeToGitHub } = await import("./layers/personal.js");
 
 const ENV = {
   KNOWLEDGE_DATABASE_URL: "postgres://fake-public",
@@ -123,5 +123,27 @@ describe("dual-mode routing: private mode reaches the personal layer, never the 
   it("search: public mode never calls the personal-layer search function", async () => {
     await callTool("search", { query: "test" }, "public");
     expect(personalSearchDocuments).not.toHaveBeenCalled();
+  });
+
+  it("write: domain guidance stays a structured non-MCP-error result", async () => {
+    vi.mocked(writeToGitHub).mockResolvedValueOnce({
+      success: false,
+      reason: "post_scaffold_required",
+      error: "creation blocked",
+      next_action: "run scripts/new-post.py",
+    });
+
+    const res = await callTool("write", {
+      source: "DS-my-strategy",
+      path: "docs/post.md",
+      content: "---\ntype: post\n---",
+    }, "private") as { result: { content: [{ text: string }]; isError?: boolean } };
+
+    expect(res.result.isError).toBeUndefined();
+    expect(JSON.parse(res.result.content[0].text)).toMatchObject({
+      success: false,
+      reason: "post_scaffold_required",
+      next_action: "run scripts/new-post.py",
+    });
   });
 });

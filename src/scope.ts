@@ -8,6 +8,9 @@
  */
 
 import { neon } from "@neondatabase/serverless";
+import { normalizeRepositoryPath } from "./repository-path.js";
+
+export { normalizeRepositoryPath as normalizePath } from "./repository-path.js";
 
 /** neon() tagged-template client (HTTP driver). Returns rows array directly. */
 type NeonSql = ReturnType<typeof neon>;
@@ -103,27 +106,12 @@ interface BridgeScopeRow {
   taint_level: number;
 }
 
-export function normalizePath(input: string): string {
-  let path = input.replace(/\\/g, "/");
-  path = path.replace(/\/+/g, "/");
-  path = path.replace(/^\/+/, "");
-  const segments: string[] = [];
-  for (const seg of path.split("/")) {
-    if (seg === "..") {
-      segments.pop();
-    } else if (seg && seg !== ".") {
-      segments.push(seg);
-    }
-  }
-  return segments.join("/");
-}
-
 export function hasDotfileSegment(normalizedPath: string): boolean {
   return normalizedPath.split("/").some((seg) => seg.startsWith("."));
 }
 
 export function matchesGlob(path: string, pattern: string): boolean {
-  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
   const PDS = "\x00DSS\x00";
   const PD = "\x00DS\x00";
   const PS = "\x00SS\x00";
@@ -181,6 +169,16 @@ export async function checkBridgeWriteScope(opts: {
 
   const expectedAgentId = `iwe_bridge:${toolName}`;
   let agentId = declaredAgentId ?? expectedAgentId;
+  let safePath: string | undefined;
+  try {
+    safePath = requiresPath
+      ? normalizeRepositoryPath(path ?? "")
+      : path !== undefined ? normalizeRepositoryPath(path) : undefined;
+  } catch {
+    // Request syntax is rejected before scope lookup or audit writes. No stateful enforcement
+    // work should run for a path that cannot identify one repository object unambiguously.
+    return deny("scope denied: path must be a safe repository-relative path", "path_not_allowed", toolName, source);
+  }
   let isPeerPilotFallback = false;
   let isOwnDataWiden = false;
   let isContinuationDefault = false;
@@ -188,12 +186,6 @@ export async function checkBridgeWriteScope(opts: {
   if (requireDeclaredAgentId && (!declaredAgentId || declaredAgentId.length === 0)) {
     isPeerPilotFallback = true;
     agentId = PEER_PILOT_AGENT_ID;
-
-    if (requiresPath && !path) {
-      await tryInsertViolation({ indicatorsSql, agentId, userId, reason: "path_not_allowed", attemptedTool: toolName, attemptedRepo: source, requestId });
-      return deny("scope denied: path required for peer-pilot helper", "path_not_allowed", toolName);
-    }
-    const safePath = path ? normalizePath(path) : undefined;
 
     if (safePath && hasDotfileSegment(safePath)) {
       await tryInsertViolation({ indicatorsSql, agentId, userId, reason: "path_not_allowed", attemptedTool: toolName, attemptedRepo: source, attemptedPath: safePath, requestId });
@@ -302,7 +294,7 @@ export async function checkBridgeWriteScope(opts: {
     // leaving scope_not_found/scope_revoked/scope_expired violations impossible to diagnose from
     // agent_scope_violations alone (source/path always came back empty regardless of what was
     // actually attempted).
-    await tryInsertViolation({ indicatorsSql, agentId, userId, reason, attemptedTool: toolName, attemptedRepo: source, attemptedPath: path ? normalizePath(path) : undefined, requestId });
+    await tryInsertViolation({ indicatorsSql, agentId, userId, reason, attemptedTool: toolName, attemptedRepo: source, attemptedPath: safePath, requestId });
     return deny(`scope denied: ${reason}`, reason, toolName);
   }
 
@@ -311,8 +303,6 @@ export async function checkBridgeWriteScope(opts: {
     await tryInsertViolation({ indicatorsSql, agentId, userId, reason: "operation_not_allowed", attemptedTool: toolName, requestId });
     return deny(`scope denied: operation '${operation}' not in allowed_operations`, "operation_not_allowed", toolName);
   }
-
-  const safePath = path ? normalizePath(path) : undefined;
 
   if (!isOwnDataWiden && source && !scopeRow.allowed_repos.includes(source)) {
     await tryInsertViolation({ indicatorsSql, agentId, userId, reason: "source_not_allowed", attemptedTool: toolName, attemptedRepo: source, requestId });
