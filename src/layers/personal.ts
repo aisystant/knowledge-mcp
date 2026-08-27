@@ -58,7 +58,6 @@ const MANAGED_KNOWLEDGE_INDEX_OWNER = "tserentserenov";
 const MANAGED_KNOWLEDGE_INDEX_REPO = "ds-knowledge-index-tseren";
 const GIT_BLOB_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const POST_CHANNEL_FILENAME = /^(?:(?:\d{2}-\d{2})|\d{1,4})-\d{1,2}-(?:club|facebook|linkedin|telegram|tenchat|x|youtube|dzen|habr)-\d{4}-\d{2}-\d{2}\.md$/i;
-const SERVICE_DOCUMENT_FILENAME = /^\d{4}-\d{2}-\d{2}-week-(?:review|draft)(?:-[a-z0-9-]+)?\.md$/i;
 
 export const POST_SCAFFOLD_REQUIRED_MESSAGE =
   "Создание публикации через personal_write заблокировано: номер и канонический путь назначает scripts/new-post.py.";
@@ -109,7 +108,6 @@ export function getManagedKnowledgeIndexPostEvidence(
   if (!isManagedRepo || !normalizedPath.startsWith("docs/")) return null;
 
   const filename = normalizedPath.split("/").at(-1) ?? "";
-  if (SERVICE_DOCUMENT_FILENAME.test(filename)) return null;
   if (frontmatterDeclaresPost(content)) return "frontmatter_type_post";
   return POST_CHANNEL_FILENAME.test(filename) ? "channel_filename" : null;
 }

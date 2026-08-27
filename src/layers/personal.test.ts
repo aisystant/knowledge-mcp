@@ -139,6 +139,7 @@ describe("normalizeRepositoryPath", () => {
 describe("Knowledge Index publication creation guard", () => {
   const postPath = "docs/2026/05-август/40-08-2026-08-27-topic/40-08-1-club-2026-08-27.md";
   const postContent = "---\ntype: post\ntitle: Topic\n---\n# Topic";
+  const weekReviewContent = "---\ntype: week_review\n---\n# Week review";
   const targetContext = ctx({ sources: [knowledgeIndexTarget], sourceNames: [knowledgeIndexTarget.source] });
 
   it("detects noncanonical type:post frontmatter", () => {
@@ -161,13 +162,13 @@ describe("Knowledge Index publication creation guard", () => {
     )).toBe("channel_filename");
   });
 
-  it("allows ordinary Markdown, service week review, docs2, and another resolved repository", () => {
+  it("allows ordinary Markdown, non-post week review, docs2, and another resolved repository", () => {
     const otherTarget = { githubOwner: "TserenTserenov", githubRepo: "DS-my-strategy" };
     expect(getManagedKnowledgeIndexPostEvidence(knowledgeIndexTarget, "docs/2026/notes.md", "# note")).toBeNull();
     expect(getManagedKnowledgeIndexPostEvidence(
       knowledgeIndexTarget,
       "docs/2026/2026-08-24-week-review-w34.md",
-      postContent,
+      weekReviewContent,
     )).toBeNull();
     expect(getManagedKnowledgeIndexPostEvidence(knowledgeIndexTarget, "docs2/2026/post.md", postContent)).toBeNull();
     expect(getManagedKnowledgeIndexPostEvidence(otherTarget, postPath, postContent)).toBeNull();
@@ -179,6 +180,27 @@ describe("Knowledge Index publication creation guard", () => {
       "docs/2026/drafts/topic-week-review-bypass.md",
       postContent,
     )).toBe("frontmatter_type_post");
+  });
+
+  it("does not let a service-style filename override explicit type: post", async () => {
+    const servicePath = "docs/2026/2026-08-24-week-review-w34.md";
+    expect(getManagedKnowledgeIndexPostEvidence(
+      knowledgeIndexTarget,
+      servicePath,
+      postContent,
+    )).toBe("frontmatter_type_post");
+
+    const { request, dependencies } = githubDependencies([{ ok: false, status: 404 }]);
+    const result = await writeToGitHub(
+      ENV, targetContext, knowledgeIndexTarget.source, servicePath, postContent, "create", dependencies,
+    );
+
+    expect(result).toMatchObject({ success: false, reason: "post_scaffold_required" });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).not.toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ method: "PUT" }),
+    );
   });
 
   it("returns a structured scaffold instruction on 404 without issuing PUT", async () => {
@@ -276,7 +298,7 @@ describe("Knowledge Index publication creation guard", () => {
 
   it.each([
     ["ordinary Markdown", "docs/2026/ordinary.md", "# Ordinary"],
-    ["week review service file", "docs/2026/2026-08-24-week-review-w34.md", postContent],
+    ["week review service file", "docs/2026/2026-08-24-week-review-w34.md", weekReviewContent],
   ])("allows %s creation on a confirmed 404", async (_case, ordinaryPath, content) => {
     const { request, dependencies } = githubDependencies([
       { ok: false, status: 404 },
