@@ -26,8 +26,13 @@ vi.mock("@neondatabase/serverless", () => ({
 import {
   detectPersonalQueryType,
   encodeGitHubContentsPath,
+  getPersonalWriteCreationBlock,
+  isManagedKnowledgeIndexPostPath,
+  KNOWLEDGE_INDEX_POST_CREATION_BLOCK,
+  normalizeRepositoryPath,
   connectSource,
   deleteFromGitHub,
+  writeToGitHub,
   personalListSources,
   personalGetDocument,
   disconnectSource,
@@ -51,6 +56,26 @@ function ctx(overrides: Partial<UserContext> = {}): UserContext {
   };
 }
 
+const knowledgeIndexTarget = {
+  source: "knowledge-index-alias",
+  githubOwner: "TserenTserenov",
+  githubRepo: "DS-Knowledge-Index-Tseren",
+  pathPrefix: "",
+  sourceType: "content",
+};
+
+function githubDependencies(responses: Array<Partial<Response> & { ok: boolean }>) {
+  const request = vi.fn();
+  for (const response of responses) request.mockResolvedValueOnce(response);
+  return {
+    request,
+    dependencies: {
+      getInstallationToken: vi.fn().mockResolvedValue("ghs_test_token"),
+      fetch: request as unknown as typeof globalThis.fetch,
+    },
+  };
+}
+
 describe("encodeGitHubContentsPath", () => {
   it("percent-encodes Cyrillic in each segment while preserving separators", () => {
     expect(encodeGitHubContentsPath("docs/2026/05-август/файл.md")).toBe(
@@ -62,6 +87,120 @@ describe("encodeGitHubContentsPath", () => {
     expect(encodeGitHubContentsPath("docs/a b/#tag?/100%.md")).toBe(
       "docs/a%20b/%23tag%3F/100%25.md",
     );
+  });
+});
+
+describe("normalizeRepositoryPath", () => {
+  it("normalizes separators, dot segments, duplicate slashes, and Unicode", () => {
+    expect(normalizeRepositoryPath("./docs//2026\\draft/../cafe\u0301.md")).toBe(
+      "docs/2026/café.md",
+    );
+  });
+
+  it("rejects paths that escape the repository root", () => {
+    expect(() => normalizeRepositoryPath("../../docs/2026/post.md")).toThrow("must not escape");
+  });
+});
+
+describe("Knowledge Index publication creation guard", () => {
+  const postPath = "docs/2026/05-август/40-08-2026-08-27-topic/40-08-1-club-2026-08-27.md";
+
+  it("recognizes a normalized year-based Markdown publication path", () => {
+    expect(isManagedKnowledgeIndexPostPath(
+      knowledgeIndexTarget,
+      `./docs//2026\\05-август/../05-август/${postPath.split("/").at(-1)}`,
+    )).toBe(true);
+  });
+
+  it("rejects creation when GitHub did not confirm an existing SHA", () => {
+    expect(getPersonalWriteCreationBlock(knowledgeIndexTarget, postPath)).toBe(KNOWLEDGE_INDEX_POST_CREATION_BLOCK);
+    expect(getPersonalWriteCreationBlock(knowledgeIndexTarget, postPath, "not-a-git-sha")).toBe(KNOWLEDGE_INDEX_POST_CREATION_BLOCK);
+    expect(KNOWLEDGE_INDEX_POST_CREATION_BLOCK).toContain("scripts/new-post.py");
+    expect(KNOWLEDGE_INDEX_POST_CREATION_BLOCK).toContain("ASCII/manual fallback");
+  });
+
+  it("allows updates to an existing publication", () => {
+    expect(getPersonalWriteCreationBlock(knowledgeIndexTarget, postPath, "a".repeat(40))).toBeUndefined();
+  });
+
+  it("does not block non-publication paths or a different resolved repository", () => {
+    const otherTarget = { githubOwner: "TserenTserenov", githubRepo: "DS-my-strategy" };
+    expect(getPersonalWriteCreationBlock(knowledgeIndexTarget, "docs/research/2026-08-study.md")).toBeUndefined();
+    expect(getPersonalWriteCreationBlock(knowledgeIndexTarget, "docs/README.md")).toBeUndefined();
+    expect(getPersonalWriteCreationBlock(otherTarget, "docs/2026/note.md")).toBeUndefined();
+  });
+
+  it("blocks an aliased personal_write at the fetch boundary without issuing PUT", async () => {
+    const { request, dependencies } = githubDependencies([{ ok: false, status: 404 }]);
+    const targetContext = ctx({ sources: [knowledgeIndexTarget], sourceNames: [knowledgeIndexTarget.source] });
+    const expectedUrl = "https://api.github.com/repos/TserenTserenov/DS-Knowledge-Index-Tseren/contents/" +
+      "docs/2026/05-%D0%B0%D0%B2%D0%B3%D1%83%D1%81%D1%82/40-08-2026-08-27-topic/40-08-1-club-2026-08-27.md";
+
+    const result = await writeToGitHub(
+      ENV,
+      targetContext,
+      knowledgeIndexTarget.source,
+      postPath,
+      "# post",
+      "create post",
+      dependencies,
+    );
+
+    expect(result).toEqual({ success: false, error: KNOWLEDGE_INDEX_POST_CREATION_BLOCK });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledWith(
+      expectedUrl,
+      expect.not.objectContaining({ method: "PUT" }),
+    );
+  });
+
+  it("fails closed with scaffold instructions when the existence check is unavailable", async () => {
+    const request = vi.fn().mockRejectedValue(new Error("GitHub unavailable"));
+    const targetContext = ctx({ sources: [knowledgeIndexTarget], sourceNames: [knowledgeIndexTarget.source] });
+
+    const result = await writeToGitHub(
+      ENV,
+      targetContext,
+      knowledgeIndexTarget.source,
+      postPath,
+      "# post",
+      "create post",
+      {
+        getInstallationToken: vi.fn().mockResolvedValue("ghs_test_token"),
+        fetch: request as unknown as typeof globalThis.fetch,
+      },
+    );
+
+    expect(result).toEqual({ success: false, error: KNOWLEDGE_INDEX_POST_CREATION_BLOCK });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows personal_write to update a confirmed existing publication", async () => {
+    const existingSha = "a".repeat(40);
+    const { request, dependencies } = githubDependencies([
+      { ok: true, status: 200, json: async () => ({ sha: existingSha }) },
+      { ok: true, status: 200, json: async () => ({ content: { sha: "b".repeat(40), html_url: "https://github.test/post" } }) },
+    ]);
+    const targetContext = ctx({ sources: [knowledgeIndexTarget], sourceNames: [knowledgeIndexTarget.source] });
+
+    const result = await writeToGitHub(
+      ENV,
+      targetContext,
+      knowledgeIndexTarget.source,
+      postPath,
+      "# updated post",
+      "update post",
+      dependencies,
+    );
+
+    expect(result.success).toBe(true);
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(request.mock.calls[1][0]).toBe(
+      "https://api.github.com/repos/TserenTserenov/DS-Knowledge-Index-Tseren/contents/" +
+      "docs/2026/05-%D0%B0%D0%B2%D0%B3%D1%83%D1%81%D1%82/40-08-2026-08-27-topic/40-08-1-club-2026-08-27.md",
+    );
+    expect(request.mock.calls[1][1]).toEqual(expect.objectContaining({ method: "PUT" }));
+    expect(JSON.parse((request.mock.calls[1][1] as RequestInit).body as string)).toEqual(expect.objectContaining({ sha: existingSha }));
   });
 });
 
@@ -109,6 +248,25 @@ describe("deleteFromGitHub", () => {
     const result = await deleteFromGitHub(ENV, ctx(), "not-a-real-source", "notes/idea.md", "delete");
     expect(result.success).toBe(false);
     expect(result.error).toContain("Unknown source");
+  });
+
+  it("uses the exact encoded Contents API URL for Cyrillic delete paths", async () => {
+    const sha = "c".repeat(40);
+    const { request, dependencies } = githubDependencies([
+      { ok: true, status: 200, json: async () => ({ sha }) },
+      { ok: true, status: 200 },
+    ]);
+    queryQueue.push([]); // indexed document cleanup
+    const path = "notes/05-август/файл #1.md";
+
+    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", path, "delete", dependencies);
+
+    expect(result.success).toBe(true);
+    const expectedUrl = "https://api.github.com/repos/TserenTserenov/DS-my-strategy/contents/" +
+      "notes/05-%D0%B0%D0%B2%D0%B3%D1%83%D1%81%D1%82/%D1%84%D0%B0%D0%B9%D0%BB%20%231.md";
+    expect(request.mock.calls[0][0]).toBe(expectedUrl);
+    expect(request.mock.calls[1][0]).toBe(expectedUrl);
+    expect(request.mock.calls[1][1]).toEqual(expect.objectContaining({ method: "DELETE" }));
   });
 });
 

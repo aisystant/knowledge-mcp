@@ -1,5 +1,5 @@
 // Personal-corpus data layer for the private MCP mode (WP-410 срез-2b).
-// Ported from personal-knowledge-mcp/src/index.ts as-is (faithful port, no behavior change):
+// Ported from personal-knowledge-mcp/src/index.ts, then hardened in this private-mode layer:
 // resolveUserContext, GitHub App JWT signing, writeToGitHub, getInstallationToken.
 //
 // Talks to the personal Neon DB (env.DATABASE_URL) via plain neon() + explicit `WHERE user_id`
@@ -39,9 +39,81 @@ export interface UserContext {
   sourceNames: string[];
 }
 
+const MANAGED_KNOWLEDGE_INDEX_OWNER = "tserentserenov";
+const MANAGED_KNOWLEDGE_INDEX_REPO = "ds-knowledge-index-tseren";
+const MANAGED_POST_PATH = /^docs\/\d{4}\/.+\.md$/i;
+const GIT_BLOB_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+
+export const KNOWLEDGE_INDEX_POST_CREATION_BLOCK =
+  "Создание публикации через personal_write заблокировано: из корня DS-Knowledge-Index-Tseren запусти " +
+  "`python3 scripts/new-post.py --date YYYY-MM-DD --slug <slug> --title \"<title>\" --channels <channels>`. " +
+  "Скрипт назначает номер и канонический путь. Если shell или scripts/new-post.py недоступны, остановись и сообщи о блокере; " +
+  "ASCII/manual fallback и ручное создание файла запрещены.";
+
+/**
+ * Canonicalize a caller-supplied repository-relative path before policy checks and URL encoding.
+ * Backslashes are treated as separators because URL stacks may normalize them that way later.
+ */
+export function normalizeRepositoryPath(path: string): string {
+  if (!path || path.includes("\0")) {
+    throw new Error("Repository path must be a non-empty string without NUL bytes");
+  }
+  if (path.startsWith("/") || path.startsWith("\\")) {
+    throw new Error("Repository path must be relative to the repository root");
+  }
+
+  const segments: string[] = [];
+  for (const segment of path.normalize("NFC").replace(/\\/g, "/").split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      if (segments.length === 0) {
+        throw new Error("Repository path must not escape the repository root");
+      }
+      segments.pop();
+      continue;
+    }
+    segments.push(segment);
+  }
+
+  if (segments.length === 0) {
+    throw new Error("Repository path must resolve to a file");
+  }
+  return segments.join("/");
+}
+
+/** True only for publication-like Markdown paths in the resolved repository identity. */
+export function isManagedKnowledgeIndexPostPath(
+  target: Pick<UserSource, "githubOwner" | "githubRepo">,
+  path: string,
+): boolean {
+  const isManagedRepo = target.githubOwner.toLowerCase() === MANAGED_KNOWLEDGE_INDEX_OWNER
+    && target.githubRepo.toLowerCase() === MANAGED_KNOWLEDGE_INDEX_REPO;
+  return isManagedRepo && MANAGED_POST_PATH.test(normalizeRepositoryPath(path));
+}
+
+/**
+ * Existing publications may be edited, but creating one must go through the repository allocator.
+ * Missing or unparseable GitHub metadata has no SHA and therefore fails closed.
+ */
+export function getPersonalWriteCreationBlock(
+  target: Pick<UserSource, "githubOwner" | "githubRepo">,
+  path: string,
+  existingSha?: string,
+): string | undefined {
+  const targetExists = typeof existingSha === "string" && GIT_BLOB_SHA.test(existingSha);
+  if (targetExists || !isManagedKnowledgeIndexPostPath(target, path)) return undefined;
+  return KNOWLEDGE_INDEX_POST_CREATION_BLOCK;
+}
+
 /** Encode a GitHub Contents API path without escaping directory separators. */
 export function encodeGitHubContentsPath(path: string): string {
   return path.split("/").map(encodeURIComponent).join("/");
+}
+
+/** Build the GitHub Contents API URL from the same normalized path used by policy checks. */
+export function githubContentsApiUrl(owner: string, repo: string, path: string): string {
+  const encodedPath = encodeGitHubContentsPath(normalizeRepositoryPath(path));
+  return `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
 }
 
 // Exported for reuse by ./reindex.ts (WP-410 Деплой-2 группа Б) — same personal Neon DB.
@@ -189,6 +261,11 @@ export async function getInstallationToken(env: PersonalEnv, owner: string): Pro
   return tokenData.token;
 }
 
+export interface GitHubApiDependencies {
+  getInstallationToken: typeof getInstallationToken;
+  fetch: typeof globalThis.fetch;
+}
+
 /**
  * Write a file to GitHub repo using Installation Token.
  */
@@ -198,32 +275,55 @@ export async function writeToGitHub(
   source: string,
   path: string,
   content: string,
-  message: string
+  message: string,
+  dependencies: Partial<GitHubApiDependencies> = {},
 ): Promise<{ success: boolean; sha?: string; url?: string; error?: string }> {
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return { success: false, error: `Unknown source: ${source}` };
 
+  let fullPath: string;
+  try {
+    const normalizedPath = normalizeRepositoryPath(path);
+    const prefixedPath = userSource.pathPrefix ? `${userSource.pathPrefix}${normalizedPath}` : normalizedPath;
+    fullPath = normalizeRepositoryPath(prefixedPath);
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : "Invalid repository path" };
+  }
+
   const owner = userSource.githubOwner;
   const repo = userSource.githubRepo;
-  const token = await getInstallationToken(env, owner);
+  const getToken = dependencies.getInstallationToken ?? getInstallationToken;
+  const githubFetch = dependencies.fetch ?? globalThis.fetch;
+  const token = await getToken(env, owner);
   if (!token) return { success: false, error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge` };
 
-  const fullPath = userSource.pathPrefix ? `${userSource.pathPrefix}${path}` : path;
-  const encodedPath = encodeGitHubContentsPath(fullPath);
-  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
+  const apiUrl = githubContentsApiUrl(owner, repo, fullPath);
 
   // Check if file exists (need sha for update)
   let existingSha: string | undefined;
-  const getResp = await fetch(apiUrl, {
-    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
-  });
-  if (getResp.ok) {
-    const existing = (await getResp.json()) as { sha: string };
-    existingSha = existing.sha;
+  try {
+    const getResp = await githubFetch(apiUrl, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+    });
+    if (getResp.ok) {
+      const existing = (await getResp.json()) as { sha: string };
+      if (typeof existing.sha === "string" && GIT_BLOB_SHA.test(existing.sha)) {
+        existingSha = existing.sha;
+      }
+    }
+  } catch (err) {
+    const creationBlock = getPersonalWriteCreationBlock(userSource, fullPath);
+    if (creationBlock) return { success: false, error: creationBlock };
+    throw err;
+  }
+
+  const creationBlock = getPersonalWriteCreationBlock(userSource, fullPath, existingSha);
+  if (creationBlock) {
+    return { success: false, error: creationBlock };
   }
 
   // Create or update file
-  const putResp = await fetch(apiUrl, {
+  const putResp = await githubFetch(apiUrl, {
     method: "PUT",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge", "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -251,21 +351,32 @@ export async function deleteFromGitHub(
   ctx: UserContext,
   source: string,
   path: string,
-  message: string
+  message: string,
+  dependencies: Partial<GitHubApiDependencies> = {},
 ): Promise<{ success: boolean; error?: string }> {
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return { success: false, error: `Unknown source: ${source}` };
 
+  let normalizedPath: string;
+  let fullPath: string;
+  try {
+    normalizedPath = normalizeRepositoryPath(path);
+    const prefixedPath = userSource.pathPrefix ? `${userSource.pathPrefix}${normalizedPath}` : normalizedPath;
+    fullPath = normalizeRepositoryPath(prefixedPath);
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : "Invalid repository path" };
+  }
+
   const owner = userSource.githubOwner;
   const repo = userSource.githubRepo;
-  const token = await getInstallationToken(env, owner);
+  const getToken = dependencies.getInstallationToken ?? getInstallationToken;
+  const githubFetch = dependencies.fetch ?? globalThis.fetch;
+  const token = await getToken(env, owner);
   if (!token) return { success: false, error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge` };
 
-  const fullPath = userSource.pathPrefix ? `${userSource.pathPrefix}${path}` : path;
-  const encodedPath = encodeGitHubContentsPath(fullPath);
-  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
+  const apiUrl = githubContentsApiUrl(owner, repo, fullPath);
 
-  const getResp = await fetch(apiUrl, {
+  const getResp = await githubFetch(apiUrl, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
   });
   if (!getResp.ok) {
@@ -273,7 +384,7 @@ export async function deleteFromGitHub(
   }
   const existing = (await getResp.json()) as { sha: string };
 
-  const delResp = await fetch(apiUrl, {
+  const delResp = await githubFetch(apiUrl, {
     method: "DELETE",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge", "Content-Type": "application/json" },
     body: JSON.stringify({ message, sha: existing.sha }),
@@ -292,7 +403,7 @@ export async function deleteFromGitHub(
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
   await sql`
     DELETE FROM ${sql.unsafe(documentsTable)}
-    WHERE user_id = ${ctx.userId} AND source = ${source} AND (filename = ${path} OR filename LIKE ${path + "::%"})
+    WHERE user_id = ${ctx.userId} AND source = ${source} AND (filename = ${normalizedPath} OR filename LIKE ${normalizedPath + "::%"})
   `;
 
   return { success: true };

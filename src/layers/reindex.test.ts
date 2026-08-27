@@ -147,6 +147,7 @@ describe("personalReindexFiles", () => {
 
   it("skips a file whose content hash is unchanged", async () => {
     const hash = await contentHash("unchanged content");
+    const path = "docs/2026/05-август/файл #1.md";
     queryQueue.push([sourceRow()]); // resolveUserContext
     queryQueue.push([{ hash }]); // hash check — matches
 
@@ -154,10 +155,15 @@ describe("personalReindexFiles", () => {
     globalThis.fetch = vi.fn().mockResolvedValueOnce({ ok: true, text: async () => "unchanged content" }); // file content
 
     const result = await personalReindexFiles(ENV, {
-      source: "DS-my-strategy", files: [{ path: "note.md", action: "modified" }], user_id: USER_ID,
+      source: "DS-my-strategy", files: [{ path, action: "modified" }], user_id: USER_ID,
     });
     expect(result.skipped).toBe(1);
     expect(result.processed).toBe(0);
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      "https://api.github.com/repos/TserenTserenov/DS-my-strategy/contents/" +
+      "docs/2026/05-%D0%B0%D0%B2%D0%B3%D1%83%D1%81%D1%82/%D1%84%D0%B0%D0%B9%D0%BB%20%231.md",
+      expect.objectContaining({ headers: expect.objectContaining({ Accept: "application/vnd.github.raw+json" }) }),
+    );
     globalThis.fetch = originalFetch;
   });
 

@@ -18,7 +18,7 @@ import {
   personalDb,
   personalGetEmbedding,
   getInstallationToken,
-  encodeGitHubContentsPath,
+  githubContentsApiUrl,
   type PersonalEnv,
   type UserContext,
 } from "./personal.js";
@@ -106,8 +106,7 @@ async function readFromGitHub(
   if (!token) return null;
 
   const fullPath = userSource.pathPrefix ? `${userSource.pathPrefix}${path}` : path;
-  const encodedPath = encodeGitHubContentsPath(fullPath);
-  const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`, {
+  const resp = await fetch(githubContentsApiUrl(owner, repo, fullPath), {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github.raw+json",
