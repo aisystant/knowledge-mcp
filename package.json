@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "npm run guard:privacy && wrangler deploy",
+    "deploy": "npm ci --legacy-peer-deps && npm run test && npm run typecheck && npm run guard:privacy && bash scripts/verified-deploy.sh",
     "guard:privacy": "bash scripts/check-account-id-filter.sh",
     "typecheck": "tsc --noEmit",
     "ingest": "tsx scripts/ingest.ts",

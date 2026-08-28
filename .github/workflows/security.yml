@@ -6,16 +6,19 @@ on:
   pull_request:
     branches: ["**"]
 
+permissions:
+  contents: read
+
 jobs:
   npm-audit:
     name: npm audit (B5.3)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "20"
-      - run: npm install --ignore-scripts
+          node-version: "22"
+      - run: npm ci --ignore-scripts
       - name: npm audit (high+critical)
         run: npm audit --audit-level=high
 
@@ -23,8 +26,8 @@ jobs:
     name: Semgrep SAST (B5.2)
     runs-on: ubuntu-latest
     container:
-      image: semgrep/semgrep
+      image: semgrep/semgrep:1.175.0@sha256:b94b53d02fd4a022f9eac4e2af1380f5c3c4c21400e79d3336bdff1d1db5e796
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Semgrep scan
         run: semgrep scan --config=p/typescript --config=p/secrets --error src/
