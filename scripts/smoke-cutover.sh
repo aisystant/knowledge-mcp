@@ -80,4 +80,4 @@ echo "С user_id=Tseren (personal | platform): ${rls_tseren}"
 echo
 echo "=== Сводка ==="
 echo "Smoke test PASS — RLS работает, FTS работает, pgvector работает."
-echo "Следующий шаг: deploy worker через wrangler secret put KNOWLEDGE_DATABASE_URL + wrangler deploy"
+echo "Следующий шаг: настройте KNOWLEDGE_DATABASE_URL, затем выполните npm run deploy из чистого origin/main"
