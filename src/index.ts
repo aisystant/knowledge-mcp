@@ -32,6 +32,7 @@ import {
   deleteFromGitHub,
   personalSearchDocuments,
   personalGetDocument,
+  AmbiguousSourceError,
   personalListSources,
   personalMemorySearch,
   connectSource,
@@ -2514,7 +2515,15 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
           }
 
           if (toolName === "get_document") {
-            const doc = await personalGetDocument(env, ctx, args.filename as string, args.source as string | undefined);
+            let doc;
+            try {
+              doc = await personalGetDocument(env, ctx, args.filename as string, args.source as string | undefined);
+            } catch (e) {
+              if (e instanceof AmbiguousSourceError) {
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `filename exists in multiple sources (${e.sources.join(", ")}) — pass source to disambiguate` }], isError: true } };
+              }
+              throw e;
+            }
             if (!doc) {
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Document not found" }], isError: true } };
             }

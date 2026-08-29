@@ -18,6 +18,9 @@ import {
   personalDb,
   personalGetEmbedding,
   getInstallationToken,
+  documentChunkPrefix,
+  assertIndexablePath,
+  buildDeleteDocumentQuery,
   type PersonalEnv,
   type UserContext,
 } from "./personal.js";
@@ -48,44 +51,61 @@ const REINDEX_COOLDOWN_SECONDS = 60;
 // --- File content processing (faithful port of personal-knowledge-mcp/src/index.ts:2246-2332) ---
 
 /**
- * Split content into chunks by markdown headers, then by size.
- * Returns array of { key, content } where key = "filename::Section".
+ * Split content into chunks, preserving every source byte:
+ * chunks.join("") === content always holds (WP-7 Ф94 — faithful port of
+ * personal-knowledge-mcp/src/index.ts:chunkContent).
  */
-export function chunkContent(filename: string, content: string): { key: string; content: string }[] {
-  if (content.length <= CHUNK_SIZE) {
-    return [{ key: filename, content }];
-  }
+export function chunkContent(content: string): string[] {
+  if (content.length <= CHUNK_SIZE) return [content];
 
-  const chunks: { key: string; content: string }[] = [];
-  const sections = content.split(/(?=^## )/m);
+  const chunks: string[] = [];
+  // Zero-width split — sections already cover content exactly. A "## " at
+  // content's very start produces a leading "" element (JS split behavior);
+  // drop it — it's empty, so this can't affect byte-fidelity, but keeping it
+  // would waste an embedding call and shift every ordinal by one.
+  const sections = content.split(/(?=^## )/m).filter(s => s.length > 0);
 
   for (const section of sections) {
-    const headerMatch = section.match(/^##\s+(.+)/);
-    const sectionName = headerMatch ? headerMatch[1].trim().slice(0, 80) : "intro";
-    const sectionKey = `${filename}::${sectionName}`;
-
     if (section.length <= CHUNK_SIZE) {
-      chunks.push({ key: sectionKey, content: section });
-    } else {
-      const paragraphs = section.split(/\n\n+/);
-      let current = "";
-      let partNum = 1;
-      for (const para of paragraphs) {
-        if (current.length + para.length + 2 > CHUNK_SIZE && current) {
-          chunks.push({ key: `${sectionKey} (${partNum})`, content: current });
-          current = para;
-          partNum++;
-        } else {
-          current = current ? `${current}\n\n${para}` : para;
-        }
-      }
-      if (current) {
-        chunks.push({ key: partNum > 1 ? `${sectionKey} (${partNum})` : sectionKey, content: current });
+      chunks.push(section);
+      continue;
+    }
+    const parts = section.split(/(?=\n\n+)/);
+    let current = "";
+    for (const part of parts) {
+      if (current && current.length + part.length > CHUNK_SIZE) {
+        chunks.push(...hardSplit(current));
+        current = part;
+      } else {
+        current += part;
       }
     }
+    if (current) chunks.push(...hardSplit(current));
   }
 
   return chunks;
+}
+
+/** Force-split a single piece under CHUNK_SIZE — covers a lone paragraph longer than CHUNK_SIZE. */
+function hardSplit(piece: string): string[] {
+  if (piece.length <= CHUNK_SIZE) return [piece];
+  const out: string[] = [];
+  for (let i = 0; i < piece.length; i += CHUNK_SIZE) out.push(piece.slice(i, i + CHUNK_SIZE));
+  return out;
+}
+
+/** Run async tasks with bounded concurrency — avoids an embedding-API burst per document. */
+export async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
 }
 
 /** Read file content from GitHub via App Installation Token (GET, distinct from writeToGitHub's PUT). */
@@ -167,10 +187,12 @@ export async function personalReindexFiles(
 
     try {
       if (file.action === "removed") {
-        await sql`DELETE FROM ${sql.unsafe(documentsTable)} WHERE source = ${req.source} AND user_id = ${ctx.userId} AND (filename = ${file.path} OR filename LIKE ${file.path + "::%"})`;
+        await buildDeleteDocumentQuery(sql, documentsTable, req.source, ctx.userId, file.path);
         result.deleted++;
         continue;
       }
+
+      assertIndexablePath(file.path);
 
       const content = await readFromGitHub(env, ctx, req.source, file.path);
       if (!content) {
@@ -183,37 +205,41 @@ export async function personalReindexFiles(
         continue;
       }
 
+      // Check hash — skip only if unchanged AND already on v2. A hash match on
+      // a still-legacy row must NOT skip — it would never get backfilled to v2
+      // otherwise, since a reindex re-run is the only backfill path and most
+      // content doesn't change between runs (WP-7 Ф94).
       const hash = await contentHash(content);
-      const existing = await sql`SELECT hash FROM ${sql.unsafe(documentsTable)} WHERE filename = ${file.path} AND source = ${req.source} AND user_id = ${ctx.userId} LIMIT 1`;
-      if (existing.length > 0 && existing[0].hash === hash) {
+      const chunkPrefix = documentChunkPrefix(file.path);
+      const existing = await sql`
+        SELECT hash, protocol_version FROM ${sql.unsafe(documentsTable)}
+        WHERE (filename = ${file.path} OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
+          AND source = ${req.source} AND user_id = ${ctx.userId}
+        LIMIT 1
+      `;
+      if (existing.length > 0 && existing[0].hash === hash && existing[0].protocol_version === 2) {
         result.skipped++;
         continue;
       }
 
-      await sql`DELETE FROM ${sql.unsafe(documentsTable)} WHERE source = ${req.source} AND user_id = ${ctx.userId} AND (filename = ${file.path} OR filename LIKE ${file.path + "::%"})`;
+      const chunks = chunkContent(content);
+      const sourceType = ctx.sources.find((s) => s.source === req.source)?.sourceType || "ds";
+      const embeddings = await mapWithConcurrency(chunks, 4, c => personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", c.slice(0, 8000)));
 
-      const chunks = chunkContent(file.path, content);
-
-      for (const chunk of chunks) {
-        const embedding = await personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", chunk.content.slice(0, 8000));
-        const vec = `[${embedding.join(",")}]`;
-        const sourceType = ctx.sources.find((s) => s.source === req.source)?.sourceType || "ds";
-
-        await sql`
-          INSERT INTO ${sql.unsafe(documentsTable)} (filename, content, source, source_type, hash, embedding, search_vector, user_id)
+      // Delete old chunks (both protocol versions) and insert the new v2 set as
+      // one transaction — a mid-write crash can never leave a partial document
+      // visible to readers (WP-7 Ф94).
+      await sql.transaction([
+        buildDeleteDocumentQuery(sql, documentsTable, req.source, ctx.userId, file.path),
+        ...chunks.map((c, i) => sql`
+          INSERT INTO ${sql.unsafe(documentsTable)}
+            (filename, content, source, source_type, hash, embedding, search_vector, user_id, chunk_ordinal, protocol_version)
           VALUES (
-            ${chunk.key},
-            ${chunk.content},
-            ${req.source},
-            ${sourceType},
-            ${hash},
-            ${vec}::vector,
-            to_tsvector('simple', ${chunk.content}),
-            ${ctx.userId}
+            ${file.path}, ${c}, ${req.source}, ${sourceType}, ${hash},
+            ${`[${embeddings[i].join(",")}]`}::vector, to_tsvector('simple', ${c}), ${ctx.userId}, ${i + 1}, 2
           )
-          ON CONFLICT (filename, source, COALESCE(user_id, '')) DO NOTHING
-        `;
-      }
+        `),
+      ]);
 
       result.processed++;
     } catch (err) {

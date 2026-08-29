@@ -47,6 +47,44 @@ export function personalDb(env: PersonalEnv) {
   return neon(env.DATABASE_URL);
 }
 
+type PersonalSql = ReturnType<typeof personalDb>;
+
+/** Literal chunk-key prefix — `%`/`_` in `path` stay literal (WP-7 Ф94, faithful
+ * port of personal-knowledge-mcp/src/index.ts:documentChunkPrefix). */
+export function documentChunkPrefix(path: string): string {
+  return `${path}::`;
+}
+
+/** A canonical path can't be indexed if it contains "::" — reserved as the legacy
+ * (protocol_version=1) chunk-key separator (WP-7 Ф94). */
+export function assertIndexablePath(path: string): void {
+  if (path.includes("::")) {
+    throw new Error(`path contains reserved chunk separator "::": ${path}`);
+  }
+}
+
+/** Un-awaited DELETE query (exact filename + literal chunk prefix), reusable
+ * directly inside sql.transaction([...]) — same shape as
+ * personal-knowledge-mcp/src/index.ts:buildDeleteDocumentQuery. */
+export function buildDeleteDocumentQuery(
+  sql: PersonalSql,
+  documentsTable: string,
+  source: string,
+  userId: string,
+  filename: string,
+) {
+  const chunkPrefix = documentChunkPrefix(filename);
+  return sql`DELETE FROM ${sql.unsafe(documentsTable)} WHERE source = ${source} AND user_id = ${userId} AND (filename = ${filename} OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})`;
+}
+
+/** Thrown when `filename` matches an indexed document in 2+ connected sources and
+ * `source` wasn't given (WP-7 Ф94, same contract as personal-knowledge-mcp). */
+export class AmbiguousSourceError extends Error {
+  constructor(public readonly sources: string[]) {
+    super(`filename exists in multiple sources: ${sources.join(", ")}`);
+  }
+}
+
 export async function resolveUserContext(env: PersonalEnv, userId: string | null): Promise<UserContext> {
   if (userId) {
     try {
@@ -283,10 +321,7 @@ export async function deleteFromGitHub(
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
-  await sql`
-    DELETE FROM ${sql.unsafe(documentsTable)}
-    WHERE user_id = ${ctx.userId} AND source = ${source} AND (filename = ${path} OR filename LIKE ${path + "::%"})
-  `;
+  await buildDeleteDocumentQuery(sql, documentsTable, source, ctx.userId, path);
 
   return { success: true };
 }
@@ -532,7 +567,11 @@ export async function personalMemorySearch(
     .slice(0, limit);
 }
 
-/** Private-mode `get_document`: personal corpus only. */
+/** Private-mode `get_document`: personal corpus only.
+ * Reads the new chunk_ordinal format first (aggregating every chunk of the
+ * document in order); falls back to the legacy LIMIT-1 read only while a
+ * document hasn't been backfilled yet, so behavior never regresses during
+ * the transition (WP-7 Ф94). */
 export async function personalGetDocument(
   env: PersonalEnv,
   ctx: UserContext,
@@ -544,18 +583,53 @@ export async function personalGetDocument(
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
   const src = source ?? null;
   const sourceNames = ctx.sourceNames;
-  const baseName = filename.includes("::") ? filename.split("::")[0] : filename;
-  const chunkPrefix = `${baseName}::%`;
+  const normalizedFilename = filename.includes("::") ? filename.split("::")[0] : filename;
+  const chunkPrefix = documentChunkPrefix(normalizedFilename);
+
+  // Ambiguity check runs across BOTH protocol versions together, before any
+  // data query — checking only v2 (or only legacy) rows would silently miss
+  // the migration-window case where source A is backfilled to v2 and source B
+  // still holds a v1 copy of the same filename (WP-7 Ф94, cold-context review).
+  if (src === null) {
+    const distinctSources = await sql`
+      SELECT DISTINCT source FROM ${sql.unsafe(documentsTable)}
+      WHERE (filename = ${normalizedFilename} OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
+        AND user_id = ${ctx.userId} AND source = ANY(${sourceNames})
+    `;
+    if (distinctSources.length > 1) throw new AmbiguousSourceError(distinctSources.map(r => r.source as string));
+  }
+
+  const v2Rows = await sql`
+    SELECT filename, content, source, source_type, chunk_ordinal
+    FROM ${sql.unsafe(documentsTable)}
+    WHERE filename = ${normalizedFilename}
+      AND protocol_version = 2
+      AND user_id = ${ctx.userId}
+      AND source = ANY(${sourceNames})
+      AND (${src}::text IS NULL OR source = ${src})
+    ORDER BY chunk_ordinal
+  `;
+
+  if (v2Rows.length > 0) {
+    const r0 = v2Rows[0];
+    return {
+      filename: r0.filename as string,
+      content: v2Rows.map(r => r.content as string).join(""),
+      source: (r0.source as string) || "",
+      source_type: (r0.source_type as string) || "",
+      github_url: personalGithubUrl(ctx, (r0.source as string) || "", r0.filename as string),
+    };
+  }
 
   const rows = await sql`
     SELECT filename, content, source, source_type
     FROM ${sql.unsafe(documentsTable)}
-    WHERE (filename = ${filename} OR filename LIKE ${chunkPrefix})
+    WHERE (filename = ${normalizedFilename} OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
       AND user_id = ${ctx.userId}
       AND source = ANY(${sourceNames})
       AND (${src}::text IS NULL OR source = ${src})
     ORDER BY
-      CASE WHEN filename = ${filename} THEN 0 ELSE 1 END,
+      CASE WHEN filename = ${normalizedFilename} THEN 0 ELSE 1 END,
       filename
     LIMIT 1
   `;

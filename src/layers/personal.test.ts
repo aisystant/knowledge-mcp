@@ -76,16 +76,43 @@ describe("personalListSources", () => {
 
 describe("personalGetDocument", () => {
   it("returns null when no matching document exists", async () => {
-    queryQueue.push([]);
+    queryQueue.push([]); // ambiguity pre-check (source omitted → runs first)
+    queryQueue.push([]); // v2 query
+    queryQueue.push([]); // legacy fallback
     const doc = await personalGetDocument(ENV, ctx(), "missing.md");
     expect(doc).toBeNull();
   });
 
   it("returns the document content and a resolved github_url for a known source", async () => {
-    queryQueue.push([{ filename: "notes/idea.md", content: "hello", source: "DS-my-strategy", source_type: "ds" }]);
-    const doc = await personalGetDocument(ENV, ctx(), "notes/idea.md");
+    // source given explicitly — skips the ambiguity pre-check (WP-7 Ф94)
+    queryQueue.push([{ filename: "notes/idea.md", content: "hello", source: "DS-my-strategy", source_type: "ds", chunk_ordinal: 1 }]); // v2 query
+    const doc = await personalGetDocument(ENV, ctx(), "notes/idea.md", "DS-my-strategy");
     expect(doc?.content).toBe("hello");
     expect(doc?.github_url).toContain("github.com/TserenTserenov/DS-my-strategy");
+  });
+
+  it("joins multiple v2 chunks in the order returned, not just the first (WP-7 Ф94 regression)", async () => {
+    queryQueue.push([
+      { filename: "docs/big.md", content: "part one. ", source: "DS-my-strategy", source_type: "ds", chunk_ordinal: 1 },
+      { filename: "docs/big.md", content: "part two. ", source: "DS-my-strategy", source_type: "ds", chunk_ordinal: 2 },
+      { filename: "docs/big.md", content: "part three.", source: "DS-my-strategy", source_type: "ds", chunk_ordinal: 3 },
+    ]); // v2 query — source given, no ambiguity pre-check
+    const doc = await personalGetDocument(ENV, ctx(), "docs/big.md", "DS-my-strategy");
+    expect(doc?.content).toBe("part one. part two. part three.");
+  });
+
+  it("falls back to the legacy read when no v2 rows exist yet (WP-7 Ф94 regression)", async () => {
+    queryQueue.push([]); // v2 query — empty, not yet backfilled
+    queryQueue.push([{ filename: "docs/old.md::intro", content: "legacy content", source: "DS-my-strategy", source_type: "ds" }]); // legacy fallback
+    const doc = await personalGetDocument(ENV, ctx(), "docs/old.md", "DS-my-strategy");
+    expect(doc?.content).toBe("legacy content");
+  });
+
+  it("throws when the path exists in 2+ sources and source is omitted (WP-7 Ф94 regression)", async () => {
+    queryQueue.push([{ source: "DS-my-strategy" }, { source: "DS-other" }]); // ambiguity pre-check
+    await expect(
+      personalGetDocument(ENV, ctx({ sourceNames: ["DS-my-strategy", "DS-other"] }), "docs/shared.md"),
+    ).rejects.toThrow(/multiple sources/);
   });
 });
 
