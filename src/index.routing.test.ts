@@ -164,7 +164,7 @@ describe("/reindex route guard (WP-7 Ф100 fail-closed, peer session 2026-08-30-
   }
 
   it("refuses the personal secret with 403 — a personal push must not reach the platform indexer", async () => {
-    const res = await worker.fetch(reindexRequest("personal-secret"), reindexEnv, {} as never);
+    const res = await worker.fetch(reindexRequest("personal-secret"), reindexEnv);
     expect(res.status).toBe(403);
     const body = await res.json() as { reason: string };
     expect(body.reason).toBe("personal_reindex_not_supported_by_unified_tree");
@@ -172,14 +172,14 @@ describe("/reindex route guard (WP-7 Ф100 fail-closed, peer session 2026-08-30-
 
   it("fails closed with 503 when both secrets are configured equal (callers indistinguishable)", async () => {
     const equalEnv = { ...reindexEnv, PERSONAL_REINDEX_SECRET: "platform-secret" } as import("./index.js").Env;
-    const res = await worker.fetch(reindexRequest("platform-secret"), equalEnv, {} as never);
+    const res = await worker.fetch(reindexRequest("platform-secret"), equalEnv);
     expect(res.status).toBe(503);
     const body = await res.json() as { reason: string };
     expect(body.reason).toBe("reindex_secrets_not_distinguishable");
   });
 
   it("still lets the platform secret through to the platform indexer", async () => {
-    const res = await worker.fetch(reindexRequest("platform-secret"), reindexEnv, {} as never);
+    const res = await worker.fetch(reindexRequest("platform-secret"), reindexEnv);
     expect(res.status).toBe(200);
     const body = await res.json() as { chunks: { errors: string[] } };
     // Guard passed; the unknown-source error proves the request reached reindexFiles.
@@ -187,7 +187,7 @@ describe("/reindex route guard (WP-7 Ф100 fail-closed, peer session 2026-08-30-
   });
 
   it("still refuses a wrong secret with 401", async () => {
-    const res = await worker.fetch(reindexRequest("wrong"), reindexEnv, {} as never);
+    const res = await worker.fetch(reindexRequest("wrong"), reindexEnv);
     expect(res.status).toBe(401);
   });
 });
