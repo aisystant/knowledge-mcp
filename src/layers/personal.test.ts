@@ -875,3 +875,40 @@ describe("personalGetDocumentWithSha — single source bypasses the index entire
     expect(queryQueue.length).toBe(0);
   });
 });
+
+describe("writeToGitHub — warn-режим при перезаписи без expected_sha (решение 30.08)", () => {
+  const CUR = "a".repeat(40);
+
+  it("overwrite of an existing file without expected_sha succeeds with an explicit warning", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: CUR }),
+      responseJson({ content: { sha: "b".repeat(40), html_url: "https://github.test/x" } }),
+    ]);
+    const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "update", "update");
+    expect(result.success).toBe(true);
+    expect(result.warning).toMatch(/expected_sha не передан/);
+  });
+
+  it("creating a new file carries no warning", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      { ok: false, status: 404 } as Response,
+      responseJson({ content: { sha: "b".repeat(40), html_url: "https://github.test/x" } }),
+    ]);
+    const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/new.md", "body", "create");
+    expect(result.success).toBe(true);
+    expect(result.warning).toBeUndefined();
+  });
+
+  it("update with a matching expected_sha carries no warning", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: CUR }),
+      responseJson({ content: { sha: "b".repeat(40), html_url: "https://github.test/x" } }),
+    ]);
+    const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "update", "update", {}, CUR);
+    expect(result.success).toBe(true);
+    expect(result.warning).toBeUndefined();
+  });
+});

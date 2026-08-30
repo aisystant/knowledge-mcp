@@ -81,6 +81,7 @@ export interface PersonalWriteResult {
   next_action?: string;
   evidence?: ManagedPostEvidence;
   current_sha?: string | null;
+  warning?: string;
 }
 
 function frontmatterDeclaresPost(content: string): boolean {
@@ -438,6 +439,18 @@ export async function writeToGitHub(
   }
 
   const result = (await putResp.json()) as { content: { sha: string; html_url: string } };
+  // Overwriting an existing file without expected_sha succeeded, but any
+  // concurrent edit made after the caller's read is now silently gone. Kept
+  // non-blocking for old clients (pilot decision 30.08: warn now, enforce
+  // later once callers adopt the sha round-trip).
+  if (existingSha && expectedSha === undefined) {
+    return {
+      success: true,
+      sha: result.content.sha,
+      url: result.content.html_url,
+      warning: "Файл существовал, а expected_sha не передан — параллельные правки могли быть молча перезаписаны. Перед правкой существующего файла читай get_document(include_sha: true) и передавай его sha в expected_sha.",
+    };
+  }
   return { success: true, sha: result.content.sha, url: result.content.html_url };
 }
 
