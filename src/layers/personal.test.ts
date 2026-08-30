@@ -353,6 +353,9 @@ describe("Knowledge Index publication creation guard", () => {
     );
 
     expect(result.success).toBe(true);
+    // WP-7 Ф97.1: every successful write carries the async-indexing notice —
+    // the write is confirmed, search indexing is not.
+    expect(result.indexing).toEqual({ status: "async", note: expect.stringContaining("индексация для поиска идёт фоново") });
     expect(request).toHaveBeenCalledTimes(2);
     expect(request.mock.calls[1][1]).toEqual(expect.objectContaining({ method: "PUT" }));
   });

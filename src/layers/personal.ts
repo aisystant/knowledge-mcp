@@ -72,10 +72,20 @@ export const EXISTENCE_CHECK_NEXT_ACTION =
 
 export type ManagedPostEvidence = "frontmatter_type_post" | "channel_filename";
 
+// WP-7 F97.1: successful writes carry the async-indexing notice — the write is
+// confirmed in the result, search indexing is not (it rides push → webhook → /reindex).
+export interface IndexingNotice { status: "async"; note: string }
+
+export const INDEXING_ASYNC_NOTICE: IndexingNotice = {
+  status: "async",
+  note: "Запись подтверждена, но индексация для поиска идёт фоново после push и в этом ответе не подтверждена. Файл появится в поиске после обработки; подтверждённого статуса индексации пока нет.",
+};
+
 export interface PersonalWriteResult {
   success: boolean;
   sha?: string;
   url?: string;
+  indexing?: IndexingNotice;
   error?: string;
   reason?: "post_scaffold_required" | "existence_check_unavailable" | "version_mismatch" | "invalid_expected_sha" | "github_validation_error";
   next_action?: string;
@@ -448,10 +458,11 @@ export async function writeToGitHub(
       success: true,
       sha: result.content.sha,
       url: result.content.html_url,
+      indexing: INDEXING_ASYNC_NOTICE,
       warning: "Файл существовал, а expected_sha не передан — параллельные правки могли быть молча перезаписаны. Перед правкой существующего файла читай get_document(include_sha: true) и передавай его sha в expected_sha.",
     };
   }
-  return { success: true, sha: result.content.sha, url: result.content.html_url };
+  return { success: true, sha: result.content.sha, url: result.content.html_url, indexing: INDEXING_ASYNC_NOTICE };
 }
 
 /**

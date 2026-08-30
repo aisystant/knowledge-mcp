@@ -2473,7 +2473,7 @@ const PUBLIC_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set(["resolve_document"]
 const PRIVATE_TOOLS = [
   {
     name: "write",
-    description: "Write a file to a personal knowledge repo via GitHub. Existing files and new ordinary/service Markdown are supported. When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, a concurrent edit from another session can be silently overwritten. A new publication-like file (frontmatter type: post or a channel filename) under TserenTserenov/DS-Knowledge-Index-Tseren docs/ is server-blocked: create it with scripts/new-post.py; if shell is unavailable, stop instead of using an ASCII/manual fallback.",
+    description: "Write a file to a personal knowledge repo via GitHub. Existing files and new ordinary/service Markdown are supported; search indexing is triggered asynchronously by the push and is NOT confirmed in the result (indexing.status: async). When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, a concurrent edit from another session can be silently overwritten. A new publication-like file (frontmatter type: post or a channel filename) under TserenTserenov/DS-Knowledge-Index-Tseren docs/ is server-blocked: create it with scripts/new-post.py; if shell is unavailable, stop instead of using an ASCII/manual fallback.",
     inputSchema: {
       type: "object",
       properties: {
@@ -3813,6 +3813,25 @@ export default {
         return new Response(JSON.stringify({ error: "Unauthorized" }), {
           status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
         });
+      }
+      // WP-7 Ф100 fail-closed (peer session 2026-08-30-14): this route feeds the
+      // PLATFORM indexer. A personal push authenticated by PERSONAL_REINDEX_SECRET
+      // must not fall through — it would index personal files into the shared
+      // platform tables (isolation breach) while answering 200. Personal reindex
+      // routing for the unified tree is the Ф100 canonical-owner decision; refuse
+      // until it lands. Equal secrets make the two callers indistinguishable, so
+      // that misconfiguration also fails closed.
+      if (env.REINDEX_SECRET && env.PERSONAL_REINDEX_SECRET && secretsEqual(env.REINDEX_SECRET, env.PERSONAL_REINDEX_SECRET)) {
+        return new Response(JSON.stringify({ error: "Service Unavailable", reason: "reindex_secrets_not_distinguishable" }), {
+          status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      if (!env.REINDEX_SECRET || !secretsEqual(presented, env.REINDEX_SECRET)) {
+        return new Response(JSON.stringify({
+          error: "Forbidden",
+          reason: "personal_reindex_not_supported_by_unified_tree",
+          detail: "Personal pushes cannot be indexed by this tree until the canonical-owner decision (WP-7 F100).",
+        }), { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } });
       }
       const body = (await request.json()) as ReindexRequest;
       const chunkResult = await reindexFiles(env, body);

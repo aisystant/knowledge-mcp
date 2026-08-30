@@ -72,7 +72,7 @@ vi.mock("./layers/private.js", async (importOriginal) => {
   return { ...actual, JwtScopeGuard: FakeJwtScopeGuard };
 });
 
-const { handleMcpRequest } = await import("./index.js");
+const { handleMcpRequest, default: worker } = await import("./index.js");
 const { personalSearchDocuments, personalGetDocument, personalListSources, writeToGitHub } = await import("./layers/personal.js");
 
 const ENV = {
@@ -145,5 +145,49 @@ describe("dual-mode routing: private mode reaches the personal layer, never the 
       reason: "post_scaffold_required",
       next_action: "run scripts/new-post.py",
     });
+  });
+});
+
+describe("/reindex route guard (WP-7 Ф100 fail-closed, peer session 2026-08-30-14)", () => {
+  const reindexEnv = {
+    ...ENV,
+    REINDEX_SECRET: "platform-secret",
+    PERSONAL_REINDEX_SECRET: "personal-secret",
+  } as import("./index.js").Env;
+
+  function reindexRequest(secret: string) {
+    return new Request("https://x/reindex", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${secret}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ source: "no-such-source", files: [] }),
+    });
+  }
+
+  it("refuses the personal secret with 403 — a personal push must not reach the platform indexer", async () => {
+    const res = await worker.fetch(reindexRequest("personal-secret"), reindexEnv, {} as never);
+    expect(res.status).toBe(403);
+    const body = await res.json() as { reason: string };
+    expect(body.reason).toBe("personal_reindex_not_supported_by_unified_tree");
+  });
+
+  it("fails closed with 503 when both secrets are configured equal (callers indistinguishable)", async () => {
+    const equalEnv = { ...reindexEnv, PERSONAL_REINDEX_SECRET: "platform-secret" } as import("./index.js").Env;
+    const res = await worker.fetch(reindexRequest("platform-secret"), equalEnv, {} as never);
+    expect(res.status).toBe(503);
+    const body = await res.json() as { reason: string };
+    expect(body.reason).toBe("reindex_secrets_not_distinguishable");
+  });
+
+  it("still lets the platform secret through to the platform indexer", async () => {
+    const res = await worker.fetch(reindexRequest("platform-secret"), reindexEnv, {} as never);
+    expect(res.status).toBe(200);
+    const body = await res.json() as { chunks: { errors: string[] } };
+    // Guard passed; the unknown-source error proves the request reached reindexFiles.
+    expect(body.chunks.errors[0]).toContain("Unknown source");
+  });
+
+  it("still refuses a wrong secret with 401", async () => {
+    const res = await worker.fetch(reindexRequest("wrong"), reindexEnv, {} as never);
+    expect(res.status).toBe(401);
   });
 });

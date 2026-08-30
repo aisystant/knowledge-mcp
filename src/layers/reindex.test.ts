@@ -166,6 +166,10 @@ describe("personalReindexFiles", () => {
   it("errors without user_id, without touching the DB", async () => {
     const result = await personalReindexFiles(ENV, { source: "DS-my-strategy", files: [] });
     expect(result.errors).toEqual(["Missing user_id: personal reindex requires authenticated user context"]);
+    // WP-7 Ф98: the structured mirror carries the same failure with path "*" (source-level).
+    expect(result.error_details).toEqual([
+      { path: "*", action: "n/a", reason: "missing user_id: authenticated user context required" },
+    ]);
     expect(queryQueue).toHaveLength(0); // nothing consumed — proves no DB call happened
   });
 

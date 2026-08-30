@@ -159,17 +159,23 @@ export async function contentHash(content: string): Promise<string> {
  * knowledge-mcp `reindexFiles` in ../index.ts (different DB, different signature, untouched by
  * this file — same disambiguation as personalSearchDocuments/personalGetDocument).
  */
+// WP-7 Ф98: error_details mirrors errors[] one-to-one in a structured form the
+// webhook can aggregate per file; legacy errors[] is kept verbatim for existing
+// consumers. path "*" marks a source-level failure that is not tied to one file.
+export interface ReindexErrorDetail { path: string; action: string; reason: string }
+
 export async function personalReindexFiles(
   env: ReindexEnv,
   req: ReindexRequest
-): Promise<{ processed: number; deleted: number; skipped: number; errors: string[] }> {
+): Promise<{ processed: number; deleted: number; skipped: number; errors: string[]; error_details: ReindexErrorDetail[] }> {
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
-  const result = { processed: 0, deleted: 0, skipped: 0, errors: [] as string[] };
+  const result = { processed: 0, deleted: 0, skipped: 0, errors: [] as string[], error_details: [] as ReindexErrorDetail[] };
 
   if (!req.user_id) {
     result.errors.push("Missing user_id: personal reindex requires authenticated user context");
+    result.error_details.push({ path: "*", action: "n/a", reason: "missing user_id: authenticated user context required" });
     return result;
   }
 
@@ -177,11 +183,13 @@ export async function personalReindexFiles(
 
   if (!ctx.userId) {
     result.errors.push(`Invalid user context for user_id=${req.user_id}`);
+    result.error_details.push({ path: "*", action: "n/a", reason: `invalid user context for user_id=${req.user_id}` });
     return result;
   }
 
   if (!ctx.sourceNames.includes(req.source)) {
     result.errors.push(`Unknown source: ${req.source}. User sources: ${ctx.sourceNames.join(", ")}`);
+    result.error_details.push({ path: "*", action: "n/a", reason: `unknown source: ${req.source}` });
     return result;
   }
 
@@ -191,6 +199,7 @@ export async function personalReindexFiles(
       normalizedPath = normalizeRepositoryPath(file.path);
     } catch (err) {
       result.errors.push(`${file.path}: ${err instanceof Error ? err.message : "invalid path"}`);
+      result.error_details.push({ path: file.path, action: file.action, reason: err instanceof Error ? err.message : "invalid path" });
       continue;
     }
 
@@ -211,6 +220,7 @@ export async function personalReindexFiles(
       const content = await readFromGitHub(env, ctx, req.source, normalizedPath);
       if (!content) {
         result.errors.push(`Cannot read ${normalizedPath} from GitHub`);
+        result.error_details.push({ path: normalizedPath, action: file.action, reason: "cannot read from GitHub" });
         continue;
       }
 
@@ -258,6 +268,7 @@ export async function personalReindexFiles(
       result.processed++;
     } catch (err) {
       result.errors.push(`${file.path}: ${err instanceof Error ? err.message : "unknown error"}`);
+      result.error_details.push({ path: file.path, action: file.action, reason: err instanceof Error ? err.message : "unknown error" });
     }
   }
 
