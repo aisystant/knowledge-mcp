@@ -25,14 +25,14 @@ import {
 import { reindexConceptsForFiles } from "./concept-indexer.js";
 import { resolveMode, type McpMode } from "./mode.js";
 import { isToolAllowedInMode, JwtScopeGuard, ScopeDeniedError, PRIVATE_TOOL_NAMES, DUAL_MODE_TOOL_NAMES } from "./layers/private.js";
-import { verifyJwtLocally } from "./auth.js";
+import { verifyJwtLocally, secretsEqual } from "./auth.js";
 import {
   resolveUserContext,
   writeToGitHub,
   deleteFromGitHub,
   personalSearchDocuments,
   personalGetDocument,
-  personalGetDocumentLive,
+  personalGetDocumentWithSha,
   AmbiguousSourceError,
   personalListSources,
   personalMemorySearch,
@@ -54,6 +54,9 @@ export interface Env {
   OPENAI_API_KEY?: string;
   ORY_URL?: string; // e.g. https://auth.system-school.ru/hydra — optional, JWT verification disabled if absent
   REINDEX_SECRET?: string; // Shared secret for /reindex endpoint (set via wrangler secret)
+  // WP-7 Ф95: secret github-integration-service sends on every push for the personal
+  // (private-mode / shared-worker) deploy; the public worker keeps REINDEX_SECRET.
+  PERSONAL_REINDEX_SECRET?: string;
   // WP-268 Phase 3: Schema parameterization for database migrations
   KNOWLEDGE_DB_SCHEMA?: string; // Default: "knowledge"
   CONCEPT_GRAPH_DB_SCHEMA?: string; // Default: "concept_graph"
@@ -1877,7 +1880,7 @@ export const TOOLS = [
           enum: ["full", "headings"],
           description: "Output format: full (default) returns document content, headings returns h1-h6 outline",
         },
-        include_sha: { type: "boolean", description: "Personal sources only: read the live version straight from GitHub (not the search index) and return its sha for later use as write's expected_sha. Set true whenever you intend to edit and write this document back." },
+        include_sha: { type: "boolean", description: "Personal sources only: read the live version straight from GitHub (not the search index). The response is then a JSON object {filename, source, sha, content} — use its sha as write's expected_sha. Set true whenever you intend to edit and write this document back. If the document is not in the index yet, pass source explicitly. Not combinable with format=headings." },
       },
       required: ["filename"],
     },
@@ -2125,7 +2128,7 @@ const PRIVATE_TOOLS = [
         path: { type: "string", description: "File path relative to repo root (e.g. 'notes/my-note.md')" },
         content: { type: "string", description: "File content (markdown)" },
         message: { type: "string", description: "Commit message (default: 'Update via Aisystant MCP')" },
-        expected_sha: { type: "string", description: "sha from get_document(include_sha: true), required when editing an existing file. If the file changed since you read it, the write is refused with reason: version_mismatch instead of silently overwriting the newer content. Omit only when creating a brand-new file." },
+        expected_sha: { type: "string", pattern: "^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$", description: "sha from get_document(include_sha: true), required when editing an existing file. If the file changed since you read it, the write is refused with reason: version_mismatch instead of silently overwriting the newer content. Omit only when creating a brand-new file (never pass an empty string)." },
       },
       required: ["source", "path", "content"],
     },
@@ -2520,6 +2523,33 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
 
           if (toolName === "get_document") {
             const filename = args.filename as string;
+
+            if (args.include_sha === true) {
+              // WP-7 Ф96 (reworked after verify peer-session 30.08): live-first,
+              // index only as a source hint; sha travels INSIDE the text content
+              // as a JSON envelope — a non-standard result sibling is invisible
+              // to MCP clients. A headings outline has no meaningful sha pairing.
+              if (args.format === "headings") {
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "include_sha и format=headings несовместимы: sha относится к полному содержимому файла. Убери один из параметров." }], isError: true } };
+              }
+              let liveResult;
+              try {
+                liveResult = await personalGetDocumentWithSha(env, ctx, filename, args.source as string | undefined);
+              } catch (e) {
+                if (e instanceof AmbiguousSourceError) {
+                  return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `filename exists in multiple sources (${e.sources.join(", ")}) — pass source to disambiguate` }], isError: true } };
+                }
+                throw e;
+              }
+              if (!liveResult) {
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Документ не найден на GitHub (или недоступен). Проверь filename и source." }], isError: true } };
+              }
+              if (liveResult.kind === "source_required") {
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ error: "source_required", message: "Документа нет в индексе — для живого чтения с GitHub передай source явно.", sources: liveResult.sources }) }], isError: true } };
+              }
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ filename: liveResult.filename, source: liveResult.source, sha: liveResult.sha, content: liveResult.content }, null, 2) }] } };
+            }
+
             let doc;
             try {
               doc = await personalGetDocument(env, ctx, filename, args.source as string | undefined);
@@ -2532,17 +2562,6 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             if (!doc) {
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Document not found" }], isError: true } };
             }
-
-            if (args.include_sha === true) {
-              // WP-7 Ф96: live GitHub read, not the (possibly stale) index —
-              // content and sha must come from the same response.
-              const live = await personalGetDocumentLive(env, ctx, filename, doc.source);
-              if (!live) {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Не удалось прочитать документ напрямую с GitHub для получения sha" }], isError: true } };
-              }
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: live.content }], sha: live.sha } };
-            }
-
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: doc.content }] } };
           }
 
@@ -3353,14 +3372,23 @@ export default {
 
     // Reindex endpoint — called by Gateway webhook handler after push to platform repos
     if (url.pathname === "/reindex" && request.method === "POST") {
-      // Verify shared secret
-      if (env.REINDEX_SECRET) {
-        const auth = request.headers.get("Authorization");
-        if (!auth || auth !== `Bearer ${env.REINDEX_SECRET}`) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), {
-            status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
-          });
-        }
+      // Fail closed: with no secret configured at all this endpoint used to
+      // accept ANY caller (`if (env.REINDEX_SECRET) {...}` with no else —
+      // peer-review finding, verify session 30.08). Either the platform secret
+      // (public worker) or the personal push-webhook secret (shared worker,
+      // WP-7 Ф95) must match.
+      const configuredSecrets = [env.REINDEX_SECRET, env.PERSONAL_REINDEX_SECRET].filter((s): s is string => !!s);
+      if (configuredSecrets.length === 0) {
+        return new Response(JSON.stringify({ error: "Service Unavailable", reason: "reindex_secret_not_configured" }), {
+          status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const auth = request.headers.get("Authorization");
+      const presented = auth?.startsWith("Bearer ") ? auth.slice(7) : "";
+      if (!presented || !configuredSecrets.some(s => secretsEqual(presented, s))) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
       }
       const body = (await request.json()) as ReindexRequest;
       const chunkResult = await reindexFiles(env, body);

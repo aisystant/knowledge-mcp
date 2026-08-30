@@ -26,12 +26,14 @@ vi.mock("@neondatabase/serverless", () => ({
 
 import {
   detectPersonalQueryType,
+  canonicalContentsPath,
   connectSource,
   deleteFromGitHub,
   writeToGitHub,
   personalListSources,
   personalGetDocument,
   personalGetDocumentLive,
+  personalGetDocumentWithSha,
   disconnectSource,
   purgeSource,
   type UserContext,
@@ -367,5 +369,167 @@ describe("purgeSource", () => {
     expect(result.status).toBe("purged");
     expect(result.documents_deleted).toBe(7);
     expect(result.jobs_deleted).toBe(2);
+  });
+});
+
+describe("canonicalContentsPath (WP-7 Ф96 rework — safe live-read path)", () => {
+  it("encodes each segment and joins with the prefix", () => {
+    expect(canonicalContentsPath("archive", "docs/мой файл#1.md")).toBe("archive/docs/%D0%BC%D0%BE%D0%B9%20%D1%84%D0%B0%D0%B9%D0%BB%231.md");
+    expect(canonicalContentsPath("", "docs/plain.md")).toBe("docs/plain.md");
+  });
+
+  it("collapses dot segments and duplicate separators", () => {
+    expect(canonicalContentsPath("", "docs//./sub/../plain.md")).toBe("docs/plain.md");
+  });
+
+  it("rejects escape attempts, absolute paths, backslashes and NUL", () => {
+    for (const bad of ["../up.md", "a/../../up.md", "/abs.md", "a\\b.md", "a\0b.md", ""]) {
+      expect(() => canonicalContentsPath("archive", bad), bad).toThrow();
+    }
+  });
+});
+
+describe("personalGetDocumentWithSha (WP-7 Ф96 rework — live-first)", () => {
+  const LIVE_SHA = "f".repeat(40);
+  function liveBody() {
+    return responseJson({ sha: LIVE_SHA, content: btoa(unescape(encodeURIComponent("live body"))), encoding: "base64" });
+  }
+
+  it("reads GitHub directly when source is given, without querying the index", async () => {
+    const calls = queuedFetch([...installationTokenResponses(), liveBody()]);
+    const result = await personalGetDocumentWithSha(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy");
+    expect(result?.kind).toBe("document");
+    if (result?.kind !== "document") throw new Error("unreachable");
+    expect(result.sha).toBe(LIVE_SHA);
+    expect(result.content).toBe("live body");
+    expect(queryQueue.length).toBe(0); // nothing pre-queued, nothing consumed — index untouched
+    expect(calls.filter(c => c.url.includes("/contents/")).length).toBe(1);
+  });
+
+  it("survives an index miss when the user has exactly one source (the stale-index scenario)", async () => {
+    queryQueue.push([]); // ambiguity pre-check
+    queryQueue.push([]); // v2 query — miss
+    queryQueue.push([]); // legacy fallback — miss
+    queuedFetch([...installationTokenResponses(), liveBody()]);
+    const result = await personalGetDocumentWithSha(ENV_WITH_APP, ctx(), "notes/brand-new.md");
+    expect(result?.kind).toBe("document");
+  });
+
+  it("returns source_required on an index miss with several sources", async () => {
+    queryQueue.push([]); // ambiguity pre-check
+    queryQueue.push([]); // v2 query
+    queryQueue.push([]); // legacy fallback
+    queuedFetch([]);
+    const twoSources = ctx({ sourceNames: ["DS-my-strategy", "DS-other"] });
+    const result = await personalGetDocumentWithSha(ENV_WITH_APP, twoSources, "notes/unknown.md");
+    expect(result?.kind).toBe("source_required");
+    if (result?.kind !== "source_required") throw new Error("unreachable");
+    expect(result.sources).toEqual(["DS-my-strategy", "DS-other"]);
+  });
+
+  it("strips a legacy ::chunk suffix before the live read", async () => {
+    const calls = queuedFetch([...installationTokenResponses(), liveBody()]);
+    const result = await personalGetDocumentWithSha(ENV_WITH_APP, ctx(), "notes/idea.md::000001::intro", "DS-my-strategy");
+    expect(result?.kind).toBe("document");
+    const contentsCall = calls.find(c => c.url.includes("/contents/"));
+    expect(contentsCall?.url.endsWith("/contents/notes/idea.md")).toBe(true);
+  });
+});
+
+describe("writeToGitHub — expected_sha validation and 422 mapping (WP-7 Ф96 rework)", () => {
+  const CUR_SHA = "a".repeat(40);
+
+  it("refuses a malformed expected_sha as invalid_expected_sha before any PUT", async () => {
+    for (const bad of ["", "abc", "z".repeat(40)]) {
+      const calls = queuedFetch([...installationTokenResponses(), responseJson({ sha: CUR_SHA })]);
+      const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "content", "update", bad);
+      expect(result.success).toBe(false);
+      expect(result.reason, JSON.stringify(bad)).toBe("invalid_expected_sha");
+      expect(calls.some(c => c.method === "PUT")).toBe(false);
+    }
+  });
+
+  it("maps a 422 without sha in the message to github_validation_error, not version_mismatch", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: CUR_SHA }),
+      responseJson({ message: "path contains a malformed segment" }, 422),
+    ]);
+    const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "content", "update", CUR_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("github_validation_error");
+  });
+
+  it("still maps a 422 that names the sha to version_mismatch", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: CUR_SHA }),
+      responseJson({ message: '"sha" wasn\'t supplied' }, 422),
+    ]);
+    const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "content", "update", CUR_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("version_mismatch");
+  });
+});
+
+describe("canonicalContentsPath — malicious pathPrefix (WP-7 Ф96 round-2)", () => {
+  it("rejects a prefix that escapes or carries forbidden characters", () => {
+    for (const badPrefix of ["../private", "a/../../private", "a\\b", "a\0b"]) {
+      expect(() => canonicalContentsPath(badPrefix, "docs/ok.md"), badPrefix).toThrow();
+    }
+  });
+
+  it("still accepts a benign prefix with redundant separators", () => {
+    expect(canonicalContentsPath("archive//sub/", "doc.md")).toBe("archive/sub/doc.md");
+  });
+});
+
+describe("writeToGitHub — sha case and length edge cases (WP-7 Ф96 round-2)", () => {
+  const CUR_SHA = "a".repeat(40);
+
+  it("accepts an uppercase expected_sha for a lowercase GitHub sha — same version, not a conflict", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: CUR_SHA }),
+      responseJson({ content: { sha: "b".repeat(40), html_url: "https://github.com/x" } }),
+    ]);
+    const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "content", "update", CUR_SHA.toUpperCase());
+    expect(result.success).toBe(true);
+    expect(calls.filter(c => c.method === "PUT")).toHaveLength(1);
+  });
+
+  it("rejects sha lengths 41 and 63 as invalid_expected_sha", async () => {
+    for (const bad of ["a".repeat(41), "a".repeat(63)]) {
+      queuedFetch([...installationTokenResponses(), responseJson({ sha: CUR_SHA })]);
+      const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "content", "update", bad);
+      expect(result.reason, String(bad.length)).toBe("invalid_expected_sha");
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("personalGetDocumentLive — sha shape validation (WP-7 Ф96 round-2)", () => {
+  it("returns null when GitHub hands back a malformed sha", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: "not-a-real-sha", content: btoa("x"), encoding: "base64" }),
+    ]);
+    const doc = await personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy");
+    expect(doc).toBeNull();
+  });
+});
+
+describe("personalGetDocumentWithSha — single source bypasses the index entirely (WP-7 Ф96 round-2)", () => {
+  it("performs the live read with zero index queries for a single-source user", async () => {
+    const LIVE_SHA = "e".repeat(40);
+    queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: LIVE_SHA, content: btoa(unescape(encodeURIComponent("body"))), encoding: "base64" }),
+    ]);
+    // No queryQueue entries prepared: any index query would consume from an
+    // empty queue and (worse) prove the index is still on the critical path.
+    const result = await personalGetDocumentWithSha(ENV_WITH_APP, ctx(), "notes/brand-new.md");
+    expect(result?.kind).toBe("document");
+    expect(queryQueue.length).toBe(0);
   });
 });

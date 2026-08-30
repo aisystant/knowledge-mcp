@@ -36,3 +36,15 @@ export function extractBearerToken(request: Request): string | null {
   if (!authHeader?.startsWith("Bearer ")) return null;
   return authHeader.slice(7);
 }
+
+/** Constant-time string comparison for shared-secret checks — a plain ===
+ * leaks a timing signal on how many leading bytes matched (WP-7 Ф95
+ * peer-review; manual XOR fold so the same code runs under Node tests). */
+export function secretsEqual(a: string, b: string): boolean {
+  const ab = new TextEncoder().encode(a);
+  const bb = new TextEncoder().encode(b);
+  if (ab.length !== bb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < ab.length; i++) diff |= ab[i] ^ bb[i];
+  return diff === 0;
+}

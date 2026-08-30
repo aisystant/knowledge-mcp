@@ -261,8 +261,19 @@ export async function writeToGitHub(
   // call; checked here, before the PUT below, so a caller editing a version
   // someone else already replaced gets version_mismatch instead of silently
   // overwriting it.
-  if (expectedSha !== undefined && existingSha !== expectedSha) {
-    return { success: false, reason: "version_mismatch", current_sha: existingSha ?? null, error: "Файл изменился с момента чтения — перечитай personal_get_document(includeSha: true) и повтори запись." };
+  if (expectedSha !== undefined) {
+    // A malformed value ("", truncated hex) is a caller bug, not a concurrent
+    // edit — version_mismatch here would send the agent into a pointless
+    // reread loop (peer-review finding, verify session 30.08).
+    if (!/^[0-9a-f]{40}$|^[0-9a-f]{64}$/i.test(expectedSha)) {
+      return { success: false, reason: "invalid_expected_sha", error: "expected_sha должен быть 40-символьным hex sha из get_document(include_sha: true); при создании нового файла параметр не передавай вовсе." };
+    }
+    // Case-insensitive: GitHub returns lowercase, the schema accepts
+    // uppercase hex — a case-only difference is the same version, not a
+    // concurrent edit (peer-review round 2, 30.08).
+    if (existingSha?.toLowerCase() !== expectedSha.toLowerCase()) {
+      return { success: false, reason: "version_mismatch", current_sha: existingSha ?? null, error: "Файл изменился с момента чтения — перечитай personal_get_document(includeSha: true) и повтори запись." };
+    }
   }
 
   // Create or update file
@@ -278,8 +289,14 @@ export async function writeToGitHub(
 
   if (!putResp.ok) {
     const err = await putResp.text();
-    if (putResp.status === 409 || putResp.status === 422) {
+    // 409 (or a 422 whose message names the sha) = a concurrent-edit race in
+    // the GET→PUT gap; other 422s are unrelated validation failures and must
+    // not masquerade as concurrent edits (peer-review finding, 30.08).
+    if (putResp.status === 409 || (putResp.status === 422 && /sha/i.test(err))) {
       return { success: false, reason: "version_mismatch", current_sha: null, error: `Файл изменился во время записи (GitHub ${putResp.status}): ${err}` };
+    }
+    if (putResp.status === 422) {
+      return { success: false, reason: "github_validation_error", error: `GitHub отклонил запись (422): ${err}` };
     }
     return { success: false, error: `GitHub API error ${putResp.status}: ${err}` };
   }
@@ -659,6 +676,46 @@ export async function personalGetDocument(
   };
 }
 
+/** Canonicalize a repository-relative path for the live-read: reject escape
+ * attempts and encode each segment for URL use. Minimal local port of
+ * personal-knowledge-mcp's normalizeRepositoryPath/encodeGitHubContentsPath —
+ * the plain string concatenation the first version used let `../`, `#` and
+ * `?` reach the Contents API URL raw (peer-review finding, verify session
+ * 30.08). Throws on an invalid path. */
+export function canonicalContentsPath(pathPrefix: string, filename: string): string {
+  if (!filename || filename.includes("\0") || filename.includes("\\") || filename.startsWith("/")) {
+    throw new Error(`invalid repository path: ${filename}`);
+  }
+  const segments: string[] = [];
+  for (const seg of filename.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") {
+      if (segments.length === 0) throw new Error(`invalid repository path: ${filename}`);
+      segments.pop();
+      continue;
+    }
+    segments.push(seg);
+  }
+  if (segments.length === 0) throw new Error(`invalid repository path: ${filename}`);
+  // The prefix comes from the user_sources DB row, but gets the same
+  // treatment: a "..", backslash or NUL there would step outside the
+  // source's logical root just as surely as one in the filename
+  // (peer-review round 2, 30.08 — defense in depth, no dot-segment
+  // resolution for config values: any ".." is an error outright).
+  const prefixSegments: string[] = [];
+  if (pathPrefix) {
+    if (pathPrefix.includes("\0") || pathPrefix.includes("\\")) {
+      throw new Error(`invalid path prefix: ${pathPrefix}`);
+    }
+    for (const seg of pathPrefix.split("/")) {
+      if (seg === "" || seg === ".") continue;
+      if (seg === "..") throw new Error(`invalid path prefix: ${pathPrefix}`);
+      prefixSegments.push(seg);
+    }
+  }
+  return [...prefixSegments, ...segments].map(encodeURIComponent).join("/");
+}
+
 /** Read a document straight from GitHub instead of the (async, occasionally
  * stale) Neon index — used only when the caller declared intent to write
  * (get_document{ includeSha: true }). content and sha come from the SAME
@@ -675,30 +732,82 @@ export async function personalGetDocumentLive(
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return null;
 
+  let encodedPath: string;
+  try {
+    encodedPath = canonicalContentsPath(userSource.pathPrefix, filename);
+  } catch {
+    return null;
+  }
+
   const owner = userSource.githubOwner;
   const repo = userSource.githubRepo;
   const token = await getInstallationToken(env, owner);
   if (!token) return null;
 
-  const fullPath = userSource.pathPrefix ? `${userSource.pathPrefix}${filename}` : filename;
-  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${fullPath}`;
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
 
-  const response = await fetch(apiUrl, {
-    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
-  });
-  if (!response.ok) return null;
+  // External response parsing (json, atob, UTF-8 decode) can throw; the
+  // dispatch layer expects null, not an exception.
+  try {
+    const response = await fetch(apiUrl, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+    });
+    if (!response.ok) return null;
 
-  const body = (await response.json()) as { sha?: unknown; content?: unknown; encoding?: unknown };
-  if (typeof body.sha !== "string" || !body.sha || typeof body.content !== "string" || body.encoding !== "base64") return null;
+    const body = (await response.json()) as { sha?: unknown; content?: unknown; encoding?: unknown };
+    // Same sha shape check as the write path — a malformed sha handed out
+    // here would be rejected by write(expected_sha) later anyway, better to
+    // fail the read (peer-review round 2, 30.08).
+    if (typeof body.sha !== "string" || !/^[0-9a-f]{40}$|^[0-9a-f]{64}$/i.test(body.sha) || typeof body.content !== "string" || body.encoding !== "base64") return null;
 
-  return {
-    filename,
-    content: decodeURIComponent(escape(atob(body.content.replace(/\n/g, "")))),
-    source,
-    source_type: userSource.sourceType,
-    github_url: personalGithubUrl(ctx, source, filename),
-    sha: body.sha,
-  };
+    return {
+      filename,
+      content: decodeURIComponent(escape(atob(body.content.replace(/\n/g, "")))),
+      source,
+      source_type: userSource.sourceType,
+      github_url: personalGithubUrl(ctx, source, filename),
+      sha: body.sha,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** include_sha=true handler: live-first read with the index only as a source
+ * hint — an index miss must NOT fail the call, bypassing a stale index is
+ * what include_sha is FOR (peer-review finding, verify session 30.08;
+ * mirror of personal-knowledge-mcp's getDocumentWithSha). */
+export async function personalGetDocumentWithSha(
+  env: PersonalEnv,
+  ctx: UserContext,
+  filename: string,
+  source?: string,
+): Promise<
+  | { kind: "document"; filename: string; content: string; source: string; source_type: string; github_url: string | null; sha: string }
+  | { kind: "source_required"; sources: string[] }
+  | null
+> {
+  const normalized = filename.includes("::") ? filename.split("::")[0] : filename;
+
+  let resolvedSource = source;
+  if (!resolvedSource && ctx.sourceNames.length === 1) {
+    // A single connected source is already unambiguous — resolving it before
+    // the index keeps the live read working even when the index query itself
+    // fails (peer-review round 2, 30.08).
+    resolvedSource = ctx.sourceNames[0];
+  }
+  if (!resolvedSource) {
+    // Index as a hint only; AmbiguousSourceError propagates as in the plain path.
+    const indexed = await personalGetDocument(env, ctx, normalized);
+    if (indexed) {
+      resolvedSource = indexed.source;
+    } else {
+      return { kind: "source_required", sources: ctx.sourceNames };
+    }
+  }
+
+  const live = await personalGetDocumentLive(env, ctx, normalized, resolvedSource);
+  return live ? { kind: "document", ...live } : null;
 }
 
 /** Private-mode `list_sources`: personal corpus only. */
