@@ -45,6 +45,8 @@ import { handleQueue, handleWatchdog, startReindexJob, getReindexJobStatus, type
 // --- Types ---
 
 export interface Env {
+  /** Cloudflare runtime version id/tag; exposed on /health for deploy provenance checks. */
+  CF_VERSION_METADATA?: WorkerVersionMetadata;
   /** Neon `knowledge` БД connection string (knowledge_chunk + concept_graph). Required. */
   KNOWLEDGE_DATABASE_URL: string;
   /** Neon `health` БД (DB #8) для observability writes (graph_usage_events). Required. */
@@ -286,6 +288,323 @@ export type SearchResult = {
   parent_filename?: string;
 };
 
+const SEARCH_RESPONSE_EXCERPT_CHARACTERS = 2_000;
+const SEARCH_RESPONSE_TRUNCATION_MARKER = "\n\n...[truncated; use get_document for the full document]";
+const SEARCH_RESULT_LIMIT_MAX = 20;
+export const SEARCH_TOOL_RESPONSE_BUDGET_BYTES = 32_000;
+
+export function normalizeSearchResultLimit(limit: number): number {
+  return Number.isFinite(limit)
+    ? Math.min(Math.max(Math.trunc(limit), 1), SEARCH_RESULT_LIMIT_MAX)
+    : 5;
+}
+
+function searchResponseExcerpt(
+  value: string | undefined,
+  characterCap: number = SEARCH_RESPONSE_EXCERPT_CHARACTERS,
+): string | undefined {
+  if (value === undefined) return value;
+  const boundedCap = Math.min(Math.max(Math.trunc(characterCap), 0), SEARCH_RESPONSE_EXCERPT_CHARACTERS);
+  if (value.length <= boundedCap) return value;
+  let end = boundedCap;
+  if (
+    end > 0
+    && value.charCodeAt(end - 1) >= 0xd800
+    && value.charCodeAt(end - 1) <= 0xdbff
+    && value.charCodeAt(end) >= 0xdc00
+    && value.charCodeAt(end) <= 0xdfff
+  ) {
+    end -= 1;
+  }
+  return value.slice(0, end) + SEARCH_RESPONSE_TRUNCATION_MARKER;
+}
+
+/** Keep search useful for discovery without serializing repeated multi-megabyte parents. */
+export function compactSearchResultsForResponse(
+  results: SearchResult[],
+  characterCap: number = SEARCH_RESPONSE_EXCERPT_CHARACTERS,
+): SearchResult[] {
+  return results.map(result => ({
+    ...result,
+    content: searchResponseExcerpt(result.content, characterCap) ?? "",
+    ...(result.parent_content === undefined
+      ? {}
+      : { parent_content: searchResponseExcerpt(result.parent_content, characterCap) }),
+  }));
+}
+
+/** Fit the complete JSON-RPC response, not only individual fields, by UTF-8 bytes. */
+export function buildSearchToolResponse(
+  id: string | number,
+  results: SearchResult[],
+  budgetBytes: number = SEARCH_TOOL_RESPONSE_BUDGET_BYTES,
+): McpResponse {
+  const boundedResults = results.slice(0, SEARCH_RESULT_LIMIT_MAX);
+  const responseBytes = (response: McpResponse): number => (
+    new TextEncoder().encode(JSON.stringify(response)).length
+  );
+  const render = (resultCount: number, characterCap: number): McpResponse => ({
+    jsonrpc: "2.0",
+    id,
+    result: {
+      content: [{
+        type: "text",
+        text: JSON.stringify(
+          compactSearchResultsForResponse(boundedResults.slice(0, resultCount), characterCap),
+          null,
+          2,
+        ),
+      }],
+    },
+  });
+
+  for (let resultCount = boundedResults.length; resultCount >= 0; resultCount -= 1) {
+    let low = 0;
+    let high = SEARCH_RESPONSE_EXCERPT_CHARACTERS;
+    let best: McpResponse | null = null;
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      const candidate = render(resultCount, middle);
+      if (responseBytes(candidate) <= budgetBytes) {
+        best = candidate;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
+      }
+    }
+    if (best) return best;
+  }
+
+  return render(0, 0);
+}
+
+export type ResolvedDocument = {
+  filename: string;
+  source: string;
+  source_type: string;
+  title: string;
+  score: number;
+  github_url: string | null;
+};
+
+export type DocumentResolutionStatus = "resolved" | "ambiguous" | "not_found";
+
+const DOCUMENT_RESOLUTION_MIN_SCORE = 0.65;
+const DOCUMENT_RESOLUTION_MIN_MARGIN = 0.05;
+const DOCUMENT_LOOKUP_QUERY_MAX_CHARACTERS = 1_000;
+const DOCUMENT_LOOKUP_TITLE_MAX_CHARACTERS = 500;
+
+type DocumentReferenceAlias = {
+  source: string;
+  filename: string;
+  canonicalTitle: string;
+  titles: readonly string[];
+};
+
+/**
+ * Observed compatibility aliases are curated, never inferred from mutable
+ * frontmatter order. This pair comes from the 2026-08-27 support case; the
+ * current path/H1 were verified in the docs repository, while the R-code
+ * itself is absent from repository metadata.
+ */
+const DOCUMENT_REFERENCE_ALIASES: Readonly<Record<string, DocumentReferenceAlias>> = {
+  "R1.1:7": {
+    source: "docs-courses",
+    filename: "professional/firefighting/distinguish-systems-and-their-representations-and-ground-yourself/about-systems-and-epistemes-descriptions-models.md",
+    canonicalTitle: "О системах и эпистемах о них (описаниях, моделях)",
+    titles: ["О системах, эпистемах и описаниях"],
+  },
+};
+
+function normalizeDocumentLookupText(value: string): string {
+  return value
+    .normalize("NFKC")
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseDocumentReference(query: string): { code: string; title: string } | null {
+  const normalized = normalizeDocumentLookupText(query);
+  const match = normalized.match(/^(\p{L}\d+(?:\.\d+)*(?::\d+)?)\s*[—–-]\s*(.+)$/u);
+  if (!match) return null;
+  return { code: match[1].toUpperCase(), title: normalizeDocumentLookupText(match[2]) };
+}
+
+function looksLikeCourseReference(query: string): boolean {
+  const normalized = normalizeDocumentLookupText(query);
+  // Any R/Р + numeric prefix is code-bearing. Only the strict parser plus an
+  // explicit curated alias may resolve it; malformed variants must never fall
+  // through to fuzzy title matching, regardless of their punctuation.
+  return /^[RrРр]+\s*\d/u.test(normalized);
+}
+
+function knownDocumentReferenceAlias(query: string): DocumentReferenceAlias | null {
+  const reference = parseDocumentReference(query);
+  if (!reference) return null;
+  const alias = DOCUMENT_REFERENCE_ALIASES[reference.code];
+  if (!alias) return null;
+  const normalizedTitle = reference.title.toLowerCase();
+  return alias.titles.some(title => normalizeDocumentLookupText(title).toLowerCase() === normalizedTitle)
+    ? alias
+    : null;
+}
+
+/**
+ * Course references such as `R1.1:7 — Title` are presentation-layer aliases,
+ * not indexed document identifiers. Keep the human title for deterministic
+ * title matching. A bare reference is intentionally not guessed: the indexed
+ * document has no canonical R-code field, so title-less resolution must fail
+ * closed instead of selecting an unrelated assignment with a similar number.
+ */
+export function normalizeDocumentLookupQuery(query: string): string {
+  const trimmed = normalizeDocumentLookupText(query);
+  if (/^\p{L}?\d+(?:\.\d+)*(?::\d+)?$/u.test(trimmed)) return "";
+  const withoutCourseReference = trimmed.replace(
+    /^\p{L}?\d+(?:\.\d+)*(?::\d+)?\s*[—–-]\s*/u,
+    "",
+  ).trim();
+  return withoutCourseReference;
+}
+
+export function classifyDocumentResolution(matches: ResolvedDocument[]): DocumentResolutionStatus {
+  const first = matches[0];
+  if (!first || first.score < DOCUMENT_RESOLUTION_MIN_SCORE) return "not_found";
+
+  const second = matches[1];
+  if (
+    second
+    && first.score - second.score < DOCUMENT_RESOLUTION_MIN_MARGIN
+    && (first.filename !== second.filename || first.source !== second.source)
+  ) {
+    return "ambiguous";
+  }
+  return "resolved";
+}
+
+/**
+ * Resolve a human title or filename to canonical, whole-document paths.
+ *
+ * This deliberately avoids embeddings, reranking and parent-content loading:
+ * callers need one small routing record before `get_document`, not several
+ * hundred kilobytes of candidate documents. Chunk rows (`filename::section`)
+ * are excluded so a caller can never mistake a section for the whole file.
+ */
+export async function resolveDocument(
+  env: Env,
+  query: string,
+  source?: string,
+  limit: number = 3,
+  userId?: string,
+): Promise<ResolvedDocument[]> {
+  const explicitReference = parseDocumentReference(query);
+  const referenceAlias = knownDocumentReferenceAlias(query);
+  if ((explicitReference || looksLikeCourseReference(query)) && !referenceAlias) return [];
+
+  const normalizedQuery = normalizeDocumentLookupQuery(query);
+  if (!normalizedQuery || normalizedQuery.length > DOCUMENT_LOOKUP_QUERY_MAX_CHARACTERS) return [];
+
+  const safeLimit = Number.isFinite(limit)
+    ? Math.min(Math.max(Math.trunc(limit), 2), 5)
+    : 3;
+  const src = source?.trim() || null;
+  if (referenceAlias && src && src !== referenceAlias.source) return [];
+  const pool = createRequestPool(activeDsn(env));
+
+  try {
+    if (referenceAlias) {
+      const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
+        SELECT source_uri AS filename,
+               source,
+               source_kind AS source_type,
+               COALESCE(
+                 substring(left(content, 16000) from E'(?m)^#[[:space:]]+([^\\r\\n]+)'),
+                 substring(left(content, 16000) from E'(?im)^title:[[:space:]]*["'']?([^"''\\r\\n]+)'),
+                 source_uri
+               ) AS title,
+               1.0 AS score
+        FROM ${sql.unsafe(knowledgeChunkTable)}
+        WHERE account_id IS NULL
+          AND parent_chunk_id IS NULL
+          AND source_uri NOT LIKE '%::%'
+          AND source = ${referenceAlias.source}
+          AND source_uri = ${referenceAlias.filename}
+        LIMIT 1
+      `, pool);
+
+      return rows.flatMap((r) => {
+        const filename = r.filename as string;
+        const resultSource = (r.source as string) || "";
+        const title = ((r.title as string) || filename).slice(0, DOCUMENT_LOOKUP_TITLE_MAX_CHARACTERS);
+        if (
+          normalizeDocumentLookupText(title).toLowerCase()
+          !== normalizeDocumentLookupText(referenceAlias.canonicalTitle).toLowerCase()
+        ) {
+          return [];
+        }
+        return [{
+          filename,
+          source: resultSource,
+          source_type: (r.source_type as string) || "",
+          title,
+          score: 1,
+          github_url: resolveGithubUrl(resultSource, filename),
+        }];
+      });
+    }
+
+    const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
+      WITH candidates AS (
+        SELECT source_uri AS filename,
+               source,
+               source_kind AS source_type,
+               COALESCE(
+                 substring(left(content, 16000) from E'(?m)^#[[:space:]]+([^\\r\\n]+)'),
+                 substring(left(content, 16000) from E'(?im)^title:[[:space:]]*["'']?([^"''\\r\\n]+)'),
+                 source_uri
+               ) AS title
+        FROM ${sql.unsafe(knowledgeChunkTable)}
+        WHERE account_id IS NULL
+          AND parent_chunk_id IS NULL
+          AND source_uri NOT LIKE '%::%'
+          AND (${src}::text IS NULL OR source = ${src})
+      ), scored AS (
+        SELECT filename, source, source_type, title,
+               GREATEST(
+                 CASE WHEN lower(filename) = lower(${normalizedQuery}) THEN 1.0 ELSE 0.0 END,
+                 CASE WHEN lower(title) = lower(${normalizedQuery}) THEN 1.0 ELSE 0.0 END,
+                 similarity(lower(title), lower(${normalizedQuery})),
+                 word_similarity(lower(${normalizedQuery}), lower(title)),
+                 similarity(lower(filename), lower(${normalizedQuery}))
+               ) AS score
+        FROM candidates
+      )
+      SELECT filename, source, source_type, title, score
+      FROM scored
+      WHERE score >= 0.25
+      ORDER BY score DESC, length(filename) ASC, filename ASC, source ASC
+      LIMIT ${safeLimit}
+    `, pool);
+
+    return rows.map((r) => {
+      const filename = r.filename as string;
+      const resultSource = (r.source as string) || "";
+      return {
+        filename,
+        source: resultSource,
+        source_type: (r.source_type as string) || "",
+        title: ((r.title as string) || filename).slice(0, DOCUMENT_LOOKUP_TITLE_MAX_CHARACTERS),
+        score: Number(r.score),
+        github_url: resolveGithubUrl(resultSource, filename),
+      };
+    });
+  } finally {
+    await pool.end().catch((err) => {
+      console.error("[resolve_document] pool.end() failed (contained):", err);
+    });
+  }
+}
+
 async function keywordSearch(
   env: Env,
   query: string,
@@ -316,7 +635,11 @@ async function keywordSearch(
   //   account_id IS NULL = platform doc (visible to all). Personal docs (account_id set)
   //   are served exclusively by personal-knowledge-mcp, never here — even with a token.
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
-    SELECT legacy_id AS id, source_uri AS filename, content, source, source_kind AS source_type,
+    SELECT legacy_id AS id, source_uri AS filename,
+           CASE WHEN length(content) > ${SEARCH_RESPONSE_EXCERPT_CHARACTERS}
+                THEN left(content, ${SEARCH_RESPONSE_EXCERPT_CHARACTERS}) || ${SEARCH_RESPONSE_TRUNCATION_MARKER}
+                ELSE content END AS content,
+           source, source_kind AS source_type,
            CASE
              WHEN source_uri ILIKE ${pattern} THEN 1.0
              WHEN ${entityPattern}::text IS NOT NULL
@@ -374,7 +697,11 @@ async function vectorSearch(
   // WP-268: knowledge_chunk schema with id/filename/source_type aliases.
   // WP-7 Ф-L2-PRIVACY: explicit account_id filter — defense-in-depth alongside RLS (mvp/015).
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
-    SELECT legacy_id AS id, source_uri AS filename, content, source, source_kind AS source_type,
+    SELECT legacy_id AS id, source_uri AS filename,
+           CASE WHEN length(content) > ${SEARCH_RESPONSE_EXCERPT_CHARACTERS}
+                THEN left(content, ${SEARCH_RESPONSE_EXCERPT_CHARACTERS}) || ${SEARCH_RESPONSE_TRUNCATION_MARKER}
+                ELSE content END AS content,
+           source, source_kind AS source_type,
            1 - (embedding <=> ${vec}::vector) AS score
     FROM ${sql.unsafe(knowledgeChunkTable)}
     WHERE embedding IS NOT NULL
@@ -521,7 +848,10 @@ export async function enrichWithParentContent(env: Env, results: SearchResult[],
   // (parent доступен только если он принадлежит тому же account_id или platform).
   const parentRows = await withUserContext(activeDsn(env), userId, (sql) => sql`
     SELECT c.source_uri AS chunk_filename, c.source AS chunk_source,
-           p.source_uri AS parent_filename, p.content AS parent_content
+           p.source_uri AS parent_filename,
+           CASE WHEN length(p.content) > ${SEARCH_RESPONSE_EXCERPT_CHARACTERS}
+                THEN left(p.content, ${SEARCH_RESPONSE_EXCERPT_CHARACTERS}) || ${SEARCH_RESPONSE_TRUNCATION_MARKER}
+                ELSE p.content END AS parent_content
     FROM ${sql.unsafe(knowledgeChunkTable)} c
     JOIN ${sql.unsafe(knowledgeChunkTable)} p ON p.chunk_uuid = c.parent_chunk_id
     WHERE c.parent_chunk_id IS NOT NULL
@@ -558,6 +888,7 @@ export async function searchDocuments(
   limit: number = 5,
   userId?: string
 ): Promise<SearchResult[]> {
+  limit = normalizeSearchResultLimit(limit);
   // One pool for this call's whole DB round-trip chain (up to 4 sequential queries below),
   // never reused past it — see rls.ts createRequestPool() for why (issue #231).
   const pool = createRequestPool(activeDsn(env));
@@ -1845,9 +2176,29 @@ async function getLearnerProgress(env: Env, userId: string, domain: string | und
 
 export const TOOLS = [
   {
+    name: "resolve_document",
+    description:
+      "Resolve a code-and-title course reference, human title, or filename to canonical whole-document paths. A bare course code is not sufficient. Returns compact metadata only; call get_document with the selected filename/source next.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", maxLength: 1000, description: "Code-and-title course reference, document title, or filename" },
+        source: { type: "string", maxLength: 512, description: "Optional exact source name" },
+        limit: { type: "number", minimum: 2, maximum: 5, description: "Maximum matches (default: 3, max: 5)" },
+      },
+      required: ["query"],
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
     name: "search",
     description:
-      "Hybrid search across knowledge base documents with LLM reranking. Searches Pack entities, guides, and DS knowledge. Uses keyword search for entity codes (e.g. DP.AGENT.001) and semantic vector search with LLM reranking for natural language queries. Returns parent document content when available for chunked documents.",
+      "Hybrid search across knowledge base documents with LLM reranking. Searches Pack entities, guides, and DS knowledge. Uses keyword search for entity codes (e.g. DP.AGENT.001) and semantic vector search with LLM reranking for natural language queries. Returns compact content excerpts and parent metadata; use get_document for full text.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1861,7 +2212,7 @@ export const TOOLS = [
           enum: ["pack", "guides", "ds", "content"],
           description: "Filter by source type: pack (domain knowledge), guides (educational), ds (processes), content (posts/articles)",
         },
-        limit: { type: "number", description: "Maximum number of results (default: 5)" },
+        limit: { type: "number", minimum: 1, maximum: 20, description: "Maximum number of results (default: 5, max: 20)" },
       },
       required: ["query"],
     },
@@ -2112,6 +2463,8 @@ export const TOOLS = [
   },
 ];
 
+const PUBLIC_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set(["resolve_document"]);
+
 // Private-only tools (WP-410 срез-2b) — only surfaced in tools/list when MCP_MODE=private.
 // Ported from personal-knowledge-mcp/src/index.ts getTools() write/propose_capture entries.
 // No per-user `source` enum here (unlike the original getTools(ctx)): knowledge-mcp's tool
@@ -2120,7 +2473,7 @@ export const TOOLS = [
 const PRIVATE_TOOLS = [
   {
     name: "write",
-    description: "Write a file to a personal knowledge repo via GitHub. Creates or updates the file and triggers reindexing. When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, a concurrent edit from another session can be silently overwritten.",
+    description: "Write a file to a personal knowledge repo via GitHub. Existing files and new ordinary/service Markdown are supported. When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, a concurrent edit from another session can be silently overwritten. A new publication-like file (frontmatter type: post or a channel filename) under TserenTserenov/DS-Knowledge-Index-Tseren docs/ is server-blocked: create it with scripts/new-post.py; if shell is unavailable, stop instead of using an ASCII/manual fallback.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2256,11 +2609,27 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
         };
 
       case "tools/list":
-        return { jsonrpc: "2.0", id, result: { tools: mode === "private" ? [...TOOLS, ...PRIVATE_TOOLS] : TOOLS } };
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            tools: mode === "private"
+              ? [...TOOLS.filter(tool => !PUBLIC_ONLY_TOOL_NAMES.has(tool.name)), ...PRIVATE_TOOLS]
+              : TOOLS,
+          },
+        };
 
       case "tools/call": {
         const toolName = (params as { name: string }).name;
         const args = (params as { arguments: Record<string, unknown> }).arguments || {};
+
+        if (mode === "private" && PUBLIC_ONLY_TOOL_NAMES.has(toolName)) {
+          return {
+            jsonrpc: "2.0",
+            id,
+            error: { code: -32601, message: `Tool "${toolName}" is not available in private mode` },
+          };
+        }
 
         // WP-410 Q1: private-only tools carry no public data path. Refuse them in public
         // mode before dispatch.
@@ -2354,7 +2723,7 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             }
 
             const expectedSha = args.expected_sha as string | undefined;
-            const writeResult = await writeToGitHub(env, ctx, source, path, content, message, expectedSha);
+            const writeResult = await writeToGitHub(env, ctx, source, path, content, message, {}, expectedSha);
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(writeResult, null, 2) }] } };
           }
 
@@ -2570,6 +2939,65 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
           return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(sources, null, 2) }] } };
         }
 
+        if (toolName === "resolve_document") {
+          const query = typeof args.query === "string" ? args.query.trim() : "";
+          const source = args.source;
+          const limit = args.limit;
+          if (
+            !query
+            || query.length > DOCUMENT_LOOKUP_QUERY_MAX_CHARACTERS
+            || (
+              source !== undefined
+              && (typeof source !== "string" || !source.trim() || source.length > 512)
+            )
+            || (
+              limit !== undefined
+              && (typeof limit !== "number" || !Number.isFinite(limit) || limit < 2 || limit > 5)
+            )
+          ) {
+            return {
+              jsonrpc: "2.0",
+              id,
+              result: { content: [{ type: "text", text: "invalid resolve_document arguments" }], isError: true },
+            };
+          }
+
+          const matches = await resolveDocument(
+            env,
+            query,
+            source as string | undefined,
+            (limit as number | undefined) ?? 3,
+            userId,
+          );
+          const status = classifyDocumentResolution(matches);
+          const match = status === "resolved" ? matches[0] : null;
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  query,
+                  normalized_query: normalizeDocumentLookupQuery(query),
+                  status,
+                  match_found: match !== null,
+                  match,
+                  alternatives: status === "resolved" ? matches.slice(1) : matches,
+                  next_action: status === "resolved"
+                    ? "read_document"
+                    : status === "ambiguous" ? "ask_clarification" : "answer_not_found",
+                  instruction: status === "resolved"
+                    ? "Call get_document once with exactly match.filename and match.source."
+                    : status === "ambiguous"
+                      ? "Stop tool calls and ask the user which candidate they meant."
+                      : "Stop tool calls and tell the user that no matching document was found.",
+                }),
+              }],
+            },
+          };
+        }
+
         if (toolName === "search") {
           const results = await searchDocuments(
             env,
@@ -2579,11 +3007,7 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             (args.limit as number) || 5,
             userId
           );
-          return {
-            jsonrpc: "2.0",
-            id,
-            result: { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] },
-          };
+          return buildSearchToolResponse(id, results);
         }
 
         if (toolName === "get_document") {
@@ -3410,7 +3834,12 @@ export default {
     }
 
     if (url.pathname === "/health") {
-      return new Response("OK", { headers: corsHeaders });
+      return new Response(JSON.stringify({
+        ok: true,
+        version: env.CF_VERSION_METADATA ?? null,
+      }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
     if (url.pathname === "/") {

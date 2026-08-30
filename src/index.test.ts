@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, TOOLS, extractTitle, buildPathTree } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, extractTitle, buildPathTree } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import { chunkLargeFile, contentHash } from "../scripts/ingest.js";
 import { neon } from "@neondatabase/serverless";
@@ -55,6 +55,216 @@ describe("detectQueryType", () => {
     expect(detectQueryType("как настроить систему подписок")).toBe("vector");
     expect(detectQueryType("what is the architecture of the platform")).toBe("vector");
     expect(detectQueryType("роли агентов в системе")).toBe("vector");
+  });
+});
+
+describe("deterministic document resolver", () => {
+  it("removes a course reference but preserves its human title and rejects a bare alias", () => {
+    expect(normalizeDocumentLookupQuery("R1.1:7 — О системах, эпистемах и описаниях"))
+      .toBe("О системах, эпистемах и описаниях");
+    expect(normalizeDocumentLookupQuery("R1.1:7")).toBe("");
+    expect(normalizeDocumentLookupQuery("DP.AGENT.001")).toBe("DP.AGENT.001");
+    expect(normalizeDocumentLookupQuery("Ｒ1.1:7\u00a0—\u00a0  О системах"))
+      .toBe("О системах");
+  });
+
+  it("does not query the database for an unresolvable bare course alias", async () => {
+    await expect(resolveDocument(
+      { KNOWLEDGE_DATABASE_URL: "postgres://example" } as Env,
+      "R1.1:7",
+    )).resolves.toEqual([]);
+    expect(mockPoolEnd).not.toHaveBeenCalled();
+  });
+
+  it("returns only compact canonical document metadata", async () => {
+    mockWithUserContextImpl = async () => [{
+      filename: "professional/firefighting/distinguish-systems-and-their-representations-and-ground-yourself/about-systems-and-epistemes-descriptions-models.md",
+      source: "docs-courses",
+      source_type: "guides",
+      title: "О системах и эпистемах о них (описаниях, моделях)",
+      score: 1,
+    }];
+
+    const results = await resolveDocument(
+      { KNOWLEDGE_DATABASE_URL: "postgres://example" } as Env,
+      "R1.1:7 — О системах, эпистемах и описаниях",
+    );
+
+    expect(results).toEqual([expect.objectContaining({
+      filename: "professional/firefighting/distinguish-systems-and-their-representations-and-ground-yourself/about-systems-and-epistemes-descriptions-models.md",
+      source: "docs-courses",
+      title: "О системах и эпистемах о них (описаниях, моделях)",
+      score: 1,
+    })]);
+    expect(results[0]).not.toHaveProperty("content");
+    expect(results[0].filename).not.toContain("::");
+    expect(mockPoolEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    "R9.9:9 — О системах, эпистемах и описаниях",
+    "R1.1:7 — Другой материал",
+    "R1.1:7x — О системах, эпистемах и описаниях",
+    "RR1.1:7 — О системах, эпистемах и описаниях",
+    "R1.1:7.0 — О системах, эпистемах и описаниях",
+    "R1.1::7 — О системах, эпистемах и описаниях",
+    "R1.1:7x",
+    "R1-1:7 — О системах, эпистемах и описаниях",
+    "R1/1:7 — О системах, эпистемах и описаниях",
+    "R 1.1:7 — О системах, эпистемах и описаниях",
+    "R1 .1:7 — О системах, эпистемах и описаниях",
+    "R1.1 :7 — О системах, эпистемах и описаниях",
+    "R1.1:7 —",
+    "R2: Deep Reinforcement Learning",
+    "Р1.1:7 — О системах, эпистемах и описаниях",
+  ])("fails closed for an unknown or title-mismatched course reference: %s", async (query) => {
+    await expect(resolveDocument(
+      { KNOWLEDGE_DATABASE_URL: "postgres://example" } as Env,
+      query,
+    )).resolves.toEqual([]);
+    expect(mockPoolEnd).not.toHaveBeenCalled();
+  });
+
+  it("does not let a source override redirect a curated course reference", async () => {
+    await expect(resolveDocument(
+      { KNOWLEDGE_DATABASE_URL: "postgres://example" } as Env,
+      "R1.1:7 — О системах, эпистемах и описаниях",
+      "FPF",
+    )).resolves.toEqual([]);
+    expect(mockPoolEnd).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a curated alias path no longer has its verified H1", async () => {
+    mockWithUserContextImpl = async () => [{
+      filename: "professional/firefighting/distinguish-systems-and-their-representations-and-ground-yourself/about-systems-and-epistemes-descriptions-models.md",
+      source: "docs-courses",
+      source_type: "guides",
+      title: "Другой материал по переиспользованному пути",
+      score: 1,
+    }];
+
+    await expect(resolveDocument(
+      { KNOWLEDGE_DATABASE_URL: "postgres://example" } as Env,
+      "R1.1:7 — О системах, эпистемах и описаниях",
+    )).resolves.toEqual([]);
+    expect(mockPoolEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([{ bad: "source" }, 42])("rejects a non-string resolver source without throwing: %p", async (source) => {
+    const response = await handleMcpRequest(
+      {
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: "resolve_document", arguments: { query: "test", source } },
+      },
+      {} as Env,
+    );
+    expect(response.result).toEqual(expect.objectContaining({ isError: true }));
+  });
+
+  it("reads only an unambiguous high-confidence match", () => {
+    const base = {
+      filename: "target.md",
+      source: "docs-courses",
+      source_type: "guides",
+      title: "Target",
+      github_url: null,
+    };
+    // Production corpus check across all 2,095 docs-courses roots was 0.862
+    // top-1 versus 0.593 runner-up; keep that observed safe separation.
+    expect(classifyDocumentResolution([{ ...base, score: 0.862 }, { ...base, filename: "other.md", score: 0.593 }]))
+      .toBe("resolved");
+    expect(classifyDocumentResolution([{ ...base, score: 0.72 }, { ...base, filename: "other.md", score: 0.70 }]))
+      .toBe("ambiguous");
+    expect(classifyDocumentResolution([{ ...base, score: 0.66 }, { ...base, filename: "other.md", score: 0.64 }]))
+      .toBe("ambiguous");
+    expect(classifyDocumentResolution([{ ...base, score: 0.64 }])).toBe("not_found");
+    expect(classifyDocumentResolution([])).toBe("not_found");
+  });
+
+  it("registers resolve_document as a read-only tool", () => {
+    const tool = TOOLS.find((candidate) => candidate.name === "resolve_document");
+    expect(tool).toBeDefined();
+    expect(tool?.annotations).toEqual(expect.objectContaining({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+    }));
+  });
+
+  it("does not expose or route the platform resolver in private mode", async () => {
+    const listed = await handleMcpRequest(
+      { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+      {} as Env,
+      undefined,
+      "private",
+    );
+    const tools = (listed.result as { tools: Array<{ name: string }> }).tools;
+    expect(tools.some(tool => tool.name === "resolve_document")).toBe(false);
+
+    const called = await handleMcpRequest(
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "resolve_document", arguments: { query: "test" } } },
+      {} as Env,
+      undefined,
+      "private",
+    );
+    expect(called.error).toEqual(expect.objectContaining({ code: -32601 }));
+  });
+});
+
+describe("compact search response", () => {
+  it("caps repeated document bodies before MCP serialization", () => {
+    const huge = "Ф".repeat(8_000_000);
+    const compacted = compactSearchResultsForResponse([{
+      id: 1,
+      filename: "FPF.md::chunk",
+      source: "FPF",
+      source_type: "pack",
+      score: 0.9,
+      github_url: null,
+      content: huge,
+      parent_filename: "FPF.md",
+      parent_content: huge,
+    }]);
+
+    expect(compacted[0].content.length).toBeLessThan(2_100);
+    expect(compacted[0].parent_content?.length).toBeLessThan(2_100);
+    expect(compacted[0].content).toContain("use get_document");
+    expect(JSON.stringify(compacted).length).toBeLessThan(5_000);
+  });
+
+  it("bounds requested result counts before any database fetch", () => {
+    expect(normalizeSearchResultLimit(0)).toBe(1);
+    expect(normalizeSearchResultLimit(5)).toBe(5);
+    expect(normalizeSearchResultLimit(100)).toBe(20);
+    expect(normalizeSearchResultLimit(Number.NaN)).toBe(5);
+  });
+
+  it("fits the complete Cyrillic JSON-RPC search response by UTF-8 bytes", () => {
+    const huge = "Ф".repeat(8_000_000);
+    const results = Array.from({ length: 20 }, (_, index) => ({
+      id: index + 1,
+      filename: `FPF-${index}.md::chunk`,
+      source: "FPF",
+      source_type: "pack",
+      score: 0.9 - index / 100,
+      github_url: null,
+      content: huge,
+      parent_filename: `FPF-${index}.md`,
+      parent_content: huge,
+    }));
+
+    const response = buildSearchToolResponse(7, results);
+    const serialized = JSON.stringify(response);
+    expect(new TextEncoder().encode(serialized).length)
+      .toBeLessThanOrEqual(SEARCH_TOOL_RESPONSE_BUDGET_BYTES);
+
+    const content = (response.result as { content: Array<{ text: string }> }).content[0].text;
+    const decoded = JSON.parse(content) as Array<{ content: string; parent_content?: string }>;
+    expect(decoded).toHaveLength(20);
+    expect(decoded[0].content).toContain("use get_document");
+    expect(decoded[0].parent_content).toContain("use get_document");
   });
 });
 

@@ -24,6 +24,12 @@ import {
   type PersonalEnv,
   type UserContext,
 } from "./personal.js";
+import {
+  githubBranchApiUrl,
+  githubContentsApiUrl,
+  normalizeRepositoryPath,
+  resolveSourcePath,
+} from "../repository-path.js";
 
 export interface ReindexEnv extends PersonalEnv {
   /** Cloudflare Queue binding for the "reindex" queue. Required to enqueue/consume batches. */
@@ -121,14 +127,14 @@ async function readFromGitHub(
   const owner = userSource.githubOwner;
   const repo = userSource.githubRepo;
 
+  // Resolve both configured prefix and request path before auth or network I/O. A malformed
+  // source configuration must never reach the installation-token or Contents endpoints.
+  const fullPath = resolveSourcePath(userSource.pathPrefix, path).fullPath;
+
   const token = await getInstallationToken(env, owner);
   if (!token) return null;
 
-  const fullPath = userSource.pathPrefix ? `${userSource.pathPrefix}${path}` : path;
-  // GitHub Contents API requires each path segment URL-encoded. Raw spaces/parens/cyrillic
-  // break the request (WP-187 Ф-K.1.2 — observed on archive/strategy-sessions/*.md).
-  const encodedPath = fullPath.split("/").map(encodeURIComponent).join("/");
-  const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`, {
+  const resp = await fetch(githubContentsApiUrl(owner, repo, fullPath), {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github.raw+json",
@@ -180,23 +186,31 @@ export async function personalReindexFiles(
   }
 
   for (const file of req.files) {
-    if (!file.path.endsWith(".md")) {
+    let normalizedPath: string;
+    try {
+      normalizedPath = normalizeRepositoryPath(file.path);
+    } catch (err) {
+      result.errors.push(`${file.path}: ${err instanceof Error ? err.message : "invalid path"}`);
+      continue;
+    }
+
+    if (!normalizedPath.endsWith(".md")) {
       result.skipped++;
       continue;
     }
 
     try {
       if (file.action === "removed") {
-        await buildDeleteDocumentQuery(sql, documentsTable, req.source, ctx.userId, file.path);
+        await buildDeleteDocumentQuery(sql, documentsTable, req.source, ctx.userId, normalizedPath);
         result.deleted++;
         continue;
       }
 
-      assertIndexablePath(file.path);
+      assertIndexablePath(normalizedPath);
 
-      const content = await readFromGitHub(env, ctx, req.source, file.path);
+      const content = await readFromGitHub(env, ctx, req.source, normalizedPath);
       if (!content) {
-        result.errors.push(`Cannot read ${file.path} from GitHub`);
+        result.errors.push(`Cannot read ${normalizedPath} from GitHub`);
         continue;
       }
 
@@ -210,10 +224,10 @@ export async function personalReindexFiles(
       // otherwise, since a reindex re-run is the only backfill path and most
       // content doesn't change between runs (WP-7 Ф94).
       const hash = await contentHash(content);
-      const chunkPrefix = documentChunkPrefix(file.path);
+      const chunkPrefix = documentChunkPrefix(normalizedPath);
       const existing = await sql`
         SELECT hash, protocol_version FROM ${sql.unsafe(documentsTable)}
-        WHERE (filename = ${file.path} OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
+        WHERE (filename = ${normalizedPath} OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
           AND source = ${req.source} AND user_id = ${ctx.userId}
         LIMIT 1
       `;
@@ -230,12 +244,12 @@ export async function personalReindexFiles(
       // one transaction — a mid-write crash can never leave a partial document
       // visible to readers (WP-7 Ф94).
       await sql.transaction([
-        buildDeleteDocumentQuery(sql, documentsTable, req.source, ctx.userId, file.path),
+        buildDeleteDocumentQuery(sql, documentsTable, req.source, ctx.userId, normalizedPath),
         ...chunks.map((c, i) => sql`
           INSERT INTO ${sql.unsafe(documentsTable)}
             (filename, content, source, source_type, hash, embedding, search_vector, user_id, chunk_ordinal, protocol_version)
           VALUES (
-            ${file.path}, ${c}, ${req.source}, ${sourceType}, ${hash},
+            ${normalizedPath}, ${c}, ${req.source}, ${sourceType}, ${hash},
             ${`[${embeddings[i].join(",")}]`}::vector, to_tsvector('simple', ${c}), ${ctx.userId}, ${i + 1}, 2
           )
         `),
@@ -261,6 +275,21 @@ interface GitHubTreeEntry {
   url?: string;
 }
 
+/** Restrict a recursive Git tree to the configured directory segment, then relativize it. */
+export function relativeMarkdownPathsFromTree(
+  tree: GitHubTreeEntry[],
+  pathPrefix: string,
+): string[] {
+  const normalizedPrefix = pathPrefix ? normalizeRepositoryPath(pathPrefix) : "";
+  const prefixBoundary = normalizedPrefix ? `${normalizedPrefix}/` : "";
+
+  return tree
+    .filter(entry => entry.type === "blob" && entry.path.endsWith(".md"))
+    .filter(entry => !prefixBoundary || entry.path.startsWith(prefixBoundary))
+    .map(entry => prefixBoundary ? entry.path.slice(prefixBoundary.length) : entry.path)
+    .filter(path => path.length > 0);
+}
+
 /**
  * List all .md files in a source repo via GitHub Trees API (recursive, single call).
  * Returns paths relative to pathPrefix (same shape as webhook ReindexFile).
@@ -268,6 +297,18 @@ interface GitHubTreeEntry {
 async function listMdFilesViaTrees(env: ReindexEnv, ctx: UserContext, source: string): Promise<string[]> {
   const userSource = ctx.sources.find((s) => s.source === source);
   if (!userSource) return [];
+
+  // Validate the configured source boundary before token acquisition or GitHub metadata calls.
+  // Keep the canonical prefix for the later tree-boundary filter.
+  let normalizedPrefix: string;
+  try {
+    normalizedPrefix = userSource.pathPrefix
+      ? normalizeRepositoryPath(userSource.pathPrefix)
+      : "";
+  } catch {
+    return [];
+  }
+
   const token = await getInstallationToken(env, userSource.githubOwner);
   if (!token) return [];
 
@@ -276,9 +317,10 @@ async function listMdFilesViaTrees(env: ReindexEnv, ctx: UserContext, source: st
   });
   if (!repoResp.ok) return [];
   const repoJson = (await repoResp.json()) as { default_branch?: string };
-  const branch = repoJson.default_branch || "main";
+  const branch = repoJson.default_branch;
+  if (!branch) return [];
 
-  const branchResp = await fetch(`https://api.github.com/repos/${userSource.githubOwner}/${userSource.githubRepo}/branches/${branch}`, {
+  const branchResp = await fetch(githubBranchApiUrl(userSource.githubOwner, userSource.githubRepo, branch), {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
   });
   if (!branchResp.ok) return [];
@@ -286,21 +328,17 @@ async function listMdFilesViaTrees(env: ReindexEnv, ctx: UserContext, source: st
   const commitSha = branchJson.commit?.sha;
   if (!commitSha) return [];
 
-  const treeResp = await fetch(`https://api.github.com/repos/${userSource.githubOwner}/${userSource.githubRepo}/git/trees/${commitSha}?recursive=1`, {
+  const treeResp = await fetch(`https://api.github.com/repos/${userSource.githubOwner}/${userSource.githubRepo}/git/trees/${encodeURIComponent(commitSha)}?recursive=1`, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
   });
   if (!treeResp.ok) return [];
   const treeJson = (await treeResp.json()) as { tree?: GitHubTreeEntry[]; truncated?: boolean };
   if (!treeJson.tree) return [];
 
-  const prefix = userSource.pathPrefix || "";
   if (treeJson.truncated) {
     console.warn(`listMdFilesViaTrees: tree truncated for ${source} (>100k entries)`);
   }
-  return treeJson.tree
-    .filter((e) => e.type === "blob" && e.path.endsWith(".md") && (!prefix || e.path.startsWith(prefix)))
-    .map((e) => (prefix ? e.path.slice(prefix.length) : e.path))
-    .filter((p) => p.length > 0);
+  return relativeMarkdownPathsFromTree(treeJson.tree, normalizedPrefix);
 }
 
 // --- Reindex jobs: producer + status (faithful port of index.ts:2495-2660) ---

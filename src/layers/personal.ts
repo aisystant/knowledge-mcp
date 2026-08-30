@@ -1,5 +1,5 @@
 // Personal-corpus data layer for the private MCP mode (WP-410 срез-2b).
-// Ported from personal-knowledge-mcp/src/index.ts as-is (faithful port, no behavior change):
+// Ported from personal-knowledge-mcp/src/index.ts, then hardened in this private-mode layer:
 // resolveUserContext, GitHub App JWT signing, writeToGitHub, getInstallationToken.
 //
 // Talks to the personal Neon DB (env.DATABASE_URL) via plain neon() + explicit `WHERE user_id`
@@ -10,6 +10,21 @@
 import { neon } from "@neondatabase/serverless";
 import { getKnowledgeSchema, KNOWLEDGE_TABLES } from "../utils/db.js";
 import { provisionBridgeScopes } from "../scope.js";
+import {
+  githubBlobUrl,
+  githubContentsApiUrl,
+  normalizeRepositoryPath,
+  resolveSourcePath,
+} from "../repository-path.js";
+
+export {
+  encodeGitHubContentsPath,
+  githubBlobUrl,
+  githubBranchApiUrl,
+  githubContentsApiUrl,
+  normalizeRepositoryPath,
+  resolveSourcePath,
+} from "../repository-path.js";
 
 export interface PersonalEnv {
   // Optional at the Env-interface level (only bound when MCP_MODE=private) — required at
@@ -37,6 +52,65 @@ export interface UserContext {
   userId: string | null;
   sources: UserSource[];
   sourceNames: string[];
+}
+
+const MANAGED_KNOWLEDGE_INDEX_OWNER = "tserentserenov";
+const MANAGED_KNOWLEDGE_INDEX_REPO = "ds-knowledge-index-tseren";
+const GIT_BLOB_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+const POST_CHANNEL_FILENAME = /^(?:(?:\d{2}-\d{2})|\d{1,4})-\d{1,2}-(?:club|facebook|linkedin|telegram|tenchat|x|youtube|dzen|habr)-\d{4}-\d{2}-\d{2}\.md$/i;
+
+export const POST_SCAFFOLD_REQUIRED_MESSAGE =
+  "Создание публикации через personal_write заблокировано: номер и канонический путь назначает scripts/new-post.py.";
+export const POST_SCAFFOLD_NEXT_ACTION =
+  "Из корня DS-Knowledge-Index-Tseren запусти `python3 scripts/new-post.py --date YYYY-MM-DD --slug <slug> " +
+  "--title \"<title>\" --channels <channels>`. Если shell или скрипт недоступны, остановись и сообщи о блокере; " +
+  "ASCII/manual fallback и ручное создание файла запрещены.";
+export const EXISTENCE_CHECK_UNAVAILABLE_MESSAGE =
+  "Не удалось надёжно определить, существует ли целевой файл в GitHub; запись остановлена без PUT.";
+export const EXISTENCE_CHECK_NEXT_ACTION =
+  "Повтори personal_write после восстановления проверки GitHub. Для публикации не используй ручной или ASCII fallback.";
+
+export type ManagedPostEvidence = "frontmatter_type_post" | "channel_filename";
+
+export interface PersonalWriteResult {
+  success: boolean;
+  sha?: string;
+  url?: string;
+  error?: string;
+  reason?: "post_scaffold_required" | "existence_check_unavailable" | "version_mismatch" | "invalid_expected_sha" | "github_validation_error";
+  next_action?: string;
+  evidence?: ManagedPostEvidence;
+  current_sha?: string | null;
+}
+
+function frontmatterDeclaresPost(content: string): boolean {
+  const lines = content.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").split("\n");
+  if (lines[0]?.trim() !== "---") return false;
+
+  const closingBoundary = lines.findIndex(
+    (line, index) => index > 0 && (line.trim() === "---" || line.trim() === "..."),
+  );
+  if (closingBoundary === -1) return false;
+
+  return lines
+    .slice(1, closingBoundary)
+    .some(line => /^type\s*:\s*(["']?)post\1\s*(?:#.*)?$/i.test(line.trim()));
+}
+
+/** Return explicit publication evidence, or null for ordinary/service Markdown. */
+export function getManagedKnowledgeIndexPostEvidence(
+  target: Pick<UserSource, "githubOwner" | "githubRepo">,
+  path: string,
+  content: string,
+): ManagedPostEvidence | null {
+  const isManagedRepo = target.githubOwner.toLowerCase() === MANAGED_KNOWLEDGE_INDEX_OWNER
+    && target.githubRepo.toLowerCase() === MANAGED_KNOWLEDGE_INDEX_REPO;
+  const normalizedPath = normalizeRepositoryPath(path);
+  if (!isManagedRepo || !normalizedPath.startsWith("docs/")) return null;
+
+  const filename = normalizedPath.split("/").at(-1) ?? "";
+  if (frontmatterDeclaresPost(content)) return "frontmatter_type_post";
+  return POST_CHANNEL_FILENAME.test(filename) ? "channel_filename" : null;
 }
 
 // Exported for reuse by ./reindex.ts (WP-410 Деплой-2 группа Б) — same personal Neon DB.
@@ -222,6 +296,63 @@ export async function getInstallationToken(env: PersonalEnv, owner: string): Pro
   return tokenData.token;
 }
 
+export interface GitHubApiDependencies {
+  getInstallationToken: typeof getInstallationToken;
+  fetch: typeof globalThis.fetch;
+}
+
+type GitHubFileExistence =
+  | { state: "exists"; sha: string }
+  | { state: "missing" }
+  | { state: "unavailable" };
+
+async function checkGitHubFileExistence(
+  githubFetch: typeof globalThis.fetch,
+  apiUrl: string,
+  token: string,
+): Promise<GitHubFileExistence> {
+  let response: Response;
+  try {
+    response = await githubFetch(apiUrl, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+    });
+  } catch {
+    return { state: "unavailable" };
+  }
+
+  if (response.status === 404) return { state: "missing" };
+  if (!response.ok) return { state: "unavailable" };
+
+  try {
+    const existing = (await response.json()) as { sha?: unknown };
+    if (typeof existing.sha !== "string" || !GIT_BLOB_SHA.test(existing.sha)) {
+      return { state: "unavailable" };
+    }
+    return { state: "exists", sha: existing.sha };
+  } catch {
+    return { state: "unavailable" };
+  }
+}
+
+function postScaffoldRequired(evidence: ManagedPostEvidence): PersonalWriteResult {
+  return {
+    success: false,
+    reason: "post_scaffold_required",
+    evidence,
+    error: POST_SCAFFOLD_REQUIRED_MESSAGE,
+    next_action: POST_SCAFFOLD_NEXT_ACTION,
+  };
+}
+
+function existenceCheckUnavailable(): PersonalWriteResult {
+  return {
+    success: false,
+    reason: "existence_check_unavailable",
+    error: EXISTENCE_CHECK_UNAVAILABLE_MESSAGE,
+    next_action: EXISTENCE_CHECK_NEXT_ACTION,
+  };
+}
+
 /**
  * Write a file to GitHub repo using Installation Token.
  */
@@ -232,28 +363,33 @@ export async function writeToGitHub(
   path: string,
   content: string,
   message: string,
+  dependencies: Partial<GitHubApiDependencies> = {},
   expectedSha?: string,
-): Promise<{ success: boolean; sha?: string; url?: string; error?: string; reason?: string; current_sha?: string | null }> {
+): Promise<PersonalWriteResult> {
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return { success: false, error: `Unknown source: ${source}` };
 
+  let fullPath: string;
+  try {
+    fullPath = resolveSourcePath(userSource.pathPrefix, path).fullPath;
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : "Invalid repository path" };
+  }
+
+  const postEvidence = getManagedKnowledgeIndexPostEvidence(userSource, fullPath, content);
+
   const owner = userSource.githubOwner;
   const repo = userSource.githubRepo;
-  const token = await getInstallationToken(env, owner);
+  const getToken = dependencies.getInstallationToken ?? getInstallationToken;
+  const githubFetch = dependencies.fetch ?? globalThis.fetch;
+  const token = await getToken(env, owner);
   if (!token) return { success: false, error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge` };
 
-  const fullPath = userSource.pathPrefix ? `${userSource.pathPrefix}${path}` : path;
-  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${fullPath}`;
-
-  // Check if file exists (need sha for update)
-  let existingSha: string | undefined;
-  const getResp = await fetch(apiUrl, {
-    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
-  });
-  if (getResp.ok) {
-    const existing = (await getResp.json()) as { sha: string };
-    existingSha = existing.sha;
-  }
+  const apiUrl = githubContentsApiUrl(owner, repo, fullPath);
+  const existence = await checkGitHubFileExistence(githubFetch, apiUrl, token);
+  if (existence.state === "unavailable") return existenceCheckUnavailable();
+  if (existence.state === "missing" && postEvidence) return postScaffoldRequired(postEvidence);
+  const existingSha = existence.state === "exists" ? existence.sha : undefined;
 
   // Optimistic concurrency (WP-7 Ф96 — ported from personal-knowledge-mcp/
   // src/index.ts:writeToGitHub, same worker per Ф94's two-trees finding).
@@ -265,7 +401,7 @@ export async function writeToGitHub(
     // A malformed value ("", truncated hex) is a caller bug, not a concurrent
     // edit — version_mismatch here would send the agent into a pointless
     // reread loop (peer-review finding, verify session 30.08).
-    if (!/^[0-9a-f]{40}$|^[0-9a-f]{64}$/i.test(expectedSha)) {
+    if (!GIT_BLOB_SHA.test(expectedSha)) {
       return { success: false, reason: "invalid_expected_sha", error: "expected_sha должен быть 40-символьным hex sha из get_document(include_sha: true); при создании нового файла параметр не передавай вовсе." };
     }
     // Case-insensitive: GitHub returns lowercase, the schema accepts
@@ -277,7 +413,7 @@ export async function writeToGitHub(
   }
 
   // Create or update file
-  const putResp = await fetch(apiUrl, {
+  const putResp = await githubFetch(apiUrl, {
     method: "PUT",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge", "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -314,20 +450,32 @@ export async function deleteFromGitHub(
   ctx: UserContext,
   source: string,
   path: string,
-  message: string
+  message: string,
+  dependencies: Partial<GitHubApiDependencies> = {},
 ): Promise<{ success: boolean; error?: string }> {
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return { success: false, error: `Unknown source: ${source}` };
 
+  let normalizedPath: string;
+  let fullPath: string;
+  try {
+    const resolvedPath = resolveSourcePath(userSource.pathPrefix, path);
+    normalizedPath = resolvedPath.relativePath;
+    fullPath = resolvedPath.fullPath;
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : "Invalid repository path" };
+  }
+
   const owner = userSource.githubOwner;
   const repo = userSource.githubRepo;
-  const token = await getInstallationToken(env, owner);
+  const getToken = dependencies.getInstallationToken ?? getInstallationToken;
+  const githubFetch = dependencies.fetch ?? globalThis.fetch;
+  const token = await getToken(env, owner);
   if (!token) return { success: false, error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge` };
 
-  const fullPath = userSource.pathPrefix ? `${userSource.pathPrefix}${path}` : path;
-  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${fullPath}`;
+  const apiUrl = githubContentsApiUrl(owner, repo, fullPath);
 
-  const getResp = await fetch(apiUrl, {
+  const getResp = await githubFetch(apiUrl, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
   });
   if (!getResp.ok) {
@@ -335,7 +483,7 @@ export async function deleteFromGitHub(
   }
   const existing = (await getResp.json()) as { sha: string };
 
-  const delResp = await fetch(apiUrl, {
+  const delResp = await githubFetch(apiUrl, {
     method: "DELETE",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge", "Content-Type": "application/json" },
     body: JSON.stringify({ message, sha: existing.sha }),
@@ -352,7 +500,7 @@ export async function deleteFromGitHub(
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
-  await buildDeleteDocumentQuery(sql, documentsTable, source, ctx.userId, path);
+  await buildDeleteDocumentQuery(sql, documentsTable, source, ctx.userId, normalizedPath);
 
   return { success: true };
 }
@@ -383,8 +531,12 @@ function personalGithubUrl(ctx: UserContext, source: string, filename: string): 
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return null;
   const cleanFilename = filename.split("::")[0];
-  const prefix = userSource.pathPrefix ? `${userSource.pathPrefix}/` : "";
-  return `https://github.com/${userSource.githubOwner}/${userSource.githubRepo}/blob/main/${prefix}${cleanFilename}`;
+  try {
+    const fullPath = resolveSourcePath(userSource.pathPrefix, cleanFilename).fullPath;
+    return githubBlobUrl(userSource.githubOwner, userSource.githubRepo, fullPath);
+  } catch {
+    return null;
+  }
 }
 
 // Exported for reuse by ./reindex.ts (WP-410 Деплой-2 группа Б) — same embedding call.
@@ -609,13 +761,22 @@ export async function personalGetDocument(
   filename: string,
   source?: string
 ): Promise<{ filename: string; content: string; source: string; source_type: string; github_url: string | null } | null> {
+  const separatorIndex = filename.indexOf("::");
+  const requestedBaseName = separatorIndex === -1 ? filename : filename.slice(0, separatorIndex);
+  let baseName: string;
+  try {
+    baseName = normalizeRepositoryPath(requestedBaseName);
+  } catch {
+    return null;
+  }
+  const normalizedFilename = separatorIndex === -1 ? baseName : `${baseName}${filename.slice(separatorIndex)}`;
+
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
   const src = source ?? null;
   const sourceNames = ctx.sourceNames;
-  const normalizedFilename = filename.includes("::") ? filename.split("::")[0] : filename;
-  const chunkPrefix = documentChunkPrefix(normalizedFilename);
+  const chunkPrefix = documentChunkPrefix(baseName);
 
   // Ambiguity check runs across BOTH protocol versions together, before any
   // data query — checking only v2 (or only legacy) rows would silently miss
@@ -624,7 +785,7 @@ export async function personalGetDocument(
   if (src === null) {
     const distinctSources = await sql`
       SELECT DISTINCT source FROM ${sql.unsafe(documentsTable)}
-      WHERE (filename = ${normalizedFilename} OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
+      WHERE (filename = ${baseName} OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
         AND user_id = ${ctx.userId} AND source = ANY(${sourceNames})
     `;
     if (distinctSources.length > 1) throw new AmbiguousSourceError(distinctSources.map(r => r.source as string));
@@ -633,7 +794,7 @@ export async function personalGetDocument(
   const v2Rows = await sql`
     SELECT filename, content, source, source_type, chunk_ordinal
     FROM ${sql.unsafe(documentsTable)}
-    WHERE filename = ${normalizedFilename}
+    WHERE filename = ${baseName}
       AND protocol_version = 2
       AND user_id = ${ctx.userId}
       AND source = ANY(${sourceNames})
@@ -655,7 +816,8 @@ export async function personalGetDocument(
   const rows = await sql`
     SELECT filename, content, source, source_type
     FROM ${sql.unsafe(documentsTable)}
-    WHERE (filename = ${normalizedFilename} OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
+    WHERE (filename = ${normalizedFilename}
+           OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
       AND user_id = ${ctx.userId}
       AND source = ANY(${sourceNames})
       AND (${src}::text IS NULL OR source = ${src})

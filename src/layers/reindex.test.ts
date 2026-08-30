@@ -56,17 +56,19 @@ import {
   handleWatchdog,
   getReindexJobStatus,
   startReindexJob,
+  relativeMarkdownPathsFromTree,
   chunkContent,
   contentHash,
   mapWithConcurrency,
   type ReindexEnv,
   type ReindexBatchMessage,
 } from "./reindex.js";
-import { assertIndexablePath } from "./personal.js";
+import { assertIndexablePath, getInstallationToken } from "./personal.js";
 
 beforeEach(() => {
   queryQueue = [];
   sqlCalls = [];
+  vi.mocked(getInstallationToken).mockClear();
 });
 
 const ENV: ReindexEnv = {
@@ -78,8 +80,16 @@ const ENV: ReindexEnv = {
 
 const USER_ID = "11111111-1111-1111-1111-111111111111";
 
-function sourceRow() {
-  return { source: "DS-my-strategy", github_owner: "TserenTserenov", github_repo: "DS-my-strategy", path_prefix: "", source_type: "ds" };
+function sourceRow(pathPrefix: string = "") {
+  return { source: "DS-my-strategy", github_owner: "TserenTserenov", github_repo: "DS-my-strategy", path_prefix: pathPrefix, source_type: "ds" };
+}
+
+function latestSqlCallContaining(fragment: string): unknown[] {
+  const call = [...sqlCalls].reverse().find(([template]) =>
+    (template as TemplateStringsArray).join(" ").includes(fragment)
+  );
+  if (!call) throw new Error(`SQL call containing ${fragment} not found`);
+  return call;
 }
 
 describe("chunkContent", () => {
@@ -180,32 +190,74 @@ describe("personalReindexFiles", () => {
     globalThis.fetch = originalFetch;
   });
 
+  it.each(["a\\b.md", "\\a.md"])("rejects invalid path %s before GitHub fetch", async path => {
+    queryQueue.push([sourceRow()]); // resolveUserContext
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn();
+
+    const result = await personalReindexFiles(ENV, {
+      source: "DS-my-strategy", files: [{ path, action: "modified" }], user_id: USER_ID,
+    });
+
+    expect(result.errors[0]).toContain("must be relative");
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    globalThis.fetch = originalFetch;
+  });
+
   it("deletes on action=removed without reading GitHub", async () => {
     queryQueue.push([sourceRow()]); // resolveUserContext
     queryQueue.push([]); // DELETE result (ignored)
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn();
+    const path = "gone%_file.md";
     const result = await personalReindexFiles(ENV, {
-      source: "DS-my-strategy", files: [{ path: "gone.md", action: "removed" }], user_id: USER_ID,
+      source: "DS-my-strategy", files: [{ path, action: "removed" }], user_id: USER_ID,
     });
     expect(result.deleted).toBe(1);
     expect(globalThis.fetch).not.toHaveBeenCalled();
+    const [template, ...values] = latestSqlCallContaining("DELETE") as [TemplateStringsArray, ...unknown[]];
+    expect(template.join(" ")).not.toContain(" LIKE ");
+    expect(values).toContain(path);
+    expect(values).toContain(`${path}::`);
     globalThis.fetch = originalFetch;
   });
 
-  it("skips a file whose content hash is unchanged and already on v2", async () => {
+  it.each(["vault", "vault/"])("reads an exact encoded URL with pathPrefix %s", async pathPrefix => {
     const hash = await contentHash("unchanged content");
-    queryQueue.push([sourceRow()]); // resolveUserContext
-    queryQueue.push([{ hash, protocol_version: 2 }]); // hash check — matches, already backfilled
+    const path = "docs/cafe\u0301_%#? file.md";
+    queryQueue.push([sourceRow(pathPrefix)]); // resolveUserContext
+    queryQueue.push([{ hash, protocol_version: 2 }]); // hash check — matches, already backfilled (merged Ф94 skip needs v2)
 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn().mockResolvedValueOnce({ ok: true, text: async () => "unchanged content" }); // file content
 
     const result = await personalReindexFiles(ENV, {
-      source: "DS-my-strategy", files: [{ path: "note.md", action: "modified" }], user_id: USER_ID,
+      source: "DS-my-strategy", files: [{ path, action: "modified" }], user_id: USER_ID,
     });
     expect(result.skipped).toBe(1);
     expect(result.processed).toBe(0);
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      "https://api.github.com/repos/TserenTserenov/DS-my-strategy/contents/" +
+      "vault/docs/cafe%CC%81_%25%23%3F%20file.md",
+      expect.objectContaining({ headers: expect.objectContaining({ Accept: "application/vnd.github.raw+json" }) }),
+    );
+    globalThis.fetch = originalFetch;
+  });
+
+  it("rejects an invalid configured prefix before token acquisition or fetch", async () => {
+    queryQueue.push([sourceRow("../outside")]); // resolveUserContext
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn();
+
+    const result = await personalReindexFiles(ENV, {
+      source: "DS-my-strategy",
+      files: [{ path: "note.md", action: "modified" }],
+      user_id: USER_ID,
+    });
+
+    expect(result.errors[0]).toContain("escape the repository root");
+    expect(getInstallationToken).not.toHaveBeenCalled();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
     globalThis.fetch = originalFetch;
   });
 
@@ -228,6 +280,7 @@ describe("personalReindexFiles", () => {
   });
 
   it("processes a changed file: reads GitHub, embeds, and inserts", async () => {
+    const path = "note%_file.md";
     queryQueue.push([sourceRow()]); // resolveUserContext
     queryQueue.push([{ hash: "0000000000000000" }]); // hash check — different, proceed
     queryQueue.push([]); // DELETE old chunks
@@ -239,11 +292,28 @@ describe("personalReindexFiles", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [{ embedding: [0.1, 0.2, 0.3] }] }) }); // embedding
 
     const result = await personalReindexFiles(ENV, {
-      source: "DS-my-strategy", files: [{ path: "note.md", action: "modified" }], user_id: USER_ID,
+      source: "DS-my-strategy", files: [{ path, action: "modified" }], user_id: USER_ID,
     });
     expect(result.processed).toBe(1);
     expect(result.errors).toEqual([]);
+    const [template, ...values] = latestSqlCallContaining("DELETE") as [TemplateStringsArray, ...unknown[]];
+    expect(template.join(" ")).not.toContain(" LIKE ");
+    expect(values).toContain(path);
+    expect(values).toContain(`${path}::`);
     globalThis.fetch = originalFetch;
+  });
+});
+
+describe("relativeMarkdownPathsFromTree", () => {
+  const tree = [
+    { path: "docs/a.md", mode: "100644", type: "blob" as const, sha: "a" },
+    { path: "docs/deep/b.md", mode: "100644", type: "blob" as const, sha: "b" },
+    { path: "docs2/bypass.md", mode: "100644", type: "blob" as const, sha: "c" },
+    { path: "docs/image.png", mode: "100644", type: "blob" as const, sha: "d" },
+  ];
+
+  it.each(["docs", "docs/"])("uses a segment boundary for prefix %s", pathPrefix => {
+    expect(relativeMarkdownPathsFromTree(tree, pathPrefix)).toEqual(["a.md", "deep/b.md"]);
   });
 });
 
@@ -278,6 +348,97 @@ describe("startReindexJob", () => {
     const result = await startReindexJob(ENV, USER_ID, "DS-my-strategy"); // ENV has no REINDEX_QUEUE
     expect(result.status).toBe("failed");
     expect(result.message).toContain("REINDEX_QUEUE binding missing");
+  });
+
+  it("looks up and segment-encodes the repository default branch before reading its tree", async () => {
+    queryQueue.push([]); // no recent job
+    queryQueue.push([{ id: "job-branch" }]); // INSERT reindex job
+    queryQueue.push([sourceRow("docs/")]); // resolveUserContext
+    queryQueue.push([]); // UPDATE running
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ default_branch: "feature/a" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ commit: { sha: "a".repeat(40) } }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          tree: [
+            { path: "docs/note.md", mode: "100644", type: "blob", sha: "b".repeat(40) },
+            { path: "docs2/bypass.md", mode: "100644", type: "blob", sha: "c".repeat(40) },
+          ],
+        }),
+      });
+    const sendBatch = vi.fn().mockResolvedValue(undefined);
+    const env = {
+      ...ENV,
+      REINDEX_QUEUE: { sendBatch } as unknown as Queue<ReindexBatchMessage>,
+    };
+
+    const result = await startReindexJob(env, USER_ID, "DS-my-strategy");
+
+    expect(result.status).toBe("running");
+    expect(globalThis.fetch).toHaveBeenNthCalledWith(
+      2,
+      "https://api.github.com/repos/TserenTserenov/DS-my-strategy/branches/feature%2Fa",
+      expect.any(Object),
+    );
+    expect(globalThis.fetch).toHaveBeenNthCalledWith(
+      3,
+      `https://api.github.com/repos/TserenTserenov/DS-my-strategy/git/trees/${"a".repeat(40)}?recursive=1`,
+      expect.any(Object),
+    );
+    expect(sendBatch).toHaveBeenCalledWith([
+      expect.objectContaining({ body: expect.objectContaining({ files: [{ path: "note.md", action: "modified" }] }) }),
+    ]);
+    globalThis.fetch = originalFetch;
+  });
+
+  it("stops tree lookup when repository metadata has no default branch", async () => {
+    queryQueue.push([]); // no recent job
+    queryQueue.push([{ id: "job-no-default" }]); // INSERT reindex job
+    queryQueue.push([sourceRow("docs")]); // resolveUserContext
+    queryQueue.push([]); // UPDATE running
+    queryQueue.push([]); // UPDATE succeeded for zero files
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({}) });
+    const sendBatch = vi.fn();
+    const env = {
+      ...ENV,
+      REINDEX_QUEUE: { sendBatch } as unknown as Queue<ReindexBatchMessage>,
+    };
+
+    const result = await startReindexJob(env, USER_ID, "DS-my-strategy");
+
+    expect(result.message).toContain("No files");
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    expect(sendBatch).not.toHaveBeenCalled();
+    globalThis.fetch = originalFetch;
+  });
+
+  it("rejects an invalid tree prefix before token acquisition or GitHub fetch", async () => {
+    queryQueue.push([]); // no recent job
+    queryQueue.push([{ id: "job-invalid-prefix" }]); // INSERT reindex job
+    queryQueue.push([sourceRow("../outside")]); // resolveUserContext
+    queryQueue.push([]); // UPDATE running with zero files
+    queryQueue.push([]); // UPDATE succeeded
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn();
+    const sendBatch = vi.fn();
+    const env = {
+      ...ENV,
+      REINDEX_QUEUE: { sendBatch } as unknown as Queue<ReindexBatchMessage>,
+    };
+
+    const result = await startReindexJob(env, USER_ID, "DS-my-strategy");
+
+    expect(result.message).toContain("No files");
+    expect(getInstallationToken).not.toHaveBeenCalled();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(sendBatch).not.toHaveBeenCalled();
+    globalThis.fetch = originalFetch;
   });
 });
 

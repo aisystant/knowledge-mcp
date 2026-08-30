@@ -8,6 +8,9 @@
  */
 
 import { neon } from "@neondatabase/serverless";
+import { normalizeRepositoryPath } from "./repository-path.js";
+
+export { normalizeRepositoryPath as normalizePath } from "./repository-path.js";
 
 /** neon() tagged-template client (HTTP driver). Returns rows array directly. */
 type NeonSql = ReturnType<typeof neon>;
@@ -21,6 +24,8 @@ export const BRIDGE_WRITE_TOOLS = new Set<string>([
 const PEER_PILOT_AGENT_ID = "pilot-helper-in-environment";
 const PEER_PILOT_ALLOWED_SOURCE = "personal-guide";
 const PEER_PILOT_ALLOWED_PATH_PREFIX = "lesson/";
+const PEER_PILOT_ALLOWED_PATHS = ["docs/**", "inbox/**", "**/*.md"] as const;
+const PEER_PILOT_ALLOWED_OPERATIONS = ["write", "propose"] as const;
 
 const TOOL_OPERATION_MAP: Record<string, string> = {
   personal_write: "write",
@@ -103,19 +108,22 @@ interface BridgeScopeRow {
   taint_level: number;
 }
 
-export function normalizePath(input: string): string {
-  let path = input.replace(/\\/g, "/");
-  path = path.replace(/\/+/g, "/");
-  path = path.replace(/^\/+/, "");
-  const segments: string[] = [];
-  for (const seg of path.split("/")) {
-    if (seg === "..") {
-      segments.pop();
-    } else if (seg && seg !== ".") {
-      segments.push(seg);
-    }
-  }
-  return segments.join("/");
+interface StoredBridgeScopeRow {
+  allowed_repos: string[] | null;
+  allowed_paths: string[] | null;
+  allowed_operations: string[] | null;
+  taint_level: number;
+  revoked_at: string | null;
+  expires_at: string | null;
+}
+
+function activeBridgeScope(row: StoredBridgeScopeRow): BridgeScopeRow {
+  return {
+    allowed_repos: row.allowed_repos ?? [],
+    allowed_paths: row.allowed_paths ?? [],
+    allowed_operations: row.allowed_operations ?? [],
+    taint_level: row.taint_level,
+  };
 }
 
 export function hasDotfileSegment(normalizedPath: string): boolean {
@@ -123,7 +131,7 @@ export function hasDotfileSegment(normalizedPath: string): boolean {
 }
 
 export function matchesGlob(path: string, pattern: string): boolean {
-  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
   const PDS = "\x00DSS\x00";
   const PD = "\x00DS\x00";
   const PS = "\x00SS\x00";
@@ -181,6 +189,16 @@ export async function checkBridgeWriteScope(opts: {
 
   const expectedAgentId = `iwe_bridge:${toolName}`;
   let agentId = declaredAgentId ?? expectedAgentId;
+  let safePath: string | undefined;
+  try {
+    safePath = requiresPath
+      ? normalizeRepositoryPath(path ?? "")
+      : path !== undefined ? normalizeRepositoryPath(path) : undefined;
+  } catch {
+    // Request syntax is rejected before scope lookup or audit writes. No stateful enforcement
+    // work should run for a path that cannot identify one repository object unambiguously.
+    return deny("scope denied: path must be a safe repository-relative path", "path_not_allowed", toolName, source);
+  }
   let isPeerPilotFallback = false;
   let isOwnDataWiden = false;
   let isContinuationDefault = false;
@@ -188,12 +206,6 @@ export async function checkBridgeWriteScope(opts: {
   if (requireDeclaredAgentId && (!declaredAgentId || declaredAgentId.length === 0)) {
     isPeerPilotFallback = true;
     agentId = PEER_PILOT_AGENT_ID;
-
-    if (requiresPath && !path) {
-      await tryInsertViolation({ indicatorsSql, agentId, userId, reason: "path_not_allowed", attemptedTool: toolName, attemptedRepo: source, requestId });
-      return deny("scope denied: path required for peer-pilot helper", "path_not_allowed", toolName);
-    }
-    const safePath = path ? normalizePath(path) : undefined;
 
     if (safePath && hasDotfileSegment(safePath)) {
       await tryInsertViolation({ indicatorsSql, agentId, userId, reason: "path_not_allowed", attemptedTool: toolName, attemptedRepo: source, attemptedPath: safePath, requestId });
@@ -237,45 +249,10 @@ export async function checkBridgeWriteScope(opts: {
       WHERE scope_kind = 'bridge'
         AND agent_id = ${agentId}
         AND user_id = ${userId}::uuid
-    `) as Array<{
-      allowed_repos: string[] | null;
-      allowed_paths: string[] | null;
-      allowed_operations: string[] | null;
-      taint_level: number;
-      revoked_at: string | null;
-      expires_at: string | null;
-    }>;
+    `) as StoredBridgeScopeRow[];
 
     if (rows.length === 0) {
-      // Self-heal (WP-410 Pre-Close checklist, session 2026-07-03-18 — restores commit 051edf7,
-      // dropped when this file was ported from personal-knowledge-mcp/src/scope.ts before that
-      // fix landed there). The caller already proved ownership to reach here — own-data-widen
-      // (source is one of their real active/connected sources) or the known-safe continuation-
-      // default path — but no fallback row has ever been provisioned for them (e.g. their source
-      // was connected before this fallback identity existed). Provision now instead of denying
-      // forever; mirrors connect_source's own idempotent upsert.
-      if (isPeerPilotFallback && (isOwnDataWiden || isContinuationDefault) && source) {
-        try {
-          await provisionBridgeScopes(indicatorsSql, userId, source);
-          scopeRow = {
-            allowed_repos: [source],
-            allowed_paths: ["docs/**", "inbox/**", "**/*.md"],
-            allowed_operations: ["write", "propose"],
-            taint_level: 0,
-          };
-        } catch (err) {
-          console.error(JSON.stringify({
-            phase: "peer_pilot_self_heal_failed",
-            severity: "error",
-            user_id_prefix: userId.slice(0, 8),
-            source,
-            error: err instanceof Error ? err.message : String(err),
-          }));
-          denyReason = "scope_not_found";
-        }
-      } else {
-        denyReason = "scope_not_found";
-      }
+      denyReason = "scope_not_found";
     } else {
       const row = rows[0];
       if (row.revoked_at !== null) {
@@ -283,16 +260,37 @@ export async function checkBridgeWriteScope(opts: {
       } else if (row.expires_at !== null && new Date(row.expires_at).getTime() <= Date.now()) {
         denyReason = "scope_expired";
       } else {
-        scopeRow = {
-          allowed_repos: row.allowed_repos ?? [],
-          allowed_paths: row.allowed_paths ?? [],
-          allowed_operations: row.allowed_operations ?? [],
-          taint_level: row.taint_level,
-        };
+        scopeRow = activeBridgeScope(row);
       }
     }
   } catch {
     return deny("scope denied: indicators DB error", "indicators_db_unavailable", toolName);
+  }
+
+  if (
+    denyReason === "scope_not_found"
+    && isPeerPilotFallback
+    && (isOwnDataWiden || isContinuationDefault)
+    && source
+  ) {
+    // A missing-agent fallback can repair only its own row, and only after the active-source
+    // ownership check above. Explicit connect remains the sole path allowed to restore all
+    // bridge identities or clear a revocation.
+    try {
+      const repairedScope = await provisionPeerPilotScope(indicatorsSql, userId, source);
+      if (repairedScope) {
+        scopeRow = repairedScope;
+        denyReason = null;
+      }
+    } catch (err) {
+      console.error(JSON.stringify({
+        phase: "peer_pilot_self_heal_failed",
+        severity: "error",
+        user_id_prefix: userId.slice(0, 8),
+        source,
+        error: err instanceof Error ? err.message : String(err),
+      }));
+    }
   }
 
   if (denyReason !== null || scopeRow === null) {
@@ -302,7 +300,7 @@ export async function checkBridgeWriteScope(opts: {
     // leaving scope_not_found/scope_revoked/scope_expired violations impossible to diagnose from
     // agent_scope_violations alone (source/path always came back empty regardless of what was
     // actually attempted).
-    await tryInsertViolation({ indicatorsSql, agentId, userId, reason, attemptedTool: toolName, attemptedRepo: source, attemptedPath: path ? normalizePath(path) : undefined, requestId });
+    await tryInsertViolation({ indicatorsSql, agentId, userId, reason, attemptedTool: toolName, attemptedRepo: source, attemptedPath: safePath, requestId });
     return deny(`scope denied: ${reason}`, reason, toolName);
   }
 
@@ -311,8 +309,6 @@ export async function checkBridgeWriteScope(opts: {
     await tryInsertViolation({ indicatorsSql, agentId, userId, reason: "operation_not_allowed", attemptedTool: toolName, requestId });
     return deny(`scope denied: operation '${operation}' not in allowed_operations`, "operation_not_allowed", toolName);
   }
-
-  const safePath = path ? normalizePath(path) : undefined;
 
   if (!isOwnDataWiden && source && !scopeRow.allowed_repos.includes(source)) {
     await tryInsertViolation({ indicatorsSql, agentId, userId, reason: "source_not_allowed", attemptedTool: toolName, attemptedRepo: source, requestId });
@@ -363,6 +359,36 @@ interface InsertViolationOpts {
   attemptedRepo?: string;
   attemptedPath?: string;
   requestId?: string;
+}
+
+/**
+ * Repair only the peer-pilot row after ownership has been proven. A revoked or expired row is
+ * deliberately not revived: its conditional conflict update returns no row and the caller denies.
+ */
+async function provisionPeerPilotScope(
+  indicatorsSql: NeonSql,
+  userId: string,
+  source: string,
+): Promise<BridgeScopeRow | null> {
+  const allowedRepos = [source];
+  const allowedPaths = [...PEER_PILOT_ALLOWED_PATHS];
+  const allowedOperations = [...PEER_PILOT_ALLOWED_OPERATIONS];
+  const rows = (await indicatorsSql`
+    INSERT INTO agent_scopes_mvp
+      (scope_kind, agent_id, user_id, allowed_repos, allowed_paths, allowed_operations, granted_by)
+    VALUES
+      ('bridge', ${PEER_PILOT_AGENT_ID},
+       ${userId}::uuid, ${allowedRepos}::text[], ${allowedPaths}::text[], ${allowedOperations}::text[], 'bridge_install')
+    ON CONFLICT (agent_id, user_id) DO UPDATE SET
+      allowed_repos = ARRAY(SELECT DISTINCT unnest(agent_scopes_mvp.allowed_repos || EXCLUDED.allowed_repos)),
+      allowed_paths = EXCLUDED.allowed_paths,
+      allowed_operations = EXCLUDED.allowed_operations
+    WHERE agent_scopes_mvp.revoked_at IS NULL
+      AND (agent_scopes_mvp.expires_at IS NULL OR agent_scopes_mvp.expires_at > NOW())
+    RETURNING allowed_repos, allowed_paths, allowed_operations, taint_level, revoked_at, expires_at
+  `) as StoredBridgeScopeRow[];
+
+  return rows.length > 0 ? activeBridgeScope(rows[0]) : null;
 }
 
 async function tryInsertViolation(opts: InsertViolationOpts): Promise<void> {
