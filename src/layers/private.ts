@@ -43,6 +43,12 @@ export const PRIVATE_TOOL_NAMES: ReadonlySet<string> = new Set([
   // dispatched name would collide after the gateway's strip (see index.ts comment on "reindex").
   "reindex",
   "reindex_status",
+  // WP-7 Ф97.2: per-file indexing status (personal_index_status). Data layer
+  // (buildIndexStatusSuccessQuery/writeIndexStatusError) lives in personal.ts;
+  // the actual tools/list + dispatch entry is only wired in personal-knowledge-mcp's
+  // src/index.ts so far — gateway-mcp routing for the private-mode path through
+  // this worker is a known remainder, not yet done in this pass.
+  "index_status",
 ]);
 
 /**

@@ -73,6 +73,8 @@ export const KNOWLEDGE_TABLES = {
   // WP-410 срез-2b: legacy per-user table (personal-knowledge-mcp), predates the WP-268
   // knowledge_chunk migration — never migrated because it only ever held personal notes.
   documents: (schema: string) => qualifyTable("documents", schema),
+  // WP-7 Ф97.2 (migration 021): per-file indexing status, queried by personal_index_status.
+  file_index_status: (schema: string) => qualifyTable("file_index_status", schema),
 };
 
 /**

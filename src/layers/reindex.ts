@@ -21,6 +21,9 @@ import {
   documentChunkPrefix,
   assertIndexablePath,
   buildDeleteDocumentQuery,
+  buildIndexStatusSuccessQuery,
+  buildDeleteIndexStatusQuery,
+  writeIndexStatusError,
   type PersonalEnv,
   type UserContext,
 } from "./personal.js";
@@ -171,6 +174,7 @@ export async function personalReindexFiles(
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+  const statusTable = KNOWLEDGE_TABLES.file_index_status(schema);
   const result = { processed: 0, deleted: 0, skipped: 0, errors: [] as string[], error_details: [] as ReindexErrorDetail[] };
 
   if (!req.user_id) {
@@ -210,22 +214,38 @@ export async function personalReindexFiles(
 
     try {
       if (file.action === "removed") {
-        await buildDeleteDocumentQuery(sql, documentsTable, req.source, ctx.userId, normalizedPath);
+        // Delete document rows and status row together — a status left behind
+        // after its document is gone would report 'indexed' on a file that no
+        // longer exists (WP-7 Ф97.2, Codex round 1 finding).
+        await sql.transaction([
+          buildDeleteDocumentQuery(sql, documentsTable, req.source, ctx.userId, normalizedPath),
+          buildDeleteIndexStatusQuery(sql, statusTable, req.source, ctx.userId, normalizedPath),
+        ]);
         result.deleted++;
         continue;
       }
 
       assertIndexablePath(normalizedPath);
 
+      // WP-7 Ф97.2 cold review: readFromGitHub returns null on failure but ""
+      // on a genuinely empty (0-byte) file — `!content` treated both the same,
+      // which used to only pollute a throwaway errors[] entry but now would
+      // durably (and wrongly) mark a successfully-read empty file as 'error'
+      // in file_index_status. Only null is a real read failure.
       const content = await readFromGitHub(env, ctx, req.source, normalizedPath);
-      if (!content) {
+      if (content === null) {
         result.errors.push(`Cannot read ${normalizedPath} from GitHub`);
         result.error_details.push({ path: normalizedPath, action: file.action, reason: "cannot read from GitHub" });
+        await writeIndexStatusError(sql, statusTable, req.source, ctx.userId, normalizedPath, "cannot read from GitHub");
         continue;
       }
 
       if (content.length > MAX_FILE_SIZE) {
         result.skipped++;
+        // Unlike the hash-match skip below, this file will never become
+        // searchable as-is — the user needs to see that, not just silence
+        // (WP-7 Ф97.2: this is the gap the phase exists to close).
+        await writeIndexStatusError(sql, statusTable, req.source, ctx.userId, normalizedPath, `file exceeds max size (${MAX_FILE_SIZE} bytes), skipped from indexing`);
         continue;
       }
 
@@ -243,6 +263,11 @@ export async function personalReindexFiles(
       `;
       if (existing.length > 0 && existing[0].hash === hash && existing[0].protocol_version === 2) {
         result.skipped++;
+        // Already indexed at this exact content version — confirm it in
+        // status too, or a retry after a partial batch failure would leave
+        // this file's status permanently unset even though it IS searchable
+        // (WP-7 Ф97.2, round 1 consensus point 3).
+        await buildIndexStatusSuccessQuery(sql, statusTable, req.source, ctx.userId, normalizedPath, hash);
         continue;
       }
 
@@ -250,9 +275,11 @@ export async function personalReindexFiles(
       const sourceType = ctx.sources.find((s) => s.source === req.source)?.sourceType || "ds";
       const embeddings = await mapWithConcurrency(chunks, 4, c => personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", c.slice(0, 8000)));
 
-      // Delete old chunks (both protocol versions) and insert the new v2 set as
-      // one transaction — a mid-write crash can never leave a partial document
-      // visible to readers (WP-7 Ф94).
+      // Delete old chunks (both protocol versions), insert the new v2 set, and
+      // upsert the success status as ONE transaction — a mid-write crash can
+      // never leave a partial document visible to readers (WP-7 Ф94), and can
+      // never leave new chunks committed without a matching status update
+      // (WP-7 Ф97.2, this is what closes the split-transaction race).
       await sql.transaction([
         buildDeleteDocumentQuery(sql, documentsTable, req.source, ctx.userId, normalizedPath),
         ...chunks.map((c, i) => sql`
@@ -263,12 +290,15 @@ export async function personalReindexFiles(
             ${`[${embeddings[i].join(",")}]`}::vector, to_tsvector('simple', ${c}), ${ctx.userId}, ${i + 1}, 2
           )
         `),
+        buildIndexStatusSuccessQuery(sql, statusTable, req.source, ctx.userId, normalizedPath, hash),
       ]);
 
       result.processed++;
     } catch (err) {
-      result.errors.push(`${file.path}: ${err instanceof Error ? err.message : "unknown error"}`);
-      result.error_details.push({ path: file.path, action: file.action, reason: err instanceof Error ? err.message : "unknown error" });
+      const reason = err instanceof Error ? err.message : "unknown error";
+      result.errors.push(`${file.path}: ${reason}`);
+      result.error_details.push({ path: file.path, action: file.action, reason });
+      await writeIndexStatusError(sql, statusTable, req.source, ctx.userId, normalizedPath, reason).catch(() => {});
     }
   }
 

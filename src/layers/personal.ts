@@ -162,6 +162,73 @@ export function buildDeleteDocumentQuery(
   return sql`DELETE FROM ${sql.unsafe(documentsTable)} WHERE source = ${source} AND user_id = ${userId} AND (filename = ${filename} OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})`;
 }
 
+/** Max stored length of `last_index_error` — same truncation discipline as the
+ * error samples surfaced elsewhere (WP-7 Ф98 alert samples, retry-after cap). */
+const MAX_STORED_ERROR_LENGTH = 500;
+
+/** Un-awaited success upsert for `file_index_status` (WP-7 Ф97.2). Reusable
+ * directly inside `sql.transaction([...])` alongside the chunk delete/insert —
+ * this is what closes the chunks/status split-transaction race (peer-session
+ * 2026-08-30-18, round 1): a mid-write crash rolls back both together.
+ * `indexed_at`/`content_hash` always reflect the latest SUCCESSFUL index;
+ * `last_index_error` is cleared on success. */
+export function buildIndexStatusSuccessQuery(
+  sql: PersonalSql,
+  statusTable: string,
+  source: string,
+  userId: string,
+  filename: string,
+  contentHash: string,
+) {
+  return sql`
+    INSERT INTO ${sql.unsafe(statusTable)}
+      (user_id, source, filename, status, indexed_at, last_index_error, content_hash, updated_at)
+    VALUES (${userId}, ${source}, ${filename}, 'indexed', NOW(), NULL, ${contentHash}, NOW())
+    ON CONFLICT (user_id, source, filename) DO UPDATE SET
+      status = 'indexed', indexed_at = NOW(), last_index_error = NULL,
+      content_hash = ${contentHash}, updated_at = NOW()
+  `;
+}
+
+/** Error upsert for `file_index_status` — deliberately does NOT touch
+ * `indexed_at`/`content_hash`: a failed retry on a file that was previously
+ * indexed successfully must keep reporting the last-good version as findable,
+ * not silently revert it to "never indexed" (peer-session 2026-08-30-18,
+ * Codex round 1). Called outside the chunk transaction (the transaction
+ * already rolled back by the time an error branch runs), so this is its own
+ * statement, not part of the array passed to `sql.transaction([...])`. */
+export async function writeIndexStatusError(
+  sql: PersonalSql,
+  statusTable: string,
+  source: string,
+  userId: string,
+  filename: string,
+  reason: string,
+): Promise<void> {
+  const truncated = reason.slice(0, MAX_STORED_ERROR_LENGTH);
+  await sql`
+    INSERT INTO ${sql.unsafe(statusTable)}
+      (user_id, source, filename, status, last_index_error, updated_at)
+    VALUES (${userId}, ${source}, ${filename}, 'error', ${truncated}, NOW())
+    ON CONFLICT (user_id, source, filename) DO UPDATE SET
+      status = 'error', last_index_error = ${truncated}, updated_at = NOW()
+  `;
+}
+
+/** Un-awaited DELETE for `file_index_status` — pair with `buildDeleteDocumentQuery`
+ * inside the same `sql.transaction([...])` on a `removed` action, so a file's
+ * status row never survives its own document rows (WP-7 Ф97.2, Codex round 1
+ * finding: without this the status stayed 'indexed' forever after deletion). */
+export function buildDeleteIndexStatusQuery(
+  sql: PersonalSql,
+  statusTable: string,
+  source: string,
+  userId: string,
+  filename: string,
+) {
+  return sql`DELETE FROM ${sql.unsafe(statusTable)} WHERE user_id = ${userId} AND source = ${source} AND filename = ${filename}`;
+}
+
 /** Thrown when `filename` matches an indexed document in 2+ connected sources and
  * `source` wasn't given (WP-7 Ф94, same contract as personal-knowledge-mcp). */
 export class AmbiguousSourceError extends Error {

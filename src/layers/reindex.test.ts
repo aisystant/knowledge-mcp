@@ -92,6 +92,20 @@ function latestSqlCallContaining(fragment: string): unknown[] {
   return call;
 }
 
+/** Like latestSqlCallContaining, but disambiguates between the two DELETE
+ * statements a `removed` action now issues (WP-7 Ф97.2): documents and
+ * file_index_status share the "DELETE" fragment, so this also matches on
+ * the qualified table name (the mock's `sql.unsafe` passes it through as
+ * the call's first value, verbatim). */
+function latestSqlCallContainingForTable(fragment: string, tableFragment: string): unknown[] {
+  const call = [...sqlCalls].reverse().find(([template, ...values]) =>
+    (template as TemplateStringsArray).join(" ").includes(fragment) &&
+    values.some(v => typeof v === "string" && v.includes(tableFragment))
+  );
+  if (!call) throw new Error(`SQL call containing ${fragment} for table ${tableFragment} not found`);
+  return call;
+}
+
 describe("chunkContent", () => {
   it("returns a single chunk for short content, regardless of headers", () => {
     const content = "intro\n## Раздел А\nбыло";
@@ -210,7 +224,8 @@ describe("personalReindexFiles", () => {
 
   it("deletes on action=removed without reading GitHub", async () => {
     queryQueue.push([sourceRow()]); // resolveUserContext
-    queryQueue.push([]); // DELETE result (ignored)
+    queryQueue.push([]); // DELETE documents result (ignored)
+    queryQueue.push([]); // DELETE file_index_status result (ignored) — WP-7 Ф97.2
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn();
     const path = "gone%_file.md";
@@ -219,10 +234,16 @@ describe("personalReindexFiles", () => {
     });
     expect(result.deleted).toBe(1);
     expect(globalThis.fetch).not.toHaveBeenCalled();
-    const [template, ...values] = latestSqlCallContaining("DELETE") as [TemplateStringsArray, ...unknown[]];
-    expect(template.join(" ")).not.toContain(" LIKE ");
-    expect(values).toContain(path);
-    expect(values).toContain(`${path}::`);
+    const [docTemplate, ...docValues] = latestSqlCallContainingForTable("DELETE", "knowledge.documents") as [TemplateStringsArray, ...unknown[]];
+    expect(docTemplate.join(" ")).not.toContain(" LIKE ");
+    expect(docValues).toContain(path);
+    expect(docValues).toContain(`${path}::`);
+    // WP-7 Ф97.2: the removed action must also delete the status row, in the
+    // same transaction — otherwise a deleted file keeps reporting 'indexed'.
+    const [, ...statusValues] = latestSqlCallContainingForTable("DELETE", "knowledge.file_index_status") as [TemplateStringsArray, ...unknown[]];
+    expect(statusValues).toContain(USER_ID);
+    expect(statusValues).toContain("DS-my-strategy");
+    expect(statusValues).toContain(path);
     globalThis.fetch = originalFetch;
   });
 
@@ -289,6 +310,7 @@ describe("personalReindexFiles", () => {
     queryQueue.push([{ hash: "0000000000000000" }]); // hash check — different, proceed
     queryQueue.push([]); // DELETE old chunks
     queryQueue.push([]); // INSERT result (ignored)
+    queryQueue.push([]); // UPSERT file_index_status success (ignored) — WP-7 Ф97.2
 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn()
@@ -304,6 +326,12 @@ describe("personalReindexFiles", () => {
     expect(template.join(" ")).not.toContain(" LIKE ");
     expect(values).toContain(path);
     expect(values).toContain(`${path}::`);
+    // WP-7 Ф97.2: the success status upsert must be part of the SAME
+    // transaction array as the chunk delete/insert (closes the split-
+    // transaction race — peer-session 2026-08-30-18, round 1).
+    const [statusTemplate, ...statusValues] = latestSqlCallContainingForTable("INSERT", "knowledge.file_index_status") as [TemplateStringsArray, ...unknown[]];
+    expect(statusTemplate.join(" ")).toContain("'indexed'");
+    expect(statusValues).toContain(path);
     globalThis.fetch = originalFetch;
   });
 });
