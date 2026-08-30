@@ -77,9 +77,10 @@ export interface PersonalWriteResult {
   sha?: string;
   url?: string;
   error?: string;
-  reason?: "post_scaffold_required" | "existence_check_unavailable";
+  reason?: "post_scaffold_required" | "existence_check_unavailable" | "version_mismatch" | "invalid_expected_sha" | "github_validation_error";
   next_action?: string;
   evidence?: ManagedPostEvidence;
+  current_sha?: string | null;
 }
 
 function frontmatterDeclaresPost(content: string): boolean {
@@ -118,6 +119,44 @@ export function personalDb(env: PersonalEnv) {
     throw new Error("DATABASE_URL is required for private-mode personal data access");
   }
   return neon(env.DATABASE_URL);
+}
+
+type PersonalSql = ReturnType<typeof personalDb>;
+
+/** Literal chunk-key prefix — `%`/`_` in `path` stay literal (WP-7 Ф94, faithful
+ * port of personal-knowledge-mcp/src/index.ts:documentChunkPrefix). */
+export function documentChunkPrefix(path: string): string {
+  return `${path}::`;
+}
+
+/** A canonical path can't be indexed if it contains "::" — reserved as the legacy
+ * (protocol_version=1) chunk-key separator (WP-7 Ф94). */
+export function assertIndexablePath(path: string): void {
+  if (path.includes("::")) {
+    throw new Error(`path contains reserved chunk separator "::": ${path}`);
+  }
+}
+
+/** Un-awaited DELETE query (exact filename + literal chunk prefix), reusable
+ * directly inside sql.transaction([...]) — same shape as
+ * personal-knowledge-mcp/src/index.ts:buildDeleteDocumentQuery. */
+export function buildDeleteDocumentQuery(
+  sql: PersonalSql,
+  documentsTable: string,
+  source: string,
+  userId: string,
+  filename: string,
+) {
+  const chunkPrefix = documentChunkPrefix(filename);
+  return sql`DELETE FROM ${sql.unsafe(documentsTable)} WHERE source = ${source} AND user_id = ${userId} AND (filename = ${filename} OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})`;
+}
+
+/** Thrown when `filename` matches an indexed document in 2+ connected sources and
+ * `source` wasn't given (WP-7 Ф94, same contract as personal-knowledge-mcp). */
+export class AmbiguousSourceError extends Error {
+  constructor(public readonly sources: string[]) {
+    super(`filename exists in multiple sources: ${sources.join(", ")}`);
+  }
 }
 
 export async function resolveUserContext(env: PersonalEnv, userId: string | null): Promise<UserContext> {
@@ -325,6 +364,7 @@ export async function writeToGitHub(
   content: string,
   message: string,
   dependencies: Partial<GitHubApiDependencies> = {},
+  expectedSha?: string,
 ): Promise<PersonalWriteResult> {
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return { success: false, error: `Unknown source: ${source}` };
@@ -351,6 +391,27 @@ export async function writeToGitHub(
   if (existence.state === "missing" && postEvidence) return postScaffoldRequired(postEvidence);
   const existingSha = existence.state === "exists" ? existence.sha : undefined;
 
+  // Optimistic concurrency (WP-7 Ф96 — ported from personal-knowledge-mcp/
+  // src/index.ts:writeToGitHub, same worker per Ф94's two-trees finding).
+  // expectedSha comes from a prior personalGetDocument(includeSha: true)
+  // call; checked here, before the PUT below, so a caller editing a version
+  // someone else already replaced gets version_mismatch instead of silently
+  // overwriting it.
+  if (expectedSha !== undefined) {
+    // A malformed value ("", truncated hex) is a caller bug, not a concurrent
+    // edit — version_mismatch here would send the agent into a pointless
+    // reread loop (peer-review finding, verify session 30.08).
+    if (!GIT_BLOB_SHA.test(expectedSha)) {
+      return { success: false, reason: "invalid_expected_sha", error: "expected_sha должен быть 40-символьным hex sha из get_document(include_sha: true); при создании нового файла параметр не передавай вовсе." };
+    }
+    // Case-insensitive: GitHub returns lowercase, the schema accepts
+    // uppercase hex — a case-only difference is the same version, not a
+    // concurrent edit (peer-review round 2, 30.08).
+    if (existingSha?.toLowerCase() !== expectedSha.toLowerCase()) {
+      return { success: false, reason: "version_mismatch", current_sha: existingSha ?? null, error: "Файл изменился с момента чтения — перечитай personal_get_document(includeSha: true) и повтори запись." };
+    }
+  }
+
   // Create or update file
   const putResp = await githubFetch(apiUrl, {
     method: "PUT",
@@ -364,6 +425,15 @@ export async function writeToGitHub(
 
   if (!putResp.ok) {
     const err = await putResp.text();
+    // 409 (or a 422 whose message names the sha) = a concurrent-edit race in
+    // the GET→PUT gap; other 422s are unrelated validation failures and must
+    // not masquerade as concurrent edits (peer-review finding, 30.08).
+    if (putResp.status === 409 || (putResp.status === 422 && /sha/i.test(err))) {
+      return { success: false, reason: "version_mismatch", current_sha: null, error: `Файл изменился во время записи (GitHub ${putResp.status}): ${err}` };
+    }
+    if (putResp.status === 422) {
+      return { success: false, reason: "github_validation_error", error: `GitHub отклонил запись (422): ${err}` };
+    }
     return { success: false, error: `GitHub API error ${putResp.status}: ${err}` };
   }
 
@@ -430,13 +500,7 @@ export async function deleteFromGitHub(
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
-  const chunkPrefix = `${normalizedPath}::`;
-  await sql`
-    DELETE FROM ${sql.unsafe(documentsTable)}
-    WHERE user_id = ${ctx.userId} AND source = ${source}
-      AND (filename = ${normalizedPath}
-        OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
-  `;
+  await buildDeleteDocumentQuery(sql, documentsTable, source, ctx.userId, normalizedPath);
 
   return { success: true };
 }
@@ -686,7 +750,11 @@ export async function personalMemorySearch(
     .slice(0, limit);
 }
 
-/** Private-mode `get_document`: personal corpus only. */
+/** Private-mode `get_document`: personal corpus only.
+ * Reads the new chunk_ordinal format first (aggregating every chunk of the
+ * document in order); falls back to the legacy LIMIT-1 read only while a
+ * document hasn't been backfilled yet, so behavior never regresses during
+ * the transition (WP-7 Ф94). */
 export async function personalGetDocument(
   env: PersonalEnv,
   ctx: UserContext,
@@ -708,7 +776,42 @@ export async function personalGetDocument(
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
   const src = source ?? null;
   const sourceNames = ctx.sourceNames;
-  const chunkPrefix = `${baseName}::`;
+  const chunkPrefix = documentChunkPrefix(baseName);
+
+  // Ambiguity check runs across BOTH protocol versions together, before any
+  // data query — checking only v2 (or only legacy) rows would silently miss
+  // the migration-window case where source A is backfilled to v2 and source B
+  // still holds a v1 copy of the same filename (WP-7 Ф94, cold-context review).
+  if (src === null) {
+    const distinctSources = await sql`
+      SELECT DISTINCT source FROM ${sql.unsafe(documentsTable)}
+      WHERE (filename = ${baseName} OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
+        AND user_id = ${ctx.userId} AND source = ANY(${sourceNames})
+    `;
+    if (distinctSources.length > 1) throw new AmbiguousSourceError(distinctSources.map(r => r.source as string));
+  }
+
+  const v2Rows = await sql`
+    SELECT filename, content, source, source_type, chunk_ordinal
+    FROM ${sql.unsafe(documentsTable)}
+    WHERE filename = ${baseName}
+      AND protocol_version = 2
+      AND user_id = ${ctx.userId}
+      AND source = ANY(${sourceNames})
+      AND (${src}::text IS NULL OR source = ${src})
+    ORDER BY chunk_ordinal
+  `;
+
+  if (v2Rows.length > 0) {
+    const r0 = v2Rows[0];
+    return {
+      filename: r0.filename as string,
+      content: v2Rows.map(r => r.content as string).join(""),
+      source: (r0.source as string) || "",
+      source_type: (r0.source_type as string) || "",
+      github_url: personalGithubUrl(ctx, (r0.source as string) || "", r0.filename as string),
+    };
+  }
 
   const rows = await sql`
     SELECT filename, content, source, source_type
@@ -733,6 +836,140 @@ export async function personalGetDocument(
     source_type: (r.source_type as string) || "",
     github_url: personalGithubUrl(ctx, (r.source as string) || "", r.filename as string),
   };
+}
+
+/** Canonicalize a repository-relative path for the live-read: reject escape
+ * attempts and encode each segment for URL use. Minimal local port of
+ * personal-knowledge-mcp's normalizeRepositoryPath/encodeGitHubContentsPath —
+ * the plain string concatenation the first version used let `../`, `#` and
+ * `?` reach the Contents API URL raw (peer-review finding, verify session
+ * 30.08). Throws on an invalid path. */
+export function canonicalContentsPath(pathPrefix: string, filename: string): string {
+  if (!filename || filename.includes("\0") || filename.includes("\\") || filename.startsWith("/")) {
+    throw new Error(`invalid repository path: ${filename}`);
+  }
+  const segments: string[] = [];
+  for (const seg of filename.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") {
+      if (segments.length === 0) throw new Error(`invalid repository path: ${filename}`);
+      segments.pop();
+      continue;
+    }
+    segments.push(seg);
+  }
+  if (segments.length === 0) throw new Error(`invalid repository path: ${filename}`);
+  // The prefix comes from the user_sources DB row, but gets the same
+  // treatment: a "..", backslash or NUL there would step outside the
+  // source's logical root just as surely as one in the filename
+  // (peer-review round 2, 30.08 — defense in depth, no dot-segment
+  // resolution for config values: any ".." is an error outright).
+  const prefixSegments: string[] = [];
+  if (pathPrefix) {
+    if (pathPrefix.includes("\0") || pathPrefix.includes("\\")) {
+      throw new Error(`invalid path prefix: ${pathPrefix}`);
+    }
+    for (const seg of pathPrefix.split("/")) {
+      if (seg === "" || seg === ".") continue;
+      if (seg === "..") throw new Error(`invalid path prefix: ${pathPrefix}`);
+      prefixSegments.push(seg);
+    }
+  }
+  return [...prefixSegments, ...segments].map(encodeURIComponent).join("/");
+}
+
+/** Read a document straight from GitHub instead of the (async, occasionally
+ * stale) Neon index — used only when the caller declared intent to write
+ * (get_document{ includeSha: true }). content and sha come from the SAME
+ * Contents API response so a caller who round-trips this sha back into
+ * write is always comparing against the version of content they actually
+ * saw (WP-7 Ф96 — ported from personal-knowledge-mcp/src/index.ts:
+ * getDocumentLive, same worker per Ф94's two-trees finding). */
+export async function personalGetDocumentLive(
+  env: PersonalEnv,
+  ctx: UserContext,
+  filename: string,
+  source: string,
+): Promise<{ filename: string; content: string; source: string; source_type: string; github_url: string | null; sha: string } | null> {
+  const userSource = ctx.sources.find(s => s.source === source);
+  if (!userSource) return null;
+
+  let encodedPath: string;
+  try {
+    encodedPath = canonicalContentsPath(userSource.pathPrefix, filename);
+  } catch {
+    return null;
+  }
+
+  const owner = userSource.githubOwner;
+  const repo = userSource.githubRepo;
+  const token = await getInstallationToken(env, owner);
+  if (!token) return null;
+
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
+
+  // External response parsing (json, atob, UTF-8 decode) can throw; the
+  // dispatch layer expects null, not an exception.
+  try {
+    const response = await fetch(apiUrl, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+    });
+    if (!response.ok) return null;
+
+    const body = (await response.json()) as { sha?: unknown; content?: unknown; encoding?: unknown };
+    // Same sha shape check as the write path — a malformed sha handed out
+    // here would be rejected by write(expected_sha) later anyway, better to
+    // fail the read (peer-review round 2, 30.08).
+    if (typeof body.sha !== "string" || !/^[0-9a-f]{40}$|^[0-9a-f]{64}$/i.test(body.sha) || typeof body.content !== "string" || body.encoding !== "base64") return null;
+
+    return {
+      filename,
+      content: decodeURIComponent(escape(atob(body.content.replace(/\n/g, "")))),
+      source,
+      source_type: userSource.sourceType,
+      github_url: personalGithubUrl(ctx, source, filename),
+      sha: body.sha,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** include_sha=true handler: live-first read with the index only as a source
+ * hint — an index miss must NOT fail the call, bypassing a stale index is
+ * what include_sha is FOR (peer-review finding, verify session 30.08;
+ * mirror of personal-knowledge-mcp's getDocumentWithSha). */
+export async function personalGetDocumentWithSha(
+  env: PersonalEnv,
+  ctx: UserContext,
+  filename: string,
+  source?: string,
+): Promise<
+  | { kind: "document"; filename: string; content: string; source: string; source_type: string; github_url: string | null; sha: string }
+  | { kind: "source_required"; sources: string[] }
+  | null
+> {
+  const normalized = filename.includes("::") ? filename.split("::")[0] : filename;
+
+  let resolvedSource = source;
+  if (!resolvedSource && ctx.sourceNames.length === 1) {
+    // A single connected source is already unambiguous — resolving it before
+    // the index keeps the live read working even when the index query itself
+    // fails (peer-review round 2, 30.08).
+    resolvedSource = ctx.sourceNames[0];
+  }
+  if (!resolvedSource) {
+    // Index as a hint only; AmbiguousSourceError propagates as in the plain path.
+    const indexed = await personalGetDocument(env, ctx, normalized);
+    if (indexed) {
+      resolvedSource = indexed.source;
+    } else {
+      return { kind: "source_required", sources: ctx.sourceNames };
+    }
+  }
+
+  const live = await personalGetDocumentLive(env, ctx, normalized, resolvedSource);
+  return live ? { kind: "document", ...live } : null;
 }
 
 /** Private-mode `list_sources`: personal corpus only. */

@@ -31,8 +31,13 @@ function makeMockSql() {
   }) as unknown as {
     (..._args: unknown[]): Promise<unknown[]>;
     unsafe: (v: string) => string;
+    transaction: (queries: Promise<unknown>[]) => Promise<unknown[]>;
   };
   sql.unsafe = (v: string) => v;
+  // Each query in the array already fired (and consumed its queryQueue entry)
+  // when the array literal was built — this just awaits them together, close
+  // enough to real transaction semantics for a unit test (WP-7 Ф94).
+  sql.transaction = (queries: Promise<unknown>[]) => Promise.all(queries);
   return sql;
 }
 
@@ -54,10 +59,11 @@ import {
   relativeMarkdownPathsFromTree,
   chunkContent,
   contentHash,
+  mapWithConcurrency,
   type ReindexEnv,
   type ReindexBatchMessage,
 } from "./reindex.js";
-import { getInstallationToken } from "./personal.js";
+import { assertIndexablePath, getInstallationToken } from "./personal.js";
 
 beforeEach(() => {
   queryQueue = [];
@@ -88,15 +94,56 @@ function latestSqlCallContaining(fragment: string): unknown[] {
 
 describe("chunkContent", () => {
   it("returns a single chunk for short content, regardless of headers", () => {
-    const chunks = chunkContent("note.md", "intro\n## Раздел А\nбыло");
-    expect(chunks).toEqual([{ key: "note.md", content: "intro\n## Раздел А\nбыло" }]);
+    const content = "intro\n## Раздел А\nбыло";
+    expect(chunkContent(content)).toEqual([content]);
   });
 
-  it("splits by ## headers once content exceeds the chunk-size threshold", () => {
+  it("splits by ## headers once content exceeds the chunk-size threshold, reconstructing exactly", () => {
     const filler = "x".repeat(5_000);
     const content = `intro text ${filler}\n## Раздел А\n${filler} было\n## Раздел Б\nстало`;
-    const chunks = chunkContent("note.md", content);
-    expect(chunks.map((c) => c.key)).toEqual(["note.md::intro", "note.md::Раздел А", "note.md::Раздел Б"]);
+    const chunks = chunkContent(content);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.join("")).toBe(content);
+  });
+
+  it("hard-splits a single paragraph longer than CHUNK_SIZE and still reconstructs exactly", () => {
+    const content = "y".repeat(20_000);
+    const chunks = chunkContent(content);
+    expect(chunks.join("")).toBe(content);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(8_000);
+  });
+
+  it("does not lose a section on a duplicate heading — ordinal is positional, not key-based", () => {
+    const content = "## Same\nfirst " + "a".repeat(8_100) + "\n## Same\nsecond " + "b".repeat(8_100);
+    const chunks = chunkContent(content);
+    expect(chunks.join("")).toBe(content);
+    expect(chunks.some(c => c.includes("first"))).toBe(true);
+    expect(chunks.some(c => c.includes("second"))).toBe(true);
+  });
+});
+
+describe("assertIndexablePath", () => {
+  it("rejects a literal chunk separator, accepts an ordinary path", () => {
+    expect(() => assertIndexablePath("docs/a::b.md")).toThrow(/reserved chunk separator/);
+    expect(() => assertIndexablePath("docs/a.md")).not.toThrow();
+  });
+});
+
+describe("mapWithConcurrency", () => {
+  it("respects the concurrency bound and returns results in input order", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const items = [50, 10, 30, 5, 20, 15, 40, 25];
+    const results = await mapWithConcurrency(items, 3, async (ms, i) => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise(r => setTimeout(r, ms));
+      active--;
+      return i;
+    });
+    expect(maxActive).toBeLessThanOrEqual(3);
+    expect(results).toEqual(items.map((_, i) => i));
   });
 });
 
@@ -179,7 +226,7 @@ describe("personalReindexFiles", () => {
     const hash = await contentHash("unchanged content");
     const path = "docs/cafe\u0301_%#? file.md";
     queryQueue.push([sourceRow(pathPrefix)]); // resolveUserContext
-    queryQueue.push([{ hash }]); // hash check — matches
+    queryQueue.push([{ hash, protocol_version: 2 }]); // hash check — matches, already backfilled (merged Ф94 skip needs v2)
 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn().mockResolvedValueOnce({ ok: true, text: async () => "unchanged content" }); // file content
@@ -211,6 +258,24 @@ describe("personalReindexFiles", () => {
     expect(result.errors[0]).toContain("escape the repository root");
     expect(getInstallationToken).not.toHaveBeenCalled();
     expect(globalThis.fetch).not.toHaveBeenCalled();
+    globalThis.fetch = originalFetch;
+  });
+
+  it("does NOT skip an unchanged file still on legacy protocol_version — backfills it (WP-7 Ф94 regression)", async () => {
+    const hash = await contentHash("unchanged legacy content");
+    queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([{ hash, protocol_version: 1 }]); // hash matches, but still legacy
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce({ ok: true, text: async () => "unchanged legacy content" })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [{ embedding: [0.1, 0.2, 0.3] }] }) }); // embedding
+
+    const result = await personalReindexFiles(ENV, {
+      source: "DS-my-strategy", files: [{ path: "note.md", action: "modified" }], user_id: USER_ID,
+    });
+    expect(result.skipped).toBe(0);
+    expect(result.processed).toBe(1);
     globalThis.fetch = originalFetch;
   });
 
