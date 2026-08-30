@@ -22,7 +22,9 @@ export const BRIDGE_WRITE_TOOLS = new Set<string>([
 ]);
 
 const PEER_PILOT_AGENT_ID = "pilot-helper-in-environment";
-const PEER_PILOT_ALLOWED_SOURCE = "personal-guide";
+// WP-559 Ф3: canonical name is DS-personal-guide; the flat legacy name stays
+// allowed only until existing legacy repos are migrated/retired (transition window).
+const PEER_PILOT_ALLOWED_SOURCES = new Set(["DS-personal-guide", "personal-guide"]);
 const PEER_PILOT_ALLOWED_PATH_PREFIX = "lesson/";
 const PEER_PILOT_ALLOWED_PATHS = ["docs/**", "inbox/**", "**/*.md"] as const;
 const PEER_PILOT_ALLOWED_OPERATIONS = ["write", "propose"] as const;
@@ -214,7 +216,8 @@ export async function checkBridgeWriteScope(opts: {
 
     isContinuationDefault =
       !!safePath &&
-      source === PEER_PILOT_ALLOWED_SOURCE &&
+      source !== undefined &&
+      PEER_PILOT_ALLOWED_SOURCES.has(source) &&
       safePath.startsWith(PEER_PILOT_ALLOWED_PATH_PREFIX);
 
     if (!isContinuationDefault) {
