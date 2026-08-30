@@ -46,8 +46,18 @@ export const PRIVATE_TOOL_NAMES: ReadonlySet<string> = new Set([
   // WP-7 Ф97.2: per-file indexing status (personal_index_status). Data layer
   // (buildIndexStatusSuccessQuery/writeIndexStatusError) lives in personal.ts;
   // the actual tools/list + dispatch entry is only wired in personal-knowledge-mcp's
-  // src/index.ts so far — gateway-mcp routing for the private-mode path through
-  // this worker is a known remainder, not yet done in this pass.
+  // src/index.ts so far — NOT this worker's private mode.
+  //
+  // Deliberately not finishing that wiring here (peer-session 2026-08-30-22
+  // consensus, verified against gateway-mcp/src/index.ts:812-817 +
+  // routeToolCall): the gateway's backend registry has exactly three fixed
+  // core entries (knowledge/dt/personal), and the "personal" prefix always
+  // routes to PERSONAL_KNOWLEDGE_MCP_URL — i.e. personal-knowledge-mcp, not
+  // this worker's private mode. Finishing the dispatcher here would add code
+  // with no live caller. Revisit only when the gateway's ownership of the
+  // "personal" prefix actually changes (a real route to THIS worker's
+  // private mode appears in that registry) — not on any other trigger like
+  // "the registry grew a 4th entry", which wouldn't change this fact.
   "index_status",
 ]);
 

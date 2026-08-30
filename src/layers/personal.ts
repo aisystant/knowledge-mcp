@@ -171,7 +171,19 @@ const MAX_STORED_ERROR_LENGTH = 500;
  * this is what closes the chunks/status split-transaction race (peer-session
  * 2026-08-30-18, round 1): a mid-write crash rolls back both together.
  * `indexed_at`/`content_hash` always reflect the latest SUCCESSFUL index;
- * `last_index_error` is cleared on success. */
+ * `last_index_error` is cleared on success.
+ *
+ * KNOWN GAP, deliberately not closed (peer-session 2026-08-30-22, round 2 —
+ * Codex vs Kimi): this upsert has NO protection against two interleaved
+ * writes for the same (user_id, source, filename) landing out of order — a
+ * stale batch (older push, or a retry that started before a newer push
+ * committed) can overwrite a newer successful result. `content_hash` alone
+ * cannot fix this (a hash has no order); a `WHERE updated_at < NOW()` guard
+ * was proposed and rejected — it is not a real compare-and-swap, since any
+ * concurrently-committed row is "older than NOW()" too. A real fix needs an
+ * ordered revision (a monotonic id assigned once per webhook delivery, not
+ * per file) or a Git-ancestry check against `payload.after`; both are
+ * out of scope for Ф97.2 and not yet a separate РП. */
 export function buildIndexStatusSuccessQuery(
   sql: PersonalSql,
   statusTable: string,
