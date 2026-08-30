@@ -12,7 +12,9 @@
 // in personal.ts. That requires an ordered revision/idempotency key, deferred
 // as separate work (peer-session 2026-08-30-22 consensus).
 //
-// Opt-in only — regular `npm test`/CI never runs this file:
+// Opt-in only — `describe.skipIf` below means the suite body (and every real
+// network/DB call in it) only runs with both env vars set; regular
+// `npm test`/CI evaluates the skipped shell but never executes it:
 //   RUN_LIVE_NEON_TESTS=1 LIVE_NEON_DATABASE_URL=postgres://... \
 //     npx vitest run src/layers/reindex.live.test.ts
 //
@@ -30,6 +32,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { getKnowledgeSchema, KNOWLEDGE_TABLES } from "../utils/db.js";
+import { personalDb } from "./personal.js";
 
 vi.mock("./personal.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./personal.js")>();
@@ -59,15 +62,19 @@ describe.skipIf(!RUN_LIVE || !DB_URL)("personalReindexFiles — live Neon idempo
     GITHUB_APP_PRIVATE_KEY: "fake-not-used",
   };
 
-  let sql: ReturnType<typeof import("@neondatabase/serverless").neon>;
+  // Reuses personalDb() itself (the same helper personalReindexFiles calls)
+  // rather than calling neon() directly — ReturnType<typeof neon> on the
+  // bare generic function doesn't narrow to concrete row types the way a
+  // call through personalDb's own inferred return type does (found via CI
+  // typecheck: indexing `existing[0]` etc. failed with the raw import).
+  let sql: ReturnType<typeof personalDb>;
   let schema: string;
   let documentsTable: string;
   let statusTable: string;
   let userSourcesTable: string;
 
   beforeAll(async () => {
-    const { neon } = await import("@neondatabase/serverless");
-    sql = neon(DB_URL as string);
+    sql = personalDb(ENV);
     schema = getKnowledgeSchema(ENV);
     documentsTable = KNOWLEDGE_TABLES.documents(schema);
     statusTable = KNOWLEDGE_TABLES.file_index_status(schema);
