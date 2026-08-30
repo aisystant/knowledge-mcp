@@ -2,7 +2,8 @@
 // Ported logic (search/get_document/list_sources/memory_search/connect_source/delete) is
 // exercised against a mocked neon() tag function — no live Neon connection.
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { generateKeyPairSync } from "node:crypto";
 
 let queryQueue: unknown[][] = [];
 
@@ -27,8 +28,10 @@ import {
   detectPersonalQueryType,
   connectSource,
   deleteFromGitHub,
+  writeToGitHub,
   personalListSources,
   personalGetDocument,
+  personalGetDocumentLive,
   disconnectSource,
   purgeSource,
   type UserContext,
@@ -49,6 +52,45 @@ function ctx(overrides: Partial<UserContext> = {}): UserContext {
     ...overrides,
   };
 }
+
+// getInstallationToken really parses+imports this key (crypto.subtle) before any
+// fetch happens, so it must be a structurally valid PKCS#8 RSA key — a throwaway
+// one generated fresh per test run, never used to sign anything real.
+const { privateKey: TEST_PRIVATE_KEY_PEM } = generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+  privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  publicKeyEncoding: { type: "spki", format: "pem" },
+});
+const ENV_WITH_APP: PersonalEnv = { ...ENV, GITHUB_APP_ID: "app-1", GITHUB_APP_PRIVATE_KEY: TEST_PRIVATE_KEY_PEM };
+
+function responseJson(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+/** getInstallationToken() (personal.ts:197) always issues these two calls
+ * first, in this order, before any Contents API call. */
+function installationTokenResponses(): Response[] {
+  return [
+    responseJson([{ id: 42, account: { login: "TserenTserenov" } }]), // GET /app/installations
+    responseJson({ token: "installation-token" }), // POST /access_tokens
+  ];
+}
+
+function queuedFetch(items: Response[]) {
+  const calls: { url: string; method: string; body?: string }[] = [];
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(input), method: init?.method ?? "GET", ...(typeof init?.body === "string" ? { body: init.body } : {}) });
+    const item = items.shift();
+    if (!item) throw new Error("unexpected fetch call: " + String(input));
+    return item;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return calls;
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe("detectPersonalQueryType", () => {
   it("routes entity codes to keyword", () => {
@@ -121,6 +163,88 @@ describe("deleteFromGitHub", () => {
     const result = await deleteFromGitHub(ENV, ctx(), "not-a-real-source", "notes/idea.md", "delete");
     expect(result.success).toBe(false);
     expect(result.error).toContain("Unknown source");
+  });
+});
+
+describe("writeToGitHub — optimistic concurrency (WP-7 Ф96, ported from personal-knowledge-mcp)", () => {
+  const VALID_SHA = "a".repeat(40);
+
+  it("proceeds to PUT when expectedSha matches the current GitHub sha", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: VALID_SHA }), // existing-content GET
+      responseJson({ content: { sha: "b".repeat(40), html_url: "https://github.com/x" } }), // PUT
+    ]);
+    const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "updated", "update", VALID_SHA);
+    expect(result.success).toBe(true);
+    expect(calls.filter(c => c.method === "PUT")).toHaveLength(1);
+  });
+
+  it("refuses a stale expectedSha before issuing any PUT", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: VALID_SHA }), // GitHub's current sha differs from the caller's stale read
+    ]);
+    const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "edited from stale read", "update", "c".repeat(40));
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("version_mismatch");
+    expect(result.current_sha).toBe(VALID_SHA);
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("keeps prior overwrite behavior when expectedSha is omitted", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: VALID_SHA }),
+      responseJson({ content: { sha: "b".repeat(40), html_url: "https://github.com/x" } }),
+    ]);
+    const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "updated", "update");
+    expect(result.success).toBe(true);
+    expect(calls.filter(c => c.method === "PUT")).toHaveLength(1);
+  });
+
+  it("normalizes a GitHub 409 on PUT to version_mismatch instead of a generic error", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: VALID_SHA }),
+      responseJson({ message: "sha does not match" }, 409), // pre-check passed, then the PUT itself races and loses
+    ]);
+    const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "racing write", "update", VALID_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("version_mismatch");
+  });
+});
+
+describe("personalGetDocumentLive (WP-7 Ф96)", () => {
+  it("returns content and sha from the same GitHub response", async () => {
+    const original = "# Заголовок\n\nС юникодом.";
+    const encoded = btoa(unescape(encodeURIComponent(original)));
+    const sha = "d".repeat(40);
+    queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha, content: encoded, encoding: "base64" }),
+    ]);
+    const doc = await personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy");
+    expect(doc?.content).toBe(original);
+    expect(doc?.sha).toBe(sha);
+  });
+
+  it("returns null for an unknown source without touching the network", async () => {
+    queuedFetch([]);
+    const doc = await personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "not-a-real-source");
+    expect(doc).toBeNull();
+  });
+
+  it("returns null on a 404 from the Contents API", async () => {
+    queuedFetch([...installationTokenResponses(), responseJson({ message: "Not Found" }, 404)]);
+    const doc = await personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/missing.md", "DS-my-strategy");
+    expect(doc).toBeNull();
+  });
+
+  it("returns null when the response is missing content/encoding", async () => {
+    queuedFetch([...installationTokenResponses(), responseJson({ sha: "e".repeat(40) })]);
+    const doc = await personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy");
+    expect(doc).toBeNull();
   });
 });
 

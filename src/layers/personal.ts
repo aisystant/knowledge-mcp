@@ -231,8 +231,9 @@ export async function writeToGitHub(
   source: string,
   path: string,
   content: string,
-  message: string
-): Promise<{ success: boolean; sha?: string; url?: string; error?: string }> {
+  message: string,
+  expectedSha?: string,
+): Promise<{ success: boolean; sha?: string; url?: string; error?: string; reason?: string; current_sha?: string | null }> {
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return { success: false, error: `Unknown source: ${source}` };
 
@@ -254,6 +255,16 @@ export async function writeToGitHub(
     existingSha = existing.sha;
   }
 
+  // Optimistic concurrency (WP-7 Ф96 — ported from personal-knowledge-mcp/
+  // src/index.ts:writeToGitHub, same worker per Ф94's two-trees finding).
+  // expectedSha comes from a prior personalGetDocument(includeSha: true)
+  // call; checked here, before the PUT below, so a caller editing a version
+  // someone else already replaced gets version_mismatch instead of silently
+  // overwriting it.
+  if (expectedSha !== undefined && existingSha !== expectedSha) {
+    return { success: false, reason: "version_mismatch", current_sha: existingSha ?? null, error: "Файл изменился с момента чтения — перечитай personal_get_document(includeSha: true) и повтори запись." };
+  }
+
   // Create or update file
   const putResp = await fetch(apiUrl, {
     method: "PUT",
@@ -267,6 +278,9 @@ export async function writeToGitHub(
 
   if (!putResp.ok) {
     const err = await putResp.text();
+    if (putResp.status === 409 || putResp.status === 422) {
+      return { success: false, reason: "version_mismatch", current_sha: null, error: `Файл изменился во время записи (GitHub ${putResp.status}): ${err}` };
+    }
     return { success: false, error: `GitHub API error ${putResp.status}: ${err}` };
   }
 
@@ -642,6 +656,48 @@ export async function personalGetDocument(
     source: (r.source as string) || "",
     source_type: (r.source_type as string) || "",
     github_url: personalGithubUrl(ctx, (r.source as string) || "", r.filename as string),
+  };
+}
+
+/** Read a document straight from GitHub instead of the (async, occasionally
+ * stale) Neon index — used only when the caller declared intent to write
+ * (get_document{ includeSha: true }). content and sha come from the SAME
+ * Contents API response so a caller who round-trips this sha back into
+ * write is always comparing against the version of content they actually
+ * saw (WP-7 Ф96 — ported from personal-knowledge-mcp/src/index.ts:
+ * getDocumentLive, same worker per Ф94's two-trees finding). */
+export async function personalGetDocumentLive(
+  env: PersonalEnv,
+  ctx: UserContext,
+  filename: string,
+  source: string,
+): Promise<{ filename: string; content: string; source: string; source_type: string; github_url: string | null; sha: string } | null> {
+  const userSource = ctx.sources.find(s => s.source === source);
+  if (!userSource) return null;
+
+  const owner = userSource.githubOwner;
+  const repo = userSource.githubRepo;
+  const token = await getInstallationToken(env, owner);
+  if (!token) return null;
+
+  const fullPath = userSource.pathPrefix ? `${userSource.pathPrefix}${filename}` : filename;
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${fullPath}`;
+
+  const response = await fetch(apiUrl, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+  });
+  if (!response.ok) return null;
+
+  const body = (await response.json()) as { sha?: unknown; content?: unknown; encoding?: unknown };
+  if (typeof body.sha !== "string" || !body.sha || typeof body.content !== "string" || body.encoding !== "base64") return null;
+
+  return {
+    filename,
+    content: decodeURIComponent(escape(atob(body.content.replace(/\n/g, "")))),
+    source,
+    source_type: userSource.sourceType,
+    github_url: personalGithubUrl(ctx, source, filename),
+    sha: body.sha,
   };
 }
 

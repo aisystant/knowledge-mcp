@@ -32,6 +32,7 @@ import {
   deleteFromGitHub,
   personalSearchDocuments,
   personalGetDocument,
+  personalGetDocumentLive,
   AmbiguousSourceError,
   personalListSources,
   personalMemorySearch,
@@ -1865,7 +1866,7 @@ export const TOOLS = [
   {
     name: "get_document",
     description:
-      "Get a specific document by filename, or extract its heading structure (table of contents). Use format=headings to see the outline without reading the full content.",
+      "Get a specific document by filename, or extract its heading structure (table of contents). Use format=headings to see the outline without reading the full content. For a personal-source document you intend to edit and write back, pass include_sha: true — the returned sha is what write's expected_sha needs to detect a concurrent edit.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1876,6 +1877,7 @@ export const TOOLS = [
           enum: ["full", "headings"],
           description: "Output format: full (default) returns document content, headings returns h1-h6 outline",
         },
+        include_sha: { type: "boolean", description: "Personal sources only: read the live version straight from GitHub (not the search index) and return its sha for later use as write's expected_sha. Set true whenever you intend to edit and write this document back." },
       },
       required: ["filename"],
     },
@@ -2115,7 +2117,7 @@ export const TOOLS = [
 const PRIVATE_TOOLS = [
   {
     name: "write",
-    description: "Write a file to a personal knowledge repo via GitHub. Creates or updates the file and triggers reindexing.",
+    description: "Write a file to a personal knowledge repo via GitHub. Creates or updates the file and triggers reindexing. When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, a concurrent edit from another session can be silently overwritten.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2123,6 +2125,7 @@ const PRIVATE_TOOLS = [
         path: { type: "string", description: "File path relative to repo root (e.g. 'notes/my-note.md')" },
         content: { type: "string", description: "File content (markdown)" },
         message: { type: "string", description: "Commit message (default: 'Update via Aisystant MCP')" },
+        expected_sha: { type: "string", description: "sha from get_document(include_sha: true), required when editing an existing file. If the file changed since you read it, the write is refused with reason: version_mismatch instead of silently overwriting the newer content. Omit only when creating a brand-new file." },
       },
       required: ["source", "path", "content"],
     },
@@ -2347,7 +2350,8 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
             }
 
-            const writeResult = await writeToGitHub(env, ctx, source, path, content, message);
+            const expectedSha = args.expected_sha as string | undefined;
+            const writeResult = await writeToGitHub(env, ctx, source, path, content, message, expectedSha);
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(writeResult, null, 2) }] } };
           }
 
@@ -2515,9 +2519,10 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
           }
 
           if (toolName === "get_document") {
+            const filename = args.filename as string;
             let doc;
             try {
-              doc = await personalGetDocument(env, ctx, args.filename as string, args.source as string | undefined);
+              doc = await personalGetDocument(env, ctx, filename, args.source as string | undefined);
             } catch (e) {
               if (e instanceof AmbiguousSourceError) {
                 return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `filename exists in multiple sources (${e.sources.join(", ")}) — pass source to disambiguate` }], isError: true } };
@@ -2527,6 +2532,17 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             if (!doc) {
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Document not found" }], isError: true } };
             }
+
+            if (args.include_sha === true) {
+              // WP-7 Ф96: live GitHub read, not the (possibly stale) index —
+              // content and sha must come from the same response.
+              const live = await personalGetDocumentLive(env, ctx, filename, doc.source);
+              if (!live) {
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Не удалось прочитать документ напрямую с GitHub для получения sha" }], isError: true } };
+              }
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: live.content }], sha: live.sha } };
+            }
+
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: doc.content }] } };
           }
 
