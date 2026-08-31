@@ -8,6 +8,7 @@
 // the dispatcher's response carries the PRIVATE-layer sentinel data, never public-layer data.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { neon } from "@neondatabase/serverless";
 
 vi.mock("@neondatabase/serverless", () => ({
   neon: vi.fn(() => {
@@ -54,6 +55,16 @@ vi.mock("./layers/personal.js", () => ({
   connectSource: vi.fn(),
   writeToGitHub: vi.fn(),
   deleteFromGitHub: vi.fn(),
+  // startReindexJob (layers/reindex.ts) calls this directly — same empty-result shape
+  // as the top-level neon() mock above, not a real connection.
+  personalDb: vi.fn(() => {
+    const sql = ((..._args: unknown[]) => Promise.resolve([])) as unknown as {
+      (..._args: unknown[]): Promise<unknown[]>;
+      unsafe: (v: string) => string;
+    };
+    sql.unsafe = (v: string) => v;
+    return sql;
+  }),
 }));
 
 // Bypass real Ory JWT verification — routing tests care about mode-based dispatch, not auth.
@@ -189,5 +200,157 @@ describe("/reindex route guard (WP-7 Ф100 fail-closed, peer session 2026-08-30-
   it("still refuses a wrong secret with 401", async () => {
     const res = await worker.fetch(reindexRequest("wrong"), reindexEnv);
     expect(res.status).toBe(401);
+  });
+});
+
+describe("/reindex-full and /provision-bridge-scopes (WP-545 Ф5, ported from personal-knowledge-mcp)", () => {
+  const serviceEnv = {
+    ...ENV,
+    INTERNAL_SERVICE_SECRET: "service-secret",
+    PERSONAL_REINDEX_SECRET: "personal-secret",
+    INDICATORS_DATABASE_URL: "postgres://fake-indicators",
+  } as import("./index.js").Env;
+
+  function postJson(path: string, secret: string, body: Record<string, unknown>) {
+    return new Request(`https://x${path}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${secret}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  // A fake neon() client for a single mockImplementationOnce call — resolves `rows`
+  // for every query (or rejects with `rejectWith`), same tagged-template shape as the
+  // top-level neon() mock. Cast through `unknown` because the real NeonQueryFunction
+  // type carries `.query`/`.transaction` this fake intentionally doesn't implement.
+  function fakeSql(rows: unknown[], rejectWith?: Error): ReturnType<typeof neon> {
+    const tagged = (..._args: unknown[]) => (rejectWith ? Promise.reject(rejectWith) : Promise.resolve(rows));
+    const sql = tagged as unknown as { unsafe: (v: string) => string };
+    sql.unsafe = (v: string) => v;
+    return tagged as unknown as ReturnType<typeof neon>;
+  }
+
+  it("/reindex-full rejects a missing token with 401", async () => {
+    const req = new Request("https://x/reindex-full", { method: "POST", body: "{}" });
+    const res = await worker.fetch(req, serviceEnv);
+    expect(res.status).toBe(401);
+  });
+
+  it("/reindex-full rejects a service secret without user_id with 400", async () => {
+    const res = await worker.fetch(postJson("/reindex-full", "service-secret", { source: "DS-my-strategy" }), serviceEnv);
+    expect(res.status).toBe(400);
+    const body = await res.json() as { reason: string };
+    expect(body.reason).toBe("user_id_required_for_service_auth");
+  });
+
+  it("/reindex-full reaches startReindexJob for INTERNAL_SERVICE_SECRET (the historical personal-tree contract)", async () => {
+    const res = await worker.fetch(
+      postJson("/reindex-full", "service-secret", { source: "DS-my-strategy", user_id: "user-1" }),
+      serviceEnv
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as { status: string; message: string };
+    // No REINDEX_QUEUE bound in this env — proves the request reached startReindexJob,
+    // not that a queue message was actually sent.
+    expect(body.status).toBe("failed");
+    expect(body.message).toContain("REINDEX_QUEUE binding missing");
+  });
+
+  it("/reindex-full also accepts PERSONAL_REINDEX_SECRET — the secret github-integration-service actually sends", async () => {
+    const res = await worker.fetch(
+      postJson("/reindex-full", "personal-secret", { source: "DS-my-strategy", user_id: "user-1" }),
+      serviceEnv
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as { status: string };
+    expect(body.status).toBe("failed"); // same REINDEX_QUEUE-missing path as above
+  });
+
+  it("/reindex-full rejects a wrong secret with 401 when no ORY_URL is configured", async () => {
+    const noOryEnv = { ...serviceEnv, ORY_URL: undefined } as import("./index.js").Env;
+    const res = await worker.fetch(
+      postJson("/reindex-full", "wrong", { source: "DS-my-strategy", user_id: "user-1" }),
+      noOryEnv
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("/provision-bridge-scopes rejects a missing token with 401", async () => {
+    const req = new Request("https://x/provision-bridge-scopes", { method: "POST", body: "{}" });
+    const res = await worker.fetch(req, serviceEnv);
+    expect(res.status).toBe(401);
+  });
+
+  it("/provision-bridge-scopes refuses an unowned source with 403 after auth succeeds", async () => {
+    // The mocked Neon client returns [] for every query, including the ownership
+    // SELECT — proves the route reaches the ownership gate, not just auth.
+    const res = await worker.fetch(
+      postJson("/provision-bridge-scopes", "service-secret", { source: "DS-my-strategy", user_id: "user-1" }),
+      serviceEnv
+    );
+    expect(res.status).toBe(403);
+    const body = await res.json() as { reason: string };
+    expect(body.reason).toBe("source_not_owned");
+  });
+
+  it("/provision-bridge-scopes provisions scopes for an owned source", async () => {
+    // Override the NEXT neon() call only (the ownership SELECT inside db(env)) to
+    // return a row — everything else (including provisionBridgeScopes' own INSERT)
+    // still gets the default []-returning client, which is fine: INSERT ... ON
+    // CONFLICT doesn't need a return value to succeed.
+    vi.mocked(neon).mockImplementationOnce(() => fakeSql([{ "?column?": 1 }]));
+
+    const res = await worker.fetch(
+      postJson("/provision-bridge-scopes", "service-secret", { source: "DS-my-strategy", user_id: "user-1" }),
+      serviceEnv
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as { scope_provisioning: string; source: string; user_id: string };
+    expect(body.scope_provisioning).toBe("ok");
+    expect(body.source).toBe("DS-my-strategy");
+    expect(body.user_id).toBe("user-1");
+  });
+
+  it("/provision-bridge-scopes never leaks the raw provisioning error to the client", async () => {
+    vi.mocked(neon)
+      .mockImplementationOnce(() => fakeSql([{ "?column?": 1 }])) // ownership SELECT — owned
+      // provisionBridgeScopes' own INSERT — throws with a message that must never
+      // reach the client (could carry SQL/table names).
+      .mockImplementationOnce(() => fakeSql([], new Error("relation agent_scopes_mvp does not exist")));
+
+    const res = await worker.fetch(
+      postJson("/provision-bridge-scopes", "service-secret", { source: "DS-my-strategy", user_id: "user-1" }),
+      serviceEnv
+    );
+    expect(res.status).toBe(200);
+    const bodyText = await res.text();
+    expect(bodyText).not.toContain("agent_scopes_mvp");
+    const body = JSON.parse(bodyText) as { scope_provisioning: string; error?: string };
+    expect(body.scope_provisioning).toBe("failed");
+    expect(body.error).toBeUndefined();
+  });
+
+  it("/reindex-full returns 400 on malformed JSON instead of throwing", async () => {
+    const req = new Request("https://x/reindex-full", {
+      method: "POST",
+      headers: { Authorization: "Bearer service-secret", "Content-Type": "application/json" },
+      body: "{not valid json",
+    });
+    const res = await worker.fetch(req, serviceEnv);
+    expect(res.status).toBe(400);
+    const body = await res.json() as { reason: string };
+    expect(body.reason).toBe("missing_source");
+  });
+
+  it("/provision-bridge-scopes returns 400 on malformed JSON instead of throwing", async () => {
+    const req = new Request("https://x/provision-bridge-scopes", {
+      method: "POST",
+      headers: { Authorization: "Bearer service-secret", "Content-Type": "application/json" },
+      body: "{not valid json",
+    });
+    const res = await worker.fetch(req, serviceEnv);
+    expect(res.status).toBe(400);
+    const body = await res.json() as { reason: string };
+    expect(body.reason).toBe("missing_source");
   });
 });
