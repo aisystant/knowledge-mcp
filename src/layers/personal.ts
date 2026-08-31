@@ -355,29 +355,51 @@ async function createGitHubAppJWT(appId: string, privateKeyPem: string): Promise
 }
 
 /**
- * Get Installation Access Token for a specific repo owner.
+ * Get a repository-scoped Installation Access Token for the authenticated user.
+ *
+ * The durable mapping lives in knowledge.github_installations. Looking through
+ * GitHub's paginated account-wide installation list made valid installations
+ * disappear for accounts with many installations once the App passed ~30
+ * installs (ported from personal-knowledge-mcp@39f6f89 — that repo is now
+ * archived, this is the only surviving copy; the pagination bug reached
+ * production here on 2026-08-31 because a WP-545 Ф5 cutover deploy overwrote
+ * this worker with the pre-fix build).
  */
 // Exported for reuse by ./reindex.ts (WP-410 Деплой-2 группа Б) — same GitHub App auth.
-export async function getInstallationToken(env: PersonalEnv, owner: string): Promise<string | null> {
+export async function getInstallationToken(
+  env: PersonalEnv,
+  userId: string | null,
+  repository: string,
+): Promise<string | null> {
   if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY) return null;
+  if (!userId) return null;
+
+  const sql = personalDb(env);
+  const installationsTable = KNOWLEDGE_TABLES.github_installations(getKnowledgeSchema(env));
+  const rows = await sql`
+    SELECT installation_id
+    FROM ${sql.unsafe(installationsTable)}
+    WHERE user_id = ${userId}
+    LIMIT 1
+  `;
+  const installationId = rows[0]?.installation_id as number | undefined;
+  if (!installationId) return null;
 
   const jwt = await createGitHubAppJWT(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY);
 
-  // Find installation for this owner
-  const installationsResp = await fetch("https://api.github.com/app/installations", {
-    headers: { Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
-  });
-
-  if (!installationsResp.ok) return null;
-
-  const installations = (await installationsResp.json()) as { id: number; account: { login: string } }[];
-  const installation = installations.find((i) => i.account.login.toLowerCase() === owner.toLowerCase());
-  if (!installation) return null;
-
-  // Get access token for this installation
-  const tokenResp = await fetch(`https://api.github.com/app/installations/${installation.id}/access_tokens`, {
+  // Token is narrowed to one repository even when the App was installed for all repos.
+  const tokenResp = await fetch(`https://api.github.com/app/installations/${installationId}/access_tokens`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "aisystant-knowledge",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      repositories: [repository],
+      permissions: { contents: "write", metadata: "read" },
+    }),
   });
 
   if (!tokenResp.ok) return null;
@@ -472,7 +494,7 @@ export async function writeToGitHub(
   const repo = userSource.githubRepo;
   const getToken = dependencies.getInstallationToken ?? getInstallationToken;
   const githubFetch = dependencies.fetch ?? globalThis.fetch;
-  const token = await getToken(env, owner);
+  const token = await getToken(env, ctx.userId, repo);
   if (!token) return { success: false, error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge` };
 
   const apiUrl = githubContentsApiUrl(owner, repo, fullPath);
@@ -573,7 +595,7 @@ export async function deleteFromGitHub(
   const repo = userSource.githubRepo;
   const getToken = dependencies.getInstallationToken ?? getInstallationToken;
   const githubFetch = dependencies.fetch ?? globalThis.fetch;
-  const token = await getToken(env, owner);
+  const token = await getToken(env, ctx.userId, repo);
   if (!token) return { success: false, error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge` };
 
   const apiUrl = githubContentsApiUrl(owner, repo, fullPath);
@@ -1006,7 +1028,7 @@ export async function personalGetDocumentLive(
 
   const owner = userSource.githubOwner;
   const repo = userSource.githubRepo;
-  const token = await getInstallationToken(env, owner);
+  const token = await getInstallationToken(env, ctx.userId, repo);
   if (!token) return null;
 
   const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;

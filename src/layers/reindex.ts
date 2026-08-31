@@ -134,7 +134,7 @@ async function readFromGitHub(
   // source configuration must never reach the installation-token or Contents endpoints.
   const fullPath = resolveSourcePath(userSource.pathPrefix, path).fullPath;
 
-  const token = await getInstallationToken(env, owner);
+  const token = await getInstallationToken(env, ctx.userId, repo);
   if (!token) return null;
 
   const resp = await fetch(githubContentsApiUrl(owner, repo, fullPath), {
@@ -350,7 +350,7 @@ async function listMdFilesViaTrees(env: ReindexEnv, ctx: UserContext, source: st
     return [];
   }
 
-  const token = await getInstallationToken(env, userSource.githubOwner);
+  const token = await getInstallationToken(env, ctx.userId, userSource.githubRepo);
   if (!token) return [];
 
   const repoResp = await fetch(`https://api.github.com/repos/${userSource.githubOwner}/${userSource.githubRepo}`, {

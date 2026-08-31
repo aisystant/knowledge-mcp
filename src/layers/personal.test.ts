@@ -84,11 +84,13 @@ function responseJson(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 
-/** getInstallationToken() (personal.ts:197) always issues these two calls
- * first, in this order, before any Contents API call. */
+/** getInstallationToken() looks up installation_id from knowledge.github_installations
+ * (one queryQueue row, pushed here as a side effect since every call site spreads this
+ * helper right before its queuedFetch setup) and then issues exactly one HTTP call
+ * (POST .../access_tokens) before any Contents API call. */
 function installationTokenResponses(): Response[] {
+  queryQueue.push([{ installation_id: 42 }]);
   return [
-    responseJson([{ id: 42, account: { login: "TserenTserenov" } }]), // GET /app/installations
     responseJson({ token: "installation-token" }), // POST /access_tokens
   ];
 }
@@ -752,9 +754,9 @@ describe("personalGetDocumentWithSha (WP-7 Ф96 rework — live-first)", () => {
   });
 
   it("survives an index miss when the user has exactly one source (the stale-index scenario)", async () => {
-    queryQueue.push([]); // ambiguity pre-check
-    queryQueue.push([]); // v2 query — miss
-    queryQueue.push([]); // legacy fallback — miss
+    // A single connected source resolves before the index is ever consulted
+    // (personalGetDocumentWithSha's early-return branch) — no index queries
+    // happen in this scenario, only the installation-token lookup below.
     queuedFetch([...installationTokenResponses(), liveBody()]);
     const result = await personalGetDocumentWithSha(ENV_WITH_APP, ctx(), "notes/brand-new.md");
     expect(result?.kind).toBe("document");
