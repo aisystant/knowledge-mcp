@@ -7,8 +7,9 @@
 # to the previously active Version, provided no other deployment superseded it.
 set -euo pipefail
 
-worker="knowledge-mcp"
-health_url="https://knowledge-mcp.aisystant.com/health"
+worker="${VERIFIED_DEPLOY_WORKER:-knowledge-mcp}"
+health_url="${VERIFIED_DEPLOY_HEALTH_URL:-https://knowledge-mcp.aisystant.com/health}"
+wrangler_config="${VERIFIED_DEPLOY_CONFIG:-wrangler.toml}"
 previous_version_id=""
 deployed_version_id=""
 git_sha=""
@@ -194,11 +195,17 @@ if ! printf '%s' "$previous_versions_json" | jq -e 'type == "array"' >/dev/null;
   exit 1
 fi
 
-deploy_log=$(mktemp "${TMPDIR:-/tmp}/knowledge-mcp-deploy.XXXXXX")
-echo "[verified-deploy] deploying $worker from git $git_sha (previous version $previous_version_id)"
+if [ ! -f "$wrangler_config" ]; then
+  echo "[verified-deploy] FATAL: wrangler config not found: $wrangler_config" >&2
+  exit 1
+fi
+
+deploy_log=$(mktemp "${TMPDIR:-/tmp}/${worker}-deploy.XXXXXX")
+echo "[verified-deploy] deploying $worker (config $wrangler_config) from git $git_sha (previous version $previous_version_id)"
 deploy_succeeded="true"
 deploy_attempted="true"
 if ! NO_COLOR=1 npx wrangler deploy \
+  --config "$wrangler_config" \
   --name "$worker" \
   --strict \
   --tag "$git_sha" \
