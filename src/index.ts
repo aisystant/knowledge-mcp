@@ -25,6 +25,7 @@ import {
 import { reindexConceptsForFiles } from "./concept-indexer.js";
 import { resolveMode, type McpMode } from "./mode.js";
 import { isToolAllowedInMode, JwtScopeGuard, ScopeDeniedError, PRIVATE_TOOL_NAMES, DUAL_MODE_TOOL_NAMES } from "./layers/private.js";
+import { provisionBridgeScopes } from "./scope.js";
 import { verifyJwtLocally, secretsEqual } from "./auth.js";
 import {
   resolveUserContext,
@@ -77,6 +78,10 @@ export interface Env {
   SCOPE_GUARD_MODE?: string;
   GITHUB_APP_ID?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
+  // WP-545 Ф5: service-to-service secret for /reindex-full and /provision-bridge-scopes,
+  // carried over from personal-knowledge-mcp (inherit-secrets cut-over — already live on
+  // the worker, these two routes just never read it in the unified tree until now).
+  INTERNAL_SERVICE_SECRET?: string;
   // WP-410 срез-2b Деплой-2 группа Б: reindex queue producer/consumer binding, same queue name
   // ("reindex") the personal-knowledge-mcp worker already runs under (inherit-secrets cut-over).
   REINDEX_QUEUE?: Queue<ReindexBatchMessage>;
@@ -249,6 +254,39 @@ export async function getEmbedding(apiKey: string, text: string): Promise<number
 
 function db(env: Env) {
   return neon(activeDsn(env));
+}
+
+// WP-545 Ф5: shared auth for /reindex-full and /provision-bridge-scopes — either
+// service secret (INTERNAL_SERVICE_SECRET or PERSONAL_REINDEX_SECRET, explicit
+// user_id required in the body) or an Ory JWT (user-initiated, user_id from the
+// token itself). Returns "bad_request" when a service secret matched but the
+// caller omitted user_id — distinct from null (no valid credential at all) so
+// the route can answer 400 instead of 401.
+async function resolveServiceOrUserAuth(
+  env: Env,
+  token: string,
+  bodyUserId: string | undefined,
+): Promise<string | null | "bad_request"> {
+  const isServiceSecret = [env.INTERNAL_SERVICE_SECRET, env.PERSONAL_REINDEX_SECRET]
+    .filter((s): s is string => !!s)
+    .some((s) => secretsEqual(token, s));
+  if (isServiceSecret) {
+    return bodyUserId && typeof bodyUserId === "string" ? bodyUserId : "bad_request";
+  }
+  if (env.ORY_URL) {
+    return await verifyJwtLocally(env.ORY_URL, token);
+  }
+  return null;
+}
+
+// WP-545 Ф5: request.json() throws on malformed/absent bodies — surface that as a
+// controlled 400 instead of an unhandled exception, for the two routes below.
+async function parseJsonBody<T>(request: Request): Promise<T | null> {
+  try {
+    return (await request.json()) as T;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -3848,6 +3886,116 @@ export default {
       }
 
       return new Response(JSON.stringify({ chunks: chunkResult, graph: graphResult }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // WP-545 Ф5: ported from personal-knowledge-mcp (WP-7 Ф100 canonical-owner cut-over).
+    // Missed by the Ф5 functional-completeness gate — github-integration-service calls both
+    // routes on every new repo connect / rename, found only by a live post-cutover 404 probe.
+    if (url.pathname === "/reindex-full" && request.method === "POST") {
+      const authHeader = request.headers.get("Authorization");
+      if (!authHeader?.startsWith("Bearer ")) {
+        return new Response(JSON.stringify({ error: "Unauthorized", reason: "missing_token" }), {
+          status: 401, headers: { ...corsHeaders, "Content-Type": "application/json", "WWW-Authenticate": "Bearer" },
+        });
+      }
+      const token = authHeader.slice(7);
+      const body = await parseJsonBody<{ source?: string; user_id?: string }>(request);
+      if (!body?.source || typeof body.source !== "string") {
+        return new Response(JSON.stringify({ error: "Bad Request", reason: "missing_source" }), {
+          status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      const effectiveUserId = await resolveServiceOrUserAuth(env, token, body.user_id);
+      if (!effectiveUserId) {
+        return new Response(JSON.stringify({ error: "Unauthorized", reason: "invalid_token" }), {
+          status: 401, headers: { ...corsHeaders, "Content-Type": "application/json", "WWW-Authenticate": "Bearer error=\"invalid_token\"" },
+        });
+      }
+      if (effectiveUserId === "bad_request") {
+        return new Response(JSON.stringify({ error: "Bad Request", reason: "user_id_required_for_service_auth" }), {
+          status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      const result = await startReindexJob(env, effectiveUserId, body.source);
+      return new Response(JSON.stringify(result), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Bridge scope auto-provision: when a personal repo is added, ensure the bridge
+    // write-scope exists so personal_write does not fail with scope_not_found.
+    // Auth mirrors /reindex-full.
+    if (url.pathname === "/provision-bridge-scopes" && request.method === "POST") {
+      const authHeader = request.headers.get("Authorization");
+      if (!authHeader?.startsWith("Bearer ")) {
+        return new Response(JSON.stringify({ error: "Unauthorized", reason: "missing_token" }), {
+          status: 401, headers: { ...corsHeaders, "Content-Type": "application/json", "WWW-Authenticate": "Bearer" },
+        });
+      }
+      const token = authHeader.slice(7);
+      const body = await parseJsonBody<{ source?: string; user_id?: string }>(request);
+      if (!body?.source || typeof body.source !== "string") {
+        return new Response(JSON.stringify({ error: "Bad Request", reason: "missing_source" }), {
+          status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      const effectiveUserId = await resolveServiceOrUserAuth(env, token, body.user_id);
+      if (!effectiveUserId) {
+        return new Response(JSON.stringify({ error: "Unauthorized", reason: "invalid_token" }), {
+          status: 401, headers: { ...corsHeaders, "Content-Type": "application/json", "WWW-Authenticate": "Bearer error=\"invalid_token\"" },
+        });
+      }
+      if (effectiveUserId === "bad_request") {
+        return new Response(JSON.stringify({ error: "Bad Request", reason: "user_id_required_for_service_auth" }), {
+          status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      // Ownership check: a valid token proves who is calling, not that `source` belongs
+      // to them. Require an active user_sources row — the webhook path already INSERTs
+      // it synchronously before this fire-and-forget call.
+      const sql = db(env);
+      const userSourcesTable = KNOWLEDGE_TABLES.user_sources(getKnowledgeSchema(env));
+      const ownedSourceRows = await sql`
+        SELECT 1 FROM ${sql.unsafe(userSourcesTable)}
+        WHERE user_id = ${effectiveUserId} AND source = ${body.source} AND active = true
+        LIMIT 1
+      `;
+      if (ownedSourceRows.length === 0) {
+        return new Response(JSON.stringify({ error: "Forbidden", reason: "source_not_owned" }), {
+          status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      let scopeProvisioning: "ok" | "failed" | "skipped" = "skipped";
+      if (env.INDICATORS_DATABASE_URL) {
+        try {
+          await provisionBridgeScopes(neon(env.INDICATORS_DATABASE_URL), effectiveUserId, body.source);
+          scopeProvisioning = "ok";
+        } catch (err) {
+          scopeProvisioning = "failed";
+          // Detail stays server-side (may carry SQL/table names) — the client only gets
+          // the stable "failed" status, never the raw exception text.
+          console.error(JSON.stringify({
+            phase: "bridge_scopes_provision_failed",
+            severity: "error",
+            user_id_prefix: effectiveUserId.slice(0, 8),
+            source: body.source,
+            error: err instanceof Error ? err.message : String(err),
+          }));
+        }
+      }
+
+      return new Response(JSON.stringify({
+        source: body.source,
+        user_id: effectiveUserId,
+        scope_provisioning: scopeProvisioning,
+      }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
