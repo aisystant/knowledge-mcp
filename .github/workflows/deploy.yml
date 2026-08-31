@@ -33,3 +33,20 @@ jobs:
         run: bash scripts/verified-deploy.sh
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # WP-545 Ф5: единый канонический путь деплоя воркера personal-knowledge-mcp
+      # из unified-дерева (завершение cut-over WP-410, АрхГейт WP-7 Ф100 accepted).
+      # По умолчанию ВЫКЛЮЧЕНО: включается repo variable PERSONAL_WORKER_DEPLOY_ENABLED=true.
+      # Обязательный порядок cut-over (ревью Codex 31.08 — иначе гонка двух репо сохраняется):
+      #   1) provision секретов KNOWLEDGE_DATABASE_URL и HEALTH_DATABASE_URL на воркере
+      #      (без них unified-сборка падает — verified-deploy откатит, проверка будет красной);
+      #   2) ОТКЛЮЧИТЬ автодеплой в репо personal-knowledge-mcp (его Actions деплоит каждый
+      #      push в main в тот же воркер);
+      #   3) только после 1-2 выставить PERSONAL_WORKER_DEPLOY_ENABLED=true.
+      - name: Deploy personal worker (verified)
+        if: vars.PERSONAL_WORKER_DEPLOY_ENABLED == 'true'
+        run: bash scripts/verified-deploy.sh
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          VERIFIED_DEPLOY_WORKER: personal-knowledge-mcp
+          VERIFIED_DEPLOY_CONFIG: wrangler.private.toml
+          VERIFIED_DEPLOY_HEALTH_URL: https://personal-knowledge-mcp.aisystant.workers.dev/health
