@@ -10,15 +10,17 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { neon } from "@neondatabase/serverless";
 
+// personalDb() (layers/personal.js) is just `neon(env.DATABASE_URL)` in production — the
+// mock below must go through this SAME vi.fn so a single mockImplementationOnce override
+// on `neon` (imported below) affects both direct db(env) callers and personalDb() callers.
+const { mockNeon } = vi.hoisted(() => {
+  const defaultSql = (..._args: unknown[]) => Promise.resolve([]);
+  (defaultSql as unknown as { unsafe: (v: string) => string }).unsafe = (v: string) => v;
+  return { mockNeon: vi.fn((..._args: unknown[]) => defaultSql) };
+});
+
 vi.mock("@neondatabase/serverless", () => ({
-  neon: vi.fn(() => {
-    const sql = ((..._args: unknown[]) => Promise.resolve([])) as unknown as {
-      (..._args: unknown[]): Promise<unknown[]>;
-      unsafe: (v: string) => string;
-    };
-    sql.unsafe = (v: string) => v;
-    return sql;
-  }),
+  neon: mockNeon,
   neonConfig: {},
   Pool: vi.fn(),
 }));
@@ -55,16 +57,11 @@ vi.mock("./layers/personal.js", () => ({
   connectSource: vi.fn(),
   writeToGitHub: vi.fn(),
   deleteFromGitHub: vi.fn(),
-  // startReindexJob (layers/reindex.ts) calls this directly — same empty-result shape
-  // as the top-level neon() mock above, not a real connection.
-  personalDb: vi.fn(() => {
-    const sql = ((..._args: unknown[]) => Promise.resolve([])) as unknown as {
-      (..._args: unknown[]): Promise<unknown[]>;
-      unsafe: (v: string) => string;
-    };
-    sql.unsafe = (v: string) => v;
-    return sql;
-  }),
+  // Real personalDb() is just neon(env.DATABASE_URL) — delegate to the same mockNeon
+  // so overriding `neon` (e.g. vi.mocked(neon).mockImplementationOnce(...) in a test)
+  // affects personalDb() callers (startReindexJob, the bridge-scopes ownership check)
+  // too, not just direct db(env) callers.
+  personalDb: vi.fn((env: { DATABASE_URL?: string }) => mockNeon(env.DATABASE_URL as string)),
 }));
 
 // Bypass real Ory JWT verification — routing tests care about mode-based dispatch, not auth.
@@ -294,8 +291,8 @@ describe("/reindex-full and /provision-bridge-scopes (WP-545 Ф5, ported from pe
   });
 
   it("/provision-bridge-scopes provisions scopes for an owned source", async () => {
-    // Override the NEXT neon() call only (the ownership SELECT inside db(env)) to
-    // return a row — everything else (including provisionBridgeScopes' own INSERT)
+    // Override the NEXT neon() call only (the ownership SELECT inside personalDb(env))
+    // to return a row — everything else (including provisionBridgeScopes' own INSERT)
     // still gets the default []-returning client, which is fine: INSERT ... ON
     // CONFLICT doesn't need a return value to succeed.
     vi.mocked(neon).mockImplementationOnce(() => fakeSql([{ "?column?": 1 }]));
@@ -304,6 +301,14 @@ describe("/reindex-full and /provision-bridge-scopes (WP-545 Ф5, ported from pe
       postJson("/provision-bridge-scopes", "service-secret", { source: "DS-my-strategy", user_id: "user-1" }),
       serviceEnv
     );
+    // Regression guard (WP-545 Ф5 hotfix, found live 31.08): the ownership check must
+    // hit the PERSONAL database (DATABASE_URL, where user_sources actually lives), not
+    // the shared knowledge database (KNOWLEDGE_DATABASE_URL) — a prior version silently
+    // used the wrong one, threw `relation "knowledge.user_sources" does not exist` on
+    // every real call, and this test still passed because mockImplementationOnce
+    // resolves for whichever DSN calls neon() first regardless of which one it is.
+    expect(neon).toHaveBeenCalledWith(serviceEnv.DATABASE_URL);
+    expect(neon).not.toHaveBeenCalledWith(serviceEnv.KNOWLEDGE_DATABASE_URL);
     expect(res.status).toBe(200);
     const body = await res.json() as { scope_provisioning: string; source: string; user_id: string };
     expect(body.scope_provisioning).toBe("ok");

@@ -40,6 +40,7 @@ import {
   connectSource,
   disconnectSource,
   purgeSource,
+  personalDb,
 } from "./layers/personal.js";
 import { handleQueue, handleWatchdog, startReindexJob, getReindexJobStatus, type ReindexBatchMessage } from "./layers/reindex.js";
 
@@ -3959,7 +3960,15 @@ export default {
       // Ownership check: a valid token proves who is calling, not that `source` belongs
       // to them. Require an active user_sources row — the webhook path already INSERTs
       // it synchronously before this fire-and-forget call.
-      const sql = db(env);
+      //
+      // WP-545 Ф5 hotfix (found live in the observation window, 31.08): user_sources
+      // lives in the PERSONAL database (env.DATABASE_URL via personalDb), the same
+      // place resolveUserContext/connectSource read it — not in the shared knowledge
+      // database that db(env) connects to. The ported code used db(env) (correct in
+      // the old single-purpose personal-tree, where "the database" WAS the personal
+      // one) and threw `relation "knowledge.user_sources" does not exist` on every
+      // real call: two production repo-connect attempts failed this way before the fix.
+      const sql = personalDb(env);
       const userSourcesTable = KNOWLEDGE_TABLES.user_sources(getKnowledgeSchema(env));
       const ownedSourceRows = await sql`
         SELECT 1 FROM ${sql.unsafe(userSourcesTable)}
