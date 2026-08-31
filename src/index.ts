@@ -3256,11 +3256,19 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
           const explicitFiles = args.files as string[] | undefined;
 
           if (!SOURCE_GITHUB_BASE[source]) {
+            // This tool only knows the fixed platform (L2) corpus map (PACK-*/ZP/FPF/SPF/docs-*).
+            // A personal (L4) GitHub source with the same-looking name is a frequent mix-up —
+            // it bit this code's own author once (see the naming note near "reindex_source" in
+            // tools/list above) and an agent again on 2026-08-31 (WP-7 peer-session
+            // 2026-08-31-46-wp7-reindex-verify-tail) — hence the explicit pointer below instead
+            // of a bare "not found".
             return {
               jsonrpc: "2.0",
               id,
               result: {
-                content: [{ type: "text", text: JSON.stringify({ error: `Unknown source: ${source}` }) }],
+                content: [{ type: "text", text: JSON.stringify({
+                  error: `Unknown source: ${source}. This tool (reindex_source) is for the shared platform corpus (PACK-*, ZP, FPF, SPF, docs-*) only. For a personal GitHub source, use personal_reindex instead.`,
+                }) }],
                 isError: true,
               },
             };
