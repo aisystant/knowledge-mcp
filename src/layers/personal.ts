@@ -376,10 +376,16 @@ export async function getInstallationToken(
 
   const sql = personalDb(env);
   const installationsTable = KNOWLEDGE_TABLES.github_installations(getKnowledgeSchema(env));
+  // user_id is only unique together with github_user_id (a pilot who re-links a
+  // different GitHub account keeps the old row) — order explicitly so a
+  // multi-row user_id deterministically picks the most recently (re)authorized
+  // installation instead of whatever order Postgres happens to return
+  // (peer-review finding, WP-7 2026-08-31).
   const rows = await sql`
     SELECT installation_id
     FROM ${sql.unsafe(installationsTable)}
     WHERE user_id = ${userId}
+    ORDER BY updated_at DESC
     LIMIT 1
   `;
   const installationId = rows[0]?.installation_id as number | undefined;

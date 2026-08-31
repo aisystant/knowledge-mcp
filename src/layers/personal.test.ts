@@ -564,6 +564,40 @@ describe("writeToGitHub — optimistic concurrency (WP-7 Ф96, ported from perso
   });
 });
 
+// getInstallationToken's signature changed from (env, owner) to (env, userId, repository)
+// on 2026-08-31 (pagination fix, WP-7) — every other test here injects a fixed-return mock
+// via `installationTokenResponses()`'s queryQueue side effect and never inspects call
+// arguments, so a caller silently passing the wrong value (e.g. owner where userId belongs)
+// would pass every other test in this file. These two pin the contract directly.
+describe("getInstallationToken call contract (WP-7 2026-08-31 pagination fix)", () => {
+  it("writeToGitHub calls getInstallationToken with (env, userId, repo) — not owner", async () => {
+    const getInstallationToken = vi.fn().mockResolvedValue("ghs_test_token");
+    const request = vi.fn()
+      .mockResolvedValueOnce(responseJson({ message: "Not Found" }, 404)) // existence check: new file
+      .mockResolvedValueOnce(responseJson({ content: { sha: "b".repeat(40), html_url: "https://github.com/x" } })); // PUT
+    const result = await writeToGitHub(
+      ENV, ctx(), "DS-my-strategy", "notes/idea.md", "hi", "msg",
+      { getInstallationToken, fetch: request as unknown as typeof globalThis.fetch },
+    );
+    expect(result.success).toBe(true);
+    expect(getInstallationToken).toHaveBeenCalledWith(ENV, ctx().userId, "DS-my-strategy");
+  });
+
+  it("deleteFromGitHub calls getInstallationToken with (env, userId, repo) — not owner", async () => {
+    const getInstallationToken = vi.fn().mockResolvedValue("ghs_test_token");
+    const request = vi.fn()
+      .mockResolvedValueOnce(responseJson({ sha: "a".repeat(40) })) // GET existing
+      .mockResolvedValueOnce(responseJson({})); // DELETE
+    queryQueue.push([]); // post-delete document-index cleanup query
+    const result = await deleteFromGitHub(
+      ENV, ctx(), "DS-my-strategy", "notes/idea.md", "msg",
+      { getInstallationToken, fetch: request as unknown as typeof globalThis.fetch },
+    );
+    expect(result.success).toBe(true);
+    expect(getInstallationToken).toHaveBeenCalledWith(ENV, ctx().userId, "DS-my-strategy");
+  });
+});
+
 describe("personalGetDocumentLive (WP-7 Ф96)", () => {
   it("returns content and sha from the same GitHub response", async () => {
     const original = "# Заголовок\n\nС юникодом.";
