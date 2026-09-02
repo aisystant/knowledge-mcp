@@ -209,6 +209,24 @@ export function buildIndexStatusSuccessQuery(
  * Codex round 1). Called outside the chunk transaction (the transaction
  * already rolled back by the time an error branch runs), so this is its own
  * statement, not part of the array passed to `sql.transaction([...])`. */
+export function buildIndexStatusErrorQuery(
+  sql: PersonalSql,
+  statusTable: string,
+  source: string,
+  userId: string,
+  filename: string,
+  reason: string,
+) {
+  const truncated = reason.slice(0, MAX_STORED_ERROR_LENGTH);
+  return sql`
+    INSERT INTO ${sql.unsafe(statusTable)}
+      (user_id, source, filename, status, last_index_error, updated_at)
+    VALUES (${userId}, ${source}, ${filename}, 'error', ${truncated}, NOW())
+    ON CONFLICT (user_id, source, filename) DO UPDATE SET
+      status = 'error', last_index_error = ${truncated}, updated_at = NOW()
+  `;
+}
+
 export async function writeIndexStatusError(
   sql: PersonalSql,
   statusTable: string,
@@ -217,14 +235,7 @@ export async function writeIndexStatusError(
   filename: string,
   reason: string,
 ): Promise<void> {
-  const truncated = reason.slice(0, MAX_STORED_ERROR_LENGTH);
-  await sql`
-    INSERT INTO ${sql.unsafe(statusTable)}
-      (user_id, source, filename, status, last_index_error, updated_at)
-    VALUES (${userId}, ${source}, ${filename}, 'error', ${truncated}, NOW())
-    ON CONFLICT (user_id, source, filename) DO UPDATE SET
-      status = 'error', last_index_error = ${truncated}, updated_at = NOW()
-  `;
+  await buildIndexStatusErrorQuery(sql, statusTable, source, userId, filename, reason);
 }
 
 /** Un-awaited DELETE for `file_index_status` — pair with `buildDeleteDocumentQuery`
@@ -249,16 +260,31 @@ export class AmbiguousSourceError extends Error {
   }
 }
 
-export async function resolveUserContext(env: PersonalEnv, userId: string | null): Promise<UserContext> {
+export interface ResolveUserContextOptions {
+  /**
+   * Include sources whose index is being rebuilt (index_state <> 'ready'). Only the reindex
+   * pipeline itself may set this — every read path stays fail-closed on a source that is
+   * mid-purge-and-reindex, so neither stale nor partial documents are ever served (WP-560 Ф3).
+   */
+  includeReindexing?: boolean;
+}
+
+export async function resolveUserContext(
+  env: PersonalEnv,
+  userId: string | null,
+  options: ResolveUserContextOptions = {},
+): Promise<UserContext> {
   if (userId) {
     try {
       const sql = personalDb(env);
       const schema = getKnowledgeSchema(env);
       const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
+      const includeReindexing = options.includeReindexing === true;
       const rows = await sql`
         SELECT source, github_owner, github_repo, path_prefix, source_type
         FROM ${sql.unsafe(userSourcesTable)}
         WHERE user_id = ${userId} AND active = true
+          AND (index_state = 'ready' OR ${includeReindexing} = true)
         ORDER BY source
       `;
       if (rows.length > 0) {
@@ -1138,24 +1164,78 @@ export async function personalListSources(
 // is in Деплой-1 at all (WP-410 explicit requirement).
 export interface ConnectSourceResult {
   source: string;
-  status: "newly_connected" | "reactivated" | "already_connected" | "error";
+  /**
+   * "rebound": the source name now points at a different physical GitHub repository than the
+   * one its documents were indexed from (or at an unverified legacy binding that already had
+   * documents). The old index is purged and a reindex job is created in the same transaction;
+   * the caller (../index.ts) must start that job. Until it finishes the source is fail-closed.
+   */
+  status: "newly_connected" | "reactivated" | "already_connected" | "rebound" | "error";
   scope_provisioning: "ok" | "failed" | "skipped";
   reindex_triggered: boolean;
-  /** Set by the caller alongside reindex_triggered; poll with personal_reindex_status. */
+  /** Set by the caller alongside reindex_triggered; poll with personal_reindex_status.
+   * For status "rebound" it is pre-created here (same transaction as the purge). */
   reindex_job_id?: string;
+  rebind_reason?: "fingerprint_mismatch" | "legacy_unverified_with_documents" | "stuck_index_recovery";
+  index_generation?: number;
   message?: string;
   error?: string;
+}
+
+export interface ConnectSourceDependencies {
+  getInstallationToken?: typeof getInstallationToken;
+  fetch?: typeof globalThis.fetch;
+}
+
+/**
+ * GitHub's immutable numeric repository id for owner/repo, as a decimal string. Never a JS
+ * number on the comparison path: the column is BIGINT and the driver returns it as a string.
+ * null = identity could not be verified (no App token, network error, non-2xx, no id) —
+ * callers treat that as fail-closed.
+ */
+async function fetchGitHubRepositoryId(
+  env: PersonalEnv,
+  userId: string,
+  owner: string,
+  repo: string,
+  dependencies: ConnectSourceDependencies,
+): Promise<string | null> {
+  const getToken = dependencies.getInstallationToken ?? getInstallationToken;
+  const githubFetch = dependencies.fetch ?? globalThis.fetch;
+  const token = await getToken(env, userId, repo);
+  if (!token) return null;
+  let response: Response;
+  try {
+    response = await githubFetch(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+    });
+  } catch {
+    return null;
+  }
+  if (!response.ok) return null;
+  const body = (await response.json()) as { id?: unknown };
+  if (typeof body.id === "number" && Number.isSafeInteger(body.id) && body.id > 0) return String(body.id);
+  if (typeof body.id === "string" && /^[1-9]\d*$/.test(body.id)) return body.id;
+  return null;
+}
+
+function bigintColumnAsString(value: unknown): string | null {
+  return value === null || value === undefined ? null : String(value);
 }
 
 export async function connectSource(
   env: PersonalEnv,
   userId: string,
-  source: string
+  source: string,
+  dependencies: ConnectSourceDependencies = {},
 ): Promise<ConnectSourceResult> {
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
   const githubInstallationsTable = KNOWLEDGE_TABLES.github_installations(schema);
   const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
+  const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+  const statusTable = KNOWLEDGE_TABLES.file_index_status(schema);
+  const reindexJobsTable = KNOWLEDGE_TABLES.reindex_jobs(schema);
 
   const installRows = await sql`
     SELECT github_username, repos FROM ${sql.unsafe(githubInstallationsTable)}
@@ -1196,30 +1276,124 @@ export async function connectSource(
     };
   }
 
-  const currentRows = await sql`
-    SELECT active FROM ${sql.unsafe(userSourcesTable)}
-    WHERE user_id = ${userId} AND source = ${source}
-    LIMIT 1
-  `;
-  const wasActive = currentRows.length > 0 ? (currentRows[0].active as boolean) : null;
+  // The name check above is only a UX pre-check. The binding that decides whether existing
+  // documents may keep being served is GitHub's immutable repository id, read through the
+  // installation token (WP-560 Ф3 — a source name re-pointed at another repository used to
+  // keep serving the previous repository's documents).
+  const repositoryId = await fetchGitHubRepositoryId(env, userId, githubUsername, source, dependencies);
+  if (!repositoryId) {
+    return {
+      source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
+      error: `Не удалось подтвердить идентичность репозитория '${source}' через GitHub App — подключение отклонено.`,
+    };
+  }
 
-  let resultStatus: "newly_connected" | "reactivated" | "already_connected";
-  if (wasActive === null) {
-    await sql`
-      INSERT INTO ${sql.unsafe(userSourcesTable)} (user_id, source, github_owner, github_repo, source_type, active)
-      VALUES (${userId}, ${source}, ${githubUsername}, ${source}, ${inferSourceType(source)}, true)
-      ON CONFLICT (user_id, source) DO UPDATE SET active = true,
-        github_owner = EXCLUDED.github_owner, github_repo = EXCLUDED.github_repo
-    `;
-    resultStatus = "newly_connected";
-  } else if (wasActive === false) {
-    await sql`
-      UPDATE ${sql.unsafe(userSourcesTable)} SET active = true
+  const readCurrentRow = async () => {
+    const rows = await sql`
+      SELECT active, github_repository_id, index_state FROM ${sql.unsafe(userSourcesTable)}
       WHERE user_id = ${userId} AND source = ${source}
+      LIMIT 1
     `;
-    resultStatus = "reactivated";
-  } else {
-    resultStatus = "already_connected";
+    return rows[0];
+  };
+  let current = await readCurrentRow();
+
+  let resultStatus: ConnectSourceResult["status"] | undefined;
+  let rebindReason: ConnectSourceResult["rebind_reason"];
+  let rebindJobId: string | undefined;
+  let indexGeneration: number | undefined;
+
+  if (!current) {
+    // DO NOTHING, not DO UPDATE: two racing first connects must not let the loser overwrite
+    // the winner's identity without the purge/generation path below. Losing the race just
+    // means "there is a row now" — fall through to the existing-row reconciliation.
+    const inserted = await sql`
+      INSERT INTO ${sql.unsafe(userSourcesTable)}
+        (user_id, source, github_owner, github_repo, source_type, active, github_repository_id)
+      VALUES (${userId}, ${source}, ${githubUsername}, ${source}, ${inferSourceType(source)}, true, ${repositoryId}::bigint)
+      ON CONFLICT (user_id, source) DO NOTHING
+      RETURNING user_id
+    `;
+    if (inserted.length > 0) {
+      resultStatus = "newly_connected";
+    } else {
+      current = await readCurrentRow();
+    }
+  }
+
+  if (resultStatus === undefined) {
+    if (!current) {
+      return {
+        source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
+        error: `Источник '${source}' не удалось ни создать, ни прочитать — повтори connect_source.`,
+      };
+    }
+    const wasActive = current.active as boolean;
+    const storedRepositoryId = bigintColumnAsString(current.github_repository_id);
+    const indexState = (current.index_state as string | undefined) ?? "ready";
+
+    if (storedRepositoryId === null) {
+      // Legacy row without a verified binding: safe to bind only while it has no documents.
+      // With documents present the binding is unproven, so treat it exactly like a mismatch.
+      const docRows = await sql`
+        SELECT COUNT(*)::int AS cnt FROM ${sql.unsafe(documentsTable)}
+        WHERE user_id = ${userId} AND source = ${source}
+      `;
+      if (((docRows[0]?.cnt as number) ?? 0) > 0) rebindReason = "legacy_unverified_with_documents";
+    } else if (storedRepositoryId !== repositoryId) {
+      rebindReason = "fingerprint_mismatch";
+    } else if (indexState !== "ready") {
+      // Same repository, but a previous rebind/reindex never reached 'ready' (job lost between
+      // the purge transaction and its start, worker crash, watchdog-failed). Readers are
+      // fail-closed on it, so a reconnect must be the recovery path: new generation (fences
+      // out anything still in flight) + fresh job. No purge — the documents that exist belong
+      // to this very repository; the full reindex re-walks the tree with hash dedup.
+      rebindReason = "stuck_index_recovery";
+    }
+
+    if (rebindReason) {
+      // One transaction: (purge,) bind the identity, bump the generation (atomically in the
+      // DB, never read-modify-write), and create the reindex job carrying that generation.
+      // A crash between any two of these can't leave a purged source without a job, and the
+      // consumer fences every document write on the generation (see reindex.ts).
+      const purge = rebindReason === "stuck_index_recovery" ? [] : [
+        sql`DELETE FROM ${sql.unsafe(documentsTable)} WHERE user_id = ${userId} AND source = ${source}`,
+        sql`DELETE FROM ${sql.unsafe(statusTable)} WHERE user_id = ${userId} AND source = ${source}`,
+      ];
+      const results = await sql.transaction([
+        ...purge,
+        sql`
+          UPDATE ${sql.unsafe(userSourcesTable)}
+          SET github_repository_id = ${repositoryId}::bigint,
+              github_owner = ${githubUsername}, github_repo = ${source},
+              active = true, index_state = 'reindexing',
+              index_generation = index_generation + 1
+          WHERE user_id = ${userId} AND source = ${source}
+          RETURNING index_generation
+        `,
+        sql`
+          INSERT INTO ${sql.unsafe(reindexJobsTable)} (user_id, source, status, generation)
+          SELECT ${userId}, ${source}, 'pending', index_generation
+          FROM ${sql.unsafe(userSourcesTable)}
+          WHERE user_id = ${userId} AND source = ${source}
+          RETURNING id, generation
+        `,
+      ]);
+      const jobRow = (results[results.length - 1] as Array<{ id: string; generation: unknown }>)[0];
+      rebindJobId = jobRow?.id;
+      indexGeneration = jobRow?.generation === undefined || jobRow?.generation === null ? undefined : Number(jobRow.generation);
+      resultStatus = "rebound";
+    } else {
+      // Fingerprint matches (or first verified binding of an empty legacy row): plain
+      // reconnect/reactivation, identity recorded where it was still NULL.
+      await sql`
+        UPDATE ${sql.unsafe(userSourcesTable)}
+        SET active = true,
+            github_repository_id = COALESCE(github_repository_id, ${repositoryId}::bigint)
+        WHERE user_id = ${userId} AND source = ${source}
+      `;
+      resultStatus = wasActive === false ? "reactivated" : "already_connected";
+    }
   }
 
   // WP-410: provision bridge write-scopes in-process — unconditional on every connect so a
@@ -1241,16 +1415,35 @@ export async function connectSource(
     }
   }
 
+  if (resultStatus === "rebound") {
+    console.warn(JSON.stringify({
+      phase: "connect_source_rebound",
+      user_id_prefix: userId.slice(0, 8),
+      source,
+      reason: rebindReason,
+      job_id: rebindJobId,
+      generation: indexGeneration,
+    }));
+  }
+
   return {
     source,
     status: resultStatus,
     scope_provisioning: scopeProvisioning,
     // Caller (../index.ts) overwrites reindex_triggered + message with the real outcome
-    // when scope_provisioning === "ok" (calls startReindexJob right after this returns).
+    // (calls startReindexJob right after this returns; for "rebound" it starts the
+    // pre-created job unconditionally, since the old index is already gone).
     reindex_triggered: false,
+    reindex_job_id: rebindJobId,
+    rebind_reason: rebindReason,
+    index_generation: indexGeneration,
     message: scopeProvisioning === "failed"
       ? "репо подключён для чтения, но запись пока не разрешена — повтори connect_source"
-      : "репо подключено, права на запись выданы.",
+      : resultStatus === "rebound"
+        ? (rebindReason === "stuck_index_recovery"
+          ? "индекс источника не был завершён ранее — запущена повторная переиндексация, до её завершения источник недоступен для чтения."
+          : "имя источника указывает на другой GitHub-репозиторий — старый индекс удалён, до завершения переиндексации источник недоступен для чтения.")
+        : "репо подключено, права на запись выданы.",
   };
 }
 

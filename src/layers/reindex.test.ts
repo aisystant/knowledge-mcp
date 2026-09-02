@@ -474,6 +474,191 @@ describe("startReindexJob", () => {
   });
 });
 
+describe("generation fencing (WP-560 Ф3)", () => {
+  it("personalReindexFiles publishes nothing and reports stale when the source moved to a newer generation", async () => {
+    queryQueue.push([sourceRow()]); // resolveUserContext (includeReindexing)
+    queryQueue.push([{ index_generation: "4" }]); // current generation ≠ job's 3
+    const result = await personalReindexFiles(ENV, {
+      source: "DS-my-strategy", user_id: USER_ID, generation: 3,
+      files: [{ path: "gone.md", action: "removed" }],
+    });
+    expect(result.stale).toBe(true);
+    expect(result.deleted).toBe(0);
+    expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("DELETE"))).toBe(false);
+  });
+
+  it("a fenced job's removal runs with the 1/COUNT fence as the first statement of the transaction", async () => {
+    queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([{ index_generation: 3 }]); // pre-check passes
+    queryQueue.push([{ fence: 1 }]); // fence statement
+    queryQueue.push([]); // DELETE documents
+    queryQueue.push([]); // DELETE status
+    const result = await personalReindexFiles(ENV, {
+      source: "DS-my-strategy", user_id: USER_ID, generation: 3,
+      files: [{ path: "gone.md", action: "removed" }],
+    });
+    expect(result.stale).toBe(false);
+    expect(result.deleted).toBe(1);
+    const fence = latestSqlCallContaining("AS fence") as unknown[];
+    expect((fence[0] as TemplateStringsArray).join(" ")).toContain("index_generation =");
+    expect(fence[4]).toBe(3); // params: [table, userId, source, generation]
+  });
+
+  it("a fence violation mid-batch (division by zero) stops the batch as stale, not as a per-file error", async () => {
+    queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([{ index_generation: 3 }]); // pre-check passes (race: bump happens right after)
+    queryQueue.push(new Error("division by zero")); // fence raises inside the transaction
+    const result = await personalReindexFiles(ENV, {
+      source: "DS-my-strategy", user_id: USER_ID, generation: 3,
+      files: [{ path: "gone.md", action: "removed" }, { path: "other.md", action: "removed" }],
+    });
+    expect(result.stale).toBe(true);
+    expect(result.errors).toEqual([]);
+    expect(result.deleted).toBe(0);
+  });
+
+  it("legacy job without generation is unfenced (no pre-check, no fence statement)", async () => {
+    queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([]); // DELETE documents
+    queryQueue.push([]); // DELETE status
+    const result = await personalReindexFiles(ENV, {
+      source: "DS-my-strategy", user_id: USER_ID, generation: null,
+      files: [{ path: "gone.md", action: "removed" }],
+    });
+    expect(result.deleted).toBe(1);
+    expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("AS fence"))).toBe(false);
+  });
+
+  it("handleQueue cancels and acks a superseded job instead of retrying it", async () => {
+    queryQueue.push([{ status: "running", generation: "3" }]); // SELECT status, generation
+    queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([{ index_generation: 4 }]); // newer generation → stale
+    queryQueue.push([]); // UPDATE reindex_jobs SET status='cancelled'
+    const msg = { body: { job_id: "job-old", user_id: USER_ID, source: "DS-my-strategy", files: [{ path: "a.md", action: "removed" as const }] }, ack: vi.fn(), retry: vi.fn(), attempts: 1 };
+    await handleQueue({ messages: [msg], queue: "reindex", ackAll: vi.fn(), retryAll: vi.fn() } as unknown as MessageBatch<ReindexBatchMessage>, ENV);
+    expect(msg.ack).toHaveBeenCalledOnce();
+    expect(msg.retry).not.toHaveBeenCalled();
+    const cancel = latestSqlCallContaining("status = 'cancelled'") as unknown[];
+    expect((cancel[0] as TemplateStringsArray).join(" ")).toContain("superseded_generation");
+  });
+
+  it("handleQueue marks the source ready (fenced on generation) when the last batch of a fenced job completes", async () => {
+    queryQueue.push([{ status: "running", generation: 3 }]); // SELECT status, generation
+    queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([{ index_generation: 3 }]); // pre-check
+    queryQueue.push([{ fence: 1 }]); // fence
+    queryQueue.push([]); // DELETE documents
+    queryQueue.push([]); // DELETE status
+    queryQueue.push([{ completed_batches: 1, expected_batches: 1 }]); // UPDATE ... RETURNING
+    queryQueue.push([]); // status='succeeded'
+    queryQueue.push([]); // user_sources index_state='ready'
+    const msg = { body: { job_id: "job-3", user_id: USER_ID, source: "DS-my-strategy", files: [{ path: "a.md", action: "removed" as const }] }, ack: vi.fn(), retry: vi.fn(), attempts: 1 };
+    await handleQueue({ messages: [msg], queue: "reindex", ackAll: vi.fn(), retryAll: vi.fn() } as unknown as MessageBatch<ReindexBatchMessage>, ENV);
+    expect(msg.ack).toHaveBeenCalledOnce();
+    const ready = latestSqlCallContaining("index_state = 'reindexing' AND index_generation =") as unknown[];
+    expect(ready[2]).toBe("ready"); // params: [table, state, userId, source, generation]
+    expect(ready[5]).toBe(3);
+  });
+
+  it("startReindexJob with a pre-created rebind job skips cooldown and reads the job's generation", async () => {
+    queryQueue.push([{ id: "job-rebind", generation: "2", status: "pending" }]); // SELECT job
+    queryQueue.push([sourceRow()]); // resolveUserContext (includeReindexing)
+    queryQueue.push([]); // UPDATE running (0 files)
+    queryQueue.push([]); // UPDATE succeeded
+    queryQueue.push([]); // user_sources index_state='ready' (fenced)
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({}) });
+    const env = { ...ENV, REINDEX_QUEUE: { sendBatch: vi.fn() } as unknown as Queue<ReindexBatchMessage> };
+
+    const result = await startReindexJob(env, USER_ID, "DS-my-strategy", { jobId: "job-rebind" });
+
+    expect(result.status).toBe("running");
+    expect(result.job_id).toBe("job-rebind");
+    expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("INTERVAL '1 second'"))).toBe(false); // no cooldown query
+    const ready = latestSqlCallContaining("index_state = 'reindexing' AND index_generation =") as unknown[];
+    expect(ready[5]).toBe(2);
+    globalThis.fetch = originalFetch;
+  });
+
+  it("startReindexJob fails cleanly when the pre-created job does not exist", async () => {
+    queryQueue.push([]); // SELECT job → none
+    const env = { ...ENV, REINDEX_QUEUE: { sendBatch: vi.fn() } as unknown as Queue<ReindexBatchMessage> };
+    const result = await startReindexJob(env, USER_ID, "DS-my-strategy", { jobId: "job-gone" });
+    expect(result.status).toBe("failed");
+    expect(result.message).toContain("job-gone");
+  });
+
+  it("startReindexJob treats an already-running pre-created job as idempotent (cooldown), not failure", async () => {
+    queryQueue.push([{ id: "job-dup", generation: 2, status: "running" }]);
+    const env = { ...ENV, REINDEX_QUEUE: { sendBatch: vi.fn() } as unknown as Queue<ReindexBatchMessage> };
+    const result = await startReindexJob(env, USER_ID, "DS-my-strategy", { jobId: "job-dup" });
+    expect(result.status).toBe("cooldown");
+    expect(result.message).toContain("already running");
+  });
+
+  it("a DB failure before the pre-created job starts leaves job 'failed' and the source 'failed' (fenced on the job's generation)", async () => {
+    queryQueue.push(new Error("connection reset")); // SELECT job throws
+    queryQueue.push([]); // UPDATE reindex_jobs failed
+    queryQueue.push([]); // UPDATE user_sources ... FROM reindex_jobs (fenced)
+    const env = { ...ENV, REINDEX_QUEUE: { sendBatch: vi.fn() } as unknown as Queue<ReindexBatchMessage> };
+    const result = await startReindexJob(env, USER_ID, "DS-my-strategy", { jobId: "job-net" });
+    expect(result.status).toBe("failed");
+    expect(result.message).toContain("connection reset");
+    const failed = latestSqlCallContaining("u.index_generation = j.generation") as unknown[];
+    expect((failed[0] as TemplateStringsArray).join(" ")).toContain("index_state = 'failed'");
+  });
+
+  it("error-status writes of a fenced job go through the fence too", async () => {
+    queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([{ index_generation: 3 }]); // pre-check
+    queryQueue.push([{ fence: 1 }]); // fence
+    queryQueue.push([]); // error-status upsert
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValueOnce({ ok: false, status: 500, json: async () => ({}) }); // readFromGitHub fails
+    const result = await personalReindexFiles(ENV, {
+      source: "DS-my-strategy", user_id: USER_ID, generation: 3,
+      files: [{ path: "broken.md", action: "modified" }],
+    });
+    globalThis.fetch = originalFetch;
+    expect(result.errors).toHaveLength(1);
+    const status = latestSqlCallContaining("'error'") as unknown[];
+    expect(status).toBeDefined();
+    const fenceIdx = sqlCalls.findIndex(([t]) => (t as TemplateStringsArray).join(" ").includes("AS fence"));
+    const statusIdx = sqlCalls.findIndex(([t]) => (t as TemplateStringsArray).join(" ").includes("'error'"));
+    expect(fenceIdx).toBeGreaterThan(-1);
+    expect(fenceIdx).toBeLessThan(statusIdx);
+  });
+
+  it("watchdog also fails 'pending' jobs nobody ever started and marks their sources 'failed'", async () => {
+    queryQueue.push([]); // stale running → none
+    queryQueue.push([{ id: "job-p", user_id: USER_ID, source: "DS-my-strategy", generation: 4 }]); // abandoned pending
+    queryQueue.push([]); // setSourceIndexState failed
+    await handleWatchdog(ENV);
+    const abandoned = latestSqlCallContaining("watchdog_pending_never_started") as unknown[];
+    expect((abandoned[0] as TemplateStringsArray).join(" ")).toContain("status = 'pending'");
+    const failed = latestSqlCallContaining("index_state = 'reindexing' AND index_generation =") as unknown[];
+    expect(failed[2]).toBe("failed");
+    expect(failed[5]).toBe(4);
+  });
+
+  it("new jobs carry the source's current generation", async () => {
+    queryQueue.push([]); // no recent job
+    queryQueue.push([{ id: "job-new", generation: 7 }]); // INSERT ... SELECT index_generation ... RETURNING
+    queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([]); // UPDATE running (0 files)
+    queryQueue.push([]); // UPDATE succeeded
+    queryQueue.push([]); // ready (fenced, generation 7)
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({}) });
+    const env = { ...ENV, REINDEX_QUEUE: { sendBatch: vi.fn() } as unknown as Queue<ReindexBatchMessage> };
+    await startReindexJob(env, USER_ID, "DS-my-strategy");
+    const insert = latestSqlCallContaining("(user_id, source, status, generation)") as unknown[];
+    expect((insert[0] as TemplateStringsArray).join(" ")).toContain("SELECT");
+    expect((insert[0] as TemplateStringsArray).join(" ")).toContain("index_generation");
+    globalThis.fetch = originalFetch;
+  });
+});
+
 describe("handleWatchdog", () => {
   it("skips without DATABASE_URL, without querying", async () => {
     await handleWatchdog({});

@@ -19,8 +19,12 @@ function makeMockSql() {
   }) as unknown as {
     (..._args: unknown[]): Promise<unknown[]>;
     unsafe: (v: string) => string;
+    transaction: (queries: Promise<unknown>[]) => Promise<unknown[]>;
   };
   sql.unsafe = (v: string) => v;
+  // Queries in the array already fired (and consumed their queryQueue entries) when the
+  // array literal was built — awaiting them together is close enough for a unit test.
+  sql.transaction = (queries: Promise<unknown>[]) => Promise.all(queries);
   return sql;
 }
 
@@ -41,6 +45,7 @@ import {
   POST_SCAFFOLD_NEXT_ACTION,
   resolveSourcePath,
   connectSource,
+  resolveUserContext,
   deleteFromGitHub,
   writeToGitHub,
   personalListSources,
@@ -632,6 +637,24 @@ describe("personalGetDocumentLive (WP-7 Ф96)", () => {
 });
 
 describe("connectSource", () => {
+  const INSTALL_ROW = { github_username: "TserenTserenov", repos: ["DS-my-strategy"] };
+  const REPO_ID = "987654321012"; // beyond 2^31 on purpose — BIGINT stays a string end to end
+
+  /** GitHub App token + GET /repos/{owner}/{repo} → { id }. `id: null` = identity unverifiable. */
+  function githubIdentity(id: number | string | null, ok = true) {
+    const fetchMock = vi.fn(async () => id === null && ok
+      ? responseJson({})
+      : responseJson(ok ? { id } : { message: "Not Found" }, ok ? 200 : 404));
+    return {
+      fetchMock,
+      dependencies: { getInstallationToken: vi.fn().mockResolvedValue("ghs_test_token"), fetch: fetchMock as unknown as typeof globalThis.fetch },
+    };
+  }
+
+  function sqlTextContaining(fragment: string): string | undefined {
+    return sqlCalls.map(([t]) => (t as TemplateStringsArray).join(" ")).find((s) => s.includes(fragment));
+  }
+
   it("errors when the user has no GitHub App installation", async () => {
     queryQueue.push([]); // installRows empty
     const result = await connectSource(ENV, "user-1", "DS-my-strategy");
@@ -655,9 +678,9 @@ describe("connectSource", () => {
   it("self-heals a legacy string-encoded repos column instead of crashing", async () => {
     queryQueue.push([{ github_username: "TserenTserenov", repos: '["DS-my-strategy","DS-other"]' }]);
     queryQueue.push([]); // currentRows — no existing row → newly_connected
-    queryQueue.push([]); // INSERT user_sources
+    queryQueue.push([{ user_id: "user-1" }]); // INSERT ... DO NOTHING RETURNING → inserted
 
-    const result = await connectSource(ENV, "user-1", "DS-my-strategy");
+    const result = await connectSource(ENV, "user-1", "DS-my-strategy", githubIdentity(1).dependencies);
 
     expect(result.status).toBe("newly_connected");
     expect(result.error).toBeUndefined();
@@ -671,15 +694,16 @@ describe("connectSource", () => {
   });
 
   it("connects a new source, provisions bridge scopes; reindex trigger is the caller's job (index.ts, группа В)", async () => {
-    queryQueue.push([{ github_username: "TserenTserenov", repos: ["DS-my-strategy"] }]); // installRows
+    queryQueue.push([INSTALL_ROW]); // installRows
     queryQueue.push([]); // currentRows — no existing row → newly_connected
-    queryQueue.push([]); // INSERT user_sources
+    queryQueue.push([{ user_id: "user-1" }]); // INSERT ... DO NOTHING RETURNING → inserted
     queryQueue.push([]); // provisionBridgeScopes INSERT
 
     const result = await connectSource(
       { ...ENV, INDICATORS_DATABASE_URL: "postgres://fake-indicators" },
       "user-1",
-      "DS-my-strategy"
+      "DS-my-strategy",
+      githubIdentity(REPO_ID).dependencies,
     );
 
     expect(result.status).toBe("newly_connected");
@@ -688,18 +712,174 @@ describe("connectSource", () => {
     // reindex.ts) — the caller in index.ts does that and overwrites these two fields.
     expect(result.reindex_triggered).toBe(false);
     expect(result.message).toContain("права на запись выданы");
+    expect(sqlTextContaining("(user_id, source, github_owner, github_repo, source_type, active, github_repository_id)")).toContain("ON CONFLICT (user_id, source) DO NOTHING");
   });
 
   it("skips scope provisioning (not fails the connect) when INDICATORS_DATABASE_URL is absent", async () => {
-    queryQueue.push([{ github_username: "TserenTserenov", repos: ["DS-my-strategy"] }]);
-    queryQueue.push([{ active: false }]); // currentRows — reactivate path
+    queryQueue.push([INSTALL_ROW]);
+    queryQueue.push([{ active: false, github_repository_id: REPO_ID, index_state: "ready" }]); // same identity, inactive → reactivate
     queryQueue.push([]); // UPDATE user_sources
 
-    const result = await connectSource(ENV, "user-1", "DS-my-strategy");
+    const result = await connectSource(ENV, "user-1", "DS-my-strategy", githubIdentity(Number(REPO_ID)).dependencies);
 
     expect(result.status).toBe("reactivated");
     expect(result.scope_provisioning).toBe("skipped");
     expect(result.reindex_triggered).toBe(false);
+  });
+
+  // --- WP-560 Ф3: repository-identity fingerprint ---
+
+  it("refuses (fail-closed) when the repository identity cannot be verified through the App", async () => {
+    queryQueue.push([INSTALL_ROW]);
+    const { dependencies, fetchMock } = githubIdentity(null, false); // 404 from GET /repos
+    const result = await connectSource(ENV, "user-1", "DS-my-strategy", dependencies);
+    expect(result.status).toBe("error");
+    expect(result.error).toContain("идентичность");
+    expect(fetchMock).toHaveBeenCalledWith("https://api.github.com/repos/TserenTserenov/DS-my-strategy", expect.any(Object));
+    expect(sqlCalls).toHaveLength(1); // only the installation lookup — nothing written, nothing read
+  });
+
+  it("refuses when GITHUB_APP credentials are missing (no token → no identity)", async () => {
+    queryQueue.push([INSTALL_ROW]);
+    const result = await connectSource(ENV, "user-1", "DS-my-strategy"); // real getInstallationToken → null without App env
+    expect(result.status).toBe("error");
+    expect(result.error).toContain("идентичность");
+  });
+
+  it("rebinds when the stored fingerprint differs: purge + bump + pending job in one transaction", async () => {
+    queryQueue.push([INSTALL_ROW]);
+    queryQueue.push([{ active: true, github_repository_id: "111", index_state: "ready" }]); // stored identity ≠ live
+    queryQueue.push([]); // DELETE documents
+    queryQueue.push([]); // DELETE file_index_status
+    queryQueue.push([{ index_generation: 2 }]); // UPDATE ... RETURNING index_generation
+    queryQueue.push([{ id: "job-rebind", generation: "2" }]); // INSERT reindex_jobs ... RETURNING
+
+    const result = await connectSource(ENV, "user-1", "DS-my-strategy", githubIdentity(Number(REPO_ID)).dependencies);
+
+    expect(result.status).toBe("rebound");
+    expect(result.rebind_reason).toBe("fingerprint_mismatch");
+    expect(result.reindex_job_id).toBe("job-rebind");
+    expect(result.index_generation).toBe(2);
+    expect(result.reindex_triggered).toBe(false); // index.ts starts the pre-created job
+    expect(result.message).toContain("недоступен для чтения");
+    expect(sqlTextContaining("DELETE FROM")).toBeDefined();
+    expect(sqlTextContaining("index_generation = index_generation + 1")).toContain("index_state = 'reindexing'");
+    expect(sqlTextContaining("(user_id, source, status, generation)")).toContain("SELECT");
+  });
+
+  it("compares the BIGINT identity as a string — a driver string equals the live numeric id", async () => {
+    queryQueue.push([INSTALL_ROW]);
+    queryQueue.push([{ active: true, github_repository_id: REPO_ID, index_state: "ready" }]); // driver returns BIGINT as string
+    queryQueue.push([]); // UPDATE (COALESCE no-op)
+
+    const result = await connectSource(ENV, "user-1", "DS-my-strategy", githubIdentity(Number(REPO_ID)).dependencies);
+
+    expect(result.status).toBe("already_connected");
+    expect(sqlTextContaining("DELETE FROM")).toBeUndefined();
+  });
+
+  it("legacy row without fingerprint but WITH documents is not trusted: fail-closed rebind", async () => {
+    queryQueue.push([INSTALL_ROW]);
+    queryQueue.push([{ active: true, github_repository_id: null, index_state: "ready" }]);
+    queryQueue.push([{ cnt: 17 }]); // documents exist under the unverified binding
+    queryQueue.push([]); // DELETE documents
+    queryQueue.push([]); // DELETE file_index_status
+    queryQueue.push([{ index_generation: 5 }]);
+    queryQueue.push([{ id: "job-legacy", generation: 5 }]);
+
+    const result = await connectSource(ENV, "user-1", "DS-my-strategy", githubIdentity(Number(REPO_ID)).dependencies);
+
+    expect(result.status).toBe("rebound");
+    expect(result.rebind_reason).toBe("legacy_unverified_with_documents");
+    expect(result.reindex_job_id).toBe("job-legacy");
+    expect(result.index_generation).toBe(5);
+  });
+
+  it("legacy row without fingerprint and without documents just gets bound (no purge)", async () => {
+    queryQueue.push([INSTALL_ROW]);
+    queryQueue.push([{ active: false, github_repository_id: null, index_state: "ready" }]);
+    queryQueue.push([{ cnt: 0 }]); // no documents
+    queryQueue.push([]); // UPDATE ... COALESCE(github_repository_id, ...)
+
+    const result = await connectSource(ENV, "user-1", "DS-my-strategy", githubIdentity(Number(REPO_ID)).dependencies);
+
+    expect(result.status).toBe("reactivated");
+    expect(result.rebind_reason).toBeUndefined();
+    expect(sqlTextContaining("COALESCE(github_repository_id")).toBeDefined();
+    expect(sqlTextContaining("DELETE FROM")).toBeUndefined();
+  });
+});
+
+describe("connectSource — review fixes (WP-560 Ф3, cold review 02.09)", () => {
+  const INSTALL_ROW = { github_username: "TserenTserenov", repos: ["DS-my-strategy"] };
+  const REPO_ID = "987654321012";
+  function deps(id: number) {
+    const fetchMock = vi.fn(async () => responseJson({ id }));
+    return { getInstallationToken: vi.fn().mockResolvedValue("ghs_test_token"), fetch: fetchMock as unknown as typeof globalThis.fetch };
+  }
+  function sqlTexts(): string[] {
+    return sqlCalls.map(([t]) => (t as TemplateStringsArray).join(" "));
+  }
+
+  it("same repository but index stuck in 'reindexing' → recovery job with a new generation, no purge", async () => {
+    queryQueue.push([INSTALL_ROW]);
+    queryQueue.push([{ active: true, github_repository_id: REPO_ID, index_state: "reindexing" }]);
+    queryQueue.push([{ index_generation: 9 }]); // UPDATE ... RETURNING (no DELETEs before it)
+    queryQueue.push([{ id: "job-recover", generation: 9 }]); // INSERT reindex_jobs
+
+    const result = await connectSource(ENV, "user-1", "DS-my-strategy", deps(Number(REPO_ID)));
+
+    expect(result.status).toBe("rebound");
+    expect(result.rebind_reason).toBe("stuck_index_recovery");
+    expect(result.reindex_job_id).toBe("job-recover");
+    expect(result.index_generation).toBe(9);
+    expect(result.message).toContain("повторная переиндексация");
+    expect(sqlTexts().some((s) => s.includes("DELETE FROM"))).toBe(false);
+    expect(sqlTexts().some((s) => s.includes("index_generation = index_generation + 1"))).toBe(true);
+  });
+
+  it("same repository, index 'failed' → same recovery path", async () => {
+    queryQueue.push([INSTALL_ROW]);
+    queryQueue.push([{ active: true, github_repository_id: REPO_ID, index_state: "failed" }]);
+    queryQueue.push([{ index_generation: 3 }]);
+    queryQueue.push([{ id: "job-recover-2", generation: 3 }]);
+    const result = await connectSource(ENV, "user-1", "DS-my-strategy", deps(Number(REPO_ID)));
+    expect(result.status).toBe("rebound");
+    expect(result.rebind_reason).toBe("stuck_index_recovery");
+  });
+
+  it("losing a first-connect race does not overwrite the winner's identity: re-reads the row and reconciles", async () => {
+    queryQueue.push([INSTALL_ROW]);
+    queryQueue.push([]); // currentRows — none yet
+    queryQueue.push([]); // INSERT ... DO NOTHING RETURNING → conflict, nothing inserted
+    queryQueue.push([{ active: true, github_repository_id: "111", index_state: "ready" }]); // winner bound another repo id
+    queryQueue.push([]); // DELETE documents
+    queryQueue.push([]); // DELETE status
+    queryQueue.push([{ index_generation: 2 }]);
+    queryQueue.push([{ id: "job-race", generation: 2 }]);
+
+    const result = await connectSource(ENV, "user-1", "DS-my-strategy", deps(Number(REPO_ID)));
+
+    expect(result.status).toBe("rebound");
+    expect(result.rebind_reason).toBe("fingerprint_mismatch");
+    expect(sqlTexts().some((s) => s.includes("DO UPDATE SET"))).toBe(false); // no silent identity overwrite
+  });
+});
+
+describe("resolveUserContext read gate (WP-560 Ф3)", () => {
+  it("readers only see active sources whose index is ready", async () => {
+    queryQueue.push([]);
+    await resolveUserContext(ENV, "user-1");
+    const text = (sqlCalls[0][0] as TemplateStringsArray).join(" ");
+    expect(text).toContain("active = true");
+    expect(text).toContain("index_state = 'ready'");
+    expect(sqlCalls[0][3]).toBe(false); // params: [table, userId, includeReindexing]
+  });
+
+  it("the indexer opts in to sources that are being rebuilt", async () => {
+    queryQueue.push([]);
+    await resolveUserContext(ENV, "user-1", { includeReindexing: true });
+    expect(sqlCalls[0][3]).toBe(true);
   });
 });
 
