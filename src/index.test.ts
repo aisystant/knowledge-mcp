@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, extractTitle, buildPathTree } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, extractTitle, buildPathTree, checkFileSizeAdmission } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import { chunkLargeFile, contentHash } from "../scripts/ingest.js";
 import { neon } from "@neondatabase/serverless";
@@ -285,6 +285,23 @@ describe("resolveGithubUrl", () => {
 
   it("returns null for unknown source", () => {
     expect(resolveGithubUrl("unknown-source", "file.md")).toBeNull();
+  });
+});
+
+// --- checkFileSizeAdmission (WP-532, 2026-09-02 — reindexFiles() silently
+// dropped files >100_000 chars before the large-file chunking branch could
+// ever run; extracted so the admission policy is testable without DB/GitHub
+// mocks) ---
+describe("checkFileSizeAdmission", () => {
+  it("admits content at or under the limit", () => {
+    expect(checkFileSizeAdmission(1_000_000)).toBeNull();
+    expect(checkFileSizeAdmission(801_500)).toBeNull(); // representative affected DPF Suite file
+  });
+
+  it("rejects content over the limit with a reason mentioning the limit", () => {
+    const reason = checkFileSizeAdmission(1_000_001);
+    expect(reason).not.toBeNull();
+    expect(reason).toContain("1000000");
   });
 });
 
