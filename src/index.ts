@@ -140,7 +140,28 @@ let misconceptionsTable: string;
 let masteryTable: string;
 let graphEventsTable: string;
 const LARGE_FILE_THRESHOLD = CHUNK_CHAR_LIMIT;
-const MAX_FILE_SIZE = 100_000; // 100KB
+// WP-532 (2026-09-02): was 100_000 (~100KB) — introduced in the same commit as
+// chunkLargeFile()/LARGE_FILE_THRESHOLD below (7f8e5963c, "Matches ingest.ts
+// chunkLargeFile() logic for consistency"). That rejected files above 100_000
+// before they could ever reach the large-file chunking branch — ingest.ts
+// (the bulk loader) has no such cap. Raised to a value comfortably above
+// every source file seen in production today (largest known: ~801K) while
+// keeping a bound on synchronous work in a single Worker request — see
+// checkFileSizeAdmission().
+const MAX_FILE_CHARS = 1_000_000;
+
+/**
+ * Pure size-admission check for reindexFiles(), split out so the policy is
+ * unit-testable without the DB/GitHub/embedding side effects of the caller.
+ * Returns a human-readable reason when the file is rejected, null when it's
+ * within bounds.
+ */
+export function checkFileSizeAdmission(contentLength: number): string | null {
+  if (contentLength > MAX_FILE_CHARS) {
+    return `file exceeds max size (${MAX_FILE_CHARS} chars), skipped from indexing`;
+  }
+  return null;
+}
 const RERANK_MODEL = "openai/gpt-4o-mini";
 const RERANK_CANDIDATES = 20; // Fetch top-N for reranking, return top-K
 const RERANK_TIMEOUT_MS = 5000;
@@ -166,13 +187,21 @@ const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> =
   "PACK-verification": { base: "https://github.com/TserenTserenov/PACK-verification/blob/main", pathPrefix: "pack/" },
   "PACK-autonomous-agents": { base: "https://github.com/TserenTserenov/PACK-autonomous-agents/blob/main", pathPrefix: "pack/" },
   "PACK-ecosystem": { base: "https://github.com/TserenTserenov/PACK-ecosystem/blob/main", pathPrefix: "pack/" },
+  // WP-532 (2026-09-02): PACK-rhetoric is public — safe to add via the unauthenticated
+  // readFromGitHubPublic() fetch this map feeds. PACK-systems-art and PACK-agent-rules
+  // are also in scripts/sources.json (the bulk-ingest registry) but are PRIVATE repos;
+  // adding them here would not work — readFromGitHubPublic() has no auth and would get
+  // 404s from raw.githubusercontent.com. They need an installation-token path like
+  // resolveUserContext/getInstallationToken in layers/personal.ts before they can join
+  // this live-reindex registry. Left out intentionally, not an oversight.
+  "PACK-rhetoric": { base: "https://github.com/TserenTserenov/PACK-rhetoric/blob/main", pathPrefix: "pack/" },
 };
 
 // L2 platform sources — always indexed with user_id=NULL, visible to all.
 // Everything else in SOURCE_GITHUB_BASE is L4 (personal) and must have user_sources entry.
 const L2_PLATFORM_SOURCES: ReadonlySet<string> = new Set([
   "FPF", "SPF",
-  "PACK-digital-platform", "PACK-MIM", "PACK-personal", "PACK-ecosystem",
+  "PACK-digital-platform", "PACK-MIM", "PACK-personal", "PACK-ecosystem", "PACK-rhetoric",
   "docs-courses", "aist-bot-docs", "exocortex-template-docs",
   "FMT-exocortex-template", "FMT-s2r",
 ]);
@@ -3749,8 +3778,13 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
         continue;
       }
 
-      if (content.length > MAX_FILE_SIZE) {
+      const sizeRejection = checkFileSizeAdmission(content.length);
+      if (sizeRejection) {
         result.skipped++;
+        // Unlike the hash-match skip below, this file will never become
+        // searchable as-is — the caller needs to see that, not read
+        // "skipped" as "already up to date" (WP-532, 2026-09-02).
+        result.errors.push(`${file.path}: ${sizeRejection}`);
         continue;
       }
 
