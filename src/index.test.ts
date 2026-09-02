@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, extractTitle, buildPathTree, checkFileSizeAdmission } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import { chunkLargeFile, contentHash } from "../scripts/ingest.js";
 import { neon } from "@neondatabase/serverless";
@@ -302,6 +302,39 @@ describe("checkFileSizeAdmission", () => {
     const reason = checkFileSizeAdmission(1_000_001);
     expect(reason).not.toBeNull();
     expect(reason).toContain("1000000");
+  });
+});
+
+// --- partitionFilesBySize (WP-532, 2026-09-02 — pre-filter for syncFullIngestSource(),
+// so a daily full-ingest pass doesn't spend a GitHub fetch on files it already knows are
+// too big for checkFileSizeAdmission()) ---
+describe("partitionFilesBySize", () => {
+  it("splits files under and over the byte limit", () => {
+    const files = [
+      { path: "small.md", size: 500 },
+      { path: "big.md", size: 2_000_000 },
+    ];
+    const { eligible, excluded } = partitionFilesBySize(files, 1_000_000);
+    expect(eligible.map((f) => f.path)).toEqual(["small.md"]);
+    expect(excluded.map((f) => f.path)).toEqual(["big.md"]);
+  });
+
+  it("treats a file exactly at the limit as eligible (matches checkFileSizeAdmission's own boundary — rejects only strictly over)", () => {
+    const files = [{ path: "boundary.md", size: 1_000_000 }];
+    const { eligible, excluded } = partitionFilesBySize(files, 1_000_000);
+    expect(eligible).toHaveLength(1);
+    expect(excluded).toHaveLength(0);
+  });
+
+  it("excludes a file one byte over the limit", () => {
+    const files = [{ path: "over-by-one.md", size: 1_000_001 }];
+    const { eligible, excluded } = partitionFilesBySize(files, 1_000_000);
+    expect(eligible).toHaveLength(0);
+    expect(excluded).toHaveLength(1);
+  });
+
+  it("returns empty arrays for empty input", () => {
+    expect(partitionFilesBySize([], 1_000_000)).toEqual({ eligible: [], excluded: [] });
   });
 });
 
