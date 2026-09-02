@@ -2913,7 +2913,28 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             // re-walk + re-embed the whole repo on every call, guarded only by startReindexJob's
             // 60s cooldown (cold-review finding, session 2026-07-03-11). A user who genuinely
             // wants to force a re-reindex of an already-connected source has reindex (gateway: personal_reindex).
-            if (
+            // WP-560 Ф3: "rebound" = the name now points at another physical repository (or an
+            // unverified legacy binding that had documents). connectSource already purged the old
+            // index and pre-created a 'pending' job in the same transaction; start it regardless
+            // of scope provisioning or cooldown — the source is fail-closed until it finishes.
+            if (connectResult.status === "rebound" && connectResult.reindex_job_id) {
+              const reindexResult = await startReindexJob(env, principal.userId, connectResult.source, { jobId: connectResult.reindex_job_id });
+              connectResult.reindex_triggered = reindexResult.status === "running";
+              if (reindexResult.status === "failed") {
+                // Not a successful rebind: the source is fail-closed with no job — a client keyed
+                // on `status` must see that, not a "rebound" that reads like success.
+                connectResult.status = "error";
+                connectResult.error = reindexResult.message;
+                connectResult.message = `старый индекс удалён, но переиндексация не запустилась (источник остаётся недоступен для чтения): ${reindexResult.message}`;
+                console.error(JSON.stringify({
+                  phase: "connect_source_rebind_reindex_failed",
+                  user_id_prefix: principal.userId.slice(0, 8),
+                  source: connectResult.source,
+                  job_id: connectResult.reindex_job_id,
+                  reason: reindexResult.message,
+                }));
+              }
+            } else if (
               (connectResult.status === "newly_connected" || connectResult.status === "reactivated") &&
               connectResult.scope_provisioning === "ok"
             ) {
