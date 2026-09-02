@@ -2255,6 +2255,15 @@ export const TOOLS = [
       },
       required: ["query"],
     },
+    // WP-560 Ф8: read-only hint for MCP clients (claude.ai skips the per-call approval
+    // prompt only when the tool declares it). Read path only — SELECT queries, no reindex,
+    // no job creation. The gateway re-checks this name against its own allowlist.
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
   },
   {
     name: "get_document",
@@ -2274,6 +2283,15 @@ export const TOOLS = [
       },
       required: ["filename"],
     },
+    // WP-560 Ф8: read-only hint for MCP clients (claude.ai skips the per-call approval
+    // prompt only when the tool declares it). Read path only — SELECT queries, no reindex,
+    // no job creation. The gateway re-checks this name against its own allowlist.
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
   },
   {
     name: "list_sources",
@@ -2287,6 +2305,15 @@ export const TOOLS = [
           description: "Filter by source type",
         },
       },
+    },
+    // WP-560 Ф8: read-only hint for MCP clients (claude.ai skips the per-call approval
+    // prompt only when the tool declares it). Read path only — SELECT queries, no reindex,
+    // no job creation. The gateway re-checks this name against its own allowlist.
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
   },
   {
@@ -2307,6 +2334,15 @@ export const TOOLS = [
         },
         limit: { type: "number", description: "Maximum number of documents (default: 100)" },
       },
+    },
+    // WP-560 Ф8: read-only hint for MCP clients (claude.ai skips the per-call approval
+    // prompt only when the tool declares it). Read path only — SELECT queries, no reindex,
+    // no job creation. The gateway re-checks this name against its own allowlist.
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
   },
   {
@@ -2329,6 +2365,15 @@ export const TOOLS = [
           description: "How many path segments below path_prefix to expand before collapsing into a dir entry (default: 1).",
         },
       },
+    },
+    // WP-560 Ф8: read-only hint for MCP clients (claude.ai skips the per-call approval
+    // prompt only when the tool declares it). Read path only — SELECT queries, no reindex,
+    // no job creation. The gateway re-checks this name against its own allowlist.
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
   },
 
@@ -2563,6 +2608,15 @@ const PRIVATE_TOOLS = [
       },
       required: ["query"],
     },
+    // WP-560 Ф8: read-only hint for MCP clients (claude.ai skips the per-call approval
+    // prompt only when the tool declares it). Read path only — SELECT queries, no reindex,
+    // no job creation. The gateway re-checks this name against its own allowlist.
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
   },
   {
     name: "connect_source",
@@ -2602,6 +2656,15 @@ const PRIVATE_TOOLS = [
         job_id: { type: "string", description: "job_id returned by connect_source or personal_reindex" },
       },
       required: ["job_id"],
+    },
+    // WP-560 Ф8: read-only hint for MCP clients (claude.ai skips the per-call approval
+    // prompt only when the tool declares it). Read path only — SELECT queries, no reindex,
+    // no job creation. The gateway re-checks this name against its own allowlist.
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
   },
   {
