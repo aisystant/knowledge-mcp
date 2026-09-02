@@ -202,13 +202,13 @@ export function buildIndexStatusSuccessQuery(
   `;
 }
 
-/** Error upsert for `file_index_status` — deliberately does NOT touch
+/** Un-awaited error upsert for `file_index_status` — deliberately does NOT touch
  * `indexed_at`/`content_hash`: a failed retry on a file that was previously
  * indexed successfully must keep reporting the last-good version as findable,
  * not silently revert it to "never indexed" (peer-session 2026-08-30-18,
- * Codex round 1). Called outside the chunk transaction (the transaction
- * already rolled back by the time an error branch runs), so this is its own
- * statement, not part of the array passed to `sql.transaction([...])`. */
+ * Codex round 1). Runs in its own `sql.transaction([...])` (the chunk
+ * transaction has already rolled back when an error branch runs) so the
+ * reindex pipeline can put the generation fence in front of it (WP-560 Ф3). */
 export function buildIndexStatusErrorQuery(
   sql: PersonalSql,
   statusTable: string,
@@ -227,16 +227,6 @@ export function buildIndexStatusErrorQuery(
   `;
 }
 
-export async function writeIndexStatusError(
-  sql: PersonalSql,
-  statusTable: string,
-  source: string,
-  userId: string,
-  filename: string,
-  reason: string,
-): Promise<void> {
-  await buildIndexStatusErrorQuery(sql, statusTable, source, userId, filename, reason);
-}
 
 /** Un-awaited DELETE for `file_index_status` — pair with `buildDeleteDocumentQuery`
  * inside the same `sql.transaction([...])` on a `removed` action, so a file's
@@ -1202,7 +1192,13 @@ async function fetchGitHubRepositoryId(
 ): Promise<string | null> {
   const getToken = dependencies.getInstallationToken ?? getInstallationToken;
   const githubFetch = dependencies.fetch ?? globalThis.fetch;
-  const token = await getToken(env, userId, repo);
+  let token: string | null;
+  try {
+    token = await getToken(env, userId, repo);
+  } catch (err) {
+    console.error(JSON.stringify({ phase: "repository_identity_token_failed", user_id_prefix: userId.slice(0, 8), repo, error: err instanceof Error ? err.message : String(err) }));
+    return null;
+  }
   if (!token) return null;
   let response: Response;
   try {
@@ -1217,6 +1213,25 @@ async function fetchGitHubRepositoryId(
   if (typeof body.id === "number" && Number.isSafeInteger(body.id) && body.id > 0) return String(body.id);
   if (typeof body.id === "string" && /^[1-9]\d*$/.test(body.id)) return body.id;
   return null;
+}
+
+/** Mirrors DEFAULT_WATCHDOG_STALE_MINUTES in ./reindex.ts: a job silent longer than this is
+ * dead as far as the watchdog is concerned, so a reconnect may take over its source. */
+const LIVE_REINDEX_JOB_WINDOW_MINUTES = 30;
+
+/** Id of a reindex job that is still alive for (user, source): running with a recent
+ * heartbeat, or pending and created recently (pending→running happens within one request). */
+async function findLiveReindexJob(sql: PersonalSql, reindexJobsTable: string, userId: string, source: string): Promise<string | null> {
+  const rows = await sql`
+    SELECT id FROM ${sql.unsafe(reindexJobsTable)}
+    WHERE user_id = ${userId} AND source = ${source}
+      AND (
+        (status = 'running' AND last_heartbeat_at > NOW() - (${LIVE_REINDEX_JOB_WINDOW_MINUTES} * INTERVAL '1 minute'))
+        OR (status = 'pending' AND started_at > NOW() - (${LIVE_REINDEX_JOB_WINDOW_MINUTES} * INTERVAL '1 minute'))
+      )
+    ORDER BY started_at DESC LIMIT 1
+  `;
+  return rows.length > 0 ? String(rows[0].id) : null;
 }
 
 function bigintColumnAsString(value: unknown): string | null {
@@ -1331,6 +1346,7 @@ export async function connectSource(
     const wasActive = current.active as boolean;
     const storedRepositoryId = bigintColumnAsString(current.github_repository_id);
     const indexState = (current.index_state as string | undefined) ?? "ready";
+    let liveJobId: string | undefined;
 
     if (storedRepositoryId === null) {
       // Legacy row without a verified binding: safe to bind only while it has no documents.
@@ -1343,12 +1359,18 @@ export async function connectSource(
     } else if (storedRepositoryId !== repositoryId) {
       rebindReason = "fingerprint_mismatch";
     } else if (indexState !== "ready") {
-      // Same repository, but a previous rebind/reindex never reached 'ready' (job lost between
-      // the purge transaction and its start, worker crash, watchdog-failed). Readers are
-      // fail-closed on it, so a reconnect must be the recovery path: new generation (fences
-      // out anything still in flight) + fresh job. No purge — the documents that exist belong
-      // to this very repository; the full reindex re-walks the tree with hash dedup.
-      rebindReason = "stuck_index_recovery";
+      // Same repository, but the index is not ready. If a job is genuinely alive (recent
+      // heartbeat / just created) this is a reconnect DURING a reindex — bumping the
+      // generation would fence that job out and restart from zero on every retry. Only when
+      // nothing is alive (job lost between the purge transaction and its start, worker crash,
+      // watchdog-failed) is a reconnect the recovery path: new generation + fresh job, no
+      // purge — the documents that exist belong to this very repository.
+      const liveJob = await findLiveReindexJob(sql, reindexJobsTable, userId, source);
+      if (liveJob) {
+        liveJobId = liveJob;
+      } else {
+        rebindReason = "stuck_index_recovery";
+      }
     }
 
     if (rebindReason) {
@@ -1393,6 +1415,7 @@ export async function connectSource(
         WHERE user_id = ${userId} AND source = ${source}
       `;
       resultStatus = wasActive === false ? "reactivated" : "already_connected";
+      if (liveJobId) rebindJobId = liveJobId;
     }
   }
 
@@ -1439,6 +1462,8 @@ export async function connectSource(
     index_generation: indexGeneration,
     message: scopeProvisioning === "failed"
       ? "репо подключён для чтения, но запись пока не разрешена — повтори connect_source"
+      : rebindJobId && resultStatus !== "rebound"
+        ? `индекс источника сейчас перестраивается (job ${rebindJobId}) — дождись завершения (personal_reindex_status), до этого источник недоступен для чтения.`
       : resultStatus === "rebound"
         ? (rebindReason === "stuck_index_recovery"
           ? "индекс источника не был завершён ранее — запущена повторная переиндексация, до её завершения источник недоступен для чтения."

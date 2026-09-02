@@ -520,14 +520,18 @@ export async function startReindexJob(
       UPDATE ${sql.unsafe(reindexJobsTable)}
       SET status = 'failed', finished_at = NOW(), errors = ${JSON.stringify([reason])}::jsonb
       WHERE id = ${options.jobId}::uuid AND status = 'pending'
-    `.catch(() => undefined);
+    `.catch((cleanupErr: unknown) => {
+      console.error(JSON.stringify({ phase: "pre_created_job_fail_cleanup_failed", job_id: options.jobId, source, error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) }));
+    });
     await sql`
       UPDATE ${sql.unsafe(userSourcesTable)} u
       SET index_state = 'failed'
       FROM ${sql.unsafe(reindexJobsTable)} j
       WHERE j.id = ${options.jobId}::uuid AND j.user_id = u.user_id AND j.source = u.source
         AND u.index_state = 'reindexing' AND u.index_generation = j.generation
-    `.catch(() => undefined);
+    `.catch((cleanupErr: unknown) => {
+      console.error(JSON.stringify({ phase: "pre_created_job_source_fail_cleanup_failed", job_id: options.jobId, source, error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) }));
+    });
   };
 
   let rows: Record<string, unknown>[];

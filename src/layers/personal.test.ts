@@ -824,6 +824,7 @@ describe("connectSource — review fixes (WP-560 Ф3, cold review 02.09)", () =>
   it("same repository but index stuck in 'reindexing' → recovery job with a new generation, no purge", async () => {
     queryQueue.push([INSTALL_ROW]);
     queryQueue.push([{ active: true, github_repository_id: REPO_ID, index_state: "reindexing" }]);
+    queryQueue.push([]); // findLiveReindexJob → nothing alive
     queryQueue.push([{ index_generation: 9 }]); // UPDATE ... RETURNING (no DELETEs before it)
     queryQueue.push([{ id: "job-recover", generation: 9 }]); // INSERT reindex_jobs
 
@@ -841,11 +842,29 @@ describe("connectSource — review fixes (WP-560 Ф3, cold review 02.09)", () =>
   it("same repository, index 'failed' → same recovery path", async () => {
     queryQueue.push([INSTALL_ROW]);
     queryQueue.push([{ active: true, github_repository_id: REPO_ID, index_state: "failed" }]);
+    queryQueue.push([]); // findLiveReindexJob → nothing alive
     queryQueue.push([{ index_generation: 3 }]);
     queryQueue.push([{ id: "job-recover-2", generation: 3 }]);
     const result = await connectSource(ENV, "user-1", "DS-my-strategy", deps(Number(REPO_ID)));
     expect(result.status).toBe("rebound");
     expect(result.rebind_reason).toBe("stuck_index_recovery");
+  });
+
+  it("reconnect DURING a live reindex does not restart it: no generation bump, points at the running job", async () => {
+    queryQueue.push([INSTALL_ROW]);
+    queryQueue.push([{ active: true, github_repository_id: REPO_ID, index_state: "reindexing" }]);
+    queryQueue.push([{ id: "job-live" }]); // findLiveReindexJob → running with fresh heartbeat
+    queryQueue.push([]); // UPDATE ... COALESCE (plain reconnect)
+
+    const result = await connectSource(ENV, "user-1", "DS-my-strategy", deps(Number(REPO_ID)));
+
+    expect(result.status).toBe("already_connected");
+    expect(result.rebind_reason).toBeUndefined();
+    expect(result.reindex_job_id).toBe("job-live");
+    expect(result.message).toContain("job-live");
+    expect(sqlTexts().some((s) => s.includes("index_generation = index_generation + 1"))).toBe(false);
+    const live = sqlTexts().find((s) => s.includes("last_heartbeat_at >"));
+    expect(live).toContain("status = 'pending'");
   });
 
   it("losing a first-connect race does not overwrite the winner's identity: re-reads the row and reconciles", async () => {
