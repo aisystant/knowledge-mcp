@@ -4177,6 +4177,125 @@ const HEARTBEAT_PACK_SOURCES = Object.keys(SOURCE_GITHUB_BASE).filter(
 const DRIFT_ALERT_THRESHOLD = 5;
 const STALENESS_ALERT_HOURS = 48;
 
+// WP-532 (2026-09-02): sources with no push-webhook and no place in the PACK-* drift
+// check above. Two separate gaps, both closed the same way for now:
+// (1) the owner hasn't installed the GitHub App on their account (verified via
+//     `knowledge.github_installations` — zero rows for e.g. ailev/FPF), so GitHub never
+//     calls this service's /github/webhook for their pushes;
+// (2) HEARTBEAT_PACK_SOURCES only covers "PACK-*" names, and even if it didn't,
+//     the loop above calls reindexConceptsForFiles() — the concept-graph indexer
+//     (concept_graph.concepts/edges), not reindexFiles() — so it wouldn't touch the
+//     knowledge_chunk rows knowledge_search actually reads (concept-indexer.ts says as
+//     much: "Non-Pack sources ... remain in full ingest").
+// This is a daily full pass through reindexFiles() instead — see syncFullIngestSource().
+// Scope: FPF only for now (SPF deferred — internal source, pilot can reindex manually
+// after a push; revisit once this has run stably for a while).
+const FULL_INGEST_SOURCES = ["FPF"];
+
+interface GitHubFileMeta {
+  path: string;
+  /** Bytes, from the GitHub Trees API — not the same unit as MAX_FILE_CHARS (JS string
+   *  length). See partitionFilesBySize(). */
+  size: number;
+}
+
+async function listGitHubFilesWithSize(source: string): Promise<GitHubFileMeta[]> {
+  const config = SOURCE_GITHUB_BASE[source];
+  if (!config) throw new Error(`Unknown source: ${source}`);
+
+  const match = config.base.match(/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)/);
+  if (!match) throw new Error(`Invalid GitHub base URL for source: ${source}`);
+
+  const [, owner, repo, branch] = match;
+  const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, {
+    headers: { "User-Agent": "aisystant-knowledge-mcp" },
+  });
+
+  if (!resp.ok) throw new Error(`GitHub Trees API ${resp.status} for ${source}`);
+  const data = await resp.json() as { tree: Array<{ path: string; type: string; size?: number }>; truncated?: boolean };
+  if (data.truncated) {
+    throw new Error(`GitHub tree truncated for ${source} — too many files.`);
+  }
+  return data.tree
+    .filter((f) =>
+      f.type === "blob" &&
+      f.path.endsWith(".md") &&
+      (!config.pathPrefix || f.path.startsWith(config.pathPrefix))
+    )
+    .map((f) => ({ path: f.path, size: f.size ?? 0 }));
+}
+
+/**
+ * Split files by GitHub's reported byte size against the character-based
+ * MAX_FILE_CHARS admission limit reindexFiles() will apply anyway. UTF-8 byte count is
+ * always >= character count, so `size <= maxBytes` guarantees `content.length <= maxBytes`
+ * too — this can only be overly conservative (excluding a non-ASCII-heavy file whose byte
+ * count crosses maxBytes while its real character count wouldn't), never the reverse. That
+ * trade is worth it to avoid a wasted GitHub fetch on files we already expect to be
+ * rejected. Boundary matches checkFileSizeAdmission()'s own `> MAX_FILE_CHARS` (i.e. a
+ * file at exactly the limit is admitted by both).
+ */
+export function partitionFilesBySize<T extends { size: number }>(
+  files: T[],
+  maxBytes: number
+): { eligible: T[]; excluded: T[] } {
+  const eligible: T[] = [];
+  const excluded: T[] = [];
+  for (const f of files) {
+    (f.size <= maxBytes ? eligible : excluded).push(f);
+  }
+  return { eligible, excluded };
+}
+
+/**
+ * Daily full-ingest pass for a source with no push-webhook (see FULL_INGEST_SOURCES).
+ * Unchanged files cost one GitHub fetch + one hash SELECT each — reindexFiles() checks
+ * the content hash before any DELETE/INSERT or embedding call — so running this against
+ * every file every day is cheap as long as the file count stays small (checked live for
+ * FPF: 7 total .md files, 2026-09-02).
+ *
+ * Scope of this first pass: only additions/modifications. A file removed upstream stays
+ * in the index until someone reindexes explicitly — detecting removals here would need a
+ * DB-vs-GitHub diff like the PACK-* branch above; deferred to keep this change narrow.
+ * Also no single-flight guard against an overlapping manual reindex_source call on the
+ * same source — acceptable at once-a-day cron frequency, revisit if that changes.
+ */
+async function syncFullIngestSource(env: Env, source: string): Promise<void> {
+  const startedAt = Date.now();
+  try {
+    const allFiles = await listGitHubFilesWithSize(source);
+    const { eligible, excluded } = partitionFilesBySize(allFiles, MAX_FILE_CHARS);
+
+    for (const f of excluded) {
+      console.log(JSON.stringify({ phase: "full_ingest_excluded", source, path: f.path, size_bytes: f.size, reason: `over MAX_FILE_CHARS prefilter (limit ${MAX_FILE_CHARS} bytes)` }));
+    }
+
+    const result = await reindexFiles(env, {
+      source,
+      files: eligible.map((f) => ({ path: f.path, action: "modified" as const })),
+    });
+
+    console.log(JSON.stringify({
+      phase: result.errors.length > 0 ? "full_ingest_partial" : "full_ingest_ok",
+      source,
+      found: allFiles.length,
+      eligible: eligible.length,
+      excluded: excluded.length,
+      processed: result.processed,
+      skipped: result.skipped,
+      errors: result.errors,
+      duration_ms: Date.now() - startedAt,
+    }));
+  } catch (e) {
+    console.error(JSON.stringify({
+      phase: "full_ingest_error",
+      source,
+      error: e instanceof Error ? e.message : String(e),
+      duration_ms: Date.now() - startedAt,
+    }));
+  }
+}
+
 async function runHeartbeat(env: Env): Promise<void> {
   console.log("[heartbeat] start, sources:", HEARTBEAT_PACK_SOURCES.join(", "));
   const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
@@ -4275,6 +4394,10 @@ async function runHeartbeat(env: Env): Promise<void> {
     } catch (e) {
       console.error(`[heartbeat] health write failed for ${source}:`, e instanceof Error ? e.message : e);
     }
+  }
+
+  for (const source of FULL_INGEST_SOURCES) {
+    await syncFullIngestSource(env, source);
   }
 
   console.log("[heartbeat] complete");
