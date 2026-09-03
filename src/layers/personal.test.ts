@@ -314,6 +314,31 @@ describe("Knowledge Index publication creation guard", () => {
     expect(request).toHaveBeenCalledTimes(1);
   });
 
+  it("fails closed for an ordinary write when target existence is unavailable (pilot choice A)", async () => {
+    const { request, dependencies } = githubDependencies([{ ok: false, status: 503 }]);
+
+    const result = await writeToGitHub(
+      ENV,
+      ctx(),
+      "DS-my-strategy",
+      "notes/new.md",
+      "# Ordinary note",
+      "create note",
+      dependencies,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      reason: "existence_check_unavailable",
+      next_action: EXISTENCE_CHECK_NEXT_ACTION,
+    });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).not.toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ method: "PUT" }),
+    );
+  });
+
   it("allows personal_write to update a confirmed existing publication", async () => {
     const existingSha = "a".repeat(40);
     const { request, dependencies } = githubDependencies([
