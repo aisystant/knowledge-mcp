@@ -131,7 +131,7 @@ const VECTOR_CONFIDENCE_THRESHOLD = 0.6;
 const CHUNK_CHAR_LIMIT = 10_000;
 
 // WP-268 Phase 3: Schema parameterization — table name references
-// Initialized in export default fetch() before request handling
+// Initialized by initTables(env) — see below.
 let knowledgeChunkTable: string;
 let retrievalFeedbackTable: string;
 let conceptsTable: string;
@@ -139,6 +139,28 @@ let conceptEdgesTable: string;
 let misconceptionsTable: string;
 let masteryTable: string;
 let graphEventsTable: string;
+
+// WP-560 Ф11 incident (2026-09-04): these were only ever assigned inside
+// fetch(), so any code reachable from scheduled() (rebuildSkillsIndex ->
+// reindexFiles(), and — pre-existing, same bug — runHeartbeat ->
+// syncFullIngestSource -> reindexFiles()) read them as undefined and built a
+// query against literal table "undefined". Confirmed live: the first real
+// cron tick after Ф11 shipped failed on every one of 51 files with
+// `relation "undefined" does not exist`. scheduled() never calls fetch(), so
+// a cron-triggered isolate never ran this assignment at all. Factored out so
+// both entry points call the same init before touching any of these tables.
+function initTables(env: Env): void {
+  const knowledgeSchema = getKnowledgeSchema(env);
+  const conceptGraphSchema = getConceptGraphSchema(env);
+  const healthSchema = getHealthSchema(env);
+  knowledgeChunkTable = KNOWLEDGE_TABLES.knowledge_chunk(knowledgeSchema);
+  retrievalFeedbackTable = KNOWLEDGE_TABLES.retrieval_feedback(knowledgeSchema);
+  conceptsTable = CONCEPT_GRAPH_TABLES.concepts(conceptGraphSchema);
+  conceptEdgesTable = CONCEPT_GRAPH_TABLES.concept_edges(conceptGraphSchema);
+  misconceptionsTable = CONCEPT_GRAPH_TABLES.concept_misconceptions(conceptGraphSchema);
+  masteryTable = CONCEPT_GRAPH_TABLES.learner_concept_mastery(conceptGraphSchema);
+  graphEventsTable = HEALTH_TABLES.graph_usage_events(healthSchema);
+}
 const LARGE_FILE_THRESHOLD = CHUNK_CHAR_LIMIT;
 // WP-532 (2026-09-02): was 100_000 (~100KB) — introduced in the same commit as
 // chunkLargeFile()/LARGE_FILE_THRESHOLD below (7f8e5963c, "Matches ingest.ts
@@ -3902,17 +3924,7 @@ export function resolveScheduledJob(mode: McpMode, cron: string): "watchdog" | "
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     // WP-268 Phase 3: Schema parameterization for database migrations
-    const knowledgeSchema = getKnowledgeSchema(env);
-    const conceptGraphSchema = getConceptGraphSchema(env);
-    const healthSchema = getHealthSchema(env);
-    // Table name references for SQL queries (assign to module-level vars used by search functions)
-    knowledgeChunkTable = KNOWLEDGE_TABLES.knowledge_chunk(knowledgeSchema);
-    retrievalFeedbackTable = KNOWLEDGE_TABLES.retrieval_feedback(knowledgeSchema);
-    conceptsTable = CONCEPT_GRAPH_TABLES.concepts(conceptGraphSchema);
-    conceptEdgesTable = CONCEPT_GRAPH_TABLES.concept_edges(conceptGraphSchema);
-    misconceptionsTable = CONCEPT_GRAPH_TABLES.concept_misconceptions(conceptGraphSchema);
-    masteryTable = CONCEPT_GRAPH_TABLES.learner_concept_mastery(conceptGraphSchema);
-    graphEventsTable = HEALTH_TABLES.graph_usage_events(healthSchema);
+    initTables(env);
 
     const url = new URL(request.url);
 
@@ -4209,6 +4221,10 @@ export default {
   // reindex watchdog, not the public drift-check heartbeat (which needs KNOWLEDGE_DATABASE_URL,
   // not bound on that deploy).
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    // WP-560 Ф11 incident: rebuildSkillsIndex/runHeartbeat both read the module-level
+    // table vars that used to be assigned only in fetch() — a cron-triggered isolate
+    // never runs fetch() first. See initTables() above for the full incident note.
+    initTables(env);
     const job = resolveScheduledJob(resolveMode(env.MCP_MODE), _event.cron);
     if (job === "watchdog") {
       ctx.waitUntil(handleWatchdog(env));
