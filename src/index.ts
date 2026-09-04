@@ -4182,24 +4182,30 @@ export default {
   },
 
   // WP-339 Ф5+Ф6 (public deploy) / WP-410 срез-2b Деплой-2 группа В (private deploy): the same
-  // cron trigger fires a different job depending which wrangler config it was deployed with —
-  // public knowledge-mcp's wrangler.toml had no [triggers] section before WP-560 Ф11 (it never
-  // fired here at all — runHeartbeat, including the FULL_INGEST_SOURCES pass added by WP-532,
-  // has never run automatically on the public deploy); private personal-knowledge-mcp's
-  // wrangler.private.toml runs this every 15 min and needs the reindex watchdog, not the public
-  // drift-check heartbeat (which needs KNOWLEDGE_DATABASE_URL, not bound on that deploy).
+  // cron trigger fires a different job depending which wrangler config it was deployed with and,
+  // on the public deploy, which of the two crons in wrangler.toml actually fired — Cloudflare
+  // passes the matched cron string on `_event.cron`, not just "the schedule ran".
   //
-  // WP-560 Ф11 adds the first cron trigger to the public wrangler.toml, but deliberately calls
-  // only the new narrow rebuildSkillsIndex() here, NOT runHeartbeat() — turning this cron on
-  // would otherwise also be the first time runHeartbeat (PACK-* drift-check + FPF full-ingest)
-  // ever fires in production, a much larger blast radius than this WP owns. That activation is
-  // a separate decision for the pilot (flagged in WP-560 Ф11, not decided here).
+  // public knowledge-mcp's wrangler.toml already ran "30 0 * * *" daily before WP-560 Ф11 (a
+  // corrected finding: an earlier version of this comment claimed the public deploy had no
+  // [triggers] at all and that runHeartbeat had never fired in production — both false, caught
+  // only after the pilot pasted the actual file content, which this environment cannot read
+  // directly). WP-560 Ф11 added a second cron, "*/15 * * * *", for the new narrow
+  // rebuildSkillsIndex() — it must not replace the daily tick's call to runHeartbeat() (PACK-*
+  // drift-check + FPF full-ingest, WP-532), so scheduled() branches on which cron actually fired.
+  // private personal-knowledge-mcp's wrangler.private.toml runs its own 15-min cron for the
+  // reindex watchdog, not the public drift-check heartbeat (which needs KNOWLEDGE_DATABASE_URL,
+  // not bound on that deploy).
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     if (resolveMode(env.MCP_MODE) === "private") {
       ctx.waitUntil(handleWatchdog(env));
       return;
     }
-    ctx.waitUntil(rebuildSkillsIndex(env));
+    if (_event.cron === "*/15 * * * *") {
+      ctx.waitUntil(rebuildSkillsIndex(env));
+      return;
+    }
+    ctx.waitUntil(runHeartbeat(env));
   },
 
   // WP-410 срез-2b Деплой-2 группа Б: real consumer, ported from personal-knowledge-mcp
