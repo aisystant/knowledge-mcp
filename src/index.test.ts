@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import { chunkLargeFile, contentHash } from "../scripts/ingest.js";
 import { neon } from "@neondatabase/serverless";
@@ -366,6 +366,29 @@ describe("SKILL_FILE_PATTERN", () => {
 
   it("rejects SKILL.md with no skill-name directory", () => {
     expect(SKILL_FILE_PATTERN.test(".claude/skills/SKILL.md")).toBe(false);
+  });
+});
+
+// --- resolveScheduledJob (WP-560 Ф11, cold-review follow-up 2026-09-04) ---
+// The pure decision scheduled() delegates to. A silent fallthrough here is the
+// exact bug that nearly dropped the daily PACK/FPF heartbeat when the 15-min
+// skills cron was added — this is the guard against it recurring.
+describe("resolveScheduledJob", () => {
+  it("routes private mode to the reindex watchdog regardless of cron", () => {
+    expect(resolveScheduledJob("private", "*/15 * * * *")).toBe("watchdog");
+    expect(resolveScheduledJob("private", "30 0 * * *")).toBe("watchdog");
+  });
+
+  it("routes the 15-minute public cron to the skills rebuild", () => {
+    expect(resolveScheduledJob("public", "*/15 * * * *")).toBe("skills");
+  });
+
+  it("routes the daily public cron to the heartbeat, not the skills rebuild", () => {
+    expect(resolveScheduledJob("public", "30 0 * * *")).toBe("heartbeat");
+  });
+
+  it("falls back to heartbeat, not silence, for any unrecognized public cron", () => {
+    expect(resolveScheduledJob("public", "0 0 1 * *")).toBe("heartbeat");
   });
 });
 

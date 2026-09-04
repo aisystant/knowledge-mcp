@@ -3885,6 +3885,18 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
   return result;
 }
 
+// WP-560 Ф11 (cold-review follow-up): pure decision extracted out of scheduled()
+// so the branch itself is unit-testable without mocking Cloudflare's runtime or
+// the three side-effecting jobs it dispatches to. A silent fallthrough here is
+// exactly the bug class that nearly dropped the daily PACK/FPF heartbeat earlier
+// today (WP-560 Ф11 incident) — this function is what src/index.test.ts asserts
+// against for every (mode, cron) combination that can occur.
+export function resolveScheduledJob(mode: McpMode, cron: string): "watchdog" | "skills" | "heartbeat" {
+  if (mode === "private") return "watchdog";
+  if (cron === "*/15 * * * *") return "skills";
+  return "heartbeat";
+}
+
 // --- HTTP server ---
 
 export default {
@@ -4197,15 +4209,14 @@ export default {
   // reindex watchdog, not the public drift-check heartbeat (which needs KNOWLEDGE_DATABASE_URL,
   // not bound on that deploy).
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    if (resolveMode(env.MCP_MODE) === "private") {
+    const job = resolveScheduledJob(resolveMode(env.MCP_MODE), _event.cron);
+    if (job === "watchdog") {
       ctx.waitUntil(handleWatchdog(env));
-      return;
-    }
-    if (_event.cron === "*/15 * * * *") {
+    } else if (job === "skills") {
       ctx.waitUntil(rebuildSkillsIndex(env));
-      return;
+    } else {
+      ctx.waitUntil(runHeartbeat(env));
     }
-    ctx.waitUntil(runHeartbeat(env));
   },
 
   // WP-410 срез-2b Деплой-2 группа Б: real consumer, ported from personal-knowledge-mcp
