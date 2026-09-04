@@ -26,3 +26,6 @@ crons = ["30 0 * * *"]
 # REINDEX_SECRET - Shared secret for /reindex endpoint
 #
 # After deploy: `wrangler secret delete DATABASE_URL` (legacy, no longer used).
+
+[triggers]
+crons = ["*/15 * * * *"]
