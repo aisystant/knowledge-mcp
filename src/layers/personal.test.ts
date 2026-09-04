@@ -564,6 +564,32 @@ describe("writeToGitHub — optimistic concurrency (WP-7 Ф96, ported from perso
   });
 });
 
+describe("writeToGitHub — existence-check failure semantics for an ordinary file (WP-7 F-WriteToGitHubParity)", () => {
+  it("treats an inconclusive existence check as missing and proceeds to create the file", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ message: "Service Unavailable" }, 503), // existence check: transient failure, not a 404
+      responseJson({ content: { sha: "b".repeat(40), html_url: "https://github.com/x" } }), // PUT
+    ]);
+    const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "new content", "create");
+    expect(result.success).toBe(true);
+    const put = calls.find(c => c.method === "PUT");
+    expect(put).toBeDefined();
+    expect(JSON.parse(put!.body!)).not.toHaveProperty("sha");
+  });
+
+  it("surfaces version_mismatch, not existence_check_unavailable, when the inconclusive check masked an existing file", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ message: "Service Unavailable" }, 503), // existence check: transient failure
+      responseJson({ message: "sha wasn't supplied" }, 422), // PUT rejected: file actually exists, needs a sha
+    ]);
+    const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "attempted write", "update");
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("version_mismatch");
+  });
+});
+
 // getInstallationToken's signature changed from (env, owner) to (env, userId, repository)
 // on 2026-08-31 (pagination fix, WP-7) — every other test here injects a fixed-return mock
 // via `installationTokenResponses()`'s queryQueue side effect and never inspects call
