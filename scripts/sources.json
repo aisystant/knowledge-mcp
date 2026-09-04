@@ -104,7 +104,7 @@
   {
     "source": "docs-courses",
     "source_type": "guides",
-    "path": "~/IWE/docs/docs/ru",
+    "path": "~/IWE/mim-docs/docs/ru",
     "exclude": [
       "node_modules/",
       "public/"
