@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import { chunkLargeFile, contentHash } from "../scripts/ingest.js";
 import { neon } from "@neondatabase/serverless";
@@ -335,6 +335,37 @@ describe("partitionFilesBySize", () => {
 
   it("returns empty arrays for empty input", () => {
     expect(partitionFilesBySize([], 1_000_000)).toEqual({ eligible: [], excluded: [] });
+  });
+});
+
+// --- SKILL_FILE_PATTERN (WP-560 Ф11 — the narrow filter that keeps
+// rebuildSkillsIndex() from ever handing reindexFiles() anything but SKILL.md
+// files, satisfying the ArchGate condition that the 15-min cron must not touch
+// the rest of FMT-exocortex-template's index) ---
+describe("SKILL_FILE_PATTERN", () => {
+  it("matches a top-level skill's SKILL.md", () => {
+    expect(SKILL_FILE_PATTERN.test(".claude/skills/ke/SKILL.md")).toBe(true);
+  });
+
+  it("matches a skill name containing digits and hyphens", () => {
+    expect(SKILL_FILE_PATTERN.test(".claude/skills/day-open-2/SKILL.md")).toBe(true);
+  });
+
+  it("rejects a file inside a skill's own subdirectory (e.g. its scripts/)", () => {
+    expect(SKILL_FILE_PATTERN.test(".claude/skills/ke/scripts/run.sh")).toBe(false);
+  });
+
+  it("rejects a nested SKILL.md one level too deep", () => {
+    expect(SKILL_FILE_PATTERN.test(".claude/skills/ke/sub/SKILL.md")).toBe(false);
+  });
+
+  it("rejects files outside .claude/skills/ entirely", () => {
+    expect(SKILL_FILE_PATTERN.test("docs/some-guide.md")).toBe(false);
+    expect(SKILL_FILE_PATTERN.test(".claude/rules/formatting.md")).toBe(false);
+  });
+
+  it("rejects SKILL.md with no skill-name directory", () => {
+    expect(SKILL_FILE_PATTERN.test(".claude/skills/SKILL.md")).toBe(false);
   });
 });
 

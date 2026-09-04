@@ -4145,6 +4145,25 @@ export default {
     }
 
     if (url.pathname === "/") {
+      // WP-560 Ф11: durable, not in-memory — a module-level timestamp would reset
+      // on any cold start of any one Worker isolate and could read back "never
+      // updated" even right after a real successful run on a different isolate.
+      // One indexed SELECT is an acceptable cost for a low-QPS health endpoint;
+      // correctness matters more than shaving a DB round-trip here.
+      let skillsLastReindexedAt: string | null = null;
+      try {
+        const healthSql = neon(env.HEALTH_DATABASE_URL.replace("-pooler", ""));
+        const freshTable = HEALTH_TABLES.graph_freshness_events(getHealthSchema(env));
+        const [row] = await healthSql`
+          SELECT created_at FROM ${healthSql.unsafe(freshTable)}
+          WHERE source = ${SKILLS_HEARTBEAT_SOURCE_LABEL} AND reindexed = true
+          ORDER BY created_at DESC LIMIT 1
+        `;
+        skillsLastReindexedAt = row ? new Date(row.created_at as string).toISOString() : null;
+      } catch (e) {
+        console.error(JSON.stringify({ phase: "health_skills_reindex_lookup_failed", error: e instanceof Error ? e.message : String(e) }));
+      }
+
       return new Response(
         JSON.stringify({
           name: "Knowledge MCP Server",
@@ -4153,6 +4172,7 @@ export default {
           mcp_endpoint: "/mcp",
           tools: TOOLS.map((t) => t.name),
           source_types: ["pack", "guides", "ds", "content"],
+          skills_last_reindexed_at: skillsLastReindexedAt,
         }),
         { headers: { "Content-Type": "application/json", ...corsHeaders } }
       );
@@ -4163,16 +4183,23 @@ export default {
 
   // WP-339 Ф5+Ф6 (public deploy) / WP-410 срез-2b Деплой-2 группа В (private deploy): the same
   // cron trigger fires a different job depending which wrangler config it was deployed with —
-  // public knowledge-mcp's wrangler.toml has no [triggers] section (it never fires here at all);
-  // private personal-knowledge-mcp's wrangler.private.toml runs this every 15 min and needs the
-  // reindex watchdog, not the public drift-check heartbeat (which needs KNOWLEDGE_DATABASE_URL,
-  // not bound on that deploy).
+  // public knowledge-mcp's wrangler.toml had no [triggers] section before WP-560 Ф11 (it never
+  // fired here at all — runHeartbeat, including the FULL_INGEST_SOURCES pass added by WP-532,
+  // has never run automatically on the public deploy); private personal-knowledge-mcp's
+  // wrangler.private.toml runs this every 15 min and needs the reindex watchdog, not the public
+  // drift-check heartbeat (which needs KNOWLEDGE_DATABASE_URL, not bound on that deploy).
+  //
+  // WP-560 Ф11 adds the first cron trigger to the public wrangler.toml, but deliberately calls
+  // only the new narrow rebuildSkillsIndex() here, NOT runHeartbeat() — turning this cron on
+  // would otherwise also be the first time runHeartbeat (PACK-* drift-check + FPF full-ingest)
+  // ever fires in production, a much larger blast radius than this WP owns. That activation is
+  // a separate decision for the pilot (flagged in WP-560 Ф11, not decided here).
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     if (resolveMode(env.MCP_MODE) === "private") {
       ctx.waitUntil(handleWatchdog(env));
       return;
     }
-    ctx.waitUntil(runHeartbeat(env));
+    ctx.waitUntil(rebuildSkillsIndex(env));
   },
 
   // WP-410 срез-2b Деплой-2 группа Б: real consumer, ported from personal-knowledge-mcp
@@ -4314,6 +4341,105 @@ async function syncFullIngestSource(env: Env, source: string): Promise<void> {
       error: e instanceof Error ? e.message : String(e),
       duration_ms: Date.now() - startedAt,
     }));
+  }
+}
+
+// WP-560 Ф10/Ф11 (peer-session 2026-09-04, ArchGate 03.09 — variant В, scheduled
+// rebuild every 15 min): the browser skill index (knowledge_load_skill /
+// personal_load_skill, both route here per Ф10's gateway-mcp fix) went stale
+// because no cron ever touched .claude/skills/ specifically — FMT-exocortex-template
+// isn't a PACK-* source (HEARTBEAT_PACK_SOURCES, above) or a FULL_INGEST_SOURCES
+// entry, and the whole source is too broad to add there anyway (ArchGate: reindexing
+// non-skill files on every 15-min tick risks contending with other readers of the
+// same index — narrower than syncFullIngestSource's per-source granularity).
+// Deliberately hand-filters to SKILL.md files before calling reindexFiles(), never
+// passes the full source listing to it.
+//
+// Two accepted limitations, same trade-off syncFullIngestSource makes above for its
+// own (daily) cadence: (1) a file removed/renamed upstream stays servable via
+// load_skill until someone reindexes explicitly — no DB-vs-GitHub diff here, kept
+// narrow; (2) no single-flight guard against an overlapping run from the next tick —
+// acceptable at a handful of small files with reindexFiles()'s own hash-skip making
+// re-runs on unchanged content a no-op (no wasted embedding calls).
+const SKILLS_SOURCE = "FMT-exocortex-template";
+const SKILLS_HEARTBEAT_SOURCE_LABEL = "FMT-exocortex-template-skills";
+export const SKILL_FILE_PATTERN = /^\.claude\/skills\/[^/]+\/SKILL\.md$/;
+
+async function rebuildSkillsIndex(env: Env): Promise<void> {
+  const startedAt = Date.now();
+  let processed = 0;
+  let skipped = 0;
+  let errors: string[] = [];
+  let foundCount = 0;
+  let eligibleCount = 0;
+  // Distinct from `errors`: a total failure (GitHub fetch throws, reindexFiles()
+  // itself throws) vs. a run that completed with some per-file errors (one
+  // oversized/unreadable file) are different severities. `reindexed` below reports
+  // whether the RUN completed, not whether every file in it was clean — a single
+  // persistently bad file must not make the freshness signal look stuck forever
+  // while everything else keeps updating (cold review flagged the naive `errors.length
+  // === 0` version of this as too strict for that reason).
+  let ranToCompletion = false;
+
+  try {
+    const allFiles = await listGitHubFilesWithSize(SKILLS_SOURCE);
+    const skillFiles = allFiles.filter((f) => SKILL_FILE_PATTERN.test(f.path));
+    foundCount = skillFiles.length;
+    const { eligible, excluded } = partitionFilesBySize(skillFiles, MAX_FILE_CHARS);
+    eligibleCount = eligible.length;
+
+    for (const f of excluded) {
+      console.log(JSON.stringify({ phase: "skills_reindex_excluded", path: f.path, size_bytes: f.size, reason: `over MAX_FILE_CHARS prefilter (limit ${MAX_FILE_CHARS} bytes)` }));
+    }
+
+    const result = await reindexFiles(env, {
+      source: SKILLS_SOURCE,
+      files: eligible.map((f) => ({ path: f.path, action: "modified" as const })),
+    });
+    processed = result.processed;
+    skipped = result.skipped;
+    errors = result.errors;
+    ranToCompletion = true;
+
+    console.log(JSON.stringify({
+      phase: errors.length > 0 ? "skills_reindex_partial" : "skills_reindex_ok",
+      found: foundCount, eligible: eligibleCount, excluded: excluded.length,
+      processed, skipped, errors,
+      duration_ms: Date.now() - startedAt,
+    }));
+  } catch (e) {
+    errors = [e instanceof Error ? e.message : String(e)];
+    console.error(JSON.stringify({
+      phase: "skills_reindex_error",
+      error: errors[0],
+      duration_ms: Date.now() - startedAt,
+    }));
+  }
+
+  // health.graph_freshness_events already holds one row per (source, run) for the
+  // PACK-* heartbeat above (migration 015) — reused here under a distinct
+  // pseudo-source label rather than adding a new table for the same shape of fact
+  // (source, counts, success, timestamp). Non-blocking: an observability write must
+  // never fail the actual reindex it's reporting on.
+  try {
+    const healthSql = neon(env.HEALTH_DATABASE_URL.replace("-pooler", ""));
+    const healthSchema = getHealthSchema(env);
+    const freshTable = HEALTH_TABLES.graph_freshness_events(healthSchema);
+    // reindexed must reflect actual completion, not "a run happened" — the whole
+    // point of this row is a freshness signal the / endpoint trusts (see below). A
+    // hardcoded `true` here would mark a total GitHub-fetch failure as fresh,
+    // silently masking an indefinitely-broken cron (cold review, Critical).
+    await healthSql`
+      INSERT INTO ${healthSql.unsafe(freshTable)}
+        (source, github_count, db_count, reindexed, reindex_processed, reindex_skipped, error)
+      VALUES (
+        ${SKILLS_HEARTBEAT_SOURCE_LABEL}, ${foundCount}, ${eligibleCount},
+        ${ranToCompletion}, ${processed}, ${skipped},
+        ${errors.length > 0 ? errors.join("; ") : null}
+      )
+    `;
+  } catch (e) {
+    console.error(JSON.stringify({ phase: "skills_reindex_health_write_failed", error: e instanceof Error ? e.message : String(e) }));
   }
 }
 
