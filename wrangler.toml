@@ -13,7 +13,7 @@ KNOWLEDGE_DB_SCHEMA = "public"
 
 # WP-339 Ф5: Daily heartbeat cron — drift check + targeted reindex at 00:30 UTC
 [triggers]
-crons = ["30 0 * * *"]
+crons = ["30 0 * * *", "*/15 * * * *"]  # WP-560 Ф11: + браузерные скиллы каждые 15 мин
 
 # Secrets (set via `wrangler secret put`):
 # KNOWLEDGE_DATABASE_URL - Neon `knowledge` БД connection string. REQUIRED.
@@ -26,6 +26,3 @@ crons = ["30 0 * * *"]
 # REINDEX_SECRET - Shared secret for /reindex endpoint
 #
 # After deploy: `wrangler secret delete DATABASE_URL` (legacy, no longer used).
-
-[triggers]
-crons = ["*/15 * * * *"]
