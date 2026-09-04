@@ -521,7 +521,14 @@ export async function writeToGitHub(
 
   const apiUrl = githubContentsApiUrl(owner, repo, fullPath);
   const existence = await checkGitHubFileExistence(githubFetch, apiUrl, token);
-  if (existence.state === "unavailable") return existenceCheckUnavailable();
+  // Fail closed on an inconclusive existence check only for a managed-post
+  // candidate — there, ambiguity risks scaffolding a duplicate publication.
+  // An ordinary file proceeds as if missing: the PUT below still round-trips
+  // through GitHub's own sha requirement (422/409 -> version_mismatch), so a
+  // transient existence-check failure costs nothing in safety and no longer
+  // fails a write that would have succeeded. Pilot policy B (WP-7
+  // F-WriteToGitHubParity, superseding the 03.09 policy A pin below).
+  if (existence.state === "unavailable" && postEvidence) return existenceCheckUnavailable();
   if (existence.state === "missing" && postEvidence) return postScaffoldRequired(postEvidence);
   const existingSha = existence.state === "exists" ? existence.sha : undefined;
 

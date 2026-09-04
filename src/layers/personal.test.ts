@@ -314,8 +314,16 @@ describe("Knowledge Index publication creation guard", () => {
     expect(request).toHaveBeenCalledTimes(1);
   });
 
-  it("fails closed for an ordinary write when target existence is unavailable (pilot choice A)", async () => {
-    const { request, dependencies } = githubDependencies([{ ok: false, status: 503 }]);
+  // Policy B (WP-7 F-WriteToGitHubParity, 04.09) — supersedes the 03.09 policy A
+  // pin ("fails closed for an ordinary write when target existence is
+  // unavailable"): an inconclusive existence check now blocks only a
+  // managed-post candidate; an ordinary file proceeds as if missing, and
+  // GitHub's own sha requirement on PUT still catches a real conflict.
+  it("proceeds to PUT for an ordinary write when target existence is unavailable, and creates the file", async () => {
+    const { request, dependencies } = githubDependencies([
+      { ok: false, status: 503 }, // existence check: transient failure, not a 404
+      { ok: true, status: 200, json: async () => ({ content: { sha: "b".repeat(40), html_url: "https://github.test/note" } }) }, // PUT
+    ]);
 
     const result = await writeToGitHub(
       ENV,
@@ -327,16 +335,32 @@ describe("Knowledge Index publication creation guard", () => {
       dependencies,
     );
 
-    expect(result).toMatchObject({
-      success: false,
-      reason: "existence_check_unavailable",
-      next_action: EXISTENCE_CHECK_NEXT_ACTION,
-    });
-    expect(request).toHaveBeenCalledTimes(1);
-    expect(request).not.toHaveBeenCalledWith(
-      expect.any(String),
-      expect.objectContaining({ method: "PUT" }),
+    expect(result.success).toBe(true);
+    expect(request).toHaveBeenCalledTimes(2);
+    const put = request.mock.calls[1][1] as RequestInit;
+    expect(put).toEqual(expect.objectContaining({ method: "PUT" }));
+    expect(JSON.parse(put.body as string)).not.toHaveProperty("sha");
+  });
+
+  it("surfaces version_mismatch, not existence_check_unavailable, when the inconclusive check masked an existing ordinary file", async () => {
+    const { request, dependencies } = githubDependencies([
+      { ok: false, status: 503 }, // existence check: transient failure
+      { ok: false, status: 422, text: async () => "sha wasn't supplied" }, // PUT rejected: file actually exists
+    ]);
+
+    const result = await writeToGitHub(
+      ENV,
+      ctx(),
+      "DS-my-strategy",
+      "notes/new.md",
+      "attempted write",
+      "update",
+      dependencies,
     );
+
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("version_mismatch");
+    expect(request).toHaveBeenCalledTimes(2);
   });
 
   it("allows personal_write to update a confirmed existing publication", async () => {
