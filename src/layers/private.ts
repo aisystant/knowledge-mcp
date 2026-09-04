@@ -44,7 +44,7 @@ export const PRIVATE_TOOL_NAMES: ReadonlySet<string> = new Set([
   "reindex",
   "reindex_status",
   // WP-7 Ф97.2: per-file indexing status (personal_index_status). Data layer
-  // (buildIndexStatusSuccessQuery/writeIndexStatusError) lives in personal.ts;
+  // (buildIndexStatusSuccessQuery/buildIndexStatusErrorQuery) lives in personal.ts;
   // the actual tools/list + dispatch entry is only wired in personal-knowledge-mcp's
   // src/index.ts so far — NOT this worker's private mode.
   //

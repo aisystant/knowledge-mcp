@@ -23,7 +23,7 @@ import {
   buildDeleteDocumentQuery,
   buildIndexStatusSuccessQuery,
   buildDeleteIndexStatusQuery,
-  writeIndexStatusError,
+  buildIndexStatusErrorQuery,
   type PersonalEnv,
   type UserContext,
 } from "./personal.js";
@@ -50,6 +50,62 @@ interface ReindexRequest {
   source: string;
   files: { path: string; action: "added" | "modified" | "removed" }[];
   user_id?: string;
+  /**
+   * Fencing token (WP-560 Ф3): the user_sources.index_generation this job was created for.
+   * null/undefined = legacy job without a generation (pre-migration-022), unfenced.
+   */
+  generation?: number | null;
+}
+
+interface ReindexFilesResult {
+  processed: number;
+  deleted: number;
+  skipped: number;
+  errors: string[];
+  error_details: ReindexErrorDetail[];
+  /** true = the source moved to a newer generation; nothing from this batch was published. */
+  stale: boolean;
+}
+
+/**
+ * First statement of every publishing transaction of a fenced job. Divides by the number of
+ * user_sources rows still at the job's generation: 1/0 raises inside the transaction, so the
+ * whole batch rolls back — a superseded job cannot publish a single chunk, status row or delete
+ * after purge+bump committed (WP-560 Ф3, DB-level equivalent of a row lock).
+ */
+function generationFence(sql: ReturnType<typeof personalDb>, userSourcesTable: string, userId: string, source: string, generation: number) {
+  return sql`
+    SELECT 1 / (
+      SELECT COUNT(*) FROM ${sql.unsafe(userSourcesTable)}
+      WHERE user_id = ${userId} AND source = ${source} AND index_generation = ${generation}
+    )::int AS fence
+  `;
+}
+
+function isFenceViolation(err: unknown): boolean {
+  return err instanceof Error && /division by zero/i.test(err.message);
+}
+
+/** Fenced: only flips the state of the generation this job belongs to. Legacy (null) = no-op. */
+async function setSourceIndexState(
+  sql: ReturnType<typeof personalDb>,
+  userSourcesTable: string,
+  userId: string,
+  source: string,
+  generation: number | null,
+  state: "ready" | "failed",
+): Promise<void> {
+  if (generation === null) return;
+  await sql`
+    UPDATE ${sql.unsafe(userSourcesTable)}
+    SET index_state = ${state}
+    WHERE user_id = ${userId} AND source = ${source}
+      AND index_state = 'reindexing' AND index_generation = ${generation}
+  `;
+}
+
+function generationColumn(value: unknown): number | null {
+  return value === null || value === undefined ? null : Number(value);
 }
 
 const MAX_FILE_SIZE = 100_000; // 100KB — skip large files
@@ -170,12 +226,14 @@ export interface ReindexErrorDetail { path: string; action: string; reason: stri
 export async function personalReindexFiles(
   env: ReindexEnv,
   req: ReindexRequest
-): Promise<{ processed: number; deleted: number; skipped: number; errors: string[]; error_details: ReindexErrorDetail[] }> {
+): Promise<ReindexFilesResult> {
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
   const statusTable = KNOWLEDGE_TABLES.file_index_status(schema);
-  const result = { processed: 0, deleted: 0, skipped: 0, errors: [] as string[], error_details: [] as ReindexErrorDetail[] };
+  const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
+  const result: ReindexFilesResult = { processed: 0, deleted: 0, skipped: 0, errors: [], error_details: [], stale: false };
+  const generation = req.generation ?? null;
 
   if (!req.user_id) {
     result.errors.push("Missing user_id: personal reindex requires authenticated user context");
@@ -183,7 +241,8 @@ export async function personalReindexFiles(
     return result;
   }
 
-  const ctx = await resolveUserContext(env, req.user_id);
+  // The indexer must see the source it is rebuilding (index_state='reindexing'); readers don't.
+  const ctx = await resolveUserContext(env, req.user_id, { includeReindexing: true });
 
   if (!ctx.userId) {
     result.errors.push(`Invalid user context for user_id=${req.user_id}`);
@@ -196,6 +255,28 @@ export async function personalReindexFiles(
     result.error_details.push({ path: "*", action: "n/a", reason: `unknown source: ${req.source}` });
     return result;
   }
+
+  // Cheap early exit; the transaction-level fence below is the actual guarantee.
+  if (generation !== null) {
+    const genRows = await sql`
+      SELECT index_generation FROM ${sql.unsafe(userSourcesTable)}
+      WHERE user_id = ${ctx.userId} AND source = ${req.source}
+      LIMIT 1
+    `;
+    if (generationColumn(genRows[0]?.index_generation) !== generation) {
+      result.stale = true;
+      return result;
+    }
+  }
+  const userId = ctx.userId;
+  type PersonalQuery = ReturnType<typeof sql>;
+  // Takes a factory so the fence is built (and, in tests, observed) strictly before the
+  // statements it guards — mirroring its position as the first statement of the batch.
+  const fenced = (build: () => PersonalQuery[]): PersonalQuery[] => {
+    if (generation === null) return build();
+    const fence = generationFence(sql, userSourcesTable, userId, req.source, generation);
+    return [fence, ...build()];
+  };
 
   for (const file of req.files) {
     let normalizedPath: string;
@@ -217,10 +298,10 @@ export async function personalReindexFiles(
         // Delete document rows and status row together — a status left behind
         // after its document is gone would report 'indexed' on a file that no
         // longer exists (WP-7 Ф97.2, Codex round 1 finding).
-        await sql.transaction([
-          buildDeleteDocumentQuery(sql, documentsTable, req.source, ctx.userId, normalizedPath),
-          buildDeleteIndexStatusQuery(sql, statusTable, req.source, ctx.userId, normalizedPath),
-        ]);
+        await sql.transaction(fenced(() => [
+          buildDeleteDocumentQuery(sql, documentsTable, req.source, userId, normalizedPath),
+          buildDeleteIndexStatusQuery(sql, statusTable, req.source, userId, normalizedPath),
+        ]));
         result.deleted++;
         continue;
       }
@@ -236,7 +317,7 @@ export async function personalReindexFiles(
       if (content === null) {
         result.errors.push(`Cannot read ${normalizedPath} from GitHub`);
         result.error_details.push({ path: normalizedPath, action: file.action, reason: "cannot read from GitHub" });
-        await writeIndexStatusError(sql, statusTable, req.source, ctx.userId, normalizedPath, "cannot read from GitHub");
+        await sql.transaction(fenced(() => [buildIndexStatusErrorQuery(sql, statusTable, req.source, userId, normalizedPath, "cannot read from GitHub")]));
         continue;
       }
 
@@ -245,7 +326,7 @@ export async function personalReindexFiles(
         // Unlike the hash-match skip below, this file will never become
         // searchable as-is — the user needs to see that, not just silence
         // (WP-7 Ф97.2: this is the gap the phase exists to close).
-        await writeIndexStatusError(sql, statusTable, req.source, ctx.userId, normalizedPath, `file exceeds max size (${MAX_FILE_SIZE} bytes), skipped from indexing`);
+        await sql.transaction(fenced(() => [buildIndexStatusErrorQuery(sql, statusTable, req.source, userId, normalizedPath, `file exceeds max size (${MAX_FILE_SIZE} bytes), skipped from indexing`)]));
         continue;
       }
 
@@ -258,7 +339,7 @@ export async function personalReindexFiles(
       const existing = await sql`
         SELECT hash, protocol_version FROM ${sql.unsafe(documentsTable)}
         WHERE (filename = ${normalizedPath} OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
-          AND source = ${req.source} AND user_id = ${ctx.userId}
+          AND source = ${req.source} AND user_id = ${userId}
         LIMIT 1
       `;
       if (existing.length > 0 && existing[0].hash === hash && existing[0].protocol_version === 2) {
@@ -267,7 +348,9 @@ export async function personalReindexFiles(
         // status too, or a retry after a partial batch failure would leave
         // this file's status permanently unset even though it IS searchable
         // (WP-7 Ф97.2, round 1 consensus point 3).
-        await buildIndexStatusSuccessQuery(sql, statusTable, req.source, ctx.userId, normalizedPath, hash);
+        await sql.transaction(fenced(() => [
+          buildIndexStatusSuccessQuery(sql, statusTable, req.source, userId, normalizedPath, hash),
+        ]));
         continue;
       }
 
@@ -280,25 +363,33 @@ export async function personalReindexFiles(
       // never leave a partial document visible to readers (WP-7 Ф94), and can
       // never leave new chunks committed without a matching status update
       // (WP-7 Ф97.2, this is what closes the split-transaction race).
-      await sql.transaction([
-        buildDeleteDocumentQuery(sql, documentsTable, req.source, ctx.userId, normalizedPath),
+      await sql.transaction(fenced(() => [
+        buildDeleteDocumentQuery(sql, documentsTable, req.source, userId, normalizedPath),
         ...chunks.map((c, i) => sql`
           INSERT INTO ${sql.unsafe(documentsTable)}
             (filename, content, source, source_type, hash, embedding, search_vector, user_id, chunk_ordinal, protocol_version)
           VALUES (
             ${normalizedPath}, ${c}, ${req.source}, ${sourceType}, ${hash},
-            ${`[${embeddings[i].join(",")}]`}::vector, to_tsvector('simple', ${c}), ${ctx.userId}, ${i + 1}, 2
+            ${`[${embeddings[i].join(",")}]`}::vector, to_tsvector('simple', ${c}), ${userId}, ${i + 1}, 2
           )
         `),
-        buildIndexStatusSuccessQuery(sql, statusTable, req.source, ctx.userId, normalizedPath, hash),
-      ]);
+        buildIndexStatusSuccessQuery(sql, statusTable, req.source, userId, normalizedPath, hash),
+      ]));
 
       result.processed++;
     } catch (err) {
+      if (isFenceViolation(err)) {
+        // Superseded mid-batch: the failed transaction published nothing; stop touching this source.
+        result.stale = true;
+        break;
+      }
       const reason = err instanceof Error ? err.message : "unknown error";
       result.errors.push(`${file.path}: ${reason}`);
       result.error_details.push({ path: file.path, action: file.action, reason });
-      await writeIndexStatusError(sql, statusTable, req.source, ctx.userId, normalizedPath, reason).catch(() => {});
+      await sql.transaction(fenced(() => [buildIndexStatusErrorQuery(sql, statusTable, req.source, userId, normalizedPath, reason)])).catch((statusErr: unknown) => {
+        if (isFenceViolation(statusErr)) result.stale = true;
+      });
+      if (result.stale) break;
     }
   }
 
@@ -401,42 +492,116 @@ export interface ReindexSourceResult {
  * No caller yet in this codebase — connectSource (../layers/personal.ts) still hardcodes
  * reindex_triggered:false; wiring the trigger is Деплой-2 группа В.
  */
-export async function startReindexJob(env: ReindexEnv, userId: string, source: string): Promise<ReindexSourceResult> {
+export interface StartReindexJobOptions {
+  /**
+   * A 'pending' job pre-created by connectSource's rebind transaction (WP-560 Ф3). Cooldown is
+   * skipped: the old index is already purged, so this reindex must run regardless of recency.
+   */
+  jobId?: string;
+}
+
+export async function startReindexJob(
+  env: ReindexEnv,
+  userId: string,
+  source: string,
+  options: StartReindexJobOptions = {},
+): Promise<ReindexSourceResult> {
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
   const reindexJobsTable = KNOWLEDGE_TABLES.reindex_jobs(schema);
+  const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
 
-  const recent = await sql`
-    SELECT id, status, started_at FROM ${sql.unsafe(reindexJobsTable)}
-    WHERE user_id = ${userId} AND source = ${source}
-      AND started_at > NOW() - (${REINDEX_COOLDOWN_SECONDS} * INTERVAL '1 second')
-    ORDER BY started_at DESC LIMIT 1
-  `;
-  if (recent.length > 0) {
-    const row = recent[0];
+  // A pre-created job (rebind) that never gets started leaves its source fail-closed with a
+  // 'pending' job nobody owns. Any DB failure before the job is running must therefore land in
+  // a diagnosable state: job 'failed' + source 'failed' (fenced on the job's own generation).
+  const failPreCreatedJob = async (reason: string): Promise<void> => {
+    if (!options.jobId) return;
+    await sql`
+      UPDATE ${sql.unsafe(reindexJobsTable)}
+      SET status = 'failed', finished_at = NOW(), errors = ${JSON.stringify([reason])}::jsonb
+      WHERE id = ${options.jobId}::uuid AND status = 'pending'
+    `.catch((cleanupErr: unknown) => {
+      console.error(JSON.stringify({ phase: "pre_created_job_fail_cleanup_failed", job_id: options.jobId, source, error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) }));
+    });
+    await sql`
+      UPDATE ${sql.unsafe(userSourcesTable)} u
+      SET index_state = 'failed'
+      FROM ${sql.unsafe(reindexJobsTable)} j
+      WHERE j.id = ${options.jobId}::uuid AND j.user_id = u.user_id AND j.source = u.source
+        AND u.index_state = 'reindexing' AND u.index_generation = j.generation
+    `.catch((cleanupErr: unknown) => {
+      console.error(JSON.stringify({ phase: "pre_created_job_source_fail_cleanup_failed", job_id: options.jobId, source, error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) }));
+    });
+  };
+
+  let rows: Record<string, unknown>[];
+  try {
+    if (!options.jobId) {
+      const recent = await sql`
+        SELECT id, status, started_at FROM ${sql.unsafe(reindexJobsTable)}
+        WHERE user_id = ${userId} AND source = ${source}
+          AND started_at > NOW() - (${REINDEX_COOLDOWN_SECONDS} * INTERVAL '1 second')
+        ORDER BY started_at DESC LIMIT 1
+      `;
+      if (recent.length > 0) {
+        const row = recent[0];
+        return {
+          job_id: row.id as string,
+          status: "cooldown",
+          message: row.status === "running"
+            ? `Reindex already running for ${source} (job ${row.id}). Poll with reindex_status.`
+            : `Reindex for ${source} was started within last ${REINDEX_COOLDOWN_SECONDS}s (job ${row.id}). Retry later.`,
+          source,
+        };
+      }
+    }
+
+    if (!env.REINDEX_QUEUE) {
+      await failPreCreatedJob("REINDEX_QUEUE binding missing");
+      return { job_id: options.jobId ?? "", status: "failed", message: "REINDEX_QUEUE binding missing — reindex is unavailable in this deployment", source };
+    }
+
+    // Every job carries the source's current generation so the consumer can fence its writes.
+    rows = options.jobId
+      ? await sql`
+          SELECT id, generation, status FROM ${sql.unsafe(reindexJobsTable)}
+          WHERE id = ${options.jobId}::uuid AND user_id = ${userId} AND source = ${source}
+          LIMIT 1
+        `
+      : await sql`
+          INSERT INTO ${sql.unsafe(reindexJobsTable)} (user_id, source, status, generation)
+          SELECT ${userId}, ${source}, 'pending', index_generation
+          FROM ${sql.unsafe(userSourcesTable)}
+          WHERE user_id = ${userId} AND source = ${source}
+          RETURNING id, generation, status
+        `;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "unknown error";
+    await failPreCreatedJob(msg);
+    return { job_id: options.jobId ?? "", status: "failed", message: `Failed to start reindex: ${msg}`, source };
+  }
+  if (rows.length === 0) {
     return {
-      job_id: row.id as string,
-      status: "cooldown",
-      message: row.status === "running"
-        ? `Reindex already running for ${source} (job ${row.id}). Poll with reindex_status.`
-        : `Reindex for ${source} was started within last ${REINDEX_COOLDOWN_SECONDS}s (job ${row.id}). Retry later.`,
+      job_id: options.jobId ?? "",
+      status: "failed",
+      message: options.jobId ? `Job ${options.jobId} not found for ${source}` : `Unknown source: ${source}`,
       source,
     };
   }
-
-  if (!env.REINDEX_QUEUE) {
-    return { job_id: "", status: "failed", message: "REINDEX_QUEUE binding missing — reindex is unavailable in this deployment", source };
+  if (options.jobId && rows[0].status !== "pending") {
+    // Already started (double call) or already finished — idempotent, not a failure.
+    return {
+      job_id: options.jobId,
+      status: "cooldown",
+      message: `Job ${options.jobId} is already ${String(rows[0].status)} for ${source}. Poll with reindex_status.`,
+      source,
+    };
   }
-
-  const rows = await sql`
-    INSERT INTO ${sql.unsafe(reindexJobsTable)} (user_id, source, status)
-    VALUES (${userId}, ${source}, 'pending')
-    RETURNING id
-  `;
   const jobId = rows[0].id as string;
+  const generation = generationColumn(rows[0].generation);
 
   try {
-    const ctx = await resolveUserContext(env, userId);
+    const ctx = await resolveUserContext(env, userId, { includeReindexing: true });
     if (!ctx.sourceNames.includes(source)) {
       await sql`UPDATE ${sql.unsafe(reindexJobsTable)}
         SET status = 'failed', finished_at = NOW(),
@@ -466,6 +631,7 @@ export async function startReindexJob(env: ReindexEnv, userId: string, source: s
       await sql`UPDATE ${sql.unsafe(reindexJobsTable)}
         SET status = 'succeeded', finished_at = NOW()
         WHERE id = ${jobId}::uuid`;
+      await setSourceIndexState(sql, userSourcesTable, userId, source, generation, "ready");
       return { job_id: jobId, status: "running", message: `No files to reindex for ${source}.`, source };
     }
 
@@ -490,6 +656,8 @@ export async function startReindexJob(env: ReindexEnv, userId: string, source: s
       SET status = 'failed', finished_at = NOW(),
           errors = ${JSON.stringify([msg])}::jsonb
       WHERE id = ${jobId}::uuid`;
+    // Fail-closed stays visible as 'failed', never silently 'ready' (WP-560 Ф3).
+    await setSourceIndexState(sql, userSourcesTable, userId, source, generation, "failed");
     return { job_id: jobId, status: "failed", message: `Failed to start reindex: ${msg}`, source };
   }
 }
@@ -550,6 +718,7 @@ export async function getReindexJobStatus(env: ReindexEnv, userId: string, jobId
 export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env: ReindexEnv): Promise<void> {
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
+  const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
 
   for (const msg of batch.messages) {
     const { job_id, user_id, source, files } = msg.body;
@@ -557,7 +726,7 @@ export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env:
 
     try {
       const jobRows = await sql`
-        SELECT status FROM ${sql.unsafe(KNOWLEDGE_TABLES.reindex_jobs(schema))} WHERE id = ${job_id}::uuid LIMIT 1
+        SELECT status, generation FROM ${sql.unsafe(KNOWLEDGE_TABLES.reindex_jobs(schema))} WHERE id = ${job_id}::uuid LIMIT 1
       `;
       if (jobRows.length === 0) {
         console.warn(JSON.stringify({ phase: "consume_skip", reason: "job_not_found", job_id }));
@@ -571,7 +740,22 @@ export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env:
         continue;
       }
 
-      const result = await personalReindexFiles(env, { source, files, user_id });
+      const generation = generationColumn(jobRows[0].generation);
+      const result = await personalReindexFiles(env, { source, files, user_id, generation });
+
+      if (result.stale) {
+        // Superseded by a newer generation (rebind): drop the batch, never retry it, and
+        // retire the job so it can't be mistaken for the live one.
+        await sql`
+          UPDATE ${sql.unsafe(KNOWLEDGE_TABLES.reindex_jobs(schema))}
+            SET status = 'cancelled', finished_at = NOW(),
+                errors = COALESCE(errors, '[]'::jsonb) || '["superseded_generation"]'::jsonb
+            WHERE id = ${job_id}::uuid AND status = 'running'
+        `;
+        console.warn(JSON.stringify({ phase: "consume_skip", reason: "superseded_generation", job_id, source, generation }));
+        msg.ack();
+        continue;
+      }
 
       const errorsJson = JSON.stringify(result.errors);
       const updated = await sql`
@@ -594,6 +778,7 @@ export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env:
               SET status = 'succeeded', finished_at = NOW()
               WHERE id = ${job_id}::uuid AND status = 'running'
           `;
+          await setSourceIndexState(sql, userSourcesTable, user_id, source, generation, "ready");
         }
       }
 
@@ -660,11 +845,24 @@ export async function handleWatchdog(env: ReindexEnv): Promise<void> {
       WHERE status = 'running'
         AND last_heartbeat_at IS NOT NULL
         AND NOW() - last_heartbeat_at > (${staleMinutes} * INTERVAL '1 minute')
-      RETURNING id, user_id, source, completed_batches, expected_batches
+      RETURNING id, user_id, source, completed_batches, expected_batches, generation
     `;
+    const abandoned = await sql`
+      UPDATE ${sql.unsafe(KNOWLEDGE_TABLES.reindex_jobs(schema))}
+      SET status = 'failed',
+          finished_at = NOW(),
+          errors = COALESCE(errors, '[]'::jsonb) || '[{"reason":"watchdog_pending_never_started"}]'::jsonb
+      WHERE status = 'pending'
+        AND NOW() - started_at > (${staleMinutes} * INTERVAL '1 minute')
+      RETURNING id, user_id, source, generation
+    `;
+    for (const r of [...stale, ...abandoned]) {
+      await setSourceIndexState(sql, KNOWLEDGE_TABLES.user_sources(schema), r.user_id as string, r.source as string, generationColumn(r.generation), "failed");
+    }
     console.log(JSON.stringify({
       phase: "watchdog_ok",
       stale_count: stale.length,
+      abandoned_pending_count: abandoned.length,
       stale_jobs: stale.map((r) => ({ id: r.id, user_id_prefix: (r.user_id as string).slice(0, 8), source: r.source, completed: r.completed_batches, expected: r.expected_batches })),
       elapsed_ms: Date.now() - started,
     }));

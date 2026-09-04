@@ -154,6 +154,35 @@ describe("dual-mode routing: private mode reaches the personal layer, never the 
       next_action: "run scripts/new-post.py",
     });
   });
+
+  it("write: forwards expected_sha to the personal-layer write", async () => {
+    const expectedSha = "a".repeat(40);
+    vi.mocked(writeToGitHub).mockResolvedValueOnce({
+      success: true,
+      sha: "b".repeat(40),
+      url: "https://github.com/TserenTserenov/DS-my-strategy/blob/main/docs/note.md",
+    });
+
+    await callTool("write", {
+      source: "DS-my-strategy",
+      path: "docs/note.md",
+      content: "updated content",
+      message: "Update with optimistic concurrency",
+      expected_sha: expectedSha,
+    }, "private");
+
+    expect(writeToGitHub).toHaveBeenCalledTimes(1);
+    expect(writeToGitHub).toHaveBeenCalledWith(
+      ENV,
+      expect.objectContaining({ userId: "user-private-1" }),
+      "DS-my-strategy",
+      "docs/note.md",
+      "updated content",
+      "Update with optimistic concurrency",
+      {},
+      expectedSha,
+    );
+  });
 });
 
 describe("/reindex route guard (WP-7 Ф100 fail-closed, peer session 2026-08-30-14)", () => {

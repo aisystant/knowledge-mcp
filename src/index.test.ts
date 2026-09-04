@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, extractTitle, buildPathTree } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import { chunkLargeFile, contentHash } from "../scripts/ingest.js";
 import { neon } from "@neondatabase/serverless";
@@ -285,6 +285,87 @@ describe("resolveGithubUrl", () => {
 
   it("returns null for unknown source", () => {
     expect(resolveGithubUrl("unknown-source", "file.md")).toBeNull();
+  });
+});
+
+// --- checkFileSizeAdmission (WP-532, 2026-09-02 — reindexFiles() silently
+// dropped files >100_000 chars before the large-file chunking branch could
+// ever run; extracted so the admission policy is testable without DB/GitHub
+// mocks) ---
+describe("checkFileSizeAdmission", () => {
+  it("admits content at or under the limit", () => {
+    expect(checkFileSizeAdmission(1_000_000)).toBeNull();
+    expect(checkFileSizeAdmission(801_500)).toBeNull(); // representative affected DPF Suite file
+  });
+
+  it("rejects content over the limit with a reason mentioning the limit", () => {
+    const reason = checkFileSizeAdmission(1_000_001);
+    expect(reason).not.toBeNull();
+    expect(reason).toContain("1000000");
+  });
+});
+
+// --- partitionFilesBySize (WP-532, 2026-09-02 — pre-filter for syncFullIngestSource(),
+// so a daily full-ingest pass doesn't spend a GitHub fetch on files it already knows are
+// too big for checkFileSizeAdmission()) ---
+describe("partitionFilesBySize", () => {
+  it("splits files under and over the byte limit", () => {
+    const files = [
+      { path: "small.md", size: 500 },
+      { path: "big.md", size: 2_000_000 },
+    ];
+    const { eligible, excluded } = partitionFilesBySize(files, 1_000_000);
+    expect(eligible.map((f) => f.path)).toEqual(["small.md"]);
+    expect(excluded.map((f) => f.path)).toEqual(["big.md"]);
+  });
+
+  it("treats a file exactly at the limit as eligible (matches checkFileSizeAdmission's own boundary — rejects only strictly over)", () => {
+    const files = [{ path: "boundary.md", size: 1_000_000 }];
+    const { eligible, excluded } = partitionFilesBySize(files, 1_000_000);
+    expect(eligible).toHaveLength(1);
+    expect(excluded).toHaveLength(0);
+  });
+
+  it("excludes a file one byte over the limit", () => {
+    const files = [{ path: "over-by-one.md", size: 1_000_001 }];
+    const { eligible, excluded } = partitionFilesBySize(files, 1_000_000);
+    expect(eligible).toHaveLength(0);
+    expect(excluded).toHaveLength(1);
+  });
+
+  it("returns empty arrays for empty input", () => {
+    expect(partitionFilesBySize([], 1_000_000)).toEqual({ eligible: [], excluded: [] });
+  });
+});
+
+// --- SKILL_FILE_PATTERN (WP-560 Ф11 — the narrow filter that keeps
+// rebuildSkillsIndex() from ever handing reindexFiles() anything but SKILL.md
+// files, satisfying the ArchGate condition that the 15-min cron must not touch
+// the rest of FMT-exocortex-template's index) ---
+describe("SKILL_FILE_PATTERN", () => {
+  it("matches a top-level skill's SKILL.md", () => {
+    expect(SKILL_FILE_PATTERN.test(".claude/skills/ke/SKILL.md")).toBe(true);
+  });
+
+  it("matches a skill name containing digits and hyphens", () => {
+    expect(SKILL_FILE_PATTERN.test(".claude/skills/day-open-2/SKILL.md")).toBe(true);
+  });
+
+  it("rejects a file inside a skill's own subdirectory (e.g. its scripts/)", () => {
+    expect(SKILL_FILE_PATTERN.test(".claude/skills/ke/scripts/run.sh")).toBe(false);
+  });
+
+  it("rejects a nested SKILL.md one level too deep", () => {
+    expect(SKILL_FILE_PATTERN.test(".claude/skills/ke/sub/SKILL.md")).toBe(false);
+  });
+
+  it("rejects files outside .claude/skills/ entirely", () => {
+    expect(SKILL_FILE_PATTERN.test("docs/some-guide.md")).toBe(false);
+    expect(SKILL_FILE_PATTERN.test(".claude/rules/formatting.md")).toBe(false);
+  });
+
+  it("rejects SKILL.md with no skill-name directory", () => {
+    expect(SKILL_FILE_PATTERN.test(".claude/skills/SKILL.md")).toBe(false);
   });
 });
 
