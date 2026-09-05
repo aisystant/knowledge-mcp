@@ -200,7 +200,7 @@ const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> =
   "FPF": { base: "https://github.com/ailev/FPF/blob/main", pathPrefix: "" },
   "DS-ecosystem-development": { base: "https://github.com/aisystant/DS-ecosystem-development/blob/main", pathPrefix: "" },
   "aist-bot-docs": { base: "https://github.com/aisystant/aist_bot/blob/new-architecture", pathPrefix: "docs/" },
-  "docs-courses": { base: "https://github.com/aisystant/docs/blob/main", pathPrefix: "docs/ru/" },
+  "docs-courses": { base: "https://github.com/MimEcoSys/docs/blob/main", pathPrefix: "docs/ru/" },
   "exocortex-template-docs": { base: "https://github.com/TserenTserenov/FMT-exocortex-template/blob/main", pathPrefix: "docs/" },
   "DS-principles-curriculum": { base: "https://github.com/aisystant/DS-principles-curriculum/blob/main", pathPrefix: "" },
   "FMT-exocortex-template": { base: "https://github.com/TserenTserenov/FMT-exocortex-template/blob/main", pathPrefix: "" },
@@ -496,12 +496,18 @@ type DocumentReferenceAlias = {
  * frontmatter order. This pair comes from the 2026-08-27 support case; the
  * current path/H1 were verified in the docs repository, while the R-code
  * itself is absent from repository metadata.
+ *
+ * WP-401 Ф7 (2026-09-05): docs-courses upstream moved aisystant/docs →
+ * MimEcoSys/docs (org relocation). The lesson was renumbered/moved under
+ * the new tree, so both filename and canonicalTitle (the file's real H1,
+ * checked by the safety guard below) had to move with it — the old path no
+ * longer resolves under the new source.
  */
 const DOCUMENT_REFERENCE_ALIASES: Readonly<Record<string, DocumentReferenceAlias>> = {
   "R1.1:7": {
     source: "docs-courses",
-    filename: "professional/firefighting/distinguish-systems-and-their-representations-and-ground-yourself/about-systems-and-epistemes-descriptions-models.md",
-    canonicalTitle: "О системах и эпистемах о них (описаниях, моделях)",
+    filename: "professional/firefighting/02-identifying-describing-and-grounding-systems-effectively/09-systems-epistemes-and-descriptions.md",
+    canonicalTitle: "R1.1:7 - О системах, эпистемах и описаниях",
     titles: ["О системах, эпистемах и описаниях"],
   },
 };
