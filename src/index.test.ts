@@ -78,10 +78,10 @@ describe("deterministic document resolver", () => {
 
   it("returns only compact canonical document metadata", async () => {
     mockWithUserContextImpl = async () => [{
-      filename: "professional/firefighting/distinguish-systems-and-their-representations-and-ground-yourself/about-systems-and-epistemes-descriptions-models.md",
+      filename: "professional/firefighting/02-identifying-describing-and-grounding-systems-effectively/09-systems-epistemes-and-descriptions.md",
       source: "docs-courses",
       source_type: "guides",
-      title: "О системах и эпистемах о них (описаниях, моделях)",
+      title: "R1.1:7 - О системах, эпистемах и описаниях",
       score: 1,
     }];
 
@@ -91,9 +91,9 @@ describe("deterministic document resolver", () => {
     );
 
     expect(results).toEqual([expect.objectContaining({
-      filename: "professional/firefighting/distinguish-systems-and-their-representations-and-ground-yourself/about-systems-and-epistemes-descriptions-models.md",
+      filename: "professional/firefighting/02-identifying-describing-and-grounding-systems-effectively/09-systems-epistemes-and-descriptions.md",
       source: "docs-courses",
-      title: "О системах и эпистемах о них (описаниях, моделях)",
+      title: "R1.1:7 - О системах, эпистемах и описаниях",
       score: 1,
     })]);
     expect(results[0]).not.toHaveProperty("content");
@@ -136,7 +136,7 @@ describe("deterministic document resolver", () => {
 
   it("fails closed when a curated alias path no longer has its verified H1", async () => {
     mockWithUserContextImpl = async () => [{
-      filename: "professional/firefighting/distinguish-systems-and-their-representations-and-ground-yourself/about-systems-and-epistemes-descriptions-models.md",
+      filename: "professional/firefighting/02-identifying-describing-and-grounding-systems-effectively/09-systems-epistemes-and-descriptions.md",
       source: "docs-courses",
       source_type: "guides",
       title: "Другой материал по переиспользованному пути",
@@ -816,7 +816,7 @@ describe("searchDocuments embedding resilience", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(results).toEqual([{
       ...keywordRow,
-      github_url: "https://github.com/aisystant/docs/blob/main/docs/ru/about-systems.md",
+      github_url: "https://github.com/MimEcoSys/docs/blob/main/docs/ru/about-systems.md",
     }]);
     expect(mockPoolEnd).toHaveBeenCalledTimes(1);
 
