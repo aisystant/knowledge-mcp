@@ -10,7 +10,7 @@
 import { neon } from "@neondatabase/serverless";
 import { getKnowledgeSchema, KNOWLEDGE_TABLES } from "../utils/db.js";
 import { provisionBridgeScopes } from "../scope.js";
-import { buildPathTree, extractTitle, type PathEntry } from "../path-tree.js";
+import { buildPathTree, extractTitle, utf8ByteLength, type PathEntry } from "../path-tree.js";
 import {
   githubBlobUrl,
   githubContentsApiUrl,
@@ -1163,21 +1163,25 @@ export async function personalListDocuments(
   source?: string,
   sourceType?: string,
   limit: number = 100
-): Promise<{ filename: string; source: string; source_type: string; github_url: string | null }[]> {
+): Promise<{ filename: string; source: string; source_type: string; github_url: string | null; size_bytes: number }[]> {
   const sql = personalDb(env);
   const sourceNames = ctx.sourceNames;
   const docsTable = KNOWLEDGE_TABLES.documents(getKnowledgeSchema(env));
   const src = source ?? null;
   const stype = sourceType ?? null;
 
+  // WP-7 Ф122: GROUP BY + SUM(octet_length), not DISTINCT — a v2 document is stored as one
+  // row per chunk_ordinal, all sharing the same filename (see personalGetDocument); a plain
+  // per-row length would report only one chunk's size instead of the whole file's.
   const rows = await sql`
-    SELECT DISTINCT filename, source, source_type
+    SELECT filename, source, source_type, SUM(octet_length(content))::bigint AS size_bytes
     FROM ${sql.unsafe(docsTable)}
     WHERE user_id = ${ctx.userId}
       AND source = ANY(${sourceNames})
       AND filename NOT LIKE '%::%'
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_type = ${stype})
+    GROUP BY filename, source, source_type
     ORDER BY source, filename
     LIMIT ${limit}
   `;
@@ -1190,6 +1194,7 @@ export async function personalListDocuments(
       source: docSource,
       source_type: (r.source_type as string) || "",
       github_url: personalGithubUrl(ctx, docSource, docFilename),
+      size_bytes: Number(r.size_bytes ?? 0),
     };
   });
 }
@@ -1214,23 +1219,35 @@ export async function personalListPath(
   const likePrefix = prefix.replace(/[\\%_]/g, (c) => "\\" + c) + "%";
   const limit = 2000; // тот же лимит, что у платформенного listPath
 
+  // WP-7 Ф122 (cold review of the original Ф117 diff, same session): a v2 document is one row
+  // per chunk_ordinal sharing the same filename — the pre-Ф122 query returned every chunk as
+  // its own row, so buildPathTree emitted one duplicate "file" entry per chunk instead of one
+  // per document. string_agg in chunk_ordinal order reassembles the full content (same pattern
+  // personalGetDocument already uses via v2Rows.map(...).join("")), fixing the duplicate-listing
+  // bug and letting extractTitle/size see the whole document, not one chunk.
   const rows = await sql`
-    SELECT filename, source, content
+    SELECT filename, source,
+      string_agg(content, '' ORDER BY chunk_ordinal) AS full_content
     FROM ${sql.unsafe(docsTable)}
     WHERE user_id = ${ctx.userId}
       AND source = ANY(${sourceNames})
       AND filename NOT LIKE '%::%'
       AND (${src}::text IS NULL OR source = ${src})
       AND (${prefix}::text = '' OR filename LIKE ${likePrefix} ESCAPE '\')
+    GROUP BY filename, source
     ORDER BY source, filename
     LIMIT ${limit}
   `;
 
-  const docs = rows.map((r) => ({
-    source: (r.source as string) || "",
-    path: r.filename as string,
-    title: extractTitle((r.content as string) || ""),
-  }));
+  const docs = rows.map((r) => {
+    const content = (r.full_content as string) || "";
+    return {
+      source: (r.source as string) || "",
+      path: r.filename as string,
+      title: extractTitle(content),
+      size_bytes: utf8ByteLength(content),
+    };
+  });
 
   return buildPathTree(docs, prefix, depth);
 }

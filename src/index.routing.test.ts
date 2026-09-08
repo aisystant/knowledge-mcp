@@ -43,6 +43,11 @@ vi.mock("./rls.js", () => ({
         source: "public-src",
         source_kind: "guides",
         source_type: "guides",
+        // WP-7 Ф122: listDocuments aliases MAX(octet_length(content)) AS size_bytes in real
+        // SQL — the mock can't compute that from `content` itself, so the value is supplied
+        // directly (byte length of "public corpus content" above, ASCII so char count = byte
+        // count). listPath computes its own size_bytes from `content` in JS, no mock key needed.
+        size_bytes: 21,
       },
     ])) as unknown as { (..._args: unknown[]): Promise<unknown[]>; unsafe: (v: string) => string };
     sql.unsafe = (v: string) => v;
@@ -178,14 +183,19 @@ describe("dual-mode routing: private mode reaches the personal layer, never the 
     // dispatch-only assertion would still pass if the public listPath()/listDocuments()
     // bodies themselves were broken (e.g. the WP-7 Ф117 refactor briefly left buildPathTree/
     // extractTitle out of scope in index.ts — caught by `tsc --noEmit`, not by a shallow test).
+    // WP-7 Ф122: listDocuments/listPath (this exact code path — no unit test called them
+    // directly before this) now also compute size_bytes; parse the JSON to check the real
+    // value, not just that the string happens to contain it somewhere.
     const docsRes = await callTool("list_documents", {}, "public");
     const docsText = (docsRes as { result: { content: [{ text: string }] } }).result.content[0].text;
-    expect(docsText).toContain("PUBLIC_LEAK.md");
+    const docsParsed = JSON.parse(docsText) as { filename: string; size_bytes: number }[];
+    expect(docsParsed).toEqual([expect.objectContaining({ filename: "PUBLIC_LEAK.md", size_bytes: 21 })]);
     expect(personalListDocuments).not.toHaveBeenCalled();
 
     const pathRes = await callTool("list_path", {}, "public");
     const pathText = (pathRes as { result: { content: [{ text: string }] } }).result.content[0].text;
-    expect(pathText).toContain("PUBLIC_LEAK.md");
+    const pathParsed = JSON.parse(pathText) as { path: string; size_bytes: number }[];
+    expect(pathParsed).toEqual([expect.objectContaining({ path: "PUBLIC_LEAK.md", size_bytes: 21 })]);
     expect(personalListPath).not.toHaveBeenCalled();
   });
 

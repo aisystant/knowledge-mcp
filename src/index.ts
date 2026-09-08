@@ -1120,7 +1120,7 @@ async function getDocumentStructure(
 // below still needs these names in scope — hence a plain import alongside the re-export, both
 // pointing at the single definition in path-tree.ts. Existing imports from "./index.js"
 // (index.test.ts) keep working unchanged.
-import { extractTitle, buildPathTree, type PathEntry } from "./path-tree.js";
+import { extractTitle, buildPathTree, utf8ByteLength, type PathEntry } from "./path-tree.js";
 export { extractTitle, buildPathTree, type PathEntry } from "./path-tree.js";
 
 async function listSources(
@@ -1154,19 +1154,27 @@ async function listDocuments(
   sourceType?: string,
   limit: number = 100,
   userId?: string
-): Promise<{ filename: string; source: string; source_type: string; github_url: string | null }[]> {
+): Promise<{ filename: string; source: string; source_type: string; github_url: string | null; size_bytes: number }[]> {
   const src = source ?? null;
   const stype = sourceType ?? null;
 
-  // WP-268: knowledge_chunk schema. Distinct source_uri excludes chunk suffixes (::section).
+  // WP-268: knowledge_chunk schema. source_uri excludes chunk suffixes (::section) — the
+  // rows selected here are "parent" rows holding the document's FULL content (see listPath
+  // below). GROUP BY + MAX, not SELECT DISTINCT (WP-7 Ф122 cold review): DISTINCT over a
+  // column that varies per row (size_bytes, derived from content) only dedupes rows that are
+  // byte-identical across every selected column — a stray duplicate parent row with different
+  // content for the same (source_uri, source) would silently surface as two near-identical
+  // list entries instead of collapsing, same failure mode the personal-mode query below avoids
+  // with GROUP BY.
   // WP-7 Ф-L2-PRIVACY: explicit account_id filter — defense-in-depth.
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
-    SELECT DISTINCT source_uri AS filename, source, source_kind AS source_type
+    SELECT source_uri AS filename, source, source_kind AS source_type, MAX(octet_length(content)) AS size_bytes
     FROM ${sql.unsafe(knowledgeChunkTable)}
     WHERE source_uri NOT LIKE '%::%'
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_kind = ${stype})
       AND account_id IS NULL
+    GROUP BY source_uri, source, source_kind
     ORDER BY source, source_uri
     LIMIT ${limit}
   `);
@@ -1179,6 +1187,7 @@ async function listDocuments(
       source: docSource,
       source_type: (r.source_type as string) || "",
       github_url: resolveGithubUrl(docSource, docFilename),
+      size_bytes: Number(r.size_bytes ?? 0),
     };
   });
 }
@@ -1214,11 +1223,15 @@ async function listPath(
     LIMIT ${limit}
   `);
 
-  const docs = rows.map((r) => ({
-    source: (r.source as string) || "",
-    path: r.filename as string,
-    title: extractTitle((r.content as string) || ""),
-  }));
+  const docs = rows.map((r) => {
+    const content = (r.content as string) || "";
+    return {
+      source: (r.source as string) || "",
+      path: r.filename as string,
+      title: extractTitle(content),
+      size_bytes: utf8ByteLength(content),
+    };
+  });
 
   return buildPathTree(docs, prefix, depth);
 }

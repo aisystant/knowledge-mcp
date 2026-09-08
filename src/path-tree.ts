@@ -9,6 +9,18 @@ export interface PathEntry {
   source: string;
   path: string;
   title: string | null;
+  // WP-7 Ф122: size in bytes, undefined for a "dir" entry (a synthetic grouping, not a document
+  // with its own content) — omitted from JSON rather than null, so a client checking truthiness
+  // doesn't need to special-case 0-byte files.
+  size_bytes?: number;
+}
+
+// WP-7 Ф122: byte length of already-fetched content, not a fresh read — used by both
+// index.ts (public listPath) and layers/personal.ts (personalListPath) to report file size
+// without an extra query. TextEncoder is a standard Web API, unlike Buffer (Node-only,
+// requires the nodejs_compat flag this Worker doesn't set).
+export function utf8ByteLength(content: string): number {
+  return new TextEncoder().encode(content).length;
 }
 
 // Извлекает заголовок документа из его полного content (H1 - та же конвенция,
@@ -28,7 +40,7 @@ export function extractTitle(content: string): string | null {
 // depth клэмпится здесь же (не только в вызывающем listPath), чтобы контракт
 // самой функции был корректен для любого прямого вызова, включая тесты.
 export function buildPathTree(
-  docs: { source: string; path: string; title: string | null }[],
+  docs: { source: string; path: string; title: string | null; size_bytes?: number }[],
   pathPrefix: string,
   depth: number
 ): PathEntry[] {
@@ -40,7 +52,7 @@ export function buildPathTree(
     const rel = doc.path.startsWith(pathPrefix) ? doc.path.slice(pathPrefix.length) : doc.path;
     const segments = rel.split("/").filter((s) => s.length > 0);
     if (segments.length <= safeDepth) {
-      files.push({ type: "file", source: doc.source, path: doc.path, title: doc.title });
+      files.push({ type: "file", source: doc.source, path: doc.path, title: doc.title, size_bytes: doc.size_bytes });
     } else {
       const dirPath = pathPrefix + segments.slice(0, safeDepth).join("/");
       const dedupKey = `${doc.source} ${dirPath}`;

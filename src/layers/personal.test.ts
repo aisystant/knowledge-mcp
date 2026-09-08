@@ -473,14 +473,20 @@ describe("personalListSources", () => {
 });
 
 describe("personalListDocuments", () => {
-  it("maps rows scoped to the caller's sourceNames, with a resolved github_url", async () => {
-    queryQueue.push([{ filename: "notes/idea.md", source: "DS-my-strategy", source_type: "ds" }]);
+  it("maps rows scoped to the caller's sourceNames, with a resolved github_url and byte size", async () => {
+    // size_bytes as SUM(octet_length(content))::bigint would come back from Postgres — a
+    // single aggregated row per file, chunk count already collapsed server-side (WP-7 Ф122).
+    // size_bytes: string "42", not number 42 — the Neon/postgres.js driver returns BIGINT
+    // columns as strings by default; Number(r.size_bytes ?? 0) in the implementation must
+    // coerce that shape, not just the JS-number shape a careless mock would use.
+    queryQueue.push([{ filename: "notes/idea.md", source: "DS-my-strategy", source_type: "ds", size_bytes: "42" }]);
     const result = await personalListDocuments(ENV, ctx());
     expect(result).toEqual([{
       filename: "notes/idea.md",
       source: "DS-my-strategy",
       source_type: "ds",
       github_url: expect.stringContaining("github.com/TserenTserenov/DS-my-strategy"),
+      size_bytes: 42,
     }]);
   });
 
@@ -492,15 +498,20 @@ describe("personalListDocuments", () => {
 });
 
 describe("personalListPath", () => {
-  it("builds a path tree from the caller's own documents", async () => {
+  it("builds a path tree from the caller's own documents, with title and byte size from full_content", async () => {
+    // full_content as string_agg(content, '' ORDER BY chunk_ordinal) — the query GROUPs by
+    // filename so a multi-chunk v2 document (several rows sharing one filename, see
+    // personalGetDocument's v2Rows) comes back as ONE row here with content already
+    // reassembled in order, not one row per chunk (WP-7 Ф122 — the pre-fix query returned
+    // one row per chunk, which made buildPathTree emit a duplicate "file" entry per chunk).
     queryQueue.push([
-      { filename: "docs/intro.md", source: "DS-my-strategy", content: "# Intro" },
-      { filename: "docs/guide/setup.md", source: "DS-my-strategy", content: "# Setup" },
+      { filename: "docs/intro.md", source: "DS-my-strategy", full_content: "# Intro\n\nBody text." },
+      { filename: "docs/guide/setup.md", source: "DS-my-strategy", full_content: "# Setup" },
     ]);
     const entries = await personalListPath(ENV, ctx(), undefined, "docs/", 1);
     expect(entries).toEqual([
-      { type: "dir", source: "DS-my-strategy", path: "docs/guide", title: null },
-      { type: "file", source: "DS-my-strategy", path: "docs/intro.md", title: "Intro" },
+      { type: "dir", source: "DS-my-strategy", path: "docs/guide", title: null, size_bytes: undefined },
+      { type: "file", source: "DS-my-strategy", path: "docs/intro.md", title: "Intro", size_bytes: 19 },
     ]);
   });
 
