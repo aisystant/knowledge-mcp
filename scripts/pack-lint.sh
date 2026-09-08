@@ -100,6 +100,78 @@ if [ -n "$ROUTING_YAML_STAGED" ]; then
   fi
 fi
 
+# --- [R7] Критичный гейт Pack (WP-474 Ф11, риск-based) ---
+# Разрешение 11.08 (пир-сессия wp481-f251-arch-batch §4 п.3): обязательная
+# проверка перед слиянием только для критичных путей пакета (структура,
+# манифест, реестр); для контентных правок — автопропуск. /verify pack
+# (DP.SC.193, package-adequacy) — LLM-семантическая проверка, синхронно из
+# bash-хука не вызывается, поэтому гейт не пытается её симулировать: при
+# попадании diff в критичный класс безусловно требуется осознанный тег
+# [pack-gate-bypass: <причина>] в сообщении коммита (проверяет commit-msg).
+# Причина текстом — неформальное, ретроспективно проверяемое свидетельство,
+# тот же уровень доверия, что уже принят для [no-registry-touch] и
+# [routing-bypass] в этой кодовой базе — не криптографическое доказательство
+# (отклонено как спекулятивная сложность пир-сессией 2026-09-08-15-
+# wp474-f11-pack-risk-gate, Kimi+Codex, раунды 4-5).
+# Известное поведение (то же, что уже принято для ROUTING_BYPASS_USED):
+# merge-коммит, затрагивающий критичный путь, тоже потребует тег в сообщении
+# слияния; `git commit --amend` без новых staged-правок не перезапускает
+# проверку (git diff --cached пуст относительно HEAD).
+GIT_DIR_R7="$(git rev-parse --git-dir)"
+rm -f "$GIT_DIR_R7/PACK_GATE_BYPASS_USED"
+
+# Не заякорено на начало строки (^) — большинство Pack-репо кладут структуру
+# под pack/<domain>/, не в корень (та же двойная проверка "корень ИЛИ pack/<domain>/",
+# что уже используют DISJOINTNESS_FILE/MANIFEST_FILE выше в этом файле); критичный
+# путь — сегмент где угодно в пути, не только от начала.
+R7_CRITICAL_PATH='(^|/)(00-pack-manifest\.md|09-name-cards/|0[1-9]-|1[01]-)'
+R7_SAFE_FIELDS='^(editor|last_reviewed|tags)$'
+r7_critical=false
+
+# Извлечь только frontmatter-блок (между первыми двумя '---'), не весь файл —
+# иначе обычная строка тела вида "Note:"/"See:" ошибочно читается как поле.
+# Отсортированные "key: value"-строки (не только имена) — нужны обе части,
+# иначе смена ЗНАЧЕНИЯ уже существующего поля (напр. status: draft → mature)
+# осталась бы незамеченной при сравнении одних лишь имён полей.
+r7_frontmatter_lines() {
+  awk '/^---$/{c++; if(c==2) exit} c==1' "$1" 2>/dev/null | grep -E '^[a-zA-Z_]+:' | sort
+}
+
+R7_ENTRIES=$(git diff --cached --name-status -M -C --diff-filter=ACDMR 2>/dev/null || true)
+while IFS=$'\t' read -r r7_status r7_path r7_path2; do
+  [ -z "$r7_status" ] && continue
+  for r7_p in "$r7_path" "$r7_path2"; do
+    [ -z "$r7_p" ] && continue
+    echo "$r7_p" | grep -qE "$R7_CRITICAL_PATH" || continue
+    case "$r7_status" in
+      A*|D*|R*|C*)
+        r7_critical=true ;;
+      M)
+        # Правка существующего файла структуры: сравниваем ТОЛЬКО frontmatter
+        # версии до и после (HEAD vs staged) — изменённое поле вне safe-списка
+        # критично; правки тела файла (в т.ч. строки "Слово:") не в счёт.
+        r7_fm_old=$(git show "HEAD:$r7_p" 2>/dev/null | r7_frontmatter_lines /dev/stdin)
+        r7_fm_new=$(r7_frontmatter_lines "$r7_p")
+        r7_fields=$(comm -3 <(echo "$r7_fm_old") <(echo "$r7_fm_new") \
+          | sed -E 's/^\t?([a-zA-Z_]+):.*/\1/' | sort -u)
+        while IFS= read -r r7f; do
+          [ -z "$r7f" ] && continue
+          echo "$r7f" | grep -qE "$R7_SAFE_FIELDS" || r7_critical=true
+        done <<< "$r7_fields"
+        git diff --cached -U0 -- "$r7_p" 2>/dev/null | grep -qE '^[+-]## ' && r7_critical=true
+        ;;
+    esac
+  done
+done <<< "$R7_ENTRIES"
+
+if $r7_critical; then
+  touch "$GIT_DIR_R7/PACK_GATE_BYPASS_USED"
+  echo ""
+  echo "⚠️  pack-lint [R7]: коммит трогает критичный путь Pack (манифест / name-cards / структура SPF)."
+  echo "   Обязателен тег [pack-gate-bypass: <причина>] в сообщении коммита — commit-msg заблокирует без него."
+  echo "   Причина текстом — неформальное свидетельство ('прошёл /verify pack, seedOnly' и т.п.), не крипто-доказательство."
+fi
+
 # --- [R5] Загрузка disjointness registry (если есть) ---
 DISJOINTNESS_FILE=""
 DISJOINT_PAIRS=""
