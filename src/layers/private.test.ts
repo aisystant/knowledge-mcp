@@ -48,14 +48,19 @@ describe("PRIVATE_TOOL_NAMES", () => {
 });
 
 describe("DUAL_MODE_TOOL_NAMES", () => {
-  it("declares search/get_document/list_sources — same tool name, different backend by mode", () => {
+  it("declares search/get_document/list_sources/list_documents/list_path — same tool name, different backend by mode", () => {
     expect(DUAL_MODE_TOOL_NAMES.has("search")).toBe(true);
     expect(DUAL_MODE_TOOL_NAMES.has("get_document")).toBe(true);
     expect(DUAL_MODE_TOOL_NAMES.has("list_sources")).toBe(true);
+    // WP-7 Ф117: list_documents/list_path used to fall through to the platform-only handler
+    // in private mode (query the platform DB, filter account_id IS NULL — never a personal
+    // document) — "relation knowledge.knowledge_chunk does not exist" for a private-mode
+    // caller whose DSN has no such table. This assertion used to read `.toBe(false)`.
+    expect(DUAL_MODE_TOOL_NAMES.has("list_documents")).toBe(true);
+    expect(DUAL_MODE_TOOL_NAMES.has("list_path")).toBe(true);
   });
 
-  it("does not include list_documents or memory_search (public-only / private-only respectively)", () => {
-    expect(DUAL_MODE_TOOL_NAMES.has("list_documents")).toBe(false);
+  it("does not include memory_search (private-only)", () => {
     expect(DUAL_MODE_TOOL_NAMES.has("memory_search")).toBe(false);
   });
 });

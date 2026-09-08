@@ -49,6 +49,8 @@ import {
   deleteFromGitHub,
   writeToGitHub,
   personalListSources,
+  personalListDocuments,
+  personalListPath,
   personalGetDocument,
   personalGetDocumentLive,
   personalGetDocumentWithSha,
@@ -467,6 +469,45 @@ describe("personalListSources", () => {
     queryQueue.push([]);
     const result = await personalListSources(ENV, ctx());
     expect(result).toEqual([]);
+  });
+});
+
+describe("personalListDocuments", () => {
+  it("maps rows scoped to the caller's sourceNames, with a resolved github_url", async () => {
+    queryQueue.push([{ filename: "notes/idea.md", source: "DS-my-strategy", source_type: "ds" }]);
+    const result = await personalListDocuments(ENV, ctx());
+    expect(result).toEqual([{
+      filename: "notes/idea.md",
+      source: "DS-my-strategy",
+      source_type: "ds",
+      github_url: expect.stringContaining("github.com/TserenTserenov/DS-my-strategy"),
+    }]);
+  });
+
+  it("returns an empty list when the user has no documents", async () => {
+    queryQueue.push([]);
+    const result = await personalListDocuments(ENV, ctx());
+    expect(result).toEqual([]);
+  });
+});
+
+describe("personalListPath", () => {
+  it("builds a path tree from the caller's own documents", async () => {
+    queryQueue.push([
+      { filename: "docs/intro.md", source: "DS-my-strategy", content: "# Intro" },
+      { filename: "docs/guide/setup.md", source: "DS-my-strategy", content: "# Setup" },
+    ]);
+    const entries = await personalListPath(ENV, ctx(), undefined, "docs/", 1);
+    expect(entries).toEqual([
+      { type: "dir", source: "DS-my-strategy", path: "docs/guide", title: null },
+      { type: "file", source: "DS-my-strategy", path: "docs/intro.md", title: "Intro" },
+    ]);
+  });
+
+  it("returns an empty tree when the user has no documents", async () => {
+    queryQueue.push([]);
+    const entries = await personalListPath(ENV, ctx());
+    expect(entries).toEqual([]);
   });
 });
 

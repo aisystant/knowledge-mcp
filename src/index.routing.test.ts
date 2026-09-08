@@ -31,7 +31,19 @@ vi.mock("./rls.js", () => ({
   // sentinel row so a routing regression fails the assertions below instead of silently passing.
   withUserContext: vi.fn(async (_dsn: string, _userId: string | null | undefined, fn: (sql: unknown) => Promise<unknown>) => {
     const sql = ((..._args: unknown[]) => Promise.resolve([
-      { legacy_id: 1, source_uri: "PUBLIC_LEAK.md", content: "public corpus content", source: "public-src", source_kind: "guides" },
+      // The mock doesn't parse the SQL text, so it can't apply a query's own column aliases
+      // (e.g. listDocuments/listPath's `source_uri AS filename`) — both the raw and the
+      // aliased key are included so every public-mode caller (raw-column and aliased-SELECT
+      // alike) finds the field name it actually reads.
+      {
+        legacy_id: 1,
+        source_uri: "PUBLIC_LEAK.md",
+        filename: "PUBLIC_LEAK.md",
+        content: "public corpus content",
+        source: "public-src",
+        source_kind: "guides",
+        source_type: "guides",
+      },
     ])) as unknown as { (..._args: unknown[]): Promise<unknown[]>; unsafe: (v: string) => string };
     sql.unsafe = (v: string) => v;
     return fn(sql);
@@ -52,6 +64,14 @@ vi.mock("./layers/personal.js", () => ({
   }),
   personalListSources: vi.fn().mockResolvedValue([
     { source: "PRIVATE_SENTINEL_SOURCE", source_type: "ds", doc_count: 1 },
+  ]),
+  // WP-7 Ф117: list_documents/list_path used to have no entry here at all — DUAL_MODE_TOOL_NAMES
+  // didn't list them, so private mode fell through to the public account_id-IS-NULL handler.
+  personalListDocuments: vi.fn().mockResolvedValue([
+    { filename: "PRIVATE_SENTINEL.md", source: "DS-my-strategy", source_type: "ds", github_url: null },
+  ]),
+  personalListPath: vi.fn().mockResolvedValue([
+    { type: "file", source: "DS-my-strategy", path: "PRIVATE_SENTINEL.md", title: null },
   ]),
   personalMemorySearch: vi.fn().mockResolvedValue([]),
   connectSource: vi.fn(),
@@ -81,7 +101,7 @@ vi.mock("./layers/private.js", async (importOriginal) => {
 });
 
 const { handleMcpRequest, default: worker } = await import("./index.js");
-const { personalSearchDocuments, personalGetDocument, personalListSources, writeToGitHub } = await import("./layers/personal.js");
+const { personalSearchDocuments, personalGetDocument, personalListSources, personalListDocuments, personalListPath, writeToGitHub } = await import("./layers/personal.js");
 
 const ENV = {
   KNOWLEDGE_DATABASE_URL: "postgres://fake-public",
@@ -128,9 +148,45 @@ describe("dual-mode routing: private mode reaches the personal layer, never the 
     expect(personalListSources).toHaveBeenCalledTimes(1);
   });
 
+  // WP-7 Ф117 regression: before the fix these two fell through to the public handler
+  // (account_id IS NULL) and returned/leaked PUBLIC_LEAK.md instead of erroring OR
+  // leaking, depending on whether the platform DSN happened to have the table — this
+  // test pins the correct behavior (private-layer sentinel, public leak never touched).
+  it("list_documents: private mode returns the personal-layer sentinel, not the public corpus", async () => {
+    const res = await callTool("list_documents", {}, "private");
+    const text = (res as { result: { content: [{ text: string }] } }).result.content[0].text;
+    expect(text).toContain("PRIVATE_SENTINEL.md");
+    expect(text).not.toContain("PUBLIC_LEAK.md");
+    expect(personalListDocuments).toHaveBeenCalledTimes(1);
+  });
+
+  it("list_path: private mode returns the personal-layer sentinel, not the public corpus", async () => {
+    const res = await callTool("list_path", {}, "private");
+    const text = (res as { result: { content: [{ text: string }] } }).result.content[0].text;
+    expect(text).toContain("PRIVATE_SENTINEL.md");
+    expect(text).not.toContain("PUBLIC_LEAK.md");
+    expect(personalListPath).toHaveBeenCalledTimes(1);
+  });
+
   it("search: public mode never calls the personal-layer search function", async () => {
     await callTool("search", { query: "test" }, "public");
     expect(personalSearchDocuments).not.toHaveBeenCalled();
+  });
+
+  it("list_documents/list_path: public mode still returns the public corpus and never calls the personal-layer list functions", async () => {
+    // Asserts actual response content, not just "didn't call the private function" — a
+    // dispatch-only assertion would still pass if the public listPath()/listDocuments()
+    // bodies themselves were broken (e.g. the WP-7 Ф117 refactor briefly left buildPathTree/
+    // extractTitle out of scope in index.ts — caught by `tsc --noEmit`, not by a shallow test).
+    const docsRes = await callTool("list_documents", {}, "public");
+    const docsText = (docsRes as { result: { content: [{ text: string }] } }).result.content[0].text;
+    expect(docsText).toContain("PUBLIC_LEAK.md");
+    expect(personalListDocuments).not.toHaveBeenCalled();
+
+    const pathRes = await callTool("list_path", {}, "public");
+    const pathText = (pathRes as { result: { content: [{ text: string }] } }).result.content[0].text;
+    expect(pathText).toContain("PUBLIC_LEAK.md");
+    expect(personalListPath).not.toHaveBeenCalled();
   });
 
   it("write: domain guidance stays a structured non-MCP-error result", async () => {

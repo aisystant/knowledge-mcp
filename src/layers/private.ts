@@ -71,6 +71,12 @@ export const DUAL_MODE_TOOL_NAMES: ReadonlySet<string> = new Set([
   "search",
   "get_document",
   "list_sources",
+  // WP-7 Ф117: list_documents/list_path had no private implementation and fell through to
+  // the platform-only handlers (query the platform DB, filter account_id IS NULL — can never
+  // return personal documents; a private-mode call hit "relation knowledge.knowledge_chunk
+  // does not exist" instead, the platform DB's table not existing in the personal Neon DB).
+  "list_documents",
+  "list_path",
 ]);
 
 /**

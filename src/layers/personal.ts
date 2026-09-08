@@ -10,6 +10,7 @@
 import { neon } from "@neondatabase/serverless";
 import { getKnowledgeSchema, KNOWLEDGE_TABLES } from "../utils/db.js";
 import { provisionBridgeScopes } from "../scope.js";
+import { buildPathTree, extractTitle, type PathEntry } from "../path-tree.js";
 import {
   githubBlobUrl,
   githubContentsApiUrl,
@@ -1149,6 +1150,89 @@ export async function personalListSources(
     source_type: (r.source_type as string) || "",
     doc_count: r.doc_count as number,
   }));
+}
+
+/** Private-mode `list_documents`: personal corpus only. WP-7 Ф117 — before this, list_documents
+ * had no private branch (unlike search/get_document/list_sources) and fell through to the
+ * platform-only handler in ../index.ts, which queries the platform DB and can never return a
+ * user's personal documents. Same NOT LIKE '::' exclusion as the platform implementation
+ * (chunk-suffixed legacy rows are chunks of a document, not distinct documents). */
+export async function personalListDocuments(
+  env: PersonalEnv,
+  ctx: UserContext,
+  source?: string,
+  sourceType?: string,
+  limit: number = 100
+): Promise<{ filename: string; source: string; source_type: string; github_url: string | null }[]> {
+  const sql = personalDb(env);
+  const sourceNames = ctx.sourceNames;
+  const docsTable = KNOWLEDGE_TABLES.documents(getKnowledgeSchema(env));
+  const src = source ?? null;
+  const stype = sourceType ?? null;
+
+  const rows = await sql`
+    SELECT DISTINCT filename, source, source_type
+    FROM ${sql.unsafe(docsTable)}
+    WHERE user_id = ${ctx.userId}
+      AND source = ANY(${sourceNames})
+      AND filename NOT LIKE '%::%'
+      AND (${src}::text IS NULL OR source = ${src})
+      AND (${stype}::text IS NULL OR source_type = ${stype})
+    ORDER BY source, filename
+    LIMIT ${limit}
+  `;
+
+  return rows.map((r) => {
+    const docSource = (r.source as string) || "";
+    const docFilename = r.filename as string;
+    return {
+      filename: docFilename,
+      source: docSource,
+      source_type: (r.source_type as string) || "",
+      github_url: personalGithubUrl(ctx, docSource, docFilename),
+    };
+  });
+}
+
+/** Private-mode `list_path`: personal corpus only. Same tree-building contract as the platform
+ * implementation (../index.ts listPath) — see personalListDocuments for why a private branch
+ * was missing (WP-7 Ф117). */
+export async function personalListPath(
+  env: PersonalEnv,
+  ctx: UserContext,
+  source?: string,
+  pathPrefix?: string,
+  depth: number = 1
+): Promise<PathEntry[]> {
+  const sql = personalDb(env);
+  const sourceNames = ctx.sourceNames;
+  const docsTable = KNOWLEDGE_TABLES.documents(getKnowledgeSchema(env));
+  const src = source ?? null;
+  const prefix = pathPrefix ?? "";
+  // LIKE-спецсимволы экранируются — тот же приём, что в платформенном listPath
+  // (../index.ts), иначе path_prefix вроде "01_intro" молча матчил бы лишние строки.
+  const likePrefix = prefix.replace(/[\\%_]/g, (c) => "\\" + c) + "%";
+  const limit = 2000; // тот же лимит, что у платформенного listPath
+
+  const rows = await sql`
+    SELECT filename, source, content
+    FROM ${sql.unsafe(docsTable)}
+    WHERE user_id = ${ctx.userId}
+      AND source = ANY(${sourceNames})
+      AND filename NOT LIKE '%::%'
+      AND (${src}::text IS NULL OR source = ${src})
+      AND (${prefix}::text = '' OR filename LIKE ${likePrefix} ESCAPE '\')
+    ORDER BY source, filename
+    LIMIT ${limit}
+  `;
+
+  const docs = rows.map((r) => ({
+    source: (r.source as string) || "",
+    path: r.filename as string,
+    title: extractTitle((r.content as string) || ""),
+  }));
+
+  return buildPathTree(docs, prefix, depth);
 }
 
 // --- connect_source (WP-410 срез-2b) ---

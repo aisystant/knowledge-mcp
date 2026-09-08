@@ -36,6 +36,8 @@ import {
   personalGetDocumentWithSha,
   AmbiguousSourceError,
   personalListSources,
+  personalListDocuments,
+  personalListPath,
   personalMemorySearch,
   connectSource,
   disconnectSource,
@@ -1112,59 +1114,14 @@ async function getDocumentStructure(
   };
 }
 
-// Извлекает заголовок документа из его полного content (H1 — та же конвенция,
-// что docTitle в scripts/ingest.ts:chunkLargeFile). Применяется к parent-строке
-// (source_uri без "::" — единственная строка на файл с ПОЛНЫМ исходным content,
-// см. INSERT в reindex-обработчике: paragraph_pos=0 / embedding=NULL для больших
-// файлов, единственная строка для малых). НЕ frontmatter YAML — ingest его не парсит.
-export function extractTitle(content: string): string | null {
-  const match = content.match(/^#\s+(.+)/m);
-  return match ? match[1].trim() : null;
-}
-
-export interface PathEntry {
-  type: "file" | "dir";
-  source: string;
-  path: string;
-  title: string | null;
-}
-
-// Строит "дерево" (WP-5 backlog #31, knowledge_list_path/personal_list_path) из
-// плоского списка документов: пути глубже depth схлопываются в синтетические
-// type: "dir" записи (без title — директория не документ). depth считается от
-// pathPrefix (или от корня источника, если prefix не задан).
-// source входит в дедуп-ключ директорий — без него одноимённые поддиректории
-// в разных источниках (например "02-domain-entities" в двух разных Pack)
-// молча схлопывались бы в одну запись при вызове без фильтра source (cold review finding).
-// depth клэмпится здесь же (не только в вызывающем listPath), чтобы контракт
-// самой функции был корректен для любого прямого вызова, включая тесты.
-export function buildPathTree(
-  docs: { source: string; path: string; title: string | null }[],
-  pathPrefix: string,
-  depth: number
-): PathEntry[] {
-  const safeDepth = Math.max(1, depth);
-  const dirs = new Map<string, PathEntry>();
-  const files: PathEntry[] = [];
-
-  for (const doc of docs) {
-    const rel = doc.path.startsWith(pathPrefix) ? doc.path.slice(pathPrefix.length) : doc.path;
-    const segments = rel.split("/").filter((s) => s.length > 0);
-    if (segments.length <= safeDepth) {
-      files.push({ type: "file", source: doc.source, path: doc.path, title: doc.title });
-    } else {
-      const dirPath = pathPrefix + segments.slice(0, safeDepth).join("/");
-      const dedupKey = `${doc.source} ${dirPath}`;
-      if (!dirs.has(dedupKey)) {
-        dirs.set(dedupKey, { type: "dir", source: doc.source, path: dirPath, title: null });
-      }
-    }
-  }
-
-  return [...dirs.values(), ...files].sort(
-    (a, b) => a.source.localeCompare(b.source) || a.path.localeCompare(b.path)
-  );
-}
+// WP-7 Ф117: extractTitle/PathEntry/buildPathTree moved to ./path-tree.ts so layers/personal.ts
+// can build the same tree shape for personalListPath without an index.ts -> personal.ts ->
+// index.ts import cycle. `export ... from` only re-exports (no local binding), and listPath()
+// below still needs these names in scope — hence a plain import alongside the re-export, both
+// pointing at the single definition in path-tree.ts. Existing imports from "./index.js"
+// (index.test.ts) keep working unchanged.
+import { extractTitle, buildPathTree, type PathEntry } from "./path-tree.js";
+export { extractTitle, buildPathTree, type PathEntry } from "./path-tree.js";
 
 async function listSources(
   env: Env,
@@ -3112,6 +3069,28 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Document not found" }], isError: true } };
             }
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: doc.content }] } };
+          }
+
+          if (toolName === "list_documents") {
+            const docs = await personalListDocuments(
+              env,
+              ctx,
+              args.source as string | undefined,
+              args.source_type as string | undefined,
+              (args.limit as number) || 100
+            );
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(docs, null, 2) }] } };
+          }
+
+          if (toolName === "list_path") {
+            const entries = await personalListPath(
+              env,
+              ctx,
+              args.source as string | undefined,
+              args.path_prefix as string | undefined,
+              (args.depth as number) || 1
+            );
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(entries, null, 2) }] } };
           }
 
           // list_sources
