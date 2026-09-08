@@ -124,7 +124,20 @@ rm -f "$GIT_DIR_R7/PACK_GATE_BYPASS_USED"
 # под pack/<domain>/, не в корень (та же двойная проверка "корень ИЛИ pack/<domain>/",
 # что уже используют DISJOINTNESS_FILE/MANIFEST_FILE выше в этом файле); критичный
 # путь — сегмент где угодно в пути, не только от начала.
-R7_CRITICAL_PATH='(^|/)(00-pack-manifest\.md|09-name-cards/|0[1-9]-|1[01]-)'
+#
+# Два разных класса критичности (найдено 08.09, живой вопрос пилота — риск не
+# был замечен ни на одном из шести раундов пир-сессии):
+# - governance (манифест, реестр карточек имён) — само по себе редкое, штучное
+#   изменение; критично при ЛЮБОЙ операции, включая создание.
+# - structure (файл внутри 01-…11-…) — рутинная контентная работа (в т.ч.
+#   массовое извлечение экстрактором) создаёт здесь НОВЫЕ файлы постоянно;
+#   если считать критичным любое создание, тег стал бы обязателен на каждый
+#   обычный коммит новой сущности — прямо против цели «контент — автопропуск».
+#   Критично для structure — только risk-операции над УЖЕ существующим файлом:
+#   удаление/переименование/копирование, или правка критичного поля/заголовка
+#   (см. ветку M ниже). Создание нового файла внутри structure — не критично.
+R7_GOVERNANCE_PATH='(^|/)(00-pack-manifest\.md|09-name-cards/)'
+R7_STRUCTURE_PATH='(^|/)(0[1-9]-|1[01]-)'
 R7_SAFE_FIELDS='^(editor|last_reviewed|tags)$'
 r7_critical=false
 
@@ -142,9 +155,20 @@ while IFS=$'\t' read -r r7_status r7_path r7_path2; do
   [ -z "$r7_status" ] && continue
   for r7_p in "$r7_path" "$r7_path2"; do
     [ -z "$r7_p" ] && continue
-    echo "$r7_p" | grep -qE "$R7_CRITICAL_PATH" || continue
+    r7_is_governance=false
+    echo "$r7_p" | grep -qE "$R7_GOVERNANCE_PATH" && r7_is_governance=true
+    r7_is_structure=false
+    echo "$r7_p" | grep -qE "$R7_STRUCTURE_PATH" && r7_is_structure=true
+    { $r7_is_governance || $r7_is_structure; } || continue
     case "$r7_status" in
-      A*|D*|R*|C*)
+      A*)
+        # Создание нового файла: манифест/реестр карточек имён — редкое,
+        # штучное действие, критично всегда. Новая сущность внутри 01-…11-… —
+        # рутинная контентная работа (в т.ч. массовое извлечение экстрактором),
+        # автопропуск.
+        $r7_is_governance && r7_critical=true
+        ;;
+      D*|R*|C*)
         r7_critical=true ;;
       M)
         # Правка существующего файла структуры: сравниваем ТОЛЬКО frontmatter
