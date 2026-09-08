@@ -147,7 +147,35 @@ r7_critical=false
 # иначе смена ЗНАЧЕНИЯ уже существующего поля (напр. status: draft → mature)
 # осталась бы незамеченной при сравнении одних лишь имён полей.
 r7_frontmatter_lines() {
-  awk '/^---$/{c++; if(c==2) exit} c==1' "$1" 2>/dev/null | grep -E '^[a-zA-Z_]+:' | sort
+  # A file with no real `---`-delimited YAML frontmatter is "nothing to
+  # compare", not an error — three ways that showed up as a silent
+  # whole-script abort (00-pack-manifest.md: markdown headings + a fenced
+  # ```yaml block, no frontmatter, but several bare `---` used as body
+  # dividers further down; PD.MAP.001.md: real frontmatter, but also large
+  # enough to contain a later, unrelated `---`):
+  #   1. Zero `---` lines at all: the old awk|grep pipe hit grep's exit-1
+  #      "no match", which `pipefail` propagated into the bare `var=$(...)`
+  #      assignments at the two call sites below, and `set -e` killed the
+  #      script with no output.
+  #   2. Two-or-more `---` further down a *live* upstream pipe (`git show`):
+  #      the old awk's `c==2{exit}` fired on the second one, closing its
+  #      read end while `git show` was still writing — SIGPIPE killed `git
+  #      show`, same silent `set -e` abort.
+  #   3. Two-or-more `---` anywhere, even against an already-buffered string:
+  #      the same `exit` closes awk's read end while its own `printf`
+  #      producer is still writing — SIGPIPE kills `printf` instead, same
+  #      abort. Draining input into a variable first only fixes case 2, not
+  #      this one — it just moves the live pipe one level down.
+  # `c==1` alone (no `exit`) is exactly as correct: once a real second `---`
+  # sets c=2, `c==1` is already false for every line from there on, with or
+  # without an early stop — the `exit` was only ever a speed optimization
+  # for large files being read live, not a correctness requirement here.
+  local content
+  content=$(cat "$1" 2>/dev/null)
+  case "$content" in
+    ---*) printf '%s\n' "$content" | awk '/^---$/{c++} c==1' | { grep -E '^[a-zA-Z_]+:' || true; } | sort ;;
+    *) : ;;
+  esac
 }
 
 R7_ENTRIES=$(git diff --cached --name-status -M -C --diff-filter=ACDMR 2>/dev/null || true)
