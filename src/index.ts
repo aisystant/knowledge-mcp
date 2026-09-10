@@ -208,14 +208,15 @@ const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> =
   "FMT-exocortex-template": { base: "https://github.com/TserenTserenov/FMT-exocortex-template/blob/main", pathPrefix: "" },
   "FMT-s2r": { base: "https://github.com/TserenTserenov/FMT-s2r/blob/main", pathPrefix: "" },
   "DS-autonomous-agents": { base: "https://github.com/TserenTserenov/DS-autonomous-agents/blob/main", pathPrefix: "" },
-  "PACK-verification": { base: "https://github.com/TserenTserenov/PACK-verification/blob/main", pathPrefix: "pack/" },
-  "PACK-autonomous-agents": { base: "https://github.com/TserenTserenov/PACK-autonomous-agents/blob/main", pathPrefix: "pack/" },
   "PACK-ecosystem": { base: "https://github.com/TserenTserenov/PACK-ecosystem/blob/main", pathPrefix: "pack/" },
   // WP-532 (2026-09-02): PACK-rhetoric is public — safe to add via the unauthenticated
-  // readFromGitHubPublic() fetch this map feeds. PACK-systems-art and PACK-agent-rules
-  // are also in scripts/sources.json (the bulk-ingest registry) but are PRIVATE repos;
-  // adding them here would not work — readFromGitHubPublic() has no auth and would get
-  // 404s from raw.githubusercontent.com. They need an installation-token path like
+  // readFromGitHubPublic() fetch this map feeds. PACK-systems-art, PACK-agent-rules,
+  // PACK-verification and PACK-autonomous-agents (WP-545, 2026-09-10: the latter two
+  // heartbeated as 404 on every single run since at least 2026-09-05 — confirmed private
+  // via `GET /repos/TserenTserenov/<name>` also returning 404 unauthenticated) are also
+  // in scripts/sources.json (the bulk-ingest registry) but are PRIVATE repos; adding them
+  // here would not work — readFromGitHubPublic() has no auth and would get 404s from
+  // raw.githubusercontent.com. They need an installation-token path like
   // resolveUserContext/getInstallationToken in layers/personal.ts before they can join
   // this live-reindex registry. Left out intentionally, not an oversight.
   "PACK-rhetoric": { base: "https://github.com/TserenTserenov/PACK-rhetoric/blob/main", pathPrefix: "pack/" },
@@ -3644,26 +3645,75 @@ async function readFromGitHubPublic(source: string, filePath: string): Promise<s
   return await resp.text();
 }
 
+async function fetchGitHubTree(owner: string, repo: string, branch: string): Promise<Response> {
+  return fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, {
+    headers: { "User-Agent": "aisystant-knowledge-mcp" },
+  });
+}
+
+// WP-545 (2026-09-10): this endpoint is called unauthenticated (60 req/hour per IP,
+// shared across every Worker invocation on this account/region) — a failed response
+// needs to say WHETHER retrying makes sense, not just that it failed. A 5xx or network
+// hiccup is worth one immediate retry; a rate-limit (403 + Remaining=0, or an explicit
+// Retry-After) is not — hammering it again a few hundred ms later only makes the
+// window worse, it needs to wait for the actual reset time.
+// Shared with retryPendingHeartbeatSources() (below) via the stored `error` text —
+// marks a failure a 15-minute retry cannot fix, so catch-up leaves it for tomorrow's
+// full runHeartbeat() instead of re-hitting the same dead request every tick.
+const TERMINAL_ERROR_TAG = "[terminal-until-next-night]";
+
+function classifyGitHubTreeFailure(resp: Response): { retryable: boolean; resetAt: Date | null } {
+  const remaining = resp.headers.get("X-RateLimit-Remaining");
+  const reset = resp.headers.get("X-RateLimit-Reset");
+  const retryAfter = resp.headers.get("Retry-After");
+  if (resp.status === 403 && remaining === "0" && reset) {
+    return { retryable: false, resetAt: new Date(Number(reset) * 1000) };
+  }
+  if (resp.status === 403 && retryAfter) {
+    return { retryable: false, resetAt: new Date(Date.now() + Number(retryAfter) * 1000) };
+  }
+  if (resp.status >= 500) {
+    return { retryable: true, resetAt: null };
+  }
+  return { retryable: false, resetAt: null };
+}
+
 /**
  * List all .md files from a GitHub repo via Trees API (recursive).
  * Returns paths relative to repo root (including pathPrefix if present).
  */
 async function listGitHubFiles(source: string): Promise<string[]> {
   const config = SOURCE_GITHUB_BASE[source];
-  if (!config) throw new Error(`Unknown source: ${source}`);
+  // Both of these are static config errors (missing/malformed registry entry) — a
+  // 15-minute retry can't fix a typo, tag terminal same as the HTTP-failure paths below.
+  if (!config) throw new Error(`Unknown source: ${source} ${TERMINAL_ERROR_TAG}`);
 
   const match = config.base.match(/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)/);
-  if (!match) throw new Error(`Invalid GitHub base URL for source: ${source}`);
-
+  if (!match) throw new Error(`Invalid GitHub base URL for source: ${source} ${TERMINAL_ERROR_TAG}`);
   const [, owner, repo, branch] = match;
-  const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, {
-    headers: { "User-Agent": "aisystant-knowledge-mcp" },
-  });
 
-  if (!resp.ok) throw new Error(`GitHub Trees API ${resp.status} for ${source}`);
+  let resp = await fetchGitHubTree(owner, repo, branch);
+  let failure = resp.ok ? null : classifyGitHubTreeFailure(resp);
+  if (failure?.retryable) {
+    await new Promise((r) => setTimeout(r, 300 + Math.random() * 500));
+    resp = await fetchGitHubTree(owner, repo, branch);
+    failure = resp.ok ? null : classifyGitHubTreeFailure(resp);
+  }
+  if (!resp.ok) {
+    if (failure?.resetAt) {
+      // Parsed back by retryPendingHeartbeatSources() via GITHUB_RATE_LIMIT_RESET_RE —
+      // keep this exact "reset_at=<ISO>" shape if you touch this message.
+      throw new Error(`GitHub rate-limited for ${source}, reset_at=${failure.resetAt.toISOString()}`);
+    }
+    // No rate-limit signal — a plain 403/404/etc that a retry a few minutes from now
+    // won't fix (bad path, revoked access, real block). Tagged TERMINAL_ERROR_TAG so
+    // retryPendingHeartbeatSources() doesn't hammer the same dead request every 15
+    // minutes on the same shared GitHub quota it exists to protect.
+    throw new Error(`GitHub Trees API ${resp.status} for ${source} ${TERMINAL_ERROR_TAG}`);
+  }
   const data = await resp.json() as { tree: Array<{ path: string; type: string }>; truncated?: boolean };
   if (data.truncated) {
-    throw new Error(`GitHub tree truncated for ${source} — too many files. Use webhook-based reindex instead.`);
+    throw new Error(`GitHub tree truncated for ${source} — too many files. Use webhook-based reindex instead. ${TERMINAL_ERROR_TAG}`);
   }
   return data.tree
     .filter((f) =>
@@ -4227,7 +4277,13 @@ export default {
     if (job === "watchdog") {
       ctx.waitUntil(handleWatchdog(env));
     } else if (job === "skills") {
-      ctx.waitUntil(rebuildSkillsIndex(env));
+      // WP-545 (2026-09-10): catch-up runs after the skills rebuild, not concurrently
+      // with it — both hit GitHub's API, and running them back-to-back rather than in
+      // parallel avoids doubling up on the same rate-limit window.
+      ctx.waitUntil((async () => {
+        await rebuildSkillsIndex(env);
+        await retryPendingHeartbeatSources(env);
+      })());
     } else {
       ctx.waitUntil(runHeartbeat(env));
     }
@@ -4474,104 +4530,169 @@ async function rebuildSkillsIndex(env: Env): Promise<void> {
   }
 }
 
+// WP-545 (2026-09-10): shared by runHeartbeatForSource() (writer) and both its
+// callers, runHeartbeat()'s nightly loop and retryPendingHeartbeatSources()'s
+// 15-minute catch-up (readers) — one source must not be reindexed by both at once.
+const IN_PROGRESS_MARKER = "in_progress";
+const IN_PROGRESS_STALE_AFTER_MIN = 20; // safety TTL if a run crashed before writing its real completion row
+
+function isClaimedByAnotherRun(error: string | null, createdAt: string | undefined, now: number): boolean {
+  if (error !== IN_PROGRESS_MARKER || !createdAt) return false;
+  const ageMin = (now - Date.parse(createdAt)) / 60000;
+  return ageMin <= IN_PROGRESS_STALE_AFTER_MIN; // crashed run past the TTL is reclaimable, not "claimed"
+}
+
+// Extracted from runHeartbeat() (WP-545, 2026-09-10) so the same per-source check +
+// health-row write can also run from retryPendingHeartbeatSources() — the 15-minute
+// catch-up that recovers sources the once-a-day run missed or lost to a rate-limit.
+async function runHeartbeatForSource(
+  env: Env,
+  source: string,
+  ct: string,
+  freshTable: string,
+): Promise<void> {
+  // Built locally rather than threaded through as a parameter — matches the healthSql
+  // client a few lines down, and passing a neon() client's inferred type across a
+  // function boundary trips a TS overload-resolution mismatch (tried, reverted).
+  const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
+
+  // WP-545 (2026-09-10): mark this source as claimed BEFORE doing any work. Both the
+  // nightly cron and the 15-minute catch-up (retryPendingHeartbeatSources) call this
+  // same function — without this row, a nightly reindex still running past 15 minutes
+  // (plausible: it fetches every file in the source, not just the diff) would look
+  // like "no run yet today" to the catch-up tick, which would launch a second,
+  // concurrent reindex of the same source. IN_PROGRESS_MARKER is read back by
+  // retryPendingHeartbeatSources() as a skip signal, with a TTL there in case a run
+  // crashes before reaching the completion write below.
+  try {
+    const healthSql = neon(env.HEALTH_DATABASE_URL.replace("-pooler", ""));
+    await healthSql`
+      INSERT INTO ${healthSql.unsafe(freshTable)}
+        (source, github_count, db_count, reindexed, error)
+      VALUES (${source}, 0, 0, false, ${IN_PROGRESS_MARKER})
+    `;
+  } catch (e) {
+    console.error(`[heartbeat] in-progress marker write failed for ${source}:`, e instanceof Error ? e.message : e);
+  }
+
+  let githubCount = 0;
+  let dbCount = 0;
+  let reindexed = false;
+  let reindexProcessed: number | null = null;
+  let reindexSkipped: number | null = null;
+  let p99Hours: number | null = null;
+  let error: string | null = null;
+
+  try {
+    // 1. GitHub file count — O(1) API call via Trees endpoint
+    const files = await listGitHubFiles(source);
+    githubCount = files.length;
+
+    // 2. DB artifact count
+    const [dbRow] = await knowledgeSql`
+      SELECT count(*)::int AS cnt
+      FROM ${knowledgeSql.unsafe(ct)}
+      WHERE source_repo = ${source} AND node_type = 'artifact'
+    `;
+    dbCount = dbRow.cnt as number;
+
+    // 3. P99 staleness
+    const [staleRow] = await knowledgeSql`
+      SELECT percentile_cont(0.99) WITHIN GROUP (
+        ORDER BY EXTRACT(EPOCH FROM (NOW() - updated_at)) / 3600
+      ) AS p99
+      FROM ${knowledgeSql.unsafe(ct)}
+      WHERE source_repo = ${source} AND node_type = 'artifact'
+    `;
+    p99Hours = (staleRow?.p99 as number | null) ?? null;
+
+    const drift = Math.abs(githubCount - dbCount);
+    const stale = p99Hours !== null && p99Hours > STALENESS_ALERT_HOURS;
+
+    if (drift > DRIFT_ALERT_THRESHOLD || stale) {
+      // 4. Reindex if drift or staleness exceeds threshold.
+      // Detect orphan nodes: files that are in DB but no longer in GitHub → action: "removed"
+      const dbFilesRows = await knowledgeSql`
+        SELECT DISTINCT source_doc
+        FROM ${knowledgeSql.unsafe(ct)}
+        WHERE source_repo = ${source} AND node_type = 'artifact' AND source_doc IS NOT NULL
+      `;
+      const githubFileSet = new Set(files);
+      const removedPaths = dbFilesRows
+        .map((r: any) => r.source_doc as string)
+        .filter((p) => !githubFileSet.has(p));
+
+      const fileObjs = [
+        ...files.map((p) => ({ path: p, action: "modified" as const })),
+        ...removedPaths.map((p) => ({ path: p, action: "removed" as const })),
+      ];
+
+      console.log(
+        `[heartbeat] ${source}: drift=${githubCount - dbCount}, p99=${p99Hours?.toFixed(1)}h — reindexing (modified=${files.length}, removed=${removedPaths.length})`
+      );
+      const result = await reindexConceptsForFiles(
+        env,
+        source,
+        fileObjs,
+        (path) => readFromGitHubPublic(source, path)
+      );
+      reindexed = true;
+      reindexProcessed = result.processed;
+      reindexSkipped = result.skipped;
+    } else {
+      console.log(
+        `[heartbeat] ${source}: drift=${githubCount - dbCount}, p99=${p99Hours?.toFixed(1)}h — OK`
+      );
+    }
+  } catch (e) {
+    error = String(e);
+    console.error(`[heartbeat] ${source} error:`, error);
+  }
+
+  // 5. Write metrics to health DB (non-blocking — observability must not affect SLA)
+  try {
+    const healthSql = neon(env.HEALTH_DATABASE_URL.replace("-pooler", ""));
+    await healthSql`
+      INSERT INTO ${healthSql.unsafe(freshTable)}
+        (source, github_count, db_count, reindexed, reindex_processed, reindex_skipped, p99_staleness_hours, error)
+      VALUES (
+        ${source}, ${githubCount}, ${dbCount},
+        ${reindexed}, ${reindexProcessed}, ${reindexSkipped},
+        ${p99Hours}, ${error}
+      )
+    `;
+  } catch (e) {
+    console.error(`[heartbeat] health write failed for ${source}:`, e instanceof Error ? e.message : e);
+  }
+}
+
 async function runHeartbeat(env: Env): Promise<void> {
   console.log("[heartbeat] start, sources:", HEARTBEAT_PACK_SOURCES.join(", "));
-  const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
   const cgSchema = env.CONCEPT_GRAPH_DB_SCHEMA ?? "concept_graph";
   const healthSchema = env.HEALTH_DB_SCHEMA ?? "health";
   const ct = `${cgSchema}.concepts`;
   const freshTable = HEALTH_TABLES.graph_freshness_events(healthSchema);
+  const healthSql = neon(env.HEALTH_DATABASE_URL.replace("-pooler", ""));
 
   for (const source of HEARTBEAT_PACK_SOURCES) {
-    let githubCount = 0;
-    let dbCount = 0;
-    let reindexed = false;
-    let reindexProcessed: number | null = null;
-    let reindexSkipped: number | null = null;
-    let p99Hours: number | null = null;
-    let error: string | null = null;
-
+    // Mirrors the guard retryPendingHeartbeatSources() applies — without this, a
+    // catch-up tick's still-running reindex would get a second, concurrent nightly
+    // run of the same source colliding with it (WP-545, cold review found this gap
+    // was only guarded in the catch-up→nightly direction, not nightly→catch-up).
     try {
-      // 1. GitHub file count — O(1) API call via Trees endpoint
-      const files = await listGitHubFiles(source);
-      githubCount = files.length;
-
-      // 2. DB artifact count
-      const [dbRow] = await knowledgeSql`
-        SELECT count(*)::int AS cnt
-        FROM ${knowledgeSql.unsafe(ct)}
-        WHERE source_repo = ${source} AND node_type = 'artifact'
+      const [latest] = await healthSql`
+        SELECT error, created_at FROM ${healthSql.unsafe(freshTable)}
+        WHERE source = ${source}
+        ORDER BY created_at DESC LIMIT 1
       `;
-      dbCount = dbRow.cnt as number;
-
-      // 3. P99 staleness
-      const [staleRow] = await knowledgeSql`
-        SELECT percentile_cont(0.99) WITHIN GROUP (
-          ORDER BY EXTRACT(EPOCH FROM (NOW() - updated_at)) / 3600
-        ) AS p99
-        FROM ${knowledgeSql.unsafe(ct)}
-        WHERE source_repo = ${source} AND node_type = 'artifact'
-      `;
-      p99Hours = (staleRow?.p99 as number | null) ?? null;
-
-      const drift = Math.abs(githubCount - dbCount);
-      const stale = p99Hours !== null && p99Hours > STALENESS_ALERT_HOURS;
-
-      if (drift > DRIFT_ALERT_THRESHOLD || stale) {
-        // 4. Reindex if drift or staleness exceeds threshold.
-        // Detect orphan nodes: files that are in DB but no longer in GitHub → action: "removed"
-        const dbFilesRows = await knowledgeSql`
-          SELECT DISTINCT source_doc
-          FROM ${knowledgeSql.unsafe(ct)}
-          WHERE source_repo = ${source} AND node_type = 'artifact' AND source_doc IS NOT NULL
-        `;
-        const githubFileSet = new Set(files);
-        const removedPaths = dbFilesRows
-          .map((r: any) => r.source_doc as string)
-          .filter((p) => !githubFileSet.has(p));
-
-        const fileObjs = [
-          ...files.map((p) => ({ path: p, action: "modified" as const })),
-          ...removedPaths.map((p) => ({ path: p, action: "removed" as const })),
-        ];
-
-        console.log(
-          `[heartbeat] ${source}: drift=${githubCount - dbCount}, p99=${p99Hours?.toFixed(1)}h — reindexing (modified=${files.length}, removed=${removedPaths.length})`
-        );
-        const result = await reindexConceptsForFiles(
-          env,
-          source,
-          fileObjs,
-          (path) => readFromGitHubPublic(source, path)
-        );
-        reindexed = true;
-        reindexProcessed = result.processed;
-        reindexSkipped = result.skipped;
-      } else {
-        console.log(
-          `[heartbeat] ${source}: drift=${githubCount - dbCount}, p99=${p99Hours?.toFixed(1)}h — OK`
-        );
+      if (latest && isClaimedByAnotherRun(latest.error as string | null, latest.created_at as string | undefined, Date.now())) {
+        console.log(`[heartbeat] ${source}: skipping, already in progress via catch-up`);
+        continue;
       }
     } catch (e) {
-      error = String(e);
-      console.error(`[heartbeat] ${source} error:`, error);
+      console.error(`[heartbeat] in-progress check failed for ${source}, proceeding anyway:`, e instanceof Error ? e.message : e);
     }
-
-    // 5. Write metrics to health DB (non-blocking — observability must not affect SLA)
-    try {
-      const healthSql = neon(env.HEALTH_DATABASE_URL.replace("-pooler", ""));
-      await healthSql`
-        INSERT INTO ${healthSql.unsafe(freshTable)}
-          (source, github_count, db_count, reindexed, reindex_processed, reindex_skipped, p99_staleness_hours, error)
-        VALUES (
-          ${source}, ${githubCount}, ${dbCount},
-          ${reindexed}, ${reindexProcessed}, ${reindexSkipped},
-          ${p99Hours}, ${error}
-        )
-      `;
-    } catch (e) {
-      console.error(`[heartbeat] health write failed for ${source}:`, e instanceof Error ? e.message : e);
-    }
+    await runHeartbeatForSource(env, source, ct, freshTable);
   }
 
   for (const source of FULL_INGEST_SOURCES) {
@@ -4579,4 +4700,63 @@ async function runHeartbeat(env: Env): Promise<void> {
   }
 
   console.log("[heartbeat] complete");
+}
+
+// WP-545 (2026-09-10): the daily heartbeat above has exactly one shot per source per
+// day — a rate-limited or lost run stays lost until tomorrow. Piggybacks on the
+// existing 15-minute skills cron (no new Cloudflare cron trigger) to pick up any
+// PACK-* source that hasn't recorded a clean run yet today, respecting the reset time
+// a rate-limit failure already carries in its `error` text (see listGitHubFiles()).
+const GITHUB_RATE_LIMIT_RESET_RE = /reset_at=(\S+)/;
+
+// Cap how many sources one catch-up tick will reindex. A source that went stale over
+// an outage reindexes every current file (not just the diff, see DRIFT_ALERT_THRESHOLD
+// above), each file a separate GitHub subrequest — left uncapped, a bad night could
+// stack several such sources plus rebuildSkillsIndex()'s own fetches into one Worker
+// invocation and risk the platform's subrequest ceiling. Recovers up to 3 sources
+// per 15-minute tick instead — full backlog clears within a few ticks either way.
+const MAX_CATCHUP_SOURCES_PER_TICK = 3;
+
+async function retryPendingHeartbeatSources(env: Env): Promise<void> {
+  const healthSchema = env.HEALTH_DB_SCHEMA ?? "health";
+  const freshTable = HEALTH_TABLES.graph_freshness_events(healthSchema);
+  const healthSql = neon(env.HEALTH_DATABASE_URL.replace("-pooler", ""));
+  const cgSchema = env.CONCEPT_GRAPH_DB_SCHEMA ?? "concept_graph";
+  const ct = `${cgSchema}.concepts`;
+
+  let latestRows: any[];
+  try {
+    latestRows = await healthSql`
+      SELECT DISTINCT ON (source) source, error, created_at
+      FROM ${healthSql.unsafe(freshTable)}
+      WHERE source = ANY(${HEARTBEAT_PACK_SOURCES}::text[])
+        AND created_at >= date_trunc('day', now(), 'UTC')
+      ORDER BY source, created_at DESC
+    `;
+  } catch (e) {
+    console.error("[heartbeat-catchup] failed to read freshness events:", e instanceof Error ? e.message : e);
+    return;
+  }
+
+  const latestBySource = new Map(
+    latestRows.map((r) => [r.source as string, { error: r.error as string | null, createdAt: r.created_at as string }])
+  );
+  const now = Date.now();
+  const pending = HEARTBEAT_PACK_SOURCES.filter((source) => {
+    const latest = latestBySource.get(source);
+    if (!latest) return true; // no run at all today
+    if (latest.error === null) return false; // already completed successfully today
+    if (isClaimedByAnotherRun(latest.error, latest.createdAt, now)) return false; // nightly run still has it
+    if (latest.error.includes(TERMINAL_ERROR_TAG)) return false; // won't succeed on retry — wait for tomorrow's full run
+    const resetMatch = latest.error.match(GITHUB_RATE_LIMIT_RESET_RE);
+    if (resetMatch && Date.parse(resetMatch[1]) > now) return false; // still inside the rate-limit window
+    return true;
+  });
+
+  if (pending.length === 0) return;
+  const toRun = pending.slice(0, MAX_CATCHUP_SOURCES_PER_TICK);
+  console.log("[heartbeat-catchup] retrying:", toRun.join(", "), pending.length > toRun.length ? `(${pending.length - toRun.length} deferred to next tick)` : "");
+  for (const source of toRun) {
+    await runHeartbeatForSource(env, source, ct, freshTable);
+  }
 }
