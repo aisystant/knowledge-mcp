@@ -31,6 +31,7 @@ import {
   resolveUserContext,
   writeToGitHub,
   deleteFromGitHub,
+  allocatePostNumber,
   personalSearchDocuments,
   personalGetDocument,
   personalGetDocumentWithSha,
@@ -2612,6 +2613,19 @@ const PRIVATE_TOOLS = [
     },
   },
   {
+    name: "new_post",
+    description: "Atomically allocate the next post number for a new Knowledge Index publication (WP-560 Ф12). Call this BEFORE scripts/new-post.py and pass the returned post_number via that script's existing --post-number flag, instead of letting the script scan for it locally. Idempotent: calling again with the same draft_id (e.g. after an interrupted run) returns the same number instead of allocating a new one, so a draft can sit unpushed for hours without a duplicate.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: { type: "string", description: "Target repo (source name), e.g. the connected DS-Knowledge-Index-Tseren source" },
+        draft_id: { type: "string", pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", description: "UUID generated once per draft (v4/v7). Reusing it on retry returns the already-allocated number instead of a new one." },
+        artifact_type: { type: "string", enum: ["post"], description: "Kind of artifact being scaffolded. Only 'post' is supported today." },
+      },
+      required: ["source", "draft_id", "artifact_type"],
+    },
+  },
+  {
     name: "delete",
     description: "Delete a file from a personal knowledge repo via GitHub.",
     inputSchema: {
@@ -2819,8 +2833,13 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             delete: "personal_write",
             disconnect_source: "personal_write",
             purge_source: "personal_write",
+            // Commits to the allocator log the same way `write` commits to any other file —
+            // reuses personal_write's grant rather than a dedicated scope for one narrow op.
+            new_post: "personal_write",
           };
-          const PATH_NOT_REQUIRED_TOOLS: ReadonlySet<string> = new Set(["disconnect_source", "purge_source"]);
+          // new_post carries no file path (it commits to a fixed internal log path, not a
+          // caller-supplied one) — same shape as disconnect_source/purge_source below.
+          const PATH_NOT_REQUIRED_TOOLS: ReadonlySet<string> = new Set(["disconnect_source", "purge_source", "new_post"]);
           const canonicalToolName = SCOPE_CHECKED_TOOLS[toolName];
 
           if (canonicalToolName) {
@@ -2891,6 +2910,19 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
 
             const deleteResult = await deleteFromGitHub(env, ctx, source, path, message);
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(deleteResult, null, 2) }] } };
+          }
+
+          if (toolName === "new_post") {
+            const source = args.source as string;
+            const draftId = args.draft_id as string;
+            const artifactType = args.artifact_type as string;
+
+            if (!ctx.sourceNames.includes(source)) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
+            }
+
+            const allocateResult = await allocatePostNumber(env, ctx, source, draftId, artifactType);
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(allocateResult, null, 2) }] } };
           }
 
           if (toolName === "memory_search") {

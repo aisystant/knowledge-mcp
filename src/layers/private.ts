@@ -34,6 +34,7 @@ export const PRIVATE_TOOL_NAMES: ReadonlySet<string> = new Set([
   "write",
   "propose_capture",
   "delete",
+  "new_post",
   "memory_search",
   "connect_source",
   "disconnect_source",

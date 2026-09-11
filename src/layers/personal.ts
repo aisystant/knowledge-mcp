@@ -63,8 +63,9 @@ const POST_CHANNEL_FILENAME = /^(?:(?:\d{2}-\d{2})|\d{1,4})-\d{1,2}-(?:club|face
 export const POST_SCAFFOLD_REQUIRED_MESSAGE =
   "Создание публикации через personal_write заблокировано: номер и канонический путь назначает scripts/new-post.py.";
 export const POST_SCAFFOLD_NEXT_ACTION =
-  "Из корня DS-Knowledge-Index-Tseren запусти `python3 scripts/new-post.py --date YYYY-MM-DD --slug <slug> " +
-  "--title \"<title>\" --channels <channels>`. Если shell или скрипт недоступны, остановись и сообщи о блокере; " +
+  "Сначала вызови personal_new_post, чтобы получить post_number, затем из корня DS-Knowledge-Index-Tseren запусти " +
+  "`python3 scripts/new-post.py --date YYYY-MM-DD --slug <slug> --title \"<title>\" --channels <channels> " +
+  "--post-number <из personal_new_post>`. Если shell или скрипт недоступны, остановись и сообщи о блокере; " +
   "ASCII/manual fallback и ручное создание файла запрещены.";
 export const EXISTENCE_CHECK_UNAVAILABLE_MESSAGE =
   "Не удалось надёжно определить, существует ли целевой файл в GitHub; запись остановлена без PUT.";
@@ -594,6 +595,188 @@ export async function writeToGitHub(
     };
   }
   return { success: true, sha: result.content.sha, url: result.content.html_url, indexing: INDEXING_ASYNC_NOTICE };
+}
+
+// --- Post-number allocator (WP-560 Ф12) ---
+// Git-native atomic allocator, replacing the local filesystem scan `scripts/new-post.py`
+// used to do (duplicated post_number 190/191/196/197 under concurrent runs).
+//
+// Not routed through writeToGitHub: that function re-checks the file's sha fresh right
+// before the PUT, but sends whatever `content` the caller already built from an earlier
+// read — so a racing second call would still pass its sha check (the sha IS current)
+// while overwriting the first call's entry with content built from a stale, entry-missing
+// read. This loop always rebuilds `content` from the exact read that produced the sha it
+// sends, which is what actually closes the race.
+
+/** Append-only log path in the managed Knowledge Index repo. One JSON object per line. */
+export const ALLOCATOR_LOG_PATH = "docs/_allocator-log.jsonl";
+
+/** Allowlist, not a free-form string — an unlisted type is a 400, not a new numbering series (WP-560 Ф12 round 1-2: unbounded artifact_type was flagged as unnecessary surface for a fix with exactly one live consumer). */
+export const ALLOCATOR_ALLOWED_ARTIFACT_TYPES = ["post"] as const;
+export type AllocatorArtifactType = (typeof ALLOCATOR_ALLOWED_ARTIFACT_TYPES)[number];
+
+const ALLOCATOR_DRAFT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ALLOCATOR_MAX_RETRIES = 5;
+
+export interface AllocatorLogEntry {
+  draft_id: string;
+  artifact_type: AllocatorArtifactType;
+  post_number: number;
+  timestamp: string;
+}
+
+export interface AllocatePostNumberResult {
+  success: boolean;
+  post_number?: number;
+  draft_id?: string;
+  /** true when draft_id was already allocated — same number returned, no new commit made. */
+  reused?: boolean;
+  error?: string;
+  reason?: "invalid_draft_id" | "invalid_artifact_type" | "unknown_source" | "no_installation" | "allocator_conflict_exhausted" | "github_error";
+}
+
+async function readAllocatorLog(
+  githubFetch: typeof globalThis.fetch,
+  owner: string,
+  repo: string,
+  token: string,
+): Promise<{ entries: AllocatorLogEntry[]; sha: string | null }> {
+  const apiUrl = githubContentsApiUrl(owner, repo, ALLOCATOR_LOG_PATH);
+  const resp = await githubFetch(apiUrl, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+  });
+  if (resp.status === 404) return { entries: [], sha: null };
+  if (!resp.ok) throw new Error(`GitHub API error reading allocator log (${resp.status}): ${await resp.text()}`);
+
+  const data = (await resp.json()) as { content: string; sha: string };
+  const raw = decodeURIComponent(escape(atob(data.content.replace(/\n/g, ""))));
+  const entries = raw
+    .split("\n")
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => JSON.parse(line) as AllocatorLogEntry);
+  return { entries, sha: data.sha };
+}
+
+/**
+ * PUT the full log content. `currentSha` must come from the SAME read that produced
+ * `content` (see module note above) — never a sha fetched separately from the content
+ * being sent. Returns `conflict: true` on any sha-mismatch signal (409, or 422 naming
+ * "sha" — the latter covers "sha required" when the file appeared between our GET and
+ * this PUT, same retryable race as an outright stale sha).
+ */
+async function putAllocatorLog(
+  githubFetch: typeof globalThis.fetch,
+  owner: string,
+  repo: string,
+  token: string,
+  content: string,
+  message: string,
+  currentSha: string | null,
+): Promise<{ ok: true } | { ok: false; conflict: true } | { ok: false; conflict: false; error: string }> {
+  const apiUrl = githubContentsApiUrl(owner, repo, ALLOCATOR_LOG_PATH);
+  const resp = await githubFetch(apiUrl, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge", "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message,
+      content: btoa(unescape(encodeURIComponent(content))),
+      ...(currentSha ? { sha: currentSha } : {}),
+    }),
+  });
+  if (resp.ok) return { ok: true };
+
+  const errText = await resp.text();
+  if (resp.status === 409 || (resp.status === 422 && /sha/i.test(errText))) {
+    return { ok: false, conflict: true };
+  }
+  return { ok: false, conflict: false, error: `GitHub API error ${resp.status}: ${errText}` };
+}
+
+/**
+ * Allocate the next post number for `draftId`, idempotently. Calling again with the
+ * same `draftId` (no TTL — a draft can sit unpushed for hours, WP-560 Ф12 round 1
+ * blocker) returns the same number without a new commit, instead of racing a second
+ * number into existence.
+ */
+export async function allocatePostNumber(
+  env: PersonalEnv,
+  ctx: UserContext,
+  source: string,
+  draftId: string,
+  artifactType: string,
+  dependencies: Partial<GitHubApiDependencies> = {},
+): Promise<AllocatePostNumberResult> {
+  if (!ALLOCATOR_DRAFT_ID.test(draftId)) {
+    return { success: false, reason: "invalid_draft_id", error: "draft_id должен быть UUID (v4/v7)." };
+  }
+  if (!(ALLOCATOR_ALLOWED_ARTIFACT_TYPES as readonly string[]).includes(artifactType)) {
+    return {
+      success: false,
+      reason: "invalid_artifact_type",
+      error: `artifact_type должен быть одним из: ${ALLOCATOR_ALLOWED_ARTIFACT_TYPES.join(", ")}.`,
+    };
+  }
+
+  const userSource = ctx.sources.find(s => s.source === source);
+  if (!userSource) return { success: false, reason: "unknown_source", error: `Unknown source: ${source}` };
+
+  const owner = userSource.githubOwner;
+  const repo = userSource.githubRepo;
+  const getToken = dependencies.getInstallationToken ?? getInstallationToken;
+  const githubFetch = dependencies.fetch ?? globalThis.fetch;
+  const token = await getToken(env, ctx.userId, repo);
+  if (!token) {
+    return {
+      success: false,
+      reason: "no_installation",
+      error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge`,
+    };
+  }
+
+  for (let attempt = 0; attempt < ALLOCATOR_MAX_RETRIES; attempt++) {
+    let entries: AllocatorLogEntry[];
+    let sha: string | null;
+    try {
+      ({ entries, sha } = await readAllocatorLog(githubFetch, owner, repo, token));
+    } catch (err) {
+      return { success: false, reason: "github_error", error: err instanceof Error ? err.message : String(err) };
+    }
+
+    const existing = entries.find(e => e.draft_id === draftId);
+    if (existing) {
+      return { success: true, post_number: existing.post_number, draft_id: draftId, reused: true };
+    }
+
+    const nextNumber = entries.reduce((max, e) => Math.max(max, e.post_number), 0) + 1;
+    const newEntry: AllocatorLogEntry = {
+      draft_id: draftId,
+      artifact_type: artifactType as AllocatorArtifactType,
+      post_number: nextNumber,
+      timestamp: new Date().toISOString(),
+    };
+    const newContent = entries.map(e => JSON.stringify(e)).concat(JSON.stringify(newEntry)).join("\n") + "\n";
+
+    const putResult = await putAllocatorLog(
+      githubFetch, owner, repo, token, newContent,
+      `chore(allocator): allocate post #${nextNumber} (draft ${draftId})`,
+      sha,
+    );
+    if (putResult.ok) {
+      return { success: true, post_number: nextNumber, draft_id: draftId, reused: false };
+    }
+    if (putResult.conflict) {
+      continue; // another allocation landed between our read and PUT — re-read and retry.
+    }
+    console.error(JSON.stringify({ phase: "allocator_put_failed", severity: "error", draft_id: draftId, repo, error: putResult.error }));
+    return { success: false, reason: "github_error", error: putResult.error };
+  }
+  console.error(JSON.stringify({ phase: "allocator_conflict_exhausted", severity: "error", draft_id: draftId, repo, attempts: ALLOCATOR_MAX_RETRIES }));
+  return {
+    success: false,
+    reason: "allocator_conflict_exhausted",
+    error: `Не удалось атомарно выделить номер за ${ALLOCATOR_MAX_RETRIES} попыток — слишком много конкурентных записей в лог.`,
+  };
 }
 
 /**
