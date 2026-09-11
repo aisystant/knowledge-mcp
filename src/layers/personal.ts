@@ -63,8 +63,9 @@ const POST_CHANNEL_FILENAME = /^(?:(?:\d{2}-\d{2})|\d{1,4})-\d{1,2}-(?:club|face
 export const POST_SCAFFOLD_REQUIRED_MESSAGE =
   "Создание публикации через personal_write заблокировано: номер и канонический путь назначает scripts/new-post.py.";
 export const POST_SCAFFOLD_NEXT_ACTION =
-  "Из корня DS-Knowledge-Index-Tseren запусти `python3 scripts/new-post.py --date YYYY-MM-DD --slug <slug> " +
-  "--title \"<title>\" --channels <channels>`. Если shell или скрипт недоступны, остановись и сообщи о блокере; " +
+  "Сначала вызови personal_new_post, чтобы получить post_number, затем из корня DS-Knowledge-Index-Tseren запусти " +
+  "`python3 scripts/new-post.py --date YYYY-MM-DD --slug <slug> --title \"<title>\" --channels <channels> " +
+  "--post-number <из personal_new_post>`. Если shell или скрипт недоступны, остановись и сообщи о блокере; " +
   "ASCII/manual fallback и ручное создание файла запрещены.";
 export const EXISTENCE_CHECK_UNAVAILABLE_MESSAGE =
   "Не удалось надёжно определить, существует ли целевой файл в GitHub; запись остановлена без PUT.";

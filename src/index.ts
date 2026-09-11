@@ -2614,7 +2614,7 @@ const PRIVATE_TOOLS = [
   },
   {
     name: "new_post",
-    description: "Atomically allocate the next post number for a new Knowledge Index publication (WP-560 Ф12). Call this BEFORE scripts/new-post.py and pass its post_number/draft_id to that script's --number/--draft-id flags — the script no longer computes the number itself. Idempotent: calling again with the same draft_id (e.g. after an interrupted run) returns the same number instead of allocating a new one, so a draft can sit unpushed for hours without a duplicate.",
+    description: "Atomically allocate the next post number for a new Knowledge Index publication (WP-560 Ф12). Call this BEFORE scripts/new-post.py and pass the returned post_number via that script's existing --post-number flag, instead of letting the script scan for it locally. Idempotent: calling again with the same draft_id (e.g. after an interrupted run) returns the same number instead of allocating a new one, so a draft can sit unpushed for hours without a duplicate.",
     inputSchema: {
       type: "object",
       properties: {
