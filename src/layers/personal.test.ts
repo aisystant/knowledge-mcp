@@ -44,6 +44,8 @@ import {
   normalizeRepositoryPath,
   POST_SCAFFOLD_NEXT_ACTION,
   resolveSourcePath,
+  allocatePostNumber,
+  ALLOCATOR_LOG_PATH,
   connectSource,
   resolveUserContext,
   deleteFromGitHub,
@@ -618,6 +620,125 @@ describe("deleteFromGitHub", () => {
     expect(normalizedPath).toBe(resolveSourcePath(pathPrefix, path).relativePath);
     expect(values).toContain(normalizedPath);
     expect(values).toContain(`${normalizedPath}::`);
+  });
+});
+
+describe("allocatePostNumber (WP-560 Ф12)", () => {
+  const DRAFT_ID = "01996b1a-0000-7000-8000-000000000001";
+  const OTHER_DRAFT_ID = "01996b1a-0000-7000-8000-000000000002";
+  const allocatorContext = ctx({ sources: [knowledgeIndexTarget], sourceNames: [knowledgeIndexTarget.source] });
+
+  function logResponse(entries: Array<{ draft_id: string; artifact_type: string; post_number: number }>, sha: string) {
+    const body = entries.map(e => JSON.stringify({ ...e, timestamp: "2026-09-11T00:00:00.000Z" })).join("\n") + (entries.length ? "\n" : "");
+    return responseJson({ content: btoa(unescape(encodeURIComponent(body))), sha });
+  }
+
+  it("rejects a non-UUID draft_id without touching the network", async () => {
+    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, "not-a-uuid", "post");
+    expect(result).toMatchObject({ success: false, reason: "invalid_draft_id" });
+  });
+
+  it("rejects an artifact_type outside the allowlist without touching the network", async () => {
+    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "pack");
+    expect(result).toMatchObject({ success: false, reason: "invalid_artifact_type" });
+  });
+
+  it("allocates #1 on an empty (404) log and writes one PUT to the log path", async () => {
+    const { request, dependencies } = githubDependencies([
+      { ok: false, status: 404 }, // GET log: doesn't exist yet
+      { ok: true, status: 200, json: async () => ({}) }, // PUT: create
+    ]);
+
+    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
+
+    expect(result).toMatchObject({ success: true, post_number: 1, draft_id: DRAFT_ID, reused: false });
+    expect(request).toHaveBeenCalledTimes(2);
+    const putCall = request.mock.calls[1];
+    expect(putCall[0]).toContain(encodeURIComponent(ALLOCATOR_LOG_PATH).replace(/%2F/g, "/"));
+    const putBody = JSON.parse(putCall[1].body as string);
+    expect(putBody.sha).toBeUndefined(); // creating — no sha to send
+    const writtenLine = JSON.parse(decodeURIComponent(escape(atob(putBody.content))).trim());
+    expect(writtenLine).toMatchObject({ draft_id: DRAFT_ID, artifact_type: "post", post_number: 1 });
+  });
+
+  it("allocates the next number after existing entries, preserving them in the PUT", async () => {
+    const sha = "d".repeat(40);
+    const { request, dependencies } = githubDependencies([
+      logResponse([{ draft_id: OTHER_DRAFT_ID, artifact_type: "post", post_number: 5 }], sha),
+      { ok: true, status: 200, json: async () => ({}) },
+    ]);
+
+    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
+
+    expect(result).toMatchObject({ success: true, post_number: 6, reused: false });
+    const putBody = JSON.parse(request.mock.calls[1][1].body as string);
+    expect(putBody.sha).toBe(sha);
+    const lines = decodeURIComponent(escape(atob(putBody.content))).trim().split("\n").map(l => JSON.parse(l));
+    expect(lines).toEqual([
+      expect.objectContaining({ draft_id: OTHER_DRAFT_ID, post_number: 5 }),
+      expect.objectContaining({ draft_id: DRAFT_ID, post_number: 6 }),
+    ]);
+  });
+
+  it("is idempotent: a repeated draft_id returns the same number without a PUT", async () => {
+    const { request, dependencies } = githubDependencies([
+      logResponse([{ draft_id: DRAFT_ID, artifact_type: "post", post_number: 3 }], "e".repeat(40)),
+    ]);
+
+    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
+
+    expect(result).toMatchObject({ success: true, post_number: 3, reused: true });
+    expect(request).toHaveBeenCalledTimes(1); // read only, no PUT
+  });
+
+  it("retries on a concurrent-write conflict (409) and succeeds on the re-read", async () => {
+    const firstSha = "f".repeat(40);
+    const secondSha = "1".repeat(40);
+    const { request, dependencies } = githubDependencies([
+      logResponse([], firstSha === "no-entries" ? firstSha : firstSha), // first read: empty
+      { ok: false, status: 409, text: async () => "conflict" }, // first PUT: lost the race
+      logResponse([{ draft_id: OTHER_DRAFT_ID, artifact_type: "post", post_number: 1 }], secondSha), // re-read: winner's entry now present
+      { ok: true, status: 200, json: async () => ({}) }, // second PUT: succeeds
+    ]);
+
+    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
+
+    expect(result).toMatchObject({ success: true, post_number: 2, reused: false });
+    expect(request).toHaveBeenCalledTimes(4);
+  });
+
+  it("fails closed after exhausting retries under sustained conflict", async () => {
+    const responses: Array<Partial<Response> & { ok: boolean }> = [];
+    for (let i = 0; i < 5; i++) {
+      responses.push(logResponse([], `${i}`.repeat(40)));
+      responses.push({ ok: false, status: 409, text: async () => "conflict" });
+    }
+    const { request, dependencies } = githubDependencies(responses);
+
+    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
+
+    expect(result).toMatchObject({ success: false, reason: "allocator_conflict_exhausted" });
+    expect(request).toHaveBeenCalledTimes(10);
+  });
+
+  it("surfaces a non-conflict GitHub error without retrying", async () => {
+    const { request, dependencies } = githubDependencies([
+      logResponse([], "a".repeat(40)),
+      { ok: false, status: 500, text: async () => "internal error" },
+    ]);
+
+    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
+
+    expect(result).toMatchObject({ success: false, reason: "github_error" });
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports no_installation when the GitHub App has no installation for this repo", async () => {
+    const result = await allocatePostNumber(
+      ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post",
+      { getInstallationToken: vi.fn().mockResolvedValue(null), fetch: vi.fn() as unknown as typeof globalThis.fetch },
+    );
+    expect(result).toMatchObject({ success: false, reason: "no_installation" });
   });
 });
 
