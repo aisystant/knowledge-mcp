@@ -76,11 +76,15 @@ export type ManagedPostEvidence = "frontmatter_type_post" | "channel_filename";
 
 // WP-7 F97.1: successful writes carry the async-indexing notice — the write is
 // confirmed in the result, search indexing is not (it rides push → webhook → /reindex).
+// F144: the note now says outright that no follow-up call is needed — a bare
+// "not confirmed yet" read as an open question to a weak tool-calling model,
+// which a LibreChat/DeepSeek session apparently kept re-asking (recursion-limit
+// report), ported from the personal-knowledge-mcp tree before its 31.08 retirement.
 export interface IndexingNotice { status: "async"; note: string }
 
 export const INDEXING_ASYNC_NOTICE: IndexingNotice = {
   status: "async",
-  note: "Запись подтверждена, но индексация для поиска идёт фоново после push и в этом ответе не подтверждена. Файл появится в поиске после обработки; подтверждённого статуса индексации пока нет.",
+  note: "Запись подтверждена и завершена — дальнейших действий не требуется. Индексация для поиска идёт фоново отдельно и в этом ответе не отражена; не проверяй её сразу — только если пользователь явно спрашивает, нашёлся ли файл в поиске.",
 };
 
 export interface PersonalWriteResult {

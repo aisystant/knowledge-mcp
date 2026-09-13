@@ -2586,7 +2586,7 @@ const PUBLIC_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set(["resolve_document"]
 const PRIVATE_TOOLS = [
   {
     name: "write",
-    description: "Write a file to a personal knowledge repo via GitHub. Existing files and new ordinary/service Markdown are supported; search indexing is triggered asynchronously by the push and is NOT confirmed in the result (indexing.status: async). When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, a concurrent edit from another session can be silently overwritten. A new publication-like file (frontmatter type: post or a channel filename) under TserenTserenov/DS-Knowledge-Index-Tseren docs/ is server-blocked: create it with scripts/new-post.py; if shell is unavailable, stop instead of using an ASCII/manual fallback.",
+    description: "Write a file to a personal knowledge repo via GitHub. Existing files and new ordinary/service Markdown are supported; search indexing is triggered asynchronously by the push and is NOT confirmed in the result (indexing.status: async) — this is expected and needs no follow-up call. When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, a concurrent edit from another session can be silently overwritten. A new publication-like file (frontmatter type: post or a channel filename) under TserenTserenov/DS-Knowledge-Index-Tseren docs/ is server-blocked: create it with scripts/new-post.py; if shell is unavailable, stop instead of using an ASCII/manual fallback.",
     inputSchema: {
       type: "object",
       properties: {
