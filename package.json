@@ -16,14 +16,15 @@
     "test:watch": "vitest"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260827.1",
+    "@cloudflare/workers-types": "^5.20260915.1",
+    "@types/node": "^22.15.30",
     "tsx": "^4.7.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.11",
-    "wrangler": "^4.127.0"
+    "wrangler": "^4.131.2"
   },
   "dependencies": {
-    "@neondatabase/serverless": "^1.0.2",
-    "jose": "^6.2.2"
+    "@neondatabase/serverless": "^1.1.0",
+    "jose": "^6.2.12"
   }
 }
