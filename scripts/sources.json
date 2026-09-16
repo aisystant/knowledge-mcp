@@ -1,5 +1,14 @@
 [
   {
+    "source": "PACK-engineering-management",
+    "source_type": "pack",
+    "path": "~/IWE/PACK-engineering-management",
+    "exclude": [
+      "images/",
+      "assets/"
+    ]
+  },
+  {
     "source": "PACK-digital-platform",
     "source_type": "pack",
     "path": "~/IWE/PACK-digital-platform/pack",
