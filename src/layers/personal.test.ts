@@ -58,6 +58,7 @@ import {
   personalGetDocumentWithSha,
   disconnectSource,
   purgeSource,
+  INDEXING_ASYNC_NOTICE,
   type UserContext,
   type PersonalEnv,
 } from "./personal.js";
@@ -788,6 +789,19 @@ describe("writeToGitHub — optimistic concurrency (WP-7 Ф96, ported from perso
     const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "racing write", "update", {}, VALID_SHA);
     expect(result.success).toBe(false);
     expect(result.reason).toBe("version_mismatch");
+  });
+});
+
+// WP-7 Ф144, ported from personal-knowledge-mcp: a bare "indexing not confirmed
+// yet" read as an open question to a weak tool-calling model (a LibreChat/
+// DeepSeek session kept re-asking, hit a recursion limit). Pins the wording so
+// a future edit can't silently reintroduce that ambiguity — the archived repo
+// had this test, the canonical tree didn't.
+describe("INDEXING_ASYNC_NOTICE wording (WP-7 Ф144)", () => {
+  it("tells the caller no follow-up call is needed, not just that indexing is unconfirmed", () => {
+    expect(INDEXING_ASYNC_NOTICE.status).toBe("async");
+    expect(INDEXING_ASYNC_NOTICE.note).toContain("дальнейших действий не требуется");
+    expect(INDEXING_ASYNC_NOTICE.note).not.toMatch(/^Запись подтверждена, но/);
   });
 });
 
