@@ -14,7 +14,7 @@
 
 import { neon, type Pool } from "@neondatabase/serverless";
 import { withUserContext, createRequestPool } from "./rls.js";
-import { beginObservation, enqueueObservation, recordObservationFeedback, expireObservationText,
+import { beginObservation, enqueueObservation, recordObservationFeedback, expireObservations,
   type ObservationEnv, type ObservationRuntime } from "./retrieval-observations.js";
 import {
   getKnowledgeSchema,
@@ -4331,7 +4331,7 @@ export default {
     // never runs fetch() first. See initTables() above for the full incident note.
     initTables(env);
     const job = resolveScheduledJob(resolveMode(env.MCP_MODE), _event.cron);
-    if (env.RETRIEVAL_OBSERVATION_DATABASE_URL) ctx.waitUntil(expireObservationText(env));
+    if (env.RETRIEVAL_OBSERVATION_DATABASE_URL) ctx.waitUntil(expireObservations(env));
     if (job === "watchdog") {
       ctx.waitUntil(handleWatchdog(env));
     } else if (job === "skills") {

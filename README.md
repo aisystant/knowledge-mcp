@@ -136,7 +136,7 @@ Configuration for a controlled public-corpus pilot:
 | `RETRIEVAL_OBSERVATION_DATABASE_URL` | Separate non-owner, NOSUPERUSER, NOBYPASSRLS role; no membership in table-owner role |
 | `RETRIEVAL_OBSERVATION_ACCOUNTS` | Explicit comma-separated verified JWT subjects; no wildcard/default collection |
 | `RETRIEVAL_OBSERVATION_HMAC_KEY` | Secret of at least 32 characters; account-bound NFC+trim query fingerprints; protect and rotate as a secret |
-| `RETRIEVAL_OBSERVATION_TEXT_DAYS` | Explicit integer 1–180; absent/invalid means hash-only; choose the approved period before enabling text |
+| `RETRIEVAL_OBSERVATION_TEXT_DAYS` | Optional shorter text window, integer 1–90; defaults to approved 90 only when `platform-text` is explicitly enabled; invalid overrides mean hash-only |
 
 Public-corpus queries can contain personal information. A conservative filter
 rejects credential/PII patterns and oversized text before persistence; it cannot
@@ -155,14 +155,27 @@ prevent cross-request account reuse. The narrow `SECURITY DEFINER` expiry
 function is owned by the migration role, has a fixed search path, cannot return
 rows, and has no PUBLIC execute grant.
 
-Every existing cron tick scrubs up to 5,000 expired query texts, even with
-collection disabled (keep the database binding until cleanup is complete).
-The export view independently hides expired text if cron is delayed. Before
-production: verify privileges on the real runtime role, TLS/storage and backup
-retention, cron execution and capacity, operator access, approved text lifetime,
-and the preliminary privacy assessment. The code implements the mechanism;
-these deployment conditions are not certified by unit tests. Disabling the mode
-stops new observations; it does not erase earlier unexpired records.
+The approved lifetime of **every raw observation is 90 × 24 hours**, anchored
+once to `observed_at`. This includes hash-only, filtered and personal-mode rows;
+feedback, retries and exports cannot restart the clock. Ordinary-role RLS hides
+expired observations AND their feedback before cleanup runs. Runtime insertion
+rejects expired observations and timestamps more than five minutes ahead of the
+DB clock. Each cron tick deletes up to 5,000 expired observations; the composite
+foreign key cascades feedback. A separate bounded pass scrubs up to 5,000 texts
+whose optional shorter text window expired. Neither operation archives hashes,
+account IDs or individual snapshots into a supposed anonymous history.
+
+Cleanup runs even when collection is disabled; keep the observation database
+binding and its cron until cleanup is complete. `expire_observations()` returns
+only the count of deleted observations plus scrubbed texts, not any records.
+Monitor cron failures, backlog/long-held row locks and physical cleanup latency:
+RLS hiding is not physical deletion. Before production, verify the actual runtime
+privileges, TLS/storage, backup retention and restore procedure (purge expired
+rows before reopening restored data), cron capacity and operator access. These
+deployment conditions are not certified by unit tests. Disabling collection
+stops new writes; earlier unexpired records remain subject to the same deadline.
+Migration 023 is still unreleased; this revision replaces its draft text-only
+expiry design. No production database has been migrated by this PR.
 
 Search responses include `observation_id` on each hit and in result `_meta`.
 This means **scheduled**, not durably written: `waitUntil` persistence is best
@@ -180,7 +193,10 @@ environment, then run `npm run export:retrieval -- <private-output.json>`.
 The exporter verifies the JWT itself, selects only that subject's unexpired
 public-corpus text, deduplicates fingerprints (latest snapshot), caps at 1,000,
 and creates a new mode-0600 file without overwriting an existing file. It prints
-only the count. Do not commit this personal output to the source repository or
+only the count. Each candidate carries `expires_at`, the earlier of its text and
+record deadlines; exporting does not grant a new 90-day window. Local copies must
+be removed by that deadline by their custodian; database cron cannot erase files
+on another machine. Do not commit this personal output to the source repository or
 send it to an external judge without the separate data-sharing assessment.
 It is an **unlabelled candidate pool**, not a ≥200-query calibrated test set.
 
@@ -190,3 +206,33 @@ migration to disposable PostgreSQL and runs
 `scripts/check-retrieval-observation-rls.sql` for account isolation, composite
 feedback ownership, connection reuse and physical expiry. This remains an
 infrastructure check, not a measured retrieval-quality improvement.
+
+
+### Lifecycle of derived evaluation data
+
+- **Raw candidate pool:** the same 90-day maximum applies to source observations,
+  personal identifiers/fingerprints, feedback and local copies. Review candidates
+  weekly. Do not retain a raw copy merely by renaming it a dataset.
+- **Versioned control set:** promotion is a separate reviewed curation step,
+  recording corpus version, evidence, provenance category, intended use and a
+  responsible curator. Remove personal identifiers, event IDs, account-bound
+  fingerprints and identifying content before long-term retention. A regex pass
+  alone does not establish this. Sharing permissions are separate; any example
+  still containing personal data remains within its original raw-data deadline.
+  Mark rewritten queries as adapted, not as observed held-out queries. Review set
+  applicability on each material corpus/search change and at least quarterly;
+  remove obsolete sets without a documented continuing reproducibility purpose.
+- **Aggregate quality trends:** only period-level summaries reviewed for
+  re-identification risk can have a longer life. No per-user/query fingerprints,
+  exact event timestamps, snippet IDs or raw text. Sparse groups and differencing
+  can still identify people; group size alone is not proof of anonymity. Review
+  continued need quarterly. This PR does not create a cross-user aggregate store
+  or automatically promote deleted observations into one.
+
+The first retention review is due **30 days after collection is first enabled**,
+not 30 days after this PR. The WP-579 owner reviews useful cases by age (0–7,
+8–30, 31–90 days), representative unique-query arrival rate, curation throughput,
+corpus changes and outstanding deletion obligations. Shorten the window if older
+records add no demonstrated value. Extending beyond 90 days requires a newly
+justified decision and an explicit schema change; the current environment cannot
+enable 180 days. The old 180-day proposal is superseded.

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { beginObservation, makeObservation, mayRetainQueryText, enqueueObservation,
-  insertObservation, recordObservationFeedback, expireObservationText, exportOwnObservations, type ObservationEnv } from "./retrieval-observations.js";
+  insertObservation, recordObservationFeedback, expireObservations, exportOwnObservations, type ObservationEnv } from "./retrieval-observations.js";
 import { buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, type SearchResult } from "./index.js";
 
 const mock = vi.hoisted(() => ({ query: vi.fn(), connect: vi.fn(), release: vi.fn(), end: vi.fn(), on: vi.fn() }));
@@ -32,12 +32,17 @@ describe("observation admission and minimisation", () => {
     expect(beginObservation({ ...env, RETRIEVAL_OBSERVATION_HMAC_KEY: "short" }, runtime(), "public")).toBeUndefined();
     expect(beginObservation(env, runtime(), "public")?.accountId).toBe("account-a");
   });
-  it.each([undefined, "0", "-1", "181", "NaN", "0.5"])("never defaults invalid retention %s to text storage", async days => {
+  it.each(["0", "-1", "91", "180", "181", "NaN", "0.5"])("never defaults invalid retention %s to text storage", async days => {
     const config = { ...env, RETRIEVAL_OBSERVATION_TEXT_DAYS: days };
     const ticket = beginObservation(config, runtime(), "public")!;
     const event = await makeObservation(config, ticket, "Понятие роли", [hit], buildSearchToolResponse(1, [hit]));
     expect(event.queryText).toBeNull();
     expect(event.textExpiresAt).toBeNull();
+  });
+  it("defaults explicitly enabled platform text to the approved 90-day window", () => {
+    expect(beginObservation({ ...env, RETRIEVAL_OBSERVATION_TEXT_DAYS: undefined }, runtime(), "public")?.textDays).toBe(90);
+    expect(beginObservation({ ...env, RETRIEVAL_OBSERVATION_TEXT_DAYS: "30" }, runtime(), "public")?.textDays).toBe(30);
+    expect(beginObservation({ ...env, RETRIEVAL_OBSERVATION_MODE: "hash" }, runtime(), "public")?.textDays).toBeNull();
   });
   it("never retains personal query text even with platform text enabled", async () => {
     const ticket = beginObservation(env, runtime(), "private")!;
@@ -156,8 +161,8 @@ describe("bounded isolated persistence", () => {
     expect(insert[0]).toContain("jsonb_array_elements");
   });
   it("runs expiry even with collection disabled", async () => {
-    await expireObservationText({ ...env, RETRIEVAL_OBSERVATION_MODE: "off" });
-    expect(mock.query).toHaveBeenCalledWith("SELECT retrieval.expire_text()");
+    await expireObservations({ ...env, RETRIEVAL_OBSERVATION_MODE: "off" });
+    expect(mock.query).toHaveBeenCalledWith("SELECT retrieval.expire_observations()");
   });
   it("exports only the verified caller's unexpired platform candidates through the RLS view", async () => {
     await expect(exportOwnObservations(env, "")).rejects.toThrow("export_unavailable");

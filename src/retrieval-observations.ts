@@ -1,5 +1,7 @@
 import { Pool, type PoolClient } from "@neondatabase/serverless";
 
+export const OBSERVATION_RETENTION_DAYS = 90;
+
 /** Separate, least-privilege credentials; never reuse an owner/BYPASSRLS connection. */
 export interface ObservationEnv {
   RETRIEVAL_OBSERVATION_DATABASE_URL?: string;
@@ -65,10 +67,11 @@ export function beginObservation(
 ): ObservationTicket | undefined {
   const accountId = admittedAccount(env, runtime);
   if (!runtime || !accountId) return;
-  const days = Number(env.RETRIEVAL_OBSERVATION_TEXT_DAYS);
-  // No implicit retention period. Invalid config degrades to hashes, never unlimited text.
+  const days = Number(env.RETRIEVAL_OBSERVATION_TEXT_DAYS ?? OBSERVATION_RETENTION_DAYS);
+  // Approved raw-record lifetime is 90 days; text may have a shorter window.
+  // Invalid explicit overrides degrade to hashes, never extend record lifetime.
   const textDays = env.RETRIEVAL_OBSERVATION_MODE === "platform-text"
-    && Number.isInteger(days) && days >= 1 && days <= 180 ? days : null;
+    && Number.isInteger(days) && days >= 1 && days <= OBSERVATION_RETENTION_DAYS ? days : null;
   return { id: crypto.randomUUID(), accountId, mode, observedAt: new Date().toISOString(), textDays, runtime };
 }
 
@@ -217,12 +220,13 @@ export async function recordObservationFeedback(
   } catch { reportFailure(); return { recorded: false, reason: "observation_unavailable" }; }
 }
 
-/** Narrow SECURITY DEFINER function: scrubs expired text, cannot return any rows. */
-export async function expireObservationText(env: ObservationEnv): Promise<void> {
+/** Narrow maintenance function: deletes expired records and their feedback,
+ * and scrubs text when a shorter text-only window was configured. */
+export async function expireObservations(env: ObservationEnv): Promise<void> {
   if (!env.RETRIEVAL_OBSERVATION_DATABASE_URL) return;
   try {
     await withObservationAccount(env, "", async client => {
-      await client.query("SELECT retrieval.expire_text()");
+      await client.query("SELECT retrieval.expire_observations()");
     });
   } catch { reportFailure(); }
 }
@@ -234,7 +238,7 @@ export async function exportOwnObservations(env: ObservationEnv, verifiedAccount
   if (!verifiedAccountId || !env.RETRIEVAL_OBSERVATION_DATABASE_URL) throw new Error("export_unavailable");
   return withObservationAccount(env, verifiedAccountId, async client => {
     const result = await client.query(`
-      SELECT o.id, o.observed_at, o.query_text, o.query_fingerprint, o.fingerprint_version,
+      SELECT o.id, o.observed_at, o.expires_at, o.query_text, o.query_fingerprint, o.fingerprint_version,
         o.worker_version, o.snapshot,
         COALESCE((SELECT jsonb_agg(jsonb_build_object('document_id', f.document_id,
           'helpfulness', f.helpfulness, 'cited', f.cited) ORDER BY f.document_id)

@@ -1,7 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import { neonConfig } from "@neondatabase/serverless";
 import { verifyJwtLocally } from "../src/auth.js";
-import { exportOwnObservations } from "../src/retrieval-observations.js";
+import { exportOwnObservations, OBSERVATION_RETENTION_DAYS } from "../src/retrieval-observations.js";
 
 const [output, ...extra] = process.argv.slice(2);
 if (!output || extra.length) {
@@ -16,7 +16,8 @@ if (!output || extra.length) {
     neonConfig.webSocketConstructor = WebSocket;
     const candidates = await exportOwnObservations({ RETRIEVAL_OBSERVATION_DATABASE_URL }, accountId);
     await writeFile(output, JSON.stringify({ version: 1, kind: "unlabelled-platform-query-candidates",
-      exportedAt: new Date().toISOString(), candidates }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+      exportedAt: new Date().toISOString(), rawRecordRetentionDays: OBSERVATION_RETENTION_DAYS,
+      expiryBasis: "each candidate expires_at; export does not reset the clock", candidates }, null, 2) + "\n", { flag: "wx", mode: 0o600 });
     console.log(`Exported ${candidates.length} candidates. Not an evaluation dataset; keep the file private.`);
   } catch {
     // Driver errors and failed filesystem writes can include sensitive details.

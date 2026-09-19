@@ -2,7 +2,7 @@
 -- Deploy with a separate non-owner / NOSUPERUSER / NOBYPASSRLS runtime role.
 -- Grant that role USAGE on retrieval; SELECT,INSERT on observation;
 -- SELECT,INSERT,UPDATE on citation_feedback; SELECT on observation_export;
--- EXECUTE on expire_text(). Do not grant membership in the migration-owner role.
+-- EXECUTE on expire_observations(). Do not grant membership in the migration-owner role.
 BEGIN;
 CREATE SCHEMA retrieval;
 REVOKE ALL ON SCHEMA retrieval FROM PUBLIC;
@@ -23,16 +23,21 @@ CREATE TABLE retrieval.observation (
   CHECK (mode <> 'private' OR query_text IS NULL),
   CHECK (query_text IS NULL OR (text_disposition = 'retained'
     AND char_length(query_text) BETWEEN 1 AND 4000 AND text_expires_at IS NOT NULL
-    AND text_expires_at > observed_at AND text_expires_at <= observed_at + interval '4320 hours'))
+    AND text_expires_at > observed_at AND text_expires_at <= observed_at + interval '2160 hours'))
 );
 CREATE INDEX observation_expiring ON retrieval.observation(text_expires_at) WHERE query_text IS NOT NULL;
+CREATE INDEX observation_record_expiring ON retrieval.observation(observed_at);
 CREATE INDEX observation_by_account_time ON retrieval.observation(account_id, observed_at DESC);
 ALTER TABLE retrieval.observation ENABLE ROW LEVEL SECURITY;
 ALTER TABLE retrieval.observation FORCE ROW LEVEL SECURITY;
 CREATE POLICY observation_account ON retrieval.observation
-  USING (account_id = nullif(current_setting('app.account_id', true), ''))
-  WITH CHECK (account_id = nullif(current_setting('app.account_id', true), ''));
+  USING (account_id = nullif(current_setting('app.account_id', true), '')
+    AND observed_at > statement_timestamp() - interval '2160 hours')
+  WITH CHECK (account_id = nullif(current_setting('app.account_id', true), '')
+    AND observed_at > statement_timestamp() - interval '2160 hours'
+    AND observed_at <= statement_timestamp() + interval '5 minutes');
 -- Only the migration owner, not the runtime, may perform global expiry maintenance.
+-- CURRENT_USER is resolved to that role at policy creation, not on each request.
 CREATE POLICY observation_maintenance ON retrieval.observation TO CURRENT_USER USING (true) WITH CHECK (true);
 
 CREATE TABLE retrieval.citation_feedback (
@@ -48,30 +53,48 @@ CREATE TABLE retrieval.citation_feedback (
 ALTER TABLE retrieval.citation_feedback ENABLE ROW LEVEL SECURITY;
 ALTER TABLE retrieval.citation_feedback FORCE ROW LEVEL SECURITY;
 CREATE POLICY feedback_account ON retrieval.citation_feedback
-  USING (account_id = nullif(current_setting('app.account_id', true), ''))
-  WITH CHECK (account_id = nullif(current_setting('app.account_id', true), ''));
+  USING (account_id = nullif(current_setting('app.account_id', true), '')
+    AND EXISTS (SELECT 1 FROM retrieval.observation o
+      WHERE o.account_id = citation_feedback.account_id AND o.id = citation_feedback.observation_id))
+  WITH CHECK (account_id = nullif(current_setting('app.account_id', true), '')
+    AND EXISTS (SELECT 1 FROM retrieval.observation o
+      WHERE o.account_id = citation_feedback.account_id AND o.id = citation_feedback.observation_id));
 
 -- PostgreSQL >=15: invoker RLS applies; delayed cron never exposes expired text to exports.
 CREATE VIEW retrieval.observation_export WITH (security_invoker = true) AS
 SELECT account_id,id,mode,observed_at,query_fingerprint,fingerprint_version,
-  CASE WHEN text_expires_at > now() THEN query_text ELSE NULL END AS query_text,
-  text_expires_at,text_disposition,worker_version,snapshot
+  CASE WHEN text_expires_at > statement_timestamp() THEN query_text ELSE NULL END AS query_text,
+  text_expires_at,text_disposition,worker_version,snapshot,
+  LEAST(text_expires_at, observed_at + interval '2160 hours') AS expires_at
 FROM retrieval.observation;
 
-CREATE FUNCTION retrieval.expire_text() RETURNS integer LANGUAGE plpgsql SECURITY DEFINER
+CREATE FUNCTION retrieval.expire_observations() RETURNS integer LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog AS $$
 DECLARE scrubbed integer;
+DECLARE deleted integer;
 BEGIN
+  -- Full removal includes identifiers/fingerprints/snapshots; FK cascades feedback.
+  -- Timestamp stays anchored to the original observation, never feedback/export time.
+  WITH expired_records AS (
+    SELECT account_id,id FROM retrieval.observation
+    WHERE observed_at <= statement_timestamp() - interval '2160 hours'
+    ORDER BY observed_at LIMIT 5000 FOR UPDATE SKIP LOCKED
+  )
+  DELETE FROM retrieval.observation o USING expired_records e
+  WHERE o.account_id=e.account_id AND o.id=e.id;
+  GET DIAGNOSTICS deleted = ROW_COUNT;
+
+  -- Optional shorter raw-text window, while the remaining record is still live.
   WITH expired AS (
     SELECT account_id,id FROM retrieval.observation
-    WHERE query_text IS NOT NULL AND text_expires_at <= now()
+    WHERE query_text IS NOT NULL AND text_expires_at <= statement_timestamp()
     ORDER BY text_expires_at LIMIT 5000 FOR UPDATE SKIP LOCKED
   )
   UPDATE retrieval.observation o SET query_text = NULL, text_disposition = 'expired'
   FROM expired e WHERE o.account_id=e.account_id AND o.id=e.id;
   GET DIAGNOSTICS scrubbed = ROW_COUNT;
-  RETURN scrubbed;
+  RETURN deleted + scrubbed;
 END $$;
 REVOKE ALL ON ALL TABLES IN SCHEMA retrieval FROM PUBLIC;
-REVOKE ALL ON FUNCTION retrieval.expire_text() FROM PUBLIC;
+REVOKE ALL ON FUNCTION retrieval.expire_observations() FROM PUBLIC;
 COMMIT;
