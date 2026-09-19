@@ -3,6 +3,7 @@
 -- Grant that role USAGE on retrieval; SELECT,INSERT on observation;
 -- SELECT,INSERT,UPDATE on citation_feedback; SELECT on observation_export;
 -- EXECUTE on expire_observations(). Do not grant membership in the migration-owner role.
+-- A separate monitor role gets only USAGE on retrieval and EXECUTE on maintenance_status().
 BEGIN;
 CREATE SCHEMA retrieval;
 REVOKE ALL ON SCHEMA retrieval FROM PUBLIC;
@@ -68,6 +69,14 @@ SELECT account_id,id,mode,observed_at,query_fingerprint,fingerprint_version,
   LEAST(text_expires_at, observed_at + interval '2160 hours') AS expires_at
 FROM retrieval.observation;
 
+-- One replaceable operational state, not an unbounded event or query history.
+-- Only the migration owner / definer may mutate it. Never grant runtime table access.
+CREATE TABLE retrieval.maintenance_state (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  last_success_at timestamptz NOT NULL,
+  processed_count integer NOT NULL CHECK (processed_count >= 0)
+);
+
 CREATE FUNCTION retrieval.expire_observations() RETURNS integer LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog AS $$
 DECLARE scrubbed integer;
@@ -93,8 +102,39 @@ BEGIN
   UPDATE retrieval.observation o SET query_text = NULL, text_disposition = 'expired'
   FROM expired e WHERE o.account_id=e.account_id AND o.id=e.id;
   GET DIAGNOSTICS scrubbed = ROW_COUNT;
+  -- Commit/rollback of the heartbeat is atomic with actual cleanup, including
+  -- failures after this function returns but before the caller commits.
+  INSERT INTO retrieval.maintenance_state(singleton,last_success_at,processed_count)
+  VALUES (true, clock_timestamp(), deleted + scrubbed)
+  ON CONFLICT (singleton) DO UPDATE
+    SET last_success_at = clock_timestamp(), processed_count = EXCLUDED.processed_count;
   RETURN deleted + scrubbed;
 END $$;
+
+-- Narrow cross-account operational inspection. Calling as an ordinary role must
+-- not produce a falsely empty backlog because of account-scoped RLS.
+CREATE FUNCTION retrieval.maintenance_status()
+RETURNS TABLE(last_success_at timestamptz, seconds_since_success double precision,
+  expired_records bigint, expired_texts bigint, oldest_overdue_seconds double precision,
+  alarm boolean)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
+  WITH backlog AS (
+    SELECT count(*) FILTER (WHERE observed_at <= statement_timestamp() - interval '2160 hours') AS records,
+      count(*) FILTER (WHERE query_text IS NOT NULL AND text_expires_at <= statement_timestamp()) AS texts,
+      greatest(0, extract(epoch FROM statement_timestamp() - least(
+        min(observed_at + interval '2160 hours'),
+        min(text_expires_at) FILTER (WHERE query_text IS NOT NULL)
+      )))::double precision AS overdue
+    FROM retrieval.observation
+  )
+  SELECT s.last_success_at, extract(epoch FROM statement_timestamp() - s.last_success_at)::double precision,
+    b.records, b.texts, b.overdue,
+    (s.last_success_at IS NULL OR s.last_success_at <= statement_timestamp() - interval '30 minutes'
+      OR s.last_success_at > statement_timestamp() + interval '1 minute'
+      OR b.records > 0 OR b.texts > 0)
+  FROM backlog b LEFT JOIN retrieval.maintenance_state s ON s.singleton
+$$;
 REVOKE ALL ON ALL TABLES IN SCHEMA retrieval FROM PUBLIC;
 REVOKE ALL ON FUNCTION retrieval.expire_observations() FROM PUBLIC;
+REVOKE ALL ON FUNCTION retrieval.maintenance_status() FROM PUBLIC;
 COMMIT;

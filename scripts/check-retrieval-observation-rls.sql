@@ -3,11 +3,24 @@
 \set ON_ERROR_STOP on
 BEGIN;
 CREATE ROLE wp579_test_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS;
+CREATE ROLE wp579_test_monitor NOLOGIN NOSUPERUSER NOBYPASSRLS;
+GRANT USAGE ON SCHEMA retrieval TO wp579_test_monitor;
+GRANT EXECUTE ON FUNCTION retrieval.maintenance_status() TO wp579_test_monitor;
 GRANT USAGE ON SCHEMA retrieval TO wp579_test_runtime;
 GRANT SELECT,INSERT ON retrieval.observation TO wp579_test_runtime;
 GRANT SELECT ON retrieval.observation_export TO wp579_test_runtime;
 GRANT SELECT,INSERT,UPDATE ON retrieval.citation_feedback TO wp579_test_runtime;
 GRANT EXECUTE ON FUNCTION retrieval.expire_observations() TO wp579_test_runtime;
+SET LOCAL ROLE wp579_test_monitor;
+DO $$ BEGIN
+ IF NOT (SELECT alarm AND last_success_at IS NULL AND expired_records=0 FROM retrieval.maintenance_status())
+ THEN RAISE EXCEPTION 'missing heartbeat incorrectly healthy'; END IF;
+ IF has_table_privilege(current_user,'retrieval.observation','SELECT')
+   OR has_table_privilege(current_user,'retrieval.maintenance_state','UPDATE')
+   OR has_function_privilege(current_user,'retrieval.expire_observations()','EXECUTE')
+ THEN RAISE EXCEPTION 'monitor privilege escalation'; END IF;
+END $$;
+RESET ROLE;
 INSERT INTO retrieval.observation
  (account_id,id,mode,observed_at,query_fingerprint,query_text,text_expires_at,text_disposition,snapshot)
 VALUES
@@ -119,5 +132,46 @@ DO $$ BEGIN
  THEN RAISE EXCEPTION 'expired feedback not cascade-deleted'; END IF;
  IF retrieval.expire_observations() <> 0 THEN RAISE EXCEPTION 'cleanup not idempotent'; END IF;
 END $$;
+SET LOCAL ROLE wp579_test_runtime;
+DO $$ BEGIN
+ IF has_table_privilege(current_user,'retrieval.maintenance_state','INSERT')
+   OR has_table_privilege(current_user,'retrieval.maintenance_state','UPDATE')
+   OR has_function_privilege(current_user,'retrieval.maintenance_status()','EXECUTE')
+ THEN RAISE EXCEPTION 'runtime can forge heartbeat or inspect global status'; END IF;
+END $$;
+RESET ROLE;
+SET LOCAL ROLE wp579_test_monitor;
+DO $$ BEGIN
+ IF NOT (SELECT NOT alarm AND last_success_at IS NOT NULL AND expired_records=0 AND expired_texts=0
+   FROM retrieval.maintenance_status()) THEN RAISE EXCEPTION 'successful cleanup not visible'; END IF;
+END $$;
+RESET ROLE;
+-- A transaction failure must not fabricate a successful cleanup timestamp.
+UPDATE retrieval.maintenance_state SET last_success_at=statement_timestamp()-interval '31 minutes';
+SAVEPOINT failed_cleanup;
+SELECT retrieval.expire_observations();
+ROLLBACK TO SAVEPOINT failed_cleanup;
+SET LOCAL ROLE wp579_test_monitor;
+DO $$ BEGIN
+ IF NOT (SELECT alarm AND seconds_since_success >= 1860 FROM retrieval.maintenance_status())
+ THEN RAISE EXCEPTION 'rollback hid missed cleanup'; END IF;
+END $$;
+RESET ROLE;
+UPDATE retrieval.maintenance_state SET last_success_at=statement_timestamp()+interval '2 minutes';
+SET LOCAL ROLE wp579_test_monitor;
+DO $$ BEGIN
+ IF NOT (SELECT alarm FROM retrieval.maintenance_status())
+ THEN RAISE EXCEPTION 'future heartbeat incorrectly healthy'; END IF;
+END $$;
+RESET ROLE;
+INSERT INTO retrieval.observation(account_id,id,mode,observed_at,query_fingerprint,text_disposition,snapshot)
+VALUES ('hidden-from-monitor','00000000-0000-4000-8000-000000000010','public',
+ statement_timestamp()-interval '2161 hours',repeat('a',64),'disabled','{"hits":[]}');
+SET LOCAL ROLE wp579_test_monitor;
+DO $$ BEGIN
+ IF NOT (SELECT alarm AND expired_records=1 AND oldest_overdue_seconds>=3600 FROM retrieval.maintenance_status())
+ THEN RAISE EXCEPTION 'RLS hid expired backlog from monitor'; END IF;
+END $$;
+RESET ROLE;
 ROLLBACK;
-\echo 'RLS, cross-account feedback, connection reuse and retention verified'
+\echo 'RLS, retention, monitor isolation and atomic cleanup heartbeat verified'

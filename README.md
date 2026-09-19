@@ -177,6 +177,24 @@ stops new writes; earlier unexpired records remain subject to the same deadline.
 Migration 024 is still unreleased; this revision replaces its draft text-only
 expiry design. No production database has been migrated by this PR.
 
+Each committed cleanup now updates a single `retrieval.maintenance_state` row in
+the same transaction. Empty successful runs also advance the timestamp; a failed
+or rolled-back transaction does not. A separate monitor role may receive only
+schema USAGE and EXECUTE on `retrieval.maintenance_status()`. It receives no
+observation/export/feedback/state-table access and cannot invoke cleanup. Do not
+grant that status function to the ordinary runtime or PUBLIC.
+
+The status function runs as the migration owner, so account RLS cannot hide a
+global backlog. It returns only operational counts, overdue seconds, the last
+successful cleanup time and `alarm`. Missing success, success older than 30
+minutes, success over one minute ahead of the DB clock, or any overdue records
+or texts raises `alarm`. A successful batch can still leave an alarm when rows
+are locked or the backlog exceeds its limit. An independent monitor must treat
+query failure and no data as alerts too; installing this schema alone does not
+install or demonstrate that external monitor. Restore procedures must first
+quarantine runtime access and verify actual backlog, not trust a restored recent
+heartbeat. The singleton is operational state, not a retained query history.
+
 Search responses include `observation_id` on each hit and in result `_meta`.
 This means **scheduled**, not durably written: `waitUntil` persistence is best
 effort and does not block search. Driver operations have 2s timeouts, no retries.
@@ -291,6 +309,12 @@ history, then `ALTER ROLE retrieval_observation_runtime LOGIN`. Repeat the
 isolation test from the exact release commit in a disposable database containing
 only synthetic fixtures; "deployment version" means the code version, not the
 production database. Never run that fixture script against production.
+For external monitoring, provision a second fresh NOLOGIN role, validate its
+effective grants, and give it only schema USAGE and EXECUTE on
+`retrieval.maintenance_status()` before enabling its login. It must not inherit
+the runtime or any owner role. Configure an independent evaluator to query that
+function regularly with query errors/no-data treated as alarms. Verify its
+notification destination separately; avoid sending test alerts to other users.
 
 Install the observation DSN, HMAC key, exact verified pilot subject and mode as
 secret bindings **only on the public Worker**. Keep mode `off` while provisioning;
