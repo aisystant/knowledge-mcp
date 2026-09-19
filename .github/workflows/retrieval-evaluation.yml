@@ -1,0 +1,21 @@
+name: Retrieval evaluation contract
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  evaluation-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - run: npm ci --legacy-peer-deps
+      - run: npm run test -- src/retrieval-evaluation.test.ts
+      - run: npm run typecheck:evaluation
+      # This checks the evaluator, not retrieval quality on a real corpus.
+      # A deployment evidence gate requires the independently reviewed dataset.

@@ -7,6 +7,8 @@
     "deploy": "npm ci --legacy-peer-deps && npm run test && npm run typecheck && npm run guard:privacy && bash scripts/verified-deploy.sh",
     "guard:privacy": "bash scripts/check-account-id-filter.sh",
     "typecheck": "tsc --noEmit",
+    "typecheck:evaluation": "tsc --noEmit -p tsconfig.evaluation.json",
+    "eval:retrieval": "node --import tsx scripts/evaluate-retrieval.ts",
     "ingest": "tsx scripts/ingest.ts",
     "ingest:all": "tsx scripts/ingest.ts --config scripts/sources.json",
     "ingest:platform": "tsx scripts/ingest.ts --config scripts/sources-platform.json",
