@@ -174,8 +174,10 @@ privileges, TLS/storage, backup retention and restore procedure (purge expired
 rows before reopening restored data), cron capacity and operator access. These
 deployment conditions are not certified by unit tests. Disabling collection
 stops new writes; earlier unexpired records remain subject to the same deadline.
-Migration 024 is still unreleased; this revision replaces its draft text-only
-expiry design. No production database has been migrated by this PR.
+Applying migration 024 is a separate explicit operation; neither Worker startup
+nor merging this PR applies it. Record the applied checksum in the private
+deployment record and treat an applied migration as immutable. Subsequent schema
+changes require a new migration rather than editing an already applied file.
 
 Each committed cleanup now updates a single `retrieval.maintenance_state` row in
 the same transaction. Empty successful runs also advance the timestamp; a failed
@@ -280,7 +282,14 @@ the environment, never pasted into shell history or a PR:
 psql -X --no-password -v ON_ERROR_STOP=1 -f migrations/024-retrieval-observations.sql
 ```
 
-The following bootstrap applies once to an absent schema and a fresh role. A
+The checked bootstrap is `scripts/provision-retrieval-observation-roles.sql`:
+it creates both roles with NOLOGIN and rejects unexpected inherited/PUBLIC table,
+column, schema or definer-function access before committing. Apply it after the
+migration; it supplies the runtime grants illustrated below plus the separate
+monitor grant. Do not run both the script and the illustrative CREATE statements.
+
+The migration applies once to an absent schema; role provisioning applies once
+to fresh roles after that migration. A
 same-named preexisting object is a stop condition until its ownership, migration
 version and grants have been inspected. On a retry or reactivation, reuse only
 the verified objects created by this bootstrap; do not rerun CREATE or silently
