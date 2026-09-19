@@ -15,7 +15,22 @@ jobs:
         with:
           node-version: '22'
       - run: npm ci --legacy-peer-deps
-      - run: npm run test -- src/retrieval-evaluation.test.ts
+      - run: npm run test -- src/retrieval-evaluation.test.ts src/retrieval-observations.test.ts src/retrieval-observations-http.test.ts
+      - run: npm run typecheck
       - run: npm run typecheck:evaluation
       # This checks the evaluator, not retrieval quality on a real corpus.
       # A deployment evidence gate requires the independently reviewed dataset.
+  observation-isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: observation_test
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: psql -h localhost -U postgres -d observation_test -v ON_ERROR_STOP=1 -f migrations/023-retrieval-observations.sql -f scripts/check-retrieval-observation-rls.sql

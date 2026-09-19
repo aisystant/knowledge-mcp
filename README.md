@@ -113,3 +113,80 @@ recorded runs to a mandatory pre-merge quality check remains part of Ф2.
 - Следующий шаг: graph traversal по typed `related:` полям из frontmatter
 - pack_search = semantic view, pack_graph = graph view, pack_get = full entity view
 - При индексации: извлекать typed `related:` для построения графа связей
+
+## Retrieval observations (opt-in, WP-579)
+
+The public `search` path can record **the actual returned ranking**, full indexed
+content SHA-256 computed in the same database query, retrieved/returned excerpt
+hashes, truncation and optional citation feedback. A content hash is a version
+check, not a retained corpus: evaluation still needs a frozen source snapshot and
+human-reviewed evidence spans. `availableCount` is the post-rerank result count,
+not all matching database rows. Missing version metadata stays `null`.
+
+Collection is **off by default**. No production migration or collection is implied
+by installing this code. The current personal-search backend is unchanged: it
+does not return chunk IDs, and dedicated text-storage/sharing consent is not yet
+implemented. The event builder and database both prohibit personal raw text.
+
+Configuration for a controlled public-corpus pilot:
+
+| Binding | Required behavior |
+| --- | --- |
+| `RETRIEVAL_OBSERVATION_MODE` | `hash` or `platform-text`; any other value disables collection |
+| `RETRIEVAL_OBSERVATION_DATABASE_URL` | Separate non-owner, NOSUPERUSER, NOBYPASSRLS role; no membership in table-owner role |
+| `RETRIEVAL_OBSERVATION_ACCOUNTS` | Explicit comma-separated verified JWT subjects; no wildcard/default collection |
+| `RETRIEVAL_OBSERVATION_HMAC_KEY` | Secret of at least 32 characters; account-bound NFC+trim query fingerprints; protect and rotate as a secret |
+| `RETRIEVAL_OBSERVATION_TEXT_DAYS` | Explicit integer 1–180; absent/invalid means hash-only; choose the approved period before enabling text |
+
+Public-corpus queries can contain personal information. A conservative filter
+rejects credential/PII patterns and oversized text before persistence; it cannot
+detect every name or disclosure in prose. Stored rows remain **personal,
+pseudonymous records**, including after query text expires. Hash-only does not
+mean anonymous. Neither query text, credentials nor database error details are
+written to application logs. The account comes only from verified JWT auth;
+`x-user-id`, tool arguments, and anonymous requests cannot opt into collection.
+
+Apply `migrations/023-retrieval-observations.sql` explicitly to the intended
+PostgreSQL >=15 database using a migration owner. It creates a dedicated
+`retrieval` schema with forced RLS. Grant the runtime role only the privileges
+listed at the top of the migration. Writes fail closed if that role can bypass
+RLS or inherit the owner. Per-operation pools and transaction-local identity
+prevent cross-request account reuse. The narrow `SECURITY DEFINER` expiry
+function is owned by the migration role, has a fixed search path, cannot return
+rows, and has no PUBLIC execute grant.
+
+Every existing cron tick scrubs up to 5,000 expired query texts, even with
+collection disabled (keep the database binding until cleanup is complete).
+The export view independently hides expired text if cron is delayed. Before
+production: verify privileges on the real runtime role, TLS/storage and backup
+retention, cron execution and capacity, operator access, approved text lifetime,
+and the preliminary privacy assessment. The code implements the mechanism;
+these deployment conditions are not certified by unit tests. Disabling the mode
+stops new observations; it does not erase earlier unexpired records.
+
+Search responses include `observation_id` on each hit and in result `_meta`.
+This means **scheduled**, not durably written: `waitUntil` persistence is best
+effort and does not block search. Driver operations have 2s timeouts, no retries.
+Existing `feedback` accepts optional `observation_id` and independent `cited`
+boolean (`null` when unknown). It validates that the exact hit belonged to the
+caller's snapshot, never guesses by query hash. Missing rows (including the
+write/feedback race) return `recorded:false` with a retry reason. Older feedback
+without an observation ID keeps its existing unbound behavior and is not
+silently promoted into citation evidence.
+
+For the authenticated owner's local curation, provide `ORY_URL`,
+`RETRIEVAL_EXPORT_JWT`, and the least-privilege observation DSN through the
+environment, then run `npm run export:retrieval -- <private-output.json>`.
+The exporter verifies the JWT itself, selects only that subject's unexpired
+public-corpus text, deduplicates fingerprints (latest snapshot), caps at 1,000,
+and creates a new mode-0600 file without overwriting an existing file. It prints
+only the count. Do not commit this personal output to the source repository or
+send it to an external judge without the separate data-sharing assessment.
+It is an **unlabelled candidate pool**, not a ≥200-query calibrated test set.
+
+Verification: unit/HTTP tests cover auth spoofing, admission, filtering, snapshot
+provenance, feedback races and contained storage failure. CI also applies the
+migration to disposable PostgreSQL and runs
+`scripts/check-retrieval-observation-rls.sql` for account isolation, composite
+feedback ownership, connection reuse and physical expiry. This remains an
+infrastructure check, not a measured retrieval-quality improvement.

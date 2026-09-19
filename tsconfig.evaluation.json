@@ -1,4 +1,4 @@
 {
   "extends": "./tsconfig.json",
-  "include": ["src/retrieval-evaluation.ts", "scripts/evaluate-retrieval.ts"]
+  "include": ["src/retrieval-evaluation.ts", "scripts/evaluate-retrieval.ts", "scripts/export-retrieval-observations.ts"]
 }
