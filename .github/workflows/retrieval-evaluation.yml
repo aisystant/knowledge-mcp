@@ -33,4 +33,4 @@ jobs:
         options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - run: psql -h localhost -U postgres -d observation_test -v ON_ERROR_STOP=1 -f migrations/023-retrieval-observations.sql -f scripts/check-retrieval-observation-rls.sql
+      - run: psql -h localhost -U postgres -d observation_test -v ON_ERROR_STOP=1 -f migrations/024-retrieval-observations.sql -f scripts/check-retrieval-observation-rls.sql

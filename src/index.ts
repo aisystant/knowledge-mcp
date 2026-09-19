@@ -47,7 +47,7 @@ import {
   purgeSource,
   personalDb,
 } from "./layers/personal.js";
-import { handleQueue, handleWatchdog, startReindexJob, getReindexJobStatus, type ReindexBatchMessage } from "./layers/reindex.js";
+import { handleQueue, handleWatchdog, startReindexJob, startIncrementalReindexJob, getReindexJobStatus, type ReindexBatchMessage } from "./layers/reindex.js";
 
 // --- Types ---
 
@@ -126,6 +126,8 @@ interface ReindexFile {
 interface ReindexRequest {
   source: string;
   files: ReindexFile[];
+  /** Required for the personal branch (WP-545 Ф13); unused by the platform branch. */
+  user_id?: string;
 }
 
 // --- Config ---
@@ -3855,13 +3857,19 @@ function chunkLargeFile(content: string, filename: string): { filename: string; 
  * Called by Gateway webhook after push to PACK, SPF, FPF repos.
  * Reads files from GitHub public API, chunks, embeds, upserts to Neon.
  */
-async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed: number; deleted: number; skipped: number; errors: string[] }> {
+async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed: number; deleted: number; skipped: number; errors: string[]; status?: string; reason?: string }> {
   const sql = db(env);
   const result = { processed: 0, deleted: 0, skipped: 0, errors: [] as string[] };
 
   if (!SOURCE_GITHUB_BASE[req.source]) {
-    result.errors.push(`Unknown source: ${req.source}. Known sources: ${Object.keys(SOURCE_GITHUB_BASE).join(", ")}`);
-    return result;
+    // 2xx skip, not an `errors` entry (WP-545 Ф13): the webhook fans every push to this
+    // endpoint regardless of prefix (e.g. every personal "DS-*" repo, not only platform ones),
+    // so "unknown to this worker" is the normal state for a personal source, not an anomaly —
+    // treating it as a partial failure paged the pilot's own knowledge-mcp partial-failure
+    // alert on every single push to their personal governance repo. Still logged, for the rare
+    // genuine case of a forgotten platform-repo registration.
+    console.warn(JSON.stringify({ phase: "platform_source_unknown", source: req.source }));
+    return { ...result, status: "skipped", reason: "unknown_platform_source" };
   }
 
   // Resolve user_id: L2 platform → NULL (visible to all). L4 personal → user_sources.user_id (required).
@@ -4108,25 +4116,69 @@ export default {
           status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
         });
       }
-      // WP-7 Ф100 fail-closed (peer session 2026-08-30-14): this route feeds the
-      // PLATFORM indexer. A personal push authenticated by PERSONAL_REINDEX_SECRET
-      // must not fall through — it would index personal files into the shared
-      // platform tables (isolation breach) while answering 200. Personal reindex
-      // routing for the unified tree is the Ф100 canonical-owner decision; refuse
-      // until it lands. Equal secrets make the two callers indistinguishable, so
-      // that misconfiguration also fails closed.
+      // Isolation guard (WP-7 Ф100 cutover, WP-545 Ф13): a personal push authenticated by
+      // PERSONAL_REINDEX_SECRET must never fall through to the PLATFORM indexer below — that
+      // would write personal files into the shared platform tables. Equal secrets make the two
+      // callers indistinguishable, so that misconfiguration also fails closed.
       if (env.REINDEX_SECRET && env.PERSONAL_REINDEX_SECRET && secretsEqual(env.REINDEX_SECRET, env.PERSONAL_REINDEX_SECRET)) {
         return new Response(JSON.stringify({ error: "Service Unavailable", reason: "reindex_secrets_not_distinguishable" }), {
           status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" },
         });
       }
-      if (!env.REINDEX_SECRET || !secretsEqual(presented, env.REINDEX_SECRET)) {
-        return new Response(JSON.stringify({
-          error: "Forbidden",
-          reason: "personal_reindex_not_supported_by_unified_tree",
-          detail: "Personal pushes cannot be indexed by this tree until the canonical-owner decision (WP-7 F100).",
-        }), { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      const isPlatformCaller = !!env.REINDEX_SECRET && secretsEqual(presented, env.REINDEX_SECRET);
+      const isPersonalCaller = !isPlatformCaller && !!env.PERSONAL_REINDEX_SECRET && secretsEqual(presented, env.PERSONAL_REINDEX_SECRET);
+
+      if (isPersonalCaller) {
+        // WP-545 Ф13: personal source, incremental push-triggered reindex — queues the pushed
+        // files through the same REINDEX_QUEUE/handleQueue path the full-reindex flow already
+        // uses (kind='incremental'), instead of the unconditional 403 this route used to answer
+        // (WP-7 Ф100 fail-closed guard, live 30.08-18.09, closed by this phase). Design consensus
+        // + implementation review: peer-sessions 2026-09-18-11-wp545-f13-personal-reindex and
+        // 2026-09-18-12-wp545-f13-reindex-impl (Kimi + Codex).
+        if (env.MCP_MODE !== "private" || !env.DATABASE_URL || !env.REINDEX_QUEUE) {
+          return new Response(JSON.stringify({ error: "Service Unavailable", reason: "personal_reindex_unavailable" }), {
+            status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+        const body = (await request.json()) as ReindexRequest;
+        if (!body.user_id) {
+          return new Response(JSON.stringify({ error: "Bad Request", reason: "user_id_required" }), {
+            status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+
+        const result = await startIncrementalReindexJob(env, body.user_id, body.source, body.files);
+        console.log(JSON.stringify({
+          phase: "personal_reindex_webhook",
+          user_id_prefix: body.user_id.slice(0, 8),
+          source: body.source,
+          files_count: body.files.length,
+          result_status: result.status,
+          job_id: result.job_id,
+          reason: result.reason,
+        }));
+
+        if (result.status === "failed") {
+          return new Response(JSON.stringify({ error: "Internal Server Error", message: result.message }), {
+            status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify(
+          result.status === "queued"
+            ? { status: "queued", job_id: result.job_id }
+            : { status: "skipped", reason: result.reason, rejected_paths: result.rejected_paths }
+        ), {
+          status: result.status === "queued" ? 202 : 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
       }
+
+      if (!isPlatformCaller) {
+        return new Response(JSON.stringify({ error: "Forbidden", reason: "caller_not_recognized" }), {
+          status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
       const body = (await request.json()) as ReindexRequest;
       const chunkResult = await reindexFiles(env, body);
 

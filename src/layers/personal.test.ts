@@ -1101,6 +1101,11 @@ describe("connectSource — review fixes (WP-560 Ф3, cold review 02.09)", () =>
     expect(sqlTexts().some((s) => s.includes("index_generation = index_generation + 1"))).toBe(false);
     const live = sqlTexts().find((s) => s.includes("last_heartbeat_at >"));
     expect(live).toContain("status = 'pending'");
+    // WP-545 Ф13 cold review: findLiveReindexJob must scope to kind='full' — a running
+    // incremental (webhook push) job is not "a rebuild in flight" and must not be mistaken
+    // for one by this check (or a dropped filter here would silently pass, since the mocked
+    // rows above never carry a `kind` column to begin with).
+    expect(live).toContain("kind = 'full'");
   });
 
   it("losing a first-connect race does not overwrite the winner's identity: re-reads the row and reconciles", async () => {

@@ -146,7 +146,7 @@ mean anonymous. Neither query text, credentials nor database error details are
 written to application logs. The account comes only from verified JWT auth;
 `x-user-id`, tool arguments, and anonymous requests cannot opt into collection.
 
-Apply `migrations/023-retrieval-observations.sql` explicitly to the intended
+Apply `migrations/024-retrieval-observations.sql` explicitly to the intended
 PostgreSQL >=15 database using a migration owner. It creates a dedicated
 `retrieval` schema with forced RLS. Grant the runtime role only the privileges
 listed at the top of the migration. Writes fail closed if that role can bypass
@@ -174,7 +174,7 @@ privileges, TLS/storage, backup retention and restore procedure (purge expired
 rows before reopening restored data), cron capacity and operator access. These
 deployment conditions are not certified by unit tests. Disabling collection
 stops new writes; earlier unexpired records remain subject to the same deadline.
-Migration 023 is still unreleased; this revision replaces its draft text-only
+Migration 024 is still unreleased; this revision replaces its draft text-only
 expiry design. No production database has been migrated by this PR.
 
 Search responses include `observation_id` on each hit and in result `_meta`.
