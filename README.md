@@ -298,6 +298,9 @@ set `platform-text` only after the pre-activation checks below. Use the approved
 or set `RETRIEVAL_OBSERVATION_TEXT_DAYS=90`. Keep actual subject IDs and secret
 values out of this repository. Binding updates can create new Worker versions:
 recheck active versions and health after configuration, not only after code deploy.
+Health evidence must meet the existing verified-deploy checks: HTTP 200, a valid
+health body and the expected active version/release provenance. Check mode and
+bindings separately; health alone certifies neither mode off nor successful expiry.
 With a DSN installed, the current scheduled handler invokes cleanup even in
 mode `off`; collection is not required for the expiry/restore checks. Restore
 fixtures belong only in the isolated test database. If provisioning partially
@@ -361,12 +364,20 @@ the actual returned ranking and original expiry match, and citation feedback
 references a returned hit. Verify an unlisted subject and forged `x-user-id`
 produce no observation. Use only synthetic accounts/data for cross-account and
 expiry injection tests in the isolated database. Record the actual enable time;
-the first retention review is due 30 days later. No personal-search collection
+the first policy review is due 30 days later; it never postpones any record or
+shorter text expiry. No personal-search collection
 or broad user enrollment is part of this pilot.
 
 To stop collection, set mode `off`, verify no new observations, and keep the DSN,
 scheduled cleanup and access controls until physical removal is confirmed after
-the last record expires, including pending shorter text deadlines. Do not drop
+the last record expires, including pending shorter text deadlines. Account for
+pending writes: requests admitted before the configuration change can
+still finish asynchronous persistence. Confirm the off version serves all traffic,
+drain or account for those requests and background writes, then check that newly
+started probe requests schedule no observation. A fixed quiet interval or an
+unchanged total row count is insufficient proof (cleanup can hide new writes).
+If draining cannot be established, mark shutdown verification incomplete and keep
+cleanup running; late arrivals retain their original observation deadlines. Do not drop
 tables or delete secrets as a routine rollback. If reverting to code predating
 the cleanup handler, arrange and verify an independent expiry runner **before**
 rollback. It replaces the old Worker's missing journal cleanup and must preserve
@@ -375,3 +386,7 @@ path. Without a verified replacement, keep the current cleanup-capable version
 with collection off. The old Worker will not delete this journal. Restore each Worker's captured
 version only if no other deployment has superseded this one. Disabling collection
 does not itself erase live records or reset their deadlines.
+Rollback is evaluated separately for each Worker, not as an atomic pair. If one
+was superseded, leave that Worker alone, record the mixed-version state, and
+verify both services before considering reactivation. Never overwrite another
+deployment merely to make the pair match.
