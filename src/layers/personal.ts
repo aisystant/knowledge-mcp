@@ -1517,12 +1517,9 @@ const LIVE_REINDEX_JOB_WINDOW_MINUTES = 30;
 /** Id of a reindex job that is still alive for (user, source): running with a recent
  * heartbeat, or pending and created recently (pending→running happens within one request). */
 async function findLiveReindexJob(sql: PersonalSql, reindexJobsTable: string, userId: string, source: string): Promise<string | null> {
-  // kind='full' only (WP-545 Ф13): this check exists to detect "a full rebuild is already in
-  // flight" (e.g. to avoid double-triggering connectSource's rebind rebuild); an incremental
-  // webhook-push job running concurrently is unrelated and must not be mistaken for one.
   const rows = await sql`
     SELECT id FROM ${sql.unsafe(reindexJobsTable)}
-    WHERE user_id = ${userId} AND source = ${source} AND kind = 'full'
+    WHERE user_id = ${userId} AND source = ${source}
       AND (
         (status = 'running' AND last_heartbeat_at > NOW() - (${LIVE_REINDEX_JOB_WINDOW_MINUTES} * INTERVAL '1 minute'))
         OR (status = 'pending' AND started_at > NOW() - (${LIVE_REINDEX_JOB_WINDOW_MINUTES} * INTERVAL '1 minute'))

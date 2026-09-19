@@ -266,13 +266,11 @@ describe("/reindex route guard (WP-7 Ф100 fail-closed, peer session 2026-08-30-
     });
   }
 
-  it("refuses the personal secret with 503 when private mode isn't configured on this deploy", async () => {
-    // reindexEnv carries no MCP_MODE/DATABASE_URL/REINDEX_QUEUE — this is the public-worker
-    // deploy shape, which never has a personal corpus to enqueue into (WP-545 Ф13).
+  it("refuses the personal secret with 403 — a personal push must not reach the platform indexer", async () => {
     const res = await worker.fetch(reindexRequest("personal-secret"), reindexEnv);
-    expect(res.status).toBe(503);
+    expect(res.status).toBe(403);
     const body = await res.json() as { reason: string };
-    expect(body.reason).toBe("personal_reindex_unavailable");
+    expect(body.reason).toBe("personal_reindex_not_supported_by_unified_tree");
   });
 
   it("fails closed with 503 when both secrets are configured equal (callers indistinguishable)", async () => {
@@ -286,54 +284,14 @@ describe("/reindex route guard (WP-7 Ф100 fail-closed, peer session 2026-08-30-
   it("still lets the platform secret through to the platform indexer", async () => {
     const res = await worker.fetch(reindexRequest("platform-secret"), reindexEnv);
     expect(res.status).toBe(200);
-    const body = await res.json() as { chunks: { status: string; reason: string; errors: string[] } };
-    // Guard passed and reached reindexFiles — an unregistered source is a clean skip now
-    // (WP-545 Ф13), not a partial-failure `errors` entry: the webhook fans every push to this
-    // endpoint, including personal "DS-*" repos this worker was never meant to index.
-    expect(body.chunks.status).toBe("skipped");
-    expect(body.chunks.reason).toBe("unknown_platform_source");
-    expect(body.chunks.errors).toEqual([]);
+    const body = await res.json() as { chunks: { errors: string[] } };
+    // Guard passed; the unknown-source error proves the request reached reindexFiles.
+    expect(body.chunks.errors[0]).toContain("Unknown source");
   });
 
   it("still refuses a wrong secret with 401", async () => {
     const res = await worker.fetch(reindexRequest("wrong"), reindexEnv);
     expect(res.status).toBe(401);
-  });
-
-  describe("personal branch (WP-545 Ф13 — private-mode deploy)", () => {
-    const privateReindexEnv = {
-      ...reindexEnv,
-      MCP_MODE: "private",
-      DATABASE_URL: "postgres://fake",
-      REINDEX_QUEUE: { sendBatch: vi.fn() },
-    } as unknown as import("./index.js").Env;
-
-    function personalRequest(body: Record<string, unknown>) {
-      return new Request("https://x/reindex", {
-        method: "POST",
-        headers: { Authorization: "Bearer personal-secret", "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-    }
-
-    it("requires user_id", async () => {
-      const res = await worker.fetch(personalRequest({ source: "DS-my-strategy", files: [{ path: "a.md", action: "modified" }] }), privateReindexEnv);
-      expect(res.status).toBe(400);
-      const body = await res.json() as { reason: string };
-      expect(body.reason).toBe("user_id_required");
-    });
-
-    it("skips a push with no indexable files without needing a DB or queue call", async () => {
-      const res = await worker.fetch(personalRequest({
-        source: "DS-my-strategy",
-        files: [{ path: "image.png", action: "modified" }],
-        user_id: "user-private-1",
-      }), privateReindexEnv);
-      expect(res.status).toBe(200);
-      const body = await res.json() as { status: string; reason: string };
-      expect(body).toMatchObject({ status: "skipped", reason: "no_indexable_files" });
-      expect(vi.mocked(privateReindexEnv.REINDEX_QUEUE!.sendBatch)).not.toHaveBeenCalled();
-    });
   });
 });
 

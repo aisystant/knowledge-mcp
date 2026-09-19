@@ -44,11 +44,6 @@ export interface ReindexBatchMessage {
   user_id: string; // Ory identity owning the source
   source: string; // source name, e.g. "DS-my-strategy"
   files: { path: string; action: "modified" | "removed" }[];
-  /** Position within the job's batch sequence — the consumer's idempotent-claim key (WP-545 Ф13). */
-  batch_index: number;
-  /** 'full' (tree-listing rebuild) vs 'incremental' (webhook push delta) — gates whether job
-   * completion is allowed to flip user_sources.index_state (WP-545 Ф13, full-only). */
-  kind: "full" | "incremental";
 }
 
 interface ReindexRequest {
@@ -488,75 +483,6 @@ export interface ReindexSourceResult {
 }
 
 /**
- * Shared tail of both reindex paths: update the job row to 'running', chunk `files` into
- * ReindexBatchMessages of REINDEX_BATCH_SIZE, sendBatch to REINDEX_QUEUE. `kind` gates whether
- * a zero-file completion is allowed to flip user_sources.index_state — only 'full' may (WP-545
- * Ф13, peer-session 2026-09-18-12-wp545-f13-reindex-impl, consensus with Kimi+Codex): an
- * 'incremental' job finishing (including trivially, with zero files) must never mark a source
- * 'ready' while an unrelated full rebuild could still be in flight.
- */
-async function enqueueReindexBatches(
-  env: ReindexEnv,
-  sql: ReturnType<typeof personalDb>,
-  reindexJobsTable: string,
-  userSourcesTable: string,
-  params: {
-    jobId: string;
-    userId: string;
-    source: string;
-    files: { path: string; action: "modified" | "removed" }[];
-    kind: "full" | "incremental";
-    generation: number | null;
-  },
-): Promise<ReindexSourceResult> {
-  const { jobId, userId, source, files, kind, generation } = params;
-  const expectedBatches = Math.ceil(files.length / REINDEX_BATCH_SIZE);
-
-  await sql`UPDATE ${sql.unsafe(reindexJobsTable)}
-    SET status = 'running', total = ${files.length}, expected_batches = ${expectedBatches},
-        last_heartbeat_at = NOW()
-    WHERE id = ${jobId}::uuid`;
-
-  if (files.length === 0) {
-    await sql`UPDATE ${sql.unsafe(reindexJobsTable)}
-      SET status = 'succeeded', finished_at = NOW()
-      WHERE id = ${jobId}::uuid`;
-    if (kind === "full") {
-      await setSourceIndexState(sql, userSourcesTable, userId, source, generation, "ready");
-    }
-    return { job_id: jobId, status: "running", message: `No files to reindex for ${source}.`, source };
-  }
-
-  const batches: ReindexBatchMessage[] = [];
-  for (let i = 0, batchIndex = 0; i < files.length; i += REINDEX_BATCH_SIZE, batchIndex++) {
-    batches.push({
-      job_id: jobId,
-      user_id: userId,
-      source,
-      kind,
-      batch_index: batchIndex,
-      files: files.slice(i, i + REINDEX_BATCH_SIZE),
-    });
-  }
-
-  // CF Queues sendBatch limit is ~256KB total payload — send in chunks of 20 to stay within it.
-  const SEND_CHUNK_SIZE = 20;
-  for (let i = 0; i < batches.length; i += SEND_CHUNK_SIZE) {
-    const chunk = batches.slice(i, i + SEND_CHUNK_SIZE);
-    await env.REINDEX_QUEUE!.sendBatch(chunk.map((b) => ({ body: b })));
-  }
-
-  console.log(JSON.stringify({ phase: "enqueue", job_id: jobId, source, kind, total_files: files.length, batches: batches.length }));
-
-  return {
-    job_id: jobId,
-    status: "running",
-    message: `Reindex started for ${source}: ${files.length} file(s) in ${batches.length} batch(es). Poll reindex_status with job_id.`,
-    source,
-  };
-}
-
-/**
  * Start an async reindex job: list files via GitHub Trees, split into batches of
  * REINDEX_BATCH_SIZE, enqueue via env.REINDEX_QUEUE.sendBatch, return job_id immediately.
  * handleQueue (below) processes each batch ≤30s.
@@ -686,14 +612,44 @@ export async function startReindexJob(
 
     const paths = await listMdFilesViaTrees(env, ctx, source);
 
-    return await enqueueReindexBatches(env, sql, reindexJobsTable, userSourcesTable, {
-      jobId,
-      userId,
+    const batches: ReindexBatchMessage[] = [];
+    for (let i = 0; i < paths.length; i += REINDEX_BATCH_SIZE) {
+      batches.push({
+        job_id: jobId,
+        user_id: userId,
+        source,
+        files: paths.slice(i, i + REINDEX_BATCH_SIZE).map((p) => ({ path: p, action: "modified" as const })),
+      });
+    }
+
+    await sql`UPDATE ${sql.unsafe(reindexJobsTable)}
+      SET status = 'running', total = ${paths.length}, expected_batches = ${batches.length},
+          last_heartbeat_at = NOW()
+      WHERE id = ${jobId}::uuid`;
+
+    if (batches.length === 0) {
+      await sql`UPDATE ${sql.unsafe(reindexJobsTable)}
+        SET status = 'succeeded', finished_at = NOW()
+        WHERE id = ${jobId}::uuid`;
+      await setSourceIndexState(sql, userSourcesTable, userId, source, generation, "ready");
+      return { job_id: jobId, status: "running", message: `No files to reindex for ${source}.`, source };
+    }
+
+    // CF Queues sendBatch limit is ~256KB total payload — send in chunks of 20 to stay within it.
+    const SEND_CHUNK_SIZE = 20;
+    for (let i = 0; i < batches.length; i += SEND_CHUNK_SIZE) {
+      const chunk = batches.slice(i, i + SEND_CHUNK_SIZE);
+      await env.REINDEX_QUEUE.sendBatch(chunk.map((b) => ({ body: b })));
+    }
+
+    console.log(JSON.stringify({ phase: "enqueue", job_id: jobId, source, total_files: paths.length, batches: batches.length }));
+
+    return {
+      job_id: jobId,
+      status: "running",
+      message: `Reindex started for ${source}: ${paths.length} file(s) in ${batches.length} batch(es). Poll reindex_status with job_id.`,
       source,
-      files: paths.map((p) => ({ path: p, action: "modified" as const })),
-      kind: "full",
-      generation,
-    });
+    };
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";
     await sql`UPDATE ${sql.unsafe(reindexJobsTable)}
@@ -706,126 +662,10 @@ export async function startReindexJob(
   }
 }
 
-export interface StartIncrementalReindexJobResult {
-  status: "queued" | "skipped" | "failed";
-  reason?: string;
-  job_id?: string;
-  message: string;
-  rejected_paths?: string[];
-}
-
-/**
- * Webhook-push counterpart to startReindexJob: enqueue exactly the files a single push
- * changed (already known — no GitHub Trees listing), skip the 60s cooldown (a push is a
- * discrete event, not a recency-guarded manual trigger), and never touch user_sources.index_state
- * (kind='incremental', see enqueueReindexBatches). WP-545 Ф13, peer-session
- * 2026-09-18-12-wp545-f13-reindex-impl (design consensus + Kimi/Codex implementation review).
- *
- * Active-source gating is the INSERT...SELECT...WHERE below (atomic with job creation — no
- * TOCTOU window between "is this source connected and enabled" and "create the job row", same
- * pattern startReindexJob already uses). The probe SELECT above it is informational only, for a
- * precise skip `reason` — if the source's state changes in the gap between the two queries, the
- * atomic INSERT's outcome is authoritative and the reason falls back to "state_changed_during_check".
- */
-export async function startIncrementalReindexJob(
-  env: ReindexEnv,
-  userId: string,
-  source: string,
-  files: { path: string; action: "added" | "modified" | "removed" }[],
-): Promise<StartIncrementalReindexJobResult> {
-  const sql = personalDb(env);
-  const schema = getKnowledgeSchema(env);
-  const reindexJobsTable = KNOWLEDGE_TABLES.reindex_jobs(schema);
-  const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
-
-  const indexable: { path: string; action: "modified" | "removed" }[] = [];
-  const rejected: string[] = [];
-  for (const f of files) {
-    let normalizedPath: string;
-    try {
-      normalizedPath = normalizeRepositoryPath(f.path);
-    } catch {
-      rejected.push(f.path);
-      continue;
-    }
-    if (!normalizedPath.endsWith(".md")) continue; // matches personalReindexFiles' own silent non-.md skip
-    try {
-      assertIndexablePath(normalizedPath);
-    } catch {
-      rejected.push(f.path);
-      continue;
-    }
-    indexable.push({ path: normalizedPath, action: f.action === "added" ? "modified" : f.action });
-  }
-
-  if (indexable.length === 0) {
-    return {
-      status: "skipped",
-      reason: "no_indexable_files",
-      message: `No indexable files for ${source}`,
-      rejected_paths: rejected.length > 0 ? rejected : undefined,
-    };
-  }
-
-  const probe = await sql`
-    SELECT active, auto_reindex_enabled FROM ${sql.unsafe(userSourcesTable)}
-    WHERE user_id = ${userId} AND source = ${source}
-    LIMIT 1
-  `;
-
-  let rows: Record<string, unknown>[];
-  try {
-    rows = await sql`
-      INSERT INTO ${sql.unsafe(reindexJobsTable)} (user_id, source, status, generation, kind)
-      SELECT ${userId}, ${source}, 'pending', index_generation, 'incremental'
-      FROM ${sql.unsafe(userSourcesTable)}
-      WHERE user_id = ${userId} AND source = ${source}
-        AND active = true AND auto_reindex_enabled = true
-      RETURNING id, generation
-    `;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    return { status: "failed", message: `Failed to create incremental reindex job: ${msg}` };
-  }
-
-  if (rows.length === 0) {
-    let reason = "source_not_active_for_user";
-    if (probe.length > 0) {
-      const row = probe[0];
-      if (row.active === true && row.auto_reindex_enabled === false) reason = "auto_reindex_disabled";
-      else if (row.active === false) reason = "source_not_active_for_user";
-      else reason = "state_changed_during_check";
-    }
-    return { status: "skipped", reason, message: `Not indexing ${source}: ${reason}` };
-  }
-
-  const jobId = rows[0].id as string;
-  const generation = generationColumn(rows[0].generation);
-
-  try {
-    const result = await enqueueReindexBatches(env, sql, reindexJobsTable, userSourcesTable, {
-      jobId,
-      userId,
-      source,
-      files: indexable,
-      kind: "incremental",
-      generation,
-    });
-    return { status: "queued", job_id: jobId, message: result.message };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : "unknown error";
-    await sql`UPDATE ${sql.unsafe(reindexJobsTable)}
-      SET status = 'failed', finished_at = NOW(), errors = ${JSON.stringify([msg])}::jsonb
-      WHERE id = ${jobId}::uuid`;
-    return { status: "failed", job_id: jobId, message: `Failed to enqueue incremental reindex: ${msg}` };
-  }
-}
-
 export interface ReindexStatusResult {
   job_id: string;
   source: string;
   status: string;
-  kind: string;
   processed: number;
   skipped: number;
   deleted: number;
@@ -840,7 +680,7 @@ export async function getReindexJobStatus(env: ReindexEnv, userId: string, jobId
   const schema = getKnowledgeSchema(env);
   const reindexJobsTable = KNOWLEDGE_TABLES.reindex_jobs(schema);
   const rows = await sql`
-    SELECT id, source, status, kind, processed, skipped, deleted, total, errors, started_at, finished_at
+    SELECT id, source, status, processed, skipped, deleted, total, errors, started_at, finished_at
     FROM ${sql.unsafe(reindexJobsTable)}
     WHERE id = ${jobId}::uuid AND user_id = ${userId}
     LIMIT 1
@@ -851,7 +691,6 @@ export async function getReindexJobStatus(env: ReindexEnv, userId: string, jobId
     job_id: r.id as string,
     source: r.source as string,
     status: r.status as string,
-    kind: r.kind as string,
     processed: r.processed as number,
     skipped: r.skipped as number,
     deleted: r.deleted as number,
@@ -882,13 +721,12 @@ export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env:
   const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
 
   for (const msg of batch.messages) {
-    const { job_id, user_id, source, files, batch_index } = msg.body;
+    const { job_id, user_id, source, files } = msg.body;
     const startedAt = Date.now();
 
     try {
       const jobRows = await sql`
-        SELECT status, generation, kind, completed_batch_indexes
-        FROM ${sql.unsafe(KNOWLEDGE_TABLES.reindex_jobs(schema))} WHERE id = ${job_id}::uuid LIMIT 1
+        SELECT status, generation FROM ${sql.unsafe(KNOWLEDGE_TABLES.reindex_jobs(schema))} WHERE id = ${job_id}::uuid LIMIT 1
       `;
       if (jobRows.length === 0) {
         console.warn(JSON.stringify({ phase: "consume_skip", reason: "job_not_found", job_id }));
@@ -902,21 +740,7 @@ export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env:
         continue;
       }
 
-      // Cheap early exit for the common redelivery case — catches most duplicates before
-      // spending an embedding call on them. Not the correctness guarantee (that's the
-      // conditional UPDATE below); a duplicate that races past this check still can't
-      // double-count, it just does the processing work twice (WP-545 Ф13 — process-before-claim
-      // was chosen over claim-before-process specifically to avoid a crash-between-claim-and-
-      // process silent-loss window, consensus with Kimi+Codex).
-      const alreadyDone = (jobRows[0].completed_batch_indexes as number[] | null)?.includes(batch_index);
-      if (alreadyDone) {
-        console.warn(JSON.stringify({ phase: "consume_dup", reason: "already_completed_fast_path", job_id, batch_index }));
-        msg.ack();
-        continue;
-      }
-
       const generation = generationColumn(jobRows[0].generation);
-      const jobKind = (jobRows[0].kind as string) === "full" ? "full" : "incremental";
       const result = await personalReindexFiles(env, { source, files, user_id, generation });
 
       if (result.stale) {
@@ -934,47 +758,33 @@ export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env:
       }
 
       const errorsJson = JSON.stringify(result.errors);
-      // Atomic claim: only a delivery that wins this WHERE gets to count itself. A concurrent
-      // duplicate that raced past the fast-path check above still lands here — RETURNING no
-      // rows tells it a sibling delivery already claimed batch_index, so it acks without
-      // double-counting (WP-545 Ф13).
       const updated = await sql`
         UPDATE ${sql.unsafe(KNOWLEDGE_TABLES.reindex_jobs(schema))}
           SET processed = processed + ${result.processed},
               skipped = skipped + ${result.skipped},
               deleted = deleted + ${result.deleted},
               completed_batches = completed_batches + 1,
-              completed_batch_indexes = array_append(completed_batch_indexes, ${batch_index}),
               last_heartbeat_at = NOW(),
               errors = COALESCE(errors, '[]'::jsonb) || ${errorsJson}::jsonb
-          WHERE id = ${job_id}::uuid AND NOT (${batch_index} = ANY(completed_batch_indexes))
+          WHERE id = ${job_id}::uuid
           RETURNING completed_batches, expected_batches
       `;
 
-      if (updated.length === 0) {
-        console.warn(JSON.stringify({ phase: "consume_dup", reason: "already_completed_race", job_id, batch_index }));
-        msg.ack();
-        continue;
-      }
-
-      const { completed_batches, expected_batches } = updated[0] as { completed_batches: number; expected_batches: number | null };
-      if (expected_batches !== null && completed_batches >= expected_batches) {
-        await sql`
-          UPDATE ${sql.unsafe(KNOWLEDGE_TABLES.reindex_jobs(schema))}
-            SET status = 'succeeded', finished_at = NOW()
-            WHERE id = ${job_id}::uuid AND status = 'running'
-        `;
-        // Only a full-tree rebuild may declare the source's index 'ready' — an incremental
-        // (webhook push) job completing must never flip index_state, or a fast push-triggered
-        // job could mark 'ready' while an unrelated full rebuild is still mid-flight (WP-545 Ф13).
-        if (jobKind === "full") {
+      if (updated.length > 0) {
+        const { completed_batches, expected_batches } = updated[0] as { completed_batches: number; expected_batches: number | null };
+        if (expected_batches !== null && completed_batches >= expected_batches) {
+          await sql`
+            UPDATE ${sql.unsafe(KNOWLEDGE_TABLES.reindex_jobs(schema))}
+              SET status = 'succeeded', finished_at = NOW()
+              WHERE id = ${job_id}::uuid AND status = 'running'
+          `;
           await setSourceIndexState(sql, userSourcesTable, user_id, source, generation, "ready");
         }
       }
 
       console.log(JSON.stringify({
         phase: "consume_ok",
-        job_id, source, kind: jobKind,
+        job_id, source,
         files: files.length,
         processed: result.processed,
         skipped: result.skipped,
@@ -1035,7 +845,7 @@ export async function handleWatchdog(env: ReindexEnv): Promise<void> {
       WHERE status = 'running'
         AND last_heartbeat_at IS NOT NULL
         AND NOW() - last_heartbeat_at > (${staleMinutes} * INTERVAL '1 minute')
-      RETURNING id, user_id, source, kind, completed_batches, expected_batches, generation
+      RETURNING id, user_id, source, completed_batches, expected_batches, generation
     `;
     const abandoned = await sql`
       UPDATE ${sql.unsafe(KNOWLEDGE_TABLES.reindex_jobs(schema))}
@@ -1044,14 +854,9 @@ export async function handleWatchdog(env: ReindexEnv): Promise<void> {
           errors = COALESCE(errors, '[]'::jsonb) || '[{"reason":"watchdog_pending_never_started"}]'::jsonb
       WHERE status = 'pending'
         AND NOW() - started_at > (${staleMinutes} * INTERVAL '1 minute')
-      RETURNING id, user_id, source, kind, generation
+      RETURNING id, user_id, source, generation
     `;
-    // A stale/abandoned incremental (webhook) job never touches index_state — same rule as
-    // the queue consumer's completion path (WP-545 Ф13): only a full-tree rebuild's failure
-    // may mark the source 'failed', or a stuck push-triggered job would wrongly fail a source
-    // whose full index is actually fine.
     for (const r of [...stale, ...abandoned]) {
-      if ((r.kind as string) !== "full") continue;
       await setSourceIndexState(sql, KNOWLEDGE_TABLES.user_sources(schema), r.user_id as string, r.source as string, generationColumn(r.generation), "failed");
     }
     console.log(JSON.stringify({
