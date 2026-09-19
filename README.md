@@ -246,6 +246,9 @@ workflow can update **both** public and personal Workers when
 `PERSONAL_WORKER_DEPLOY_ENABLED=true`; capture each active version and check
 both health endpoints. Use the existing verified deployment workflow from
 current `main`, with collection still disabled. Do not deploy a draft branch.
+Record the tested commit, migration checksum and each resulting Worker version
+in the private deployment record. If `main` changes before deployment, repeat
+the checks for that exact release; "current main" is not permanent evidence.
 
 Use a private observation schema in the selected operational database, not an
 existing search-reader credential. Before applying the migration, inspect the
@@ -259,12 +262,14 @@ the environment, never pasted into shell history or a PR:
 psql -X --no-password -v ON_ERROR_STOP=1 -f migrations/024-retrieval-observations.sql
 ```
 
-Provision a fresh runtime role (do not reuse an existing role of the same name).
-In an interactive owner session, use `\password retrieval_observation_runtime`
-to set a generated password without embedding it in SQL history:
+The following bootstrap applies once to an absent schema and a fresh role. A
+same-named preexisting object is a stop condition until its ownership, migration
+version and grants have been inspected. On a retry or reactivation, reuse only
+the verified objects created by this bootstrap; do not rerun CREATE or silently
+adopt unrelated objects. Create the role without login until validation:
 
 ```sql
-CREATE ROLE retrieval_observation_runtime LOGIN
+CREATE ROLE retrieval_observation_runtime NOLOGIN
   NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION;
 GRANT USAGE ON SCHEMA retrieval TO retrieval_observation_runtime;
 GRANT SELECT, INSERT ON retrieval.observation TO retrieval_observation_runtime;
@@ -278,15 +283,29 @@ no membership in any retrieval object owner, no schema CREATE, no observation
 UPDATE/DELETE/TRUNCATE, no feedback DELETE/TRUNCATE, and no unrelated application
 table access. Both tables must have enabled and forced RLS; the export view must
 be security-invoker. The expiry function must retain its fixed search path and
-owner, with no PUBLIC execute. Repeat the disposable isolation test using the
-deployment version; never run that fixture script against production.
+owner, with no PUBLIC execute. Check these properties before setting a password
+or enabling LOGIN; use an owner session with SET ROLE to check effective runtime
+privileges. In an interactive owner session, use
+`\password retrieval_observation_runtime` to set a generated password without SQL
+history, then `ALTER ROLE retrieval_observation_runtime LOGIN`. Repeat the
+isolation test from the exact release commit in a disposable database containing
+only synthetic fixtures; "deployment version" means the code version, not the
+production database. Never run that fixture script against production.
 
 Install the observation DSN, HMAC key, exact verified pilot subject and mode as
 secret bindings **only on the public Worker**. Keep mode `off` while provisioning;
-set `platform-text` only after the checks below. Use the approved 90-day default
+set `platform-text` only after the pre-activation checks below. Use the approved 90-day default
 or set `RETRIEVAL_OBSERVATION_TEXT_DAYS=90`. Keep actual subject IDs and secret
 values out of this repository. Binding updates can create new Worker versions:
 recheck active versions and health after configuration, not only after code deploy.
+With a DSN installed, the current scheduled handler invokes cleanup even in
+mode `off`; collection is not required for the expiry/restore checks. Restore
+fixtures belong only in the isolated test database. If provisioning partially
+fails, retain mode `off`, inspect the actual version/bindings and resume from the
+last verified step. Leave verified schema/role objects in place; do not compensate
+by dropping data. If mode was accidentally enabled, disable it, inspect whether
+records were written and maintain cleanup. A failed health check blocks further
+activation and uses the captured-version rollback rules below.
 
 Before enabling collection, establish a monitored expiry run every 15 minutes
 and a restore drill on an isolated database with synthetic fixtures. RLS hiding
@@ -301,6 +320,41 @@ extension of live-data access, and provider backups require their own verified
 deletion/restore policy. Do not enable until monitoring and the restore procedure
 are demonstrated and recorded by the deployment operator.
 
+For a global backlog check, the migration owner (with its maintenance policy),
+not an ordinary account-scoped runtime, runs the following read-only query.
+An ordinary role's RLS-filtered zero would give false assurance. This reports
+only counts and overdue seconds; it is not evidence that a scheduled run occurred.
+When there is no backlog, both counts and `oldest_overdue_seconds` must be zero:
+
+```sql
+SELECT
+  count(*) FILTER (WHERE observed_at + interval '2160 hours' <= statement_timestamp())
+    AS expired_records,
+  count(*) FILTER (WHERE query_text IS NOT NULL AND text_expires_at <= statement_timestamp())
+    AS expired_texts,
+  greatest(0, extract(epoch FROM statement_timestamp() - least(
+    min(observed_at + interval '2160 hours'),
+    min(text_expires_at) FILTER (WHERE query_text IS NOT NULL)
+  ))) AS oldest_overdue_seconds
+FROM retrieval.observation;
+```
+
+The deployment operator records pre-activation evidence in the existing private
+deployment/task report: exact release and migration; target database and role
+checks; both Worker health/version checks with mode off; one observed successful
+scheduled cleanup plus its completion time; backlog counts; a demonstrated
+missed-run alert; isolated restore/expiry results; and verified provider backup
+handling. Record no DSN, credentials, subjects or query contents. Treat two missed
+15-minute runs (30 minutes without a confirmed success) as an alert. An overdue
+backlog that remains after a successful run also alerts; a controlled restore
+stays closed until fully drained. The operator must demonstrate those alerts,
+not merely document them. This instruction does not itself install monitoring.
+
+Only once that evidence is complete may the operator enable the single-account
+pilot and perform the following **post-activation** checks. A missing prerequisite
+keeps mode off. A failed post-activation check returns mode to off while preserving
+cleanup; passing a smoke test does not complete the retrieval-quality evaluation.
+
 For the first collection check, use one harmless public-corpus query from the
 allowlisted pilot with a verified JWT. Confirm its `observation_id` is durable,
 the actual returned ranking and original expiry match, and citation feedback
@@ -311,9 +365,13 @@ the first retention review is due 30 days later. No personal-search collection
 or broad user enrollment is part of this pilot.
 
 To stop collection, set mode `off`, verify no new observations, and keep the DSN,
-scheduled cleanup and access controls until the last record expires. Do not drop
+scheduled cleanup and access controls until physical removal is confirmed after
+the last record expires, including pending shorter text deadlines. Do not drop
 tables or delete secrets as a routine rollback. If reverting to code predating
-the cleanup handler, arrange an independent expiry runner **before** rollback;
-the old Worker will not delete this journal. Restore each Worker's captured
+the cleanup handler, arrange and verify an independent expiry runner **before**
+rollback. It replaces the old Worker's missing journal cleanup and must preserve
+the same cadence, monitoring and deadline checks; it is not a second collection
+path. Without a verified replacement, keep the current cleanup-capable version
+with collection off. The old Worker will not delete this journal. Restore each Worker's captured
 version only if no other deployment has superseded this one. Disabling collection
 does not itself erase live records or reset their deadlines.
