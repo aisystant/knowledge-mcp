@@ -236,3 +236,84 @@ corpus changes and outstanding deletion obligations. Shorten the window if older
 records add no demonstrated value. Extending beyond 90 days requires a newly
 justified decision and an explicit schema change; the current environment cannot
 enable 180 days. The old 180-day proposal is superseded.
+
+### Controlled activation and rollback
+
+Activation is separate from merging this PR. First integrate current `main`,
+run both type checks, the complete tests, the privacy guard and disposable-DB
+isolation checks. Confirm the migration number is still unused. The deployment
+workflow can update **both** public and personal Workers when
+`PERSONAL_WORKER_DEPLOY_ENABLED=true`; capture each active version and check
+both health endpoints. Use the existing verified deployment workflow from
+current `main`, with collection still disabled. Do not deploy a draft branch.
+
+Use a private observation schema in the selected operational database, not an
+existing search-reader credential. Before applying the migration, inspect the
+target's identity, existing schema, role memberships, effective privileges,
+backup/restore window and transport protection. The following is a preparation
+template, not a startup migration. Run it only against the explicitly selected
+database, as its migration owner; `PGDATABASE` must be supplied securely through
+the environment, never pasted into shell history or a PR:
+
+```sh
+psql -X --no-password -v ON_ERROR_STOP=1 -f migrations/024-retrieval-observations.sql
+```
+
+Provision a fresh runtime role (do not reuse an existing role of the same name).
+In an interactive owner session, use `\password retrieval_observation_runtime`
+to set a generated password without embedding it in SQL history:
+
+```sql
+CREATE ROLE retrieval_observation_runtime LOGIN
+  NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION;
+GRANT USAGE ON SCHEMA retrieval TO retrieval_observation_runtime;
+GRANT SELECT, INSERT ON retrieval.observation TO retrieval_observation_runtime;
+GRANT SELECT, INSERT, UPDATE ON retrieval.citation_feedback TO retrieval_observation_runtime;
+GRANT SELECT ON retrieval.observation_export TO retrieval_observation_runtime;
+GRANT EXECUTE ON FUNCTION retrieval.expire_observations() TO retrieval_observation_runtime;
+```
+
+Verify the role's **effective** grants, including inherited/PUBLIC privileges:
+no membership in any retrieval object owner, no schema CREATE, no observation
+UPDATE/DELETE/TRUNCATE, no feedback DELETE/TRUNCATE, and no unrelated application
+table access. Both tables must have enabled and forced RLS; the export view must
+be security-invoker. The expiry function must retain its fixed search path and
+owner, with no PUBLIC execute. Repeat the disposable isolation test using the
+deployment version; never run that fixture script against production.
+
+Install the observation DSN, HMAC key, exact verified pilot subject and mode as
+secret bindings **only on the public Worker**. Keep mode `off` while provisioning;
+set `platform-text` only after the checks below. Use the approved 90-day default
+or set `RETRIEVAL_OBSERVATION_TEXT_DAYS=90`. Keep actual subject IDs and secret
+values out of this repository. Binding updates can create new Worker versions:
+recheck active versions and health after configuration, not only after code deploy.
+
+Before enabling collection, establish a monitored expiry run every 15 minutes
+and a restore drill on an isolated database with synthetic fixtures. RLS hiding
+and a green cron invocation alone do not prove deletion: the application contains
+cleanup errors and logs only a constant warning. An operator must check that the
+cleanup actually ran and that expired-row/text counts and oldest overdue age
+return to zero; alert on missed runs, backlog or long-held locks. A batch is at
+most 5,000 records per run, so 480,000/day is a theoretical ceiling, not measured
+capacity. Drain restored expired records/texts to zero **before** restoring
+runtime access; retain the original timestamps. A backup window is not an
+extension of live-data access, and provider backups require their own verified
+deletion/restore policy. Do not enable until monitoring and the restore procedure
+are demonstrated and recorded by the deployment operator.
+
+For the first collection check, use one harmless public-corpus query from the
+allowlisted pilot with a verified JWT. Confirm its `observation_id` is durable,
+the actual returned ranking and original expiry match, and citation feedback
+references a returned hit. Verify an unlisted subject and forged `x-user-id`
+produce no observation. Use only synthetic accounts/data for cross-account and
+expiry injection tests in the isolated database. Record the actual enable time;
+the first retention review is due 30 days later. No personal-search collection
+or broad user enrollment is part of this pilot.
+
+To stop collection, set mode `off`, verify no new observations, and keep the DSN,
+scheduled cleanup and access controls until the last record expires. Do not drop
+tables or delete secrets as a routine rollback. If reverting to code predating
+the cleanup handler, arrange an independent expiry runner **before** rollback;
+the old Worker will not delete this journal. Restore each Worker's captured
+version only if no other deployment has superseded this one. Disabling collection
+does not itself erase live records or reset their deadlines.
