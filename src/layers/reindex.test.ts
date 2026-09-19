@@ -56,6 +56,7 @@ import {
   handleWatchdog,
   getReindexJobStatus,
   startReindexJob,
+  startIncrementalReindexJob,
   relativeMarkdownPathsFromTree,
   chunkContent,
   contentHash,
@@ -543,7 +544,7 @@ describe("generation fencing (WP-560 Ф3)", () => {
   });
 
   it("handleQueue marks the source ready (fenced on generation) when the last batch of a fenced job completes", async () => {
-    queryQueue.push([{ status: "running", generation: 3 }]); // SELECT status, generation
+    queryQueue.push([{ status: "running", generation: 3, kind: "full", completed_batch_indexes: [] }]); // SELECT status, generation, kind, completed_batch_indexes
     queryQueue.push([sourceRow()]); // resolveUserContext
     queryQueue.push([{ index_generation: 3 }]); // pre-check
     queryQueue.push([{ fence: 1 }]); // fence
@@ -631,7 +632,7 @@ describe("generation fencing (WP-560 Ф3)", () => {
 
   it("watchdog also fails 'pending' jobs nobody ever started and marks their sources 'failed'", async () => {
     queryQueue.push([]); // stale running → none
-    queryQueue.push([{ id: "job-p", user_id: USER_ID, source: "DS-my-strategy", generation: 4 }]); // abandoned pending
+    queryQueue.push([{ id: "job-p", user_id: USER_ID, source: "DS-my-strategy", generation: 4, kind: "full" }]); // abandoned pending
     queryQueue.push([]); // setSourceIndexState failed
     await handleWatchdog(ENV);
     const abandoned = latestSqlCallContaining("watchdog_pending_never_started") as unknown[];
@@ -691,6 +692,8 @@ describe("handleQueue", () => {
     const body: ReindexBatchMessage = {
       job_id: "job-1", user_id: USER_ID, source: "DS-my-strategy",
       files: [{ path: "note.md", action: "modified" }],
+      batch_index: 0,
+      kind: "incremental",
       ...overrides,
     };
     return { body, ack: vi.fn(), retry: vi.fn(), attempts: 1 };
@@ -740,8 +743,12 @@ describe("handleQueue", () => {
     expect(msg2.retry).not.toHaveBeenCalled();
   });
 
-  it("acks and marks the job succeeded once the last batch completes", async () => {
-    queryQueue.push([{ status: "running" }]); // SELECT status
+  it("acks and marks the job succeeded once the last batch completes, WITHOUT touching index_state (kind='incremental')", async () => {
+    // WP-545 Ф13 cold review (Medium finding): this is the negative counterpart to "handleQueue
+    // marks the source ready (fenced on generation)..." above — that test proves kind='full'
+    // DOES flip index_state; this one proves kind='incremental' (this suite's default, via
+    // makeMessage/jobRows both omitting `kind`) must NOT, even on a real last-batch completion.
+    queryQueue.push([{ status: "running", generation: 3, kind: "incremental", completed_batch_indexes: [] }]); // SELECT status
     queryQueue.push([sourceRow()]); // resolveUserContext
     queryQueue.push([]); // DELETE (removed action)
     queryQueue.push([{ completed_batches: 2, expected_batches: 2 }]); // UPDATE ... RETURNING
@@ -751,5 +758,111 @@ describe("handleQueue", () => {
     await handleQueue(makeBatch([msg]), ENV);
     expect(msg.ack).toHaveBeenCalledOnce();
     expect(msg.retry).not.toHaveBeenCalled();
+    expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("index_state = 'reindexing' AND index_generation ="))).toBe(false);
+  });
+
+  it("watchdog never touches index_state for a stale or abandoned kind='incremental' job", async () => {
+    // Negative counterpart to the two existing "marks stale/abandoned jobs failed" tests —
+    // those don't assert on index_state at all; this one explicitly proves the kind gate holds
+    // for both the stale-running and abandoned-pending branches (WP-545 Ф13 cold review).
+    queryQueue.push([{ id: "job-stale-inc", user_id: USER_ID, source: "DS-my-strategy", kind: "incremental", generation: 1, completed_batches: 1, expected_batches: 3 }]); // stale running
+    queryQueue.push([{ id: "job-pending-inc", user_id: USER_ID, source: "DS-my-strategy", kind: "incremental", generation: 1 }]); // abandoned pending
+    await handleWatchdog(ENV);
+    expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("index_state = 'reindexing' AND index_generation ="))).toBe(false);
+  });
+});
+
+describe("startIncrementalReindexJob (WP-545 Ф13)", () => {
+  // Fresh REINDEX_QUEUE mock per test — a shared const here would leak call counts across
+  // tests in this describe block (the top-level beforeEach only resets queryQueue/sqlCalls).
+  function queueEnv(): ReindexEnv {
+    return { ...ENV, REINDEX_QUEUE: { sendBatch: vi.fn() } as unknown as ReindexEnv["REINDEX_QUEUE"] };
+  }
+
+  it("skips without touching the DB when no pushed file is indexable", async () => {
+    const result = await startIncrementalReindexJob(queueEnv(), USER_ID, "DS-my-strategy", [
+      { path: "image.png", action: "modified" },
+    ]);
+    expect(result).toMatchObject({ status: "skipped", reason: "no_indexable_files" });
+    expect(sqlCalls).toHaveLength(0);
+  });
+
+  it("rejects a path-traversal file without touching the DB, alongside real files", async () => {
+    queryQueue.push([{ active: true, auto_reindex_enabled: true }]); // probe
+    queryQueue.push([{ id: "job-inc-1", generation: 5 }]); // INSERT ... RETURNING
+    queryQueue.push([]); // UPDATE running
+
+    const result = await startIncrementalReindexJob(queueEnv(), USER_ID, "DS-my-strategy", [
+      { path: "note.md", action: "modified" },
+      { path: "../escape.md", action: "modified" },
+    ]);
+    expect(result.status).toBe("queued");
+    expect(result.rejected_paths).toBeUndefined(); // rejection is only reported on the skip path today
+  });
+
+  it("creates an incremental job and enqueues to REINDEX_QUEUE for an active, enabled source", async () => {
+    queryQueue.push([{ active: true, auto_reindex_enabled: true }]); // probe
+    queryQueue.push([{ id: "job-inc-2", generation: 5 }]); // INSERT ... SELECT ... RETURNING
+    queryQueue.push([]); // UPDATE running
+
+    const env = queueEnv();
+    const result = await startIncrementalReindexJob(env, USER_ID, "DS-my-strategy", [
+      { path: "note.md", action: "modified" },
+    ]);
+
+    expect(result).toMatchObject({ status: "queued", job_id: "job-inc-2" });
+    expect(env.REINDEX_QUEUE!.sendBatch).toHaveBeenCalledOnce();
+    const [sentBatch] = vi.mocked(env.REINDEX_QUEUE!.sendBatch).mock.calls[0] as [{ body: ReindexBatchMessage }[]];
+    expect(sentBatch[0].body).toMatchObject({ job_id: "job-inc-2", kind: "incremental", batch_index: 0 });
+
+    const insertCall = latestSqlCallContaining("kind") as unknown[];
+    expect((insertCall[0] as TemplateStringsArray).join(" ")).toContain("INSERT INTO");
+  });
+
+  it("skips with source_not_active_for_user when the source row doesn't exist", async () => {
+    queryQueue.push([]); // probe: no row
+    queryQueue.push([]); // INSERT ... RETURNING: 0 rows (WHERE active/auto_reindex_enabled doesn't match)
+
+    const result = await startIncrementalReindexJob(queueEnv(), USER_ID, "DS-my-strategy", [
+      { path: "note.md", action: "modified" },
+    ]);
+    expect(result).toMatchObject({ status: "skipped", reason: "source_not_active_for_user" });
+  });
+
+  it("skips with auto_reindex_disabled when the source is active but opted out", async () => {
+    queryQueue.push([{ active: true, auto_reindex_enabled: false }]); // probe
+    queryQueue.push([]); // INSERT ... RETURNING: 0 rows
+
+    const result = await startIncrementalReindexJob(queueEnv(), USER_ID, "DS-my-strategy", [
+      { path: "note.md", action: "modified" },
+    ]);
+    expect(result).toMatchObject({ status: "skipped", reason: "auto_reindex_disabled" });
+  });
+
+  it("falls back to state_changed_during_check when the atomic insert disagrees with the earlier probe (TOCTOU)", async () => {
+    // The probe read "active" a moment before a concurrent disconnect flipped it — the
+    // informational SELECT is stale, but the atomic INSERT...SELECT...RETURNING is still the
+    // authoritative gate and correctly returns no job.
+    queryQueue.push([{ active: true, auto_reindex_enabled: true }]); // probe (now stale)
+    queryQueue.push([]); // INSERT ... RETURNING: 0 rows (source deactivated in the gap)
+
+    const result = await startIncrementalReindexJob(queueEnv(), USER_ID, "DS-my-strategy", [
+      { path: "note.md", action: "modified" },
+    ]);
+    expect(result).toMatchObject({ status: "skipped", reason: "state_changed_during_check" });
+  });
+
+  it("marks the job failed, never the source's index_state, when enqueueing throws", async () => {
+    queryQueue.push([{ active: true, auto_reindex_enabled: true }]); // probe
+    queryQueue.push([{ id: "job-inc-3", generation: 5 }]); // INSERT ... RETURNING
+    queryQueue.push(new Error("connection reset")); // UPDATE running throws
+
+    const result = await startIncrementalReindexJob(queueEnv(), USER_ID, "DS-my-strategy", [
+      { path: "note.md", action: "modified" },
+    ]);
+    expect(result).toMatchObject({ status: "failed", job_id: "job-inc-3" });
+    // Only the job row got a failure UPDATE — user_sources.index_state was never touched
+    // (kind='incremental' never gates that call in the first place).
+    expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("index_state = 'failed'"))).toBe(false);
   });
 });
