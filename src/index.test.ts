@@ -894,6 +894,101 @@ describe("searchDocuments embedding resilience", () => {
   });
 });
 
+// --- searchDocuments: empty vector result must still reach keyword search ---
+// A legitimately empty ANN result (chunks without an embedding, or a narrow filter) used
+// to skip keyword search entirely and return `[]` — the low-confidence fallback branch
+// only fired for a NON-empty vector result. These tests pin the fallback.
+
+describe("searchDocuments empty-vector keyword fallback", () => {
+  const originalFetch = globalThis.fetch;
+  const env = {
+    KNOWLEDGE_DATABASE_URL: "postgres://knowledge",
+    HEALTH_DATABASE_URL: "postgres://health",
+    OPENROUTER_API_KEY: "private-api-key",
+  };
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("returns keyword results when the vector query is empty but the embedding succeeded", async () => {
+    const query = "мим мастер роль";
+    const fetchMock = vi.fn().mockResolvedValue(mockEmbeddingResponse([0.1, 0.2, 0.3]));
+    globalThis.fetch = fetchMock;
+
+    const keywordRow = {
+      id: 42,
+      filename: "mim-master-role.md",
+      content: "Роль мастера МИМ: ведёт группу по программе.",
+      source: "docs-courses",
+      source_type: "course",
+      score: 0.9,
+    };
+    // DB call order: vectorSearch (empty) → keywordSearch (hit) → enrichWithParentContent.
+    const rowBatches = [[], [keywordRow], []];
+    let dbCall = 0;
+    mockWithUserContextImpl = (fn) => fn(makeMockSql(rowBatches[dbCall++] ?? []));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const results = await searchDocuments(env, query, "docs-courses", undefined, 5);
+
+    // Embedding fetched once; a single candidate never reaches the LLM reranker.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(dbCall).toBe(3);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ filename: "mim-master-role.md", source: "docs-courses", score: 0.9 });
+    expect(mockPoolEnd).toHaveBeenCalledTimes(1);
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const logLine = warnSpy.mock.calls[0][0] as string;
+    expect(JSON.parse(logLine)).toEqual({
+      event: "knowledge_search_vector_empty",
+      fallback: "keyword",
+      keyword_result_count: 1,
+      source_filter_present: true,
+      source_type_filter_present: false,
+    });
+    expect(logLine).not.toContain(query);
+    expect(logLine).not.toContain(env.OPENROUTER_API_KEY);
+  });
+
+  it("still returns [] when both vector and keyword find nothing, and says so in the log", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockEmbeddingResponse([0.1, 0.2, 0.3]));
+    globalThis.fetch = fetchMock;
+    let dbCall = 0;
+    mockWithUserContextImpl = (fn) => { dbCall += 1; return fn(makeMockSql([])); };
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const results = await searchDocuments(env, "как устроены системные уровни");
+
+    expect(results).toEqual([]);
+    // vectorSearch + keywordSearch; enrichWithParentContent short-circuits on empty input.
+    expect(dbCall).toBe(2);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(warnSpy.mock.calls[0][0] as string)).toMatchObject({
+      event: "knowledge_search_vector_empty",
+      keyword_result_count: 0,
+    });
+  });
+
+  it("does not repeat keyword search for a keyword-typed query that already found nothing", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockEmbeddingResponse([0.1, 0.2, 0.3]));
+    globalThis.fetch = fetchMock;
+    let dbCall = 0;
+    mockWithUserContextImpl = (fn) => { dbCall += 1; return fn(makeMockSql([])); };
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    // Entity code → keyword-first path: keywordSearch (empty) → vectorSearch (empty) → stop.
+    const results = await searchDocuments(env, "DP.D.053 §4");
+
+    expect(results).toEqual([]);
+    expect(dbCall).toBe(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+});
+
 // --- enrichWithParentContent ---
 
 describe("enrichWithParentContent", () => {

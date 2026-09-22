@@ -1026,9 +1026,26 @@ export async function searchDocuments(
       return await enrichWithParentContent(env, fallbackResults, userId, pool);
     }
 
-    // Low-confidence fallback: if vector top score < threshold, try keyword
-    if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
+    // Keyword fallback when the vector path cannot stand on its own: the top hit is below
+    // the confidence threshold, OR the ANN query legitimately returned nothing (chunks
+    // without an embedding, or a narrow source/source_type filter). Previously only the
+    // low-confidence case fell back to keyword search — a legitimately empty vector result
+    // skipped it entirely and returned `[]` with no fallback at all. A keyword-typed query
+    // already ran keywordSearch above and found nothing, so it's not repeated here.
+    const vectorEmpty = vectorResults.length === 0;
+    const vectorLowConfidence = !vectorEmpty && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD;
+    if (queryType !== "keyword" && (vectorEmpty || vectorLowConfidence)) {
       const kwFallback = await keywordSearch(env, query, source, sourceType, limit, userId, pool);
+      if (vectorEmpty) {
+        // Same privacy contract as knowledge_search_embedding_fallback: no query text, no key.
+        console.warn(JSON.stringify({
+          event: "knowledge_search_vector_empty",
+          fallback: "keyword",
+          keyword_result_count: kwFallback.length,
+          source_filter_present: source !== undefined,
+          source_type_filter_present: sourceType !== undefined,
+        }));
+      }
       if (kwFallback.length > 0) {
         // Merge: deduplicate by filename, keep highest score
         const seen = new Map<string, SearchResult>();
