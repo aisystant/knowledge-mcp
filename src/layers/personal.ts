@@ -702,6 +702,16 @@ async function putAllocatorLog(
  * same `draftId` (no TTL — a draft can sit unpushed for hours, WP-560 Ф12 round 1
  * blocker) returns the same number without a new commit, instead of racing a second
  * number into existence.
+ *
+ * Bootstrap note (found 2026-09-24, DS-Knowledge-Index-Tseren): the log is this
+ * function's only source of truth for "next number" — it never scans existing post
+ * files. A repo that already has manually/locally-numbered posts (the pre-allocator
+ * convention in scripts/new-post.py, which scans docs/**\/*-1-club-*.md frontmatter)
+ * starts with an empty log, so the first-ever call here returns post_number 1 even
+ * when the repo's real history already goes past 200. Before wiring this allocator
+ * onto a repo with such pre-existing history, seed ALLOCATOR_LOG_PATH with one entry
+ * whose post_number equals that repo's actual historical max — otherwise the first
+ * live allocation collides with an already-used number.
  */
 export async function allocatePostNumber(
   env: PersonalEnv,
