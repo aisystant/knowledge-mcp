@@ -199,7 +199,21 @@ export async function checkBridgeWriteScope(opts: {
   } catch {
     // Request syntax is rejected before scope lookup or audit writes. No stateful enforcement
     // work should run for a path that cannot identify one repository object unambiguously.
-    return deny("scope denied: path must be a safe repository-relative path", "path_not_allowed", toolName, source);
+    //
+    // detail distinguishes "the caller never sent a path" from an actually malformed one — the
+    // low-level tools/call handler in gateway-mcp does not enforce the tool schema's `required`
+    // list before dispatch (WP-560 round 8/9), so a tool call that omits `path` reaches this
+    // branch and, without this detail, reads to the caller exactly like an authorization denial
+    // (found diagnosing a real user report, 2026-09-24). No raw path/hex here — see
+    // agent_scope_violations for the audited value on the other path_not_allowed branches.
+    const detail = path === undefined
+      ? "missing"
+      : path === "" ? "empty"
+      : path.includes("\0") ? "contains_nul"
+      : path.startsWith("/") ? "leading_slash"
+      : path.includes("\\") ? "contains_backslash"
+      : "empty_or_escapes_root";
+    return deny(`scope denied: path must be a safe repository-relative path (${detail})`, "path_not_allowed", toolName, source);
   }
   let isPeerPilotFallback = false;
   let isOwnDataWiden = false;
