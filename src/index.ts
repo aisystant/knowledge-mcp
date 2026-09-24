@@ -2858,7 +2858,13 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
           };
           // new_post carries no file path (it commits to a fixed internal log path, not a
           // caller-supplied one) — same shape as disconnect_source/purge_source below.
-          const PATH_NOT_REQUIRED_TOOLS: ReadonlySet<string> = new Set(["disconnect_source", "purge_source", "new_post"]);
+          // propose_capture returns a preview only (no repo write happens here — the caller
+          // confirms with a separate `write` call, which IS path-checked); suggested_path is
+          // optional by the tool's own schema and the handler below fills a default when it's
+          // omitted, but that fill happens AFTER this scope check — omitting it here previously
+          // denied a legitimate call with the same path_not_allowed text a missing path gets.
+          // Found alongside the required-argument gap, 2026-09-24 (peer-session with Kimi+Codex).
+          const PATH_NOT_REQUIRED_TOOLS: ReadonlySet<string> = new Set(["disconnect_source", "purge_source", "new_post", "propose_capture"]);
           const canonicalToolName = SCOPE_CHECKED_TOOLS[toolName];
 
           if (canonicalToolName) {
