@@ -8,6 +8,7 @@
 // see security-gate-b73-private-port.md §2, "не RLS — подтверждено 2026-06-11, relrowsecurity=f").
 
 import { neon } from "@neondatabase/serverless";
+import { isMap, isScalar, parseDocument } from "yaml";
 import { getKnowledgeSchema, KNOWLEDGE_TABLES } from "../utils/db.js";
 import { provisionBridgeScopes } from "../scope.js";
 import { buildPathTree, extractTitle, utf8ByteLength, type PathEntry } from "../path-tree.js";
@@ -602,25 +603,28 @@ export async function writeToGitHub(
 }
 
 // --- Post-number allocator (WP-560 Ф12) ---
-// Git-native atomic allocator, replacing the local filesystem scan `scripts/new-post.py`
-// used to do (duplicated post_number 190/191/196/197 under concurrent runs).
-//
-// Not routed through writeToGitHub: that function re-checks the file's sha fresh right
-// before the PUT, but sends whatever `content` the caller already built from an earlier
-// read — so a racing second call would still pass its sha check (the sha IS current)
-// while overwriting the first call's entry with content built from a stale, entry-missing
-// read. This loop always rebuilds `content` from the exact read that produced the sha it
-// sends, which is what actually closes the race.
+// All reads belong to one immutable Git commit. A new commit has that exact parent;
+// advancing the branch with force:false rejects a competing sibling commit, even if
+// the competing writer changed a post without touching the allocator log.
 
-/** Append-only log path in the managed Knowledge Index repo. One JSON object per line. */
 export const ALLOCATOR_LOG_PATH = "docs/_allocator-log.jsonl";
-
-/** Allowlist, not a free-form string — an unlisted type is a 400, not a new numbering series (WP-560 Ф12 round 1-2: unbounded artifact_type was flagged as unnecessary surface for a fix with exactly one live consumer). */
 export const ALLOCATOR_ALLOWED_ARTIFACT_TYPES = ["post"] as const;
 export type AllocatorArtifactType = (typeof ALLOCATOR_ALLOWED_ARTIFACT_TYPES)[number];
 
 const ALLOCATOR_DRAFT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ALLOCATOR_MAX_RETRIES = 5;
+const ALLOCATOR_BLOB_BATCH_SIZE = 40;
+const ALLOCATOR_MAX_BYTES = 8 * 1024 * 1024;
+const ALLOCATOR_MAX_BLOB_BYTES = 1024 * 1024;
+const ALLOCATOR_MAX_REQUESTS = 40;
+// The gateway gives tools/call 30s; leave room for routing and response serialization.
+const ALLOCATOR_DEADLINE_MS = 25_000;
+const CLUB_POST_PATH = /^docs\/.*-1-club-[^/]+\.md$/;
+const LEGACY_CLUB_NUMBER = /^(\d+)-1-club-/;
+
+type AllocatorFailureReason = "invalid_draft_id" | "invalid_artifact_type" | "unknown_source"
+  | "no_installation" | "allocator_conflict_exhausted" | "github_error"
+  | "invalid_allocator_state" | "post_number_ownership_conflict" | "allocator_budget_exceeded";
 
 export interface AllocatorLogEntry {
   draft_id: string;
@@ -633,164 +637,345 @@ export interface AllocatePostNumberResult {
   success: boolean;
   post_number?: number;
   draft_id?: string;
-  /** true when draft_id was already allocated — same number returned, no new commit made. */
   reused?: boolean;
   error?: string;
-  reason?: "invalid_draft_id" | "invalid_artifact_type" | "unknown_source" | "no_installation" | "allocator_conflict_exhausted" | "github_error";
+  reason?: AllocatorFailureReason;
 }
 
-async function readAllocatorLog(
-  githubFetch: typeof globalThis.fetch,
-  owner: string,
-  repo: string,
-  token: string,
-): Promise<{ entries: AllocatorLogEntry[]; sha: string | null }> {
-  const apiUrl = githubContentsApiUrl(owner, repo, ALLOCATOR_LOG_PATH);
-  const resp = await githubFetch(apiUrl, {
-    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
-  });
-  if (resp.status === 404) return { entries: [], sha: null };
-  if (!resp.ok) throw new Error(`GitHub API error reading allocator log (${resp.status}): ${await resp.text()}`);
+class AllocatorStateError extends Error {}
+class AllocatorBudgetError extends Error {}
 
-  const data = (await resp.json()) as { content: string; sha: string };
-  const raw = decodeURIComponent(escape(atob(data.content.replace(/\n/g, ""))));
-  const entries = raw
-    .split("\n")
-    .map(line => line.trim())
-    .filter(Boolean)
-    .map(line => JSON.parse(line) as AllocatorLogEntry);
-  return { entries, sha: data.sha };
-}
-
-/**
- * PUT the full log content. `currentSha` must come from the SAME read that produced
- * `content` (see module note above) — never a sha fetched separately from the content
- * being sent. Returns `conflict: true` on any sha-mismatch signal (409, or 422 naming
- * "sha" — the latter covers "sha required" when the file appeared between our GET and
- * this PUT, same retryable race as an outright stale sha).
- */
-async function putAllocatorLog(
-  githubFetch: typeof globalThis.fetch,
-  owner: string,
-  repo: string,
-  token: string,
-  content: string,
-  message: string,
-  currentSha: string | null,
-): Promise<{ ok: true } | { ok: false; conflict: true } | { ok: false; conflict: false; error: string }> {
-  const apiUrl = githubContentsApiUrl(owner, repo, ALLOCATOR_LOG_PATH);
-  const resp = await githubFetch(apiUrl, {
-    method: "PUT",
-    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge", "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message,
-      content: btoa(unescape(encodeURIComponent(content))),
-      ...(currentSha ? { sha: currentSha } : {}),
-    }),
-  });
-  if (resp.ok) return { ok: true };
-
-  const errText = await resp.text();
-  if (resp.status === 409 || (resp.status === 422 && /sha/i.test(errText))) {
-    return { ok: false, conflict: true };
+function allocatorRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new AllocatorStateError("Invalid allocator/GitHub object.");
   }
-  return { ok: false, conflict: false, error: `GitHub API error ${resp.status}: ${errText}` };
+  return value as Record<string, unknown>;
 }
 
-/**
- * Allocate the next post number for `draftId`, idempotently. Calling again with the
- * same `draftId` (no TTL — a draft can sit unpushed for hours, WP-560 Ф12 round 1
- * blocker) returns the same number without a new commit, instead of racing a second
- * number into existence.
- *
- * Bootstrap note (found 2026-09-24, DS-Knowledge-Index-Tseren): the log is this
- * function's only source of truth for "next number" — it never scans existing post
- * files. A repo that already has manually/locally-numbered posts (the pre-allocator
- * convention in scripts/new-post.py, which scans docs/**\/*-1-club-*.md frontmatter)
- * starts with an empty log, so the first-ever call here returns post_number 1 even
- * when the repo's real history already goes past 200. Before wiring this allocator
- * onto a repo with such pre-existing history, seed ALLOCATOR_LOG_PATH with one entry
- * whose post_number equals that repo's actual historical max — otherwise the first
- * live allocation collides with an already-used number.
- */
+function allocatorSha(value: unknown): string {
+  if (typeof value !== "string" || !GIT_BLOB_SHA.test(value)) {
+    throw new AllocatorStateError("Invalid Git object SHA.");
+  }
+  return value;
+}
+
+function isPostNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function parseAllocatorLog(raw: string): AllocatorLogEntry[] {
+  const draftIds = new Set<string>();
+  const numbers = new Set<number>();
+  return raw.split("\n").filter(line => line.trim()).map((line, index) => {
+    let value: Record<string, unknown>;
+    try {
+      value = allocatorRecord(JSON.parse(line));
+    } catch {
+      throw new AllocatorStateError(`Invalid allocator log JSON at entry ${index + 1}.`);
+    }
+    // JSON.parse establishes JSON syntax; YAML's JSON schema also rejects duplicate
+    // (including escaped-equivalent) keys instead of keeping only their last value.
+    const document = parseDocument(line, { uniqueKeys: true, schema: "json" });
+    const keys = Object.keys(value);
+    const expectedKeys = ["draft_id", "artifact_type", "post_number", "timestamp"];
+    if (document.errors.length || keys.length !== expectedKeys.length
+      || keys.some(key => !expectedKeys.includes(key))) {
+      throw new AllocatorStateError(`Invalid/duplicate allocator log keys at entry ${index + 1}.`);
+    }
+    const { draft_id: draftId, post_number: postNumber, artifact_type: type, timestamp } = value;
+    if (typeof draftId !== "string" || !ALLOCATOR_DRAFT_ID.test(draftId)
+      || type !== "post" || !isPostNumber(postNumber)
+      || typeof timestamp !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(timestamp)
+      || !Number.isFinite(Date.parse(timestamp))) {
+      throw new AllocatorStateError(`Invalid allocator log fields at entry ${index + 1}.`);
+    }
+    if (draftIds.has(draftId.toLowerCase()) || numbers.has(postNumber)) {
+      throw new AllocatorStateError("Duplicate draft_id or post_number in allocator log.");
+    }
+    draftIds.add(draftId.toLowerCase());
+    numbers.add(postNumber);
+    return value as unknown as AllocatorLogEntry;
+  });
+}
+
+interface HistoricalPost {
+  postNumber: number;
+  draftId?: string;
+}
+
+// Parse YAML without evaluating aliases/merge keys. Only scalar ownership fields
+// participate in numbering; prose and unrelated frontmatter never claim a number.
+function historicalPost(content: string, path: string): HistoricalPost | null {
+  const lines = content.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").split("\n");
+  let header = "";
+  if (lines[0]?.trim() === "---") {
+    const end = lines.findIndex((line, index) => index > 0 && /^(---|\.\.\.)\s*$/.test(line));
+    if (end < 0) throw new AllocatorStateError(`Unclosed post frontmatter: ${path}`);
+    header = lines.slice(1, end).join("\n");
+  }
+  const document = parseDocument(header, { uniqueKeys: true });
+  if (document.errors.length || (document.contents !== null && !isMap(document.contents))) {
+    throw new AllocatorStateError(`Invalid post frontmatter: ${path}`);
+  }
+  if (isMap(document.contents) && document.contents.items.some(pair =>
+    !isScalar(pair.key) || typeof pair.key.value !== "string" || pair.key.value === "<<")) {
+    throw new AllocatorStateError(`Ambiguous post frontmatter keys: ${path}`);
+  }
+  const scalar = (name: string): string | undefined => {
+    const node = document.get(name, true);
+    if (node === undefined) return undefined;
+    if (name === "post_number" && isScalar(node) && node.value === null
+      && (node.tag === undefined || node.tag === "tag:yaml.org,2002:null")) return undefined;
+    const allowedTags = name === "draft_id" ? ["tag:yaml.org,2002:str"]
+      : ["tag:yaml.org,2002:str", "tag:yaml.org,2002:int"];
+    if (!isScalar(node) || !["PLAIN", "QUOTE_SINGLE", "QUOTE_DOUBLE"].includes(node.type ?? "")
+      || (node.tag !== undefined && !allowedTags.includes(node.tag))
+      || (typeof node.value !== "string" && typeof node.value !== "number")
+      || (name === "draft_id" && typeof node.value !== "string")) {
+      throw new AllocatorStateError(`Invalid ${name} scalar: ${path}`);
+    }
+    return typeof node.value === "number" ? node.source : node.value;
+  };
+  const numberText = scalar("post_number");
+  const draftId = scalar("draft_id");
+  if (numberText !== undefined && !/^\d+$/.test(numberText)) {
+    throw new AllocatorStateError(`Invalid post_number: ${path}`);
+  }
+  if (draftId !== undefined && !ALLOCATOR_DRAFT_ID.test(draftId)) {
+    throw new AllocatorStateError(`Invalid draft_id: ${path}`);
+  }
+  const legacy = path.split("/").at(-1)?.match(LEGACY_CLUB_NUMBER);
+  const claimedNumber = numberText ?? legacy?.[1];
+  if (claimedNumber === undefined) {
+    if (draftId !== undefined) throw new AllocatorStateError(`Draft ownership has no global post number: ${path}`);
+    return null;
+  }
+  const postNumber = Number(claimedNumber);
+  if (!isPostNumber(postNumber)) throw new AllocatorStateError(`Invalid post number: ${path}`);
+  return { postNumber, ...(draftId ? { draftId: draftId.toLowerCase() } : {}) };
+}
+
+class AllocatorGitClient {
+  private readonly baseUrl: string;
+  private readonly headers: Record<string, string>;
+  private readonly blobs = new Map<string, string>();
+  private requests = 0;
+  private blobBytes = 0;
+
+  constructor(private readonly githubFetch: typeof globalThis.fetch, private readonly owner: string,
+    private readonly repo: string, token: string, private readonly signal: AbortSignal) {
+    this.baseUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+    this.headers = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json",
+      "User-Agent": "aisystant-knowledge", "Content-Type": "application/json" };
+  }
+
+  private async fetch(url: string, method: string, body?: unknown): Promise<Response> {
+    if (this.signal.aborted || this.requests >= ALLOCATOR_MAX_REQUESTS) {
+      throw new AllocatorBudgetError("Allocator deadline or request budget exhausted; no further Git writes allowed.");
+    }
+    this.requests++;
+    return this.githubFetch(url, { method, headers: this.headers, signal: this.signal,
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+  }
+
+  request(path: string, method = "GET", body?: unknown): Promise<Response> {
+    return this.fetch(`${this.baseUrl}${path}`, method, body);
+  }
+
+  async object(path: string, method = "GET", body?: unknown): Promise<Record<string, unknown>> {
+    const response = await this.request(path, method, body);
+    if (!response.ok) throw new Error(`GitHub ${method} ${path} failed (${response.status}).`);
+    return allocatorRecord(await response.json());
+  }
+
+  // GraphQL batches immutable blob IDs, not mutable paths. Validate every alias before
+  // accepting a batch: GraphQL can return partial data together with HTTP 200/errors.
+  async readBlobs(shas: string[]): Promise<Map<string, string>> {
+    const missing = [...new Set(shas)].filter(sha => !this.blobs.has(sha));
+    for (let offset = 0; offset < missing.length; offset += ALLOCATOR_BLOB_BATCH_SIZE) {
+      const batch = missing.slice(offset, offset + ALLOCATOR_BLOB_BATCH_SIZE);
+      const selections = batch.map((sha, index) =>
+        `b${index}: object(oid: "${allocatorSha(sha)}") { ... on Blob { oid byteSize isBinary isTruncated text } }`).join("\n");
+      const response = await this.fetch("https://api.github.com/graphql", "POST", {
+        query: `query AllocatorBlobs($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { ${selections} } }`,
+        variables: { owner: this.owner, repo: this.repo },
+      });
+      if (!response.ok) throw new Error(`GitHub blob batch failed (${response.status}).`);
+      const result = allocatorRecord(await response.json());
+      if (result.errors !== undefined) throw new AllocatorStateError("GitHub returned incomplete GraphQL blob data.");
+      const repository = allocatorRecord(allocatorRecord(result.data).repository);
+      for (const [index, sha] of batch.entries()) {
+        const blob = allocatorRecord(repository[`b${index}`]);
+        if (blob.oid !== sha || blob.isBinary !== false || blob.isTruncated !== false
+          || typeof blob.text !== "string" || typeof blob.byteSize !== "number"
+          || blob.byteSize !== utf8ByteLength(blob.text)) {
+          throw new AllocatorStateError("Incomplete or mismatched Git blob.");
+        }
+        this.blobBytes += blob.byteSize;
+        if (blob.byteSize > ALLOCATOR_MAX_BLOB_BYTES || this.blobBytes > ALLOCATOR_MAX_BYTES) {
+          throw new AllocatorBudgetError("Allocator historical content exceeds the bounded read budget.");
+        }
+        this.blobs.set(sha, blob.text);
+      }
+    }
+    return this.blobs;
+  }
+}
+
+interface AllocatorSnapshot {
+  head: string;
+  tree: string;
+  entries: AllocatorLogEntry[];
+  log: string;
+  posts: HistoricalPost[];
+}
+
+async function readAllocatorSnapshot(git: AllocatorGitClient, branch: string): Promise<AllocatorSnapshot> {
+  const ref = await git.object(`/git/ref/heads/${encodeURIComponent(branch)}`);
+  const head = allocatorSha(allocatorRecord(ref.object).sha);
+  const commit = await git.object(`/git/commits/${head}`);
+  if (commit.sha !== head) throw new AllocatorStateError("Git commit does not match the requested snapshot.");
+  const tree = allocatorSha(allocatorRecord(commit.tree).sha);
+  const listing = await git.object(`/git/trees/${tree}?recursive=1`);
+  if (listing.sha !== tree || listing.truncated !== false || !Array.isArray(listing.tree)) {
+    throw new AllocatorStateError("Incomplete Git tree; allocator cannot establish the historical maximum.");
+  }
+  const treeEntries = listing.tree.map(allocatorRecord);
+  if (treeEntries.some(file => typeof file.path !== "string")) {
+    throw new AllocatorStateError("Incomplete Git tree entry path.");
+  }
+  const files = treeEntries.filter(file =>
+    file.path === ALLOCATOR_LOG_PATH || CLUB_POST_PATH.test(file.path as string));
+  if (new Set(files.map(file => file.path)).size !== files.length) {
+    throw new AllocatorStateError("Duplicate Git tree paths.");
+  }
+  let totalBytes = 0;
+  for (const file of files) {
+    if (file.type !== "blob" || !["100644", "100755"].includes(String(file.mode))
+      || typeof file.size !== "number" || !Number.isSafeInteger(file.size) || file.size < 0) {
+      throw new AllocatorStateError("Allocator log and posts must be complete regular Git files.");
+    }
+    totalBytes += file.size;
+    if (file.size > ALLOCATOR_MAX_BLOB_BYTES || totalBytes > ALLOCATOR_MAX_BYTES) {
+      throw new AllocatorBudgetError("Allocator historical content exceeds the bounded read budget.");
+    }
+  }
+  const blobs = await git.readBlobs(files.map(file => allocatorSha(file.sha)));
+  let log = "";
+  const posts: HistoricalPost[] = [];
+  for (const file of files) {
+    const content = blobs.get(file.sha as string)!;
+    if (file.path === ALLOCATOR_LOG_PATH) log = content;
+    else {
+      const post = historicalPost(content, file.path as string);
+      if (post) posts.push(post);
+    }
+  }
+  return { head, tree, entries: parseAllocatorLog(log), log, posts };
+}
+
+async function commitAllocatorEntry(
+  git: AllocatorGitClient, branch: string, snapshot: AllocatorSnapshot, entry: AllocatorLogEntry,
+): Promise<"committed" | "conflict"> {
+  const content = snapshot.log + (snapshot.log && !snapshot.log.endsWith("\n") ? "\n" : "")
+    + JSON.stringify(entry) + "\n";
+  const tree = await git.object("/git/trees", "POST", {
+    base_tree: snapshot.tree,
+    tree: [{ path: ALLOCATOR_LOG_PATH, mode: "100644", type: "blob", content }],
+  });
+  const commit = await git.object("/git/commits", "POST", {
+    message: `chore(allocator): allocate post #${entry.post_number} (draft ${entry.draft_id})`,
+    tree: allocatorSha(tree.sha), parents: [snapshot.head],
+  });
+  // A sibling commit cannot fast-forward the current ref: both allocators and legacy
+  // post writers invalidate this snapshot. Unreferenced tree/commit objects are harmless.
+  const response = await git.request(`/git/refs/heads/${encodeURIComponent(branch)}`, "PATCH", {
+    sha: allocatorSha(commit.sha), force: false,
+  });
+  if (response.ok) return "committed";
+  if (response.status === 409) return "conflict";
+  if (response.status === 422 && /not a fast[ -]forward|not fast[ -]forward/i.test(await response.text())) {
+    return "conflict";
+  }
+  throw new Error(`GitHub branch update failed (${response.status}).`);
+}
+
+function withinAllocatorDeadline<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const aborted = () => reject(new AllocatorBudgetError("Allocator authentication deadline exhausted."));
+    signal.addEventListener("abort", aborted, { once: true });
+    operation.then(value => {
+      signal.removeEventListener("abort", aborted);
+      resolve(value);
+    }, error => {
+      signal.removeEventListener("abort", aborted);
+      reject(error);
+    });
+    if (signal.aborted) aborted();
+  });
+}
+
+/** Reserve against both existing posts and the append-only log at the same Git head. */
 export async function allocatePostNumber(
-  env: PersonalEnv,
-  ctx: UserContext,
-  source: string,
-  draftId: string,
-  artifactType: string,
+  env: PersonalEnv, ctx: UserContext, source: string, draftId: string, artifactType: string,
   dependencies: Partial<GitHubApiDependencies> = {},
 ): Promise<AllocatePostNumberResult> {
-  if (!ALLOCATOR_DRAFT_ID.test(draftId)) {
+  if (typeof draftId !== "string" || !ALLOCATOR_DRAFT_ID.test(draftId)) {
     return { success: false, reason: "invalid_draft_id", error: "draft_id должен быть UUID (v4/v7)." };
   }
-  if (!(ALLOCATOR_ALLOWED_ARTIFACT_TYPES as readonly string[]).includes(artifactType)) {
-    return {
-      success: false,
-      reason: "invalid_artifact_type",
-      error: `artifact_type должен быть одним из: ${ALLOCATOR_ALLOWED_ARTIFACT_TYPES.join(", ")}.`,
-    };
+  if (artifactType !== "post") {
+    return { success: false, reason: "invalid_artifact_type", error: "artifact_type должен быть post." };
   }
-
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return { success: false, reason: "unknown_source", error: `Unknown source: ${source}` };
-
-  const owner = userSource.githubOwner;
-  const repo = userSource.githubRepo;
-  const getToken = dependencies.getInstallationToken ?? getInstallationToken;
-  const githubFetch = dependencies.fetch ?? globalThis.fetch;
-  const token = await getToken(env, ctx.userId, repo);
-  if (!token) {
-    return {
-      success: false,
-      reason: "no_installation",
-      error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge`,
-    };
-  }
-
-  for (let attempt = 0; attempt < ALLOCATOR_MAX_RETRIES; attempt++) {
-    let entries: AllocatorLogEntry[];
-    let sha: string | null;
-    try {
-      ({ entries, sha } = await readAllocatorLog(githubFetch, owner, repo, token));
-    } catch (err) {
-      return { success: false, reason: "github_error", error: err instanceof Error ? err.message : String(err) };
-    }
-
-    const existing = entries.find(e => e.draft_id === draftId);
-    if (existing) {
-      return { success: true, post_number: existing.post_number, draft_id: draftId, reused: true };
-    }
-
-    const nextNumber = entries.reduce((max, e) => Math.max(max, e.post_number), 0) + 1;
-    const newEntry: AllocatorLogEntry = {
-      draft_id: draftId,
-      artifact_type: artifactType as AllocatorArtifactType,
-      post_number: nextNumber,
-      timestamp: new Date().toISOString(),
-    };
-    const newContent = entries.map(e => JSON.stringify(e)).concat(JSON.stringify(newEntry)).join("\n") + "\n";
-
-    const putResult = await putAllocatorLog(
-      githubFetch, owner, repo, token, newContent,
-      `chore(allocator): allocate post #${nextNumber} (draft ${draftId})`,
-      sha,
+  const canonicalDraftId = draftId.toLowerCase();
+  const signal = AbortSignal.timeout(ALLOCATOR_DEADLINE_MS);
+  try {
+    // Existing authentication has no cancellation parameter. Deadline failure stops
+    // this allocation; a late auth result cannot start repository reads or writes.
+    const token = await withinAllocatorDeadline(
+      (dependencies.getInstallationToken ?? getInstallationToken)(env, ctx.userId, userSource.githubRepo), signal,
     );
-    if (putResult.ok) {
-      return { success: true, post_number: nextNumber, draft_id: draftId, reused: false };
+    if (!token) return { success: false, reason: "no_installation", error: "No GitHub App installation found for this repository." };
+    const git = new AllocatorGitClient(dependencies.fetch ?? globalThis.fetch, userSource.githubOwner, userSource.githubRepo, token, signal);
+    const repository = await git.object("");
+    if (typeof repository.default_branch !== "string" || !repository.default_branch) {
+      throw new AllocatorStateError("Repository default branch is unavailable.");
     }
-    if (putResult.conflict) {
-      continue; // another allocation landed between our read and PUT — re-read and retry.
+    for (let attempt = 0; attempt < ALLOCATOR_MAX_RETRIES; attempt++) {
+      const snapshot = await readAllocatorSnapshot(git, repository.default_branch);
+      const existing = snapshot.entries.find(entry => entry.draft_id.toLowerCase() === canonicalDraftId);
+      const draftPosts = snapshot.posts.filter(post => post.draftId === canonicalDraftId);
+      if (draftPosts.some(post => post.postNumber !== existing?.post_number)) {
+        return { success: false, reason: "post_number_ownership_conflict",
+          error: "Публикация с этим draft_id уже существует, но её номер не совпадает с общим резервом." };
+      }
+      if (existing) {
+        const owners = snapshot.posts.filter(post => post.postNumber === existing.post_number);
+        if (owners.some(post => post.draftId !== canonicalDraftId) || owners.length > 1) {
+          return { success: false, reason: "post_number_ownership_conflict",
+            error: "Зарезервированный номер уже занят публикацией с неподтверждённым владельцем draft_id." };
+        }
+        return { success: true, post_number: existing.post_number, draft_id: canonicalDraftId, reused: true };
+      }
+      const reservedMax = snapshot.entries.reduce((max, entry) => Math.max(max, entry.post_number), 0);
+      const highest = snapshot.posts.reduce((max, post) => Math.max(max, post.postNumber), reservedMax);
+      if (!isPostNumber(highest + 1)) throw new AllocatorStateError("Post number exceeds the safe integer range.");
+      const entry: AllocatorLogEntry = { draft_id: canonicalDraftId, artifact_type: "post",
+        post_number: highest + 1, timestamp: new Date().toISOString() };
+      if (await commitAllocatorEntry(git, repository.default_branch, snapshot, entry) === "committed") {
+        return { success: true, post_number: entry.post_number, draft_id: canonicalDraftId, reused: false };
+      }
     }
-    console.error(JSON.stringify({ phase: "allocator_put_failed", severity: "error", draft_id: draftId, repo, error: putResult.error }));
-    return { success: false, reason: "github_error", error: putResult.error };
+    return { success: false, reason: "allocator_conflict_exhausted",
+      error: `Не удалось выделить номер за ${ALLOCATOR_MAX_RETRIES} попыток: ветка меняется одновременно с резервированием.` };
+  } catch (error) {
+    const reason = error instanceof AllocatorStateError ? "invalid_allocator_state"
+      : error instanceof AllocatorBudgetError || signal.aborted ? "allocator_budget_exceeded" : "github_error";
+    console.error(JSON.stringify({ phase: "allocator_failed", severity: "error", reason, repo: userSource.githubRepo }));
+    return { success: false, reason, error: error instanceof Error ? error.message : String(error) };
   }
-  console.error(JSON.stringify({ phase: "allocator_conflict_exhausted", severity: "error", draft_id: draftId, repo, attempts: ALLOCATOR_MAX_RETRIES }));
-  return {
-    success: false,
-    reason: "allocator_conflict_exhausted",
-    error: `Не удалось атомарно выделить номер за ${ALLOCATOR_MAX_RETRIES} попыток — слишком много конкурентных записей в лог.`,
-  };
 }
 
 /**

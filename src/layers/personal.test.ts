@@ -3,7 +3,7 @@
 // exercised against a mocked neon() tag function — no live Neon connection.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 
 let queryQueue: unknown[][] = [];
 let sqlCalls: unknown[][] = [];
@@ -628,118 +628,418 @@ describe("allocatePostNumber (WP-560 Ф12)", () => {
   const DRAFT_ID = "01996b1a-0000-7000-8000-000000000001";
   const OTHER_DRAFT_ID = "01996b1a-0000-7000-8000-000000000002";
   const allocatorContext = ctx({ sources: [knowledgeIndexTarget], sourceNames: [knowledgeIndexTarget.source] });
+  const POST_PATH = "docs/2026/04-сентябрь/13-09-2026-09-25-post/13-09-1-club-2026-09-25.md";
+  const entry = (number: number, draftId = OTHER_DRAFT_ID) => ({
+    draft_id: draftId, artifact_type: "post", post_number: number, timestamp: "2026-09-24T18:50:00.000Z",
+  });
+  const log = (...entries: unknown[]) => entries.map(value => JSON.stringify(value)).join("\n") + "\n";
+  const post = (number: number, draftId?: string) =>
+    `---\ntype: post\npost_number: ${number}\n${draftId ? `draft_id: ${draftId}\n` : ""}---\nBody`;
 
-  function logResponse(entries: Array<{ draft_id: string; artifact_type: string; post_number: number }>, sha: string) {
-    const body = entries.map(e => JSON.stringify({ ...e, timestamp: "2026-09-11T00:00:00.000Z" })).join("\n") + (entries.length ? "\n" : "");
-    return responseJson({ content: btoa(unescape(encodeURIComponent(body))), sha });
+  // A small Git object store models observable branch updates. Objects are immutable;
+  // branch updates succeed only when the candidate's parent is still the current head.
+  class FakeGitHub {
+    private readonly blobs = new Map<string, string>();
+    private readonly trees = new Map<string, Record<string, string>>();
+    private readonly commits = new Map<string, { tree: string; parent: string | null }>();
+    head: string;
+    readonly calls: Array<{ method: string; path: string; body: any }> = [];
+    beforePatch?: () => void;
+    truncated = false;
+    mismatchedTree = false;
+    mismatchedCommit = false;
+    brokenBlob = false;
+    graphErrors = false;
+    patchBlob?: (blob: Record<string, unknown>) => Record<string, unknown> | null;
+    afterBlobBatch?: () => void;
+    reportedSize?: number;
+    patchStatus?: number;
+    readonly branch = "main";
+
+    constructor(files: Record<string, string> = {}) {
+      this.head = this.commit(files, null);
+    }
+
+    private oid(value: string): string { return createHash("sha1").update(value).digest("hex"); }
+
+    private saveTree(files: Record<string, string>): string {
+      const refs = Object.fromEntries(Object.entries(files).map(([path, content]) => {
+        const sha = this.oid(`blob:${content}`);
+        this.blobs.set(sha, content);
+        return [path, sha];
+      }));
+      const sha = this.oid(`tree:${JSON.stringify(refs)}`);
+      this.trees.set(sha, refs);
+      return sha;
+    }
+
+    private commit(files: Record<string, string>, parent: string | null): string {
+      const tree = this.saveTree(files);
+      const sha = this.oid(`commit:${tree}:${parent}`);
+      this.commits.set(sha, { tree, parent });
+      return sha;
+    }
+
+    files(head = this.head): Record<string, string> {
+      const tree = this.commits.get(head)!.tree;
+      return Object.fromEntries(Object.entries(this.trees.get(tree)!).map(([path, sha]) => [path, this.blobs.get(sha)!]));
+    }
+
+    externalWrite(path: string, content: string): void {
+      this.head = this.commit({ ...this.files(), [path]: content }, this.head);
+    }
+
+    entries(): Array<ReturnType<typeof entry>> {
+      return (this.files()[ALLOCATOR_LOG_PATH] ?? "").trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+    }
+
+    request = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url = new URL(String(input));
+      const path = url.pathname.replace(/^\/repos\/[^/]+\/[^/]+/, "");
+      const method = init?.method ?? "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      this.calls.push({ method, path, body });
+      if (method === "GET" && path === "") return responseJson({ default_branch: this.branch });
+      if (method === "GET" && path === `/git/ref/heads/${this.branch}`) {
+        return responseJson({ object: { sha: this.head, type: "commit" } });
+      }
+      if (method === "GET" && path.startsWith("/git/commits/")) {
+        const sha = path.split("/").at(-1)!;
+        return responseJson({ sha: this.mismatchedCommit ? "0".repeat(40) : sha,
+          tree: { sha: this.commits.get(sha)!.tree } });
+      }
+      if (method === "GET" && path.startsWith("/git/trees/")) {
+        const tree = this.trees.get(path.split("/").at(-1)!)!;
+        return responseJson({ sha: this.mismatchedTree ? "0".repeat(40) : path.split("/").at(-1),
+          truncated: this.truncated,
+          tree: Object.entries(tree).map(([path, sha]) => ({ path, sha, type: "blob", mode: "100644",
+            size: this.reportedSize ?? Buffer.byteLength(this.blobs.get(sha)!) })) });
+      }
+      if (method === "POST" && path === "/graphql") {
+        if (this.brokenBlob) return responseJson({ message: "unavailable" }, 503);
+        expect(body.variables).toEqual({ owner: knowledgeIndexTarget.githubOwner, repo: knowledgeIndexTarget.githubRepo });
+        const repository: Record<string, unknown> = {};
+        for (const match of body.query.matchAll(/(b\d+): object\(oid: "([a-f0-9]+)"\)/g)) {
+          const [, alias, oid] = match;
+          const text = this.blobs.get(oid)!;
+          const blob = { oid, text, byteSize: Buffer.byteLength(text), isBinary: false, isTruncated: false };
+          repository[alias] = this.patchBlob ? this.patchBlob(blob) : blob;
+        }
+        this.afterBlobBatch?.();
+        return responseJson({ data: { repository }, ...(this.graphErrors ? { errors: [{ message: "partial error" }] } : {}) });
+      }
+      if (method === "POST" && path === "/git/trees") {
+        const base = this.trees.get(body.base_tree)!;
+        const files = Object.fromEntries(Object.entries(base).map(([path, sha]) => [path, this.blobs.get(sha)!]));
+        for (const file of body.tree) files[file.path] = file.content;
+        return responseJson({ sha: this.saveTree(files) }, 201);
+      }
+      if (method === "POST" && path === "/git/commits") {
+        const sha = this.oid(`commit:${body.tree}:${body.parents[0]}`);
+        this.commits.set(sha, { tree: body.tree, parent: body.parents[0] });
+        return responseJson({ sha }, 201);
+      }
+      if (method === "PATCH" && path === `/git/refs/heads/${this.branch}`) {
+        this.beforePatch?.();
+        if (this.patchStatus) return responseJson({ message: "protected branch" }, this.patchStatus);
+        if (body.force !== false) throw new Error("Force updates are forbidden");
+        if (this.commits.get(body.sha)?.parent !== this.head) return responseJson({ message: "Update is not a fast forward" }, 422);
+        this.head = body.sha;
+        return responseJson({ object: { sha: this.head } });
+      }
+      throw new Error(`Unexpected GitHub request ${method} ${path}`);
+    });
+
+    allocate(draftId = DRAFT_ID) {
+      return allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, draftId, "post", {
+        getInstallationToken: vi.fn().mockResolvedValue("test-token"), fetch: this.request,
+      });
+    }
   }
 
-  it("rejects a non-UUID draft_id without touching the network", async () => {
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, "not-a-uuid", "post");
-    expect(result).toMatchObject({ success: false, reason: "invalid_draft_id" });
-  });
-
-  it("rejects an artifact_type outside the allowlist without touching the network", async () => {
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "pack");
-    expect(result).toMatchObject({ success: false, reason: "invalid_artifact_type" });
-  });
-
-  it("allocates #1 on an empty (404) log and writes one PUT to the log path", async () => {
-    const { request, dependencies } = githubDependencies([
-      { ok: false, status: 404 }, // GET log: doesn't exist yet
-      { ok: true, status: 200, json: async () => ({}) }, // PUT: create
-    ]);
-
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
-
-    expect(result).toMatchObject({ success: true, post_number: 1, draft_id: DRAFT_ID, reused: false });
-    expect(request).toHaveBeenCalledTimes(2);
-    const putCall = request.mock.calls[1];
-    expect(putCall[0]).toContain(encodeURIComponent(ALLOCATOR_LOG_PATH).replace(/%2F/g, "/"));
-    const putBody = JSON.parse(putCall[1].body as string);
-    expect(putBody.sha).toBeUndefined(); // creating — no sha to send
-    const writtenLine = JSON.parse(decodeURIComponent(escape(atob(putBody.content))).trim());
-    expect(writtenLine).toMatchObject({ draft_id: DRAFT_ID, artifact_type: "post", post_number: 1 });
-  });
-
-  it("allocates the next number after existing entries, preserving them in the PUT", async () => {
-    const sha = "d".repeat(40);
-    const { request, dependencies } = githubDependencies([
-      logResponse([{ draft_id: OTHER_DRAFT_ID, artifact_type: "post", post_number: 5 }], sha),
-      { ok: true, status: 200, json: async () => ({}) },
-    ]);
-
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
-
-    expect(result).toMatchObject({ success: true, post_number: 6, reused: false });
-    const putBody = JSON.parse(request.mock.calls[1][1].body as string);
-    expect(putBody.sha).toBe(sha);
-    const lines = decodeURIComponent(escape(atob(putBody.content))).trim().split("\n").map(l => JSON.parse(l));
-    expect(lines).toEqual([
-      expect.objectContaining({ draft_id: OTHER_DRAFT_ID, post_number: 5 }),
-      expect.objectContaining({ draft_id: DRAFT_ID, post_number: 6 }),
-    ]);
-  });
-
-  it("is idempotent: a repeated draft_id returns the same number without a PUT", async () => {
-    const { request, dependencies } = githubDependencies([
-      logResponse([{ draft_id: DRAFT_ID, artifact_type: "post", post_number: 3 }], "e".repeat(40)),
-    ]);
-
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
-
-    expect(result).toMatchObject({ success: true, post_number: 3, reused: true });
-    expect(request).toHaveBeenCalledTimes(1); // read only, no PUT
-  });
-
-  it("retries on a concurrent-write conflict (409) and succeeds on the re-read", async () => {
-    const firstSha = "f".repeat(40);
-    const secondSha = "1".repeat(40);
-    const { request, dependencies } = githubDependencies([
-      logResponse([], firstSha === "no-entries" ? firstSha : firstSha), // first read: empty
-      { ok: false, status: 409, text: async () => "conflict" }, // first PUT: lost the race
-      logResponse([{ draft_id: OTHER_DRAFT_ID, artifact_type: "post", post_number: 1 }], secondSha), // re-read: winner's entry now present
-      { ok: true, status: 200, json: async () => ({}) }, // second PUT: succeeds
-    ]);
-
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
-
-    expect(result).toMatchObject({ success: true, post_number: 2, reused: false });
-    expect(request).toHaveBeenCalledTimes(4);
-  });
-
-  it("fails closed after exhausting retries under sustained conflict", async () => {
-    const responses: Array<Partial<Response> & { ok: boolean }> = [];
-    for (let i = 0; i < 5; i++) {
-      responses.push(logResponse([], `${i}`.repeat(40)));
-      responses.push({ ok: false, status: 409, text: async () => "conflict" });
+  it("rejects invalid UUID/type and unknown source without network access", async () => {
+    const fetch = vi.fn();
+    for (const [source, draftId, type, reason] of [
+      [knowledgeIndexTarget.source, "invalid", "post", "invalid_draft_id"],
+      [knowledgeIndexTarget.source, DRAFT_ID, "pack", "invalid_artifact_type"],
+      ["unknown", DRAFT_ID, "post", "unknown_source"],
+    ]) {
+      expect(await allocatePostNumber(ENV, allocatorContext, source, draftId, type, { fetch }))
+        .toMatchObject({ success: false, reason });
     }
-    const { request, dependencies } = githubDependencies(responses);
-
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
-
-    expect(result).toMatchObject({ success: false, reason: "allocator_conflict_exhausted" });
-    expect(request).toHaveBeenCalledTimes(10);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("surfaces a non-conflict GitHub error without retrying", async () => {
-    const { request, dependencies } = githubDependencies([
-      logResponse([], "a".repeat(40)),
-      { ok: false, status: 500, text: async () => "internal error" },
+  it("reserves #1 in an empty repository through a non-forced Git ref update", async () => {
+    const git = new FakeGitHub({ "README.md": "keep me" });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 1, reused: false });
+    expect(git.files()["README.md"]).toBe("keep me");
+    expect(git.entries()).toEqual([expect.objectContaining({ draft_id: DRAFT_ID, post_number: 1 })]);
+    expect(git.calls.filter(call => call.method === "PATCH")).toEqual([
+      expect.objectContaining({ body: { sha: git.head, force: false } }),
     ]);
-
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
-
-    expect(result).toMatchObject({ success: false, reason: "github_error" });
-    expect(request).toHaveBeenCalledTimes(2);
   });
 
-  it("reports no_installation when the GitHub App has no installation for this repo", async () => {
-    const result = await allocatePostNumber(
-      ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post",
-      { getInstallationToken: vi.fn().mockResolvedValue(null), fetch: vi.fn() as unknown as typeof globalThis.fetch },
-    );
-    expect(result).toMatchObject({ success: false, reason: "no_installation" });
+  it("reserves #234 with live-shaped posts #233 and allocator seed #232", async () => {
+    const original = log(entry(1, "2ad290d7-d9de-4f9a-be0f-a4c9232ca9ee"), entry(232));
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: original, [POST_PATH]: post(233) });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 234 });
+    expect(git.files()[ALLOCATOR_LOG_PATH].startsWith(original)).toBe(true);
+    expect(git.entries().map(value => value.post_number)).toEqual([1, 232, 234]);
+    expect(git.files()[POST_PATH]).toBe(post(233));
+  });
+
+  it("bootstraps from legacy filename numbers and preserves unnumbered monthly posts", async () => {
+    const git = new FakeGitHub({ "docs/2026/old/233-1-club-2026-09-01.md": "Legacy body",
+      [POST_PATH]: "---\ntype: post\n---\nUnnumbered draft" });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 234 });
+  });
+
+  it("reads quoted historical numbers only inside frontmatter", async () => {
+    const git = new FakeGitHub({ [POST_PATH]: '---\npost_number: "233" # legacy\n---\npost_number: 999' });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 234 });
+  });
+
+  it.each(["null", "", "~"])("treats actual YAML null (%s) as an unnumbered monthly post", async value => {
+    const git = new FakeGitHub({ [POST_PATH]: `---\npost_number: ${value}\n---\nBody` });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 1 });
+  });
+
+  it("uses the legacy filename if its explicit global number is YAML null", async () => {
+    const git = new FakeGitHub({ "docs/old/233-1-club-2026-09-01.md": "---\npost_number: null\n---\nBody" });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 234 });
+  });
+
+  it.each(["post_number: 'null'", `post_number: null\ndraft_id: ${DRAFT_ID}`, `draft_id: ${DRAFT_ID}`])(
+    "rejects a string-null number or draft ownership without a global number: %s", async fields => {
+      const git = new FakeGitHub({ [POST_PATH]: `---\n${fields}\n---\nBody` });
+      expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+      expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+    },
+  );
+
+  it("respects a quoted YAML key instead of silently ignoring the number", async () => {
+    const git = new FakeGitHub({ [POST_PATH]: '---\n"post_number": 233\n---\nBody' });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 234 });
+  });
+
+  it.each([
+    "not json", "null", "[]", log({ ...entry(232), post_number: "232" }),
+    log({ ...entry(232), post_number: -1 }), log({ ...entry(232), post_number: 1.5 }),
+    log({ ...entry(232), post_number: Number.MAX_SAFE_INTEGER + 1 }),
+    log({ ...entry(232), artifact_type: "pack" }), log({ ...entry(232), draft_id: "invalid" }),
+    log({ ...entry(232), timestamp: "yesterday" }), log(entry(232), entry(233)),
+    log(entry(232), entry(232, DRAFT_ID)), log(entry(232), entry(233, OTHER_DRAFT_ID.toUpperCase())),
+  ])("rejects malformed/ambiguous log without publishing a Git ref: %s", async raw => {
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: raw });
+    const originalHead = git.head;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+    expect(git.head).toBe(originalHead);
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("rejects a truncated tree before reading or modifying content", async () => {
+    const git = new FakeGitHub({ [POST_PATH]: post(233) });
+    git.truncated = true;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it.each(["mismatchedTree", "mismatchedCommit"] as const)("rejects immutable object identity mismatch (%s)", async flag => {
+    const git = new FakeGitHub({ [POST_PATH]: post(233) });
+    git[flag] = true;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+    expect(git.calls.some(call => call.method !== "GET")).toBe(false);
+  });
+
+  it("rejects an unreadable historical blob before creating Git objects", async () => {
+    const git = new FakeGitHub({ [POST_PATH]: post(233) });
+    git.brokenBlob = true;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "github_error" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it.each(["post_number: oops", "post_number: 0", "post_number: 232\npost_number: 233", "post_number: 233\ndraft_id: invalid",
+    "post_number: 1e3", "post_number: |\n  233", "post_number: &num 233\n<<: {post_number: 234}",
+    "number: &num 233\npost_number: *num", '"post_number": 233\npost_number: 234',
+    "post_number: !custom 233"])(
+    "rejects malformed historical ownership: %s", async fields => {
+      const git = new FakeGitHub({ [POST_PATH]: `---\n${fields}\n---\nBody` });
+      expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+      expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+    },
+  );
+
+  it("reuses a reservation case-insensitively without a new Git commit", async () => {
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: log(entry(233, DRAFT_ID)) });
+    const head = git.head;
+    expect(await git.allocate(DRAFT_ID.toUpperCase())).toMatchObject({ success: true, post_number: 233, draft_id: DRAFT_ID, reused: true });
+    expect(git.head).toBe(head);
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("reuses an existing post only with matching draft ownership", async () => {
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: log(entry(233, DRAFT_ID)), [POST_PATH]: post(233, DRAFT_ID) });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 233, reused: true });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it.each([undefined, OTHER_DRAFT_ID])("refuses a historic number owned by another/unknown draft (%s)", async draftId => {
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: log(entry(233, DRAFT_ID)), [POST_PATH]: post(233, draftId) });
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "post_number_ownership_conflict" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("re-reads history after a competing post-only commit leaves the log unchanged", async () => {
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: log(entry(232)) });
+    git.beforePatch = () => { git.beforePatch = undefined; git.externalWrite(POST_PATH, post(233)); };
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 234 });
+    expect(git.entries().map(value => value.post_number)).toEqual([232, 234]);
+    expect(git.files()[POST_PATH]).toBe(post(233));
+    expect(git.calls.filter(call => call.method === "PATCH")).toHaveLength(2);
+  });
+
+  it("reuses a same-draft reservation that wins the ref race", async () => {
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: log(entry(232)) });
+    git.beforePatch = () => { git.beforePatch = undefined; git.externalWrite(ALLOCATOR_LOG_PATH, log(entry(232), entry(233, DRAFT_ID))); };
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 233, reused: true });
+    expect(git.entries()).toHaveLength(2);
+    expect(git.calls.filter(call => call.method === "PATCH")).toHaveLength(1);
+  });
+
+  it("gives concurrent distinct drafts distinct numbers and preserves both log entries", async () => {
+    const git = new FakeGitHub();
+    const results = await Promise.all([git.allocate(DRAFT_ID), git.allocate(OTHER_DRAFT_ID)]);
+    expect(results.every(result => result.success)).toBe(true);
+    expect(results.map(result => result.post_number).sort()).toEqual([1, 2]);
+    expect(new Set(git.entries().map(value => value.draft_id))).toEqual(new Set([DRAFT_ID, OTHER_DRAFT_ID]));
+  });
+
+  it("stops after five ref conflicts without publishing any reservation", async () => {
+    const git = new FakeGitHub();
+    let writes = 0;
+    git.beforePatch = () => git.externalWrite("README.md", `concurrent ${++writes}`);
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "allocator_conflict_exhausted" });
+    expect(git.entries()).toEqual([]);
+    expect(git.calls.filter(call => call.method === "PATCH")).toHaveLength(5);
+  });
+
+  it("does not retry a protected-branch refusal as a concurrency conflict", async () => {
+    const git = new FakeGitHub();
+    git.patchStatus = 422;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "github_error" });
+    expect(git.entries()).toEqual([]);
+    expect(git.calls.filter(call => call.method === "PATCH")).toHaveLength(1);
+  });
+
+  it.each([
+    ["missing alias", () => null],
+    ["truncated blob", (blob: Record<string, unknown>) => ({ ...blob, isTruncated: true })],
+    ["binary blob", (blob: Record<string, unknown>) => ({ ...blob, isBinary: true })],
+    ["wrong oid", (blob: Record<string, unknown>) => ({ ...blob, oid: "0".repeat(40) })],
+    ["wrong byte size", (blob: Record<string, unknown>) => ({ ...blob, byteSize: 0 })],
+    ["missing text", (blob: Record<string, unknown>) => ({ ...blob, text: null })],
+  ] as const)("rejects GraphQL %s without publishing any mutation", async (_label, patchBlob) => {
+    const git = new FakeGitHub({ [POST_PATH]: post(233) });
+    git.patchBlob = patchBlob;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("rejects GraphQL partial errors even if all requested blobs are present", async () => {
+    const git = new FakeGitHub({ [POST_PATH]: post(233) });
+    git.graphErrors = true;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("reads 217 historical posts in six bounded GraphQL batches", async () => {
+    const files = Object.fromEntries(Array.from({ length: 217 }, (_, index) =>
+      [`docs/2026/legacy/${index + 1}-1-club-2026-09-01.md`, post(index + 1)]));
+    const git = new FakeGitHub(files);
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 218 });
+    const batches = git.calls.filter(call => call.path === "/graphql");
+    expect(batches).toHaveLength(6);
+    expect(batches.every(call => [...call.body.query.matchAll(/object\(oid:/g)].length <= 40)).toBe(true);
+    expect(git.calls).toHaveLength(13);
+  });
+
+  it("rejects oversized historical content before requesting its text", async () => {
+    const git = new FakeGitHub({ [POST_PATH]: post(233) });
+    git.reportedSize = 1024 * 1024 + 1;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "allocator_budget_exceeded" });
+    expect(git.calls.some(call => call.method !== "GET")).toBe(false);
+  });
+
+  it("does not start a Git mutation once the overall deadline expires", async () => {
+    const controller = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+    try {
+      const git = new FakeGitHub({ [POST_PATH]: post(233) });
+      git.afterBlobBatch = () => controller.abort();
+      expect(await git.allocate()).toMatchObject({ success: false, reason: "allocator_budget_exceeded" });
+      expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+      expect(git.request.mock.calls.every(([, init]) => init?.signal === controller.signal)).toBe(true);
+    } finally {
+      timeout.mockRestore();
+    }
+  });
+
+  it("rejects duplicate JSON keys instead of silently taking the last number", async () => {
+    const raw = log(entry(233)).replace('"post_number":233', '"post_number":999,"post_number":233');
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: raw });
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it.each([undefined, 234])("does not reallocate a historical draft with missing/mismatched log entry (%s)", async number => {
+    const git = new FakeGitHub({ [POST_PATH]: post(233, DRAFT_ID),
+      ...(number === undefined ? {} : { [ALLOCATOR_LOG_PATH]: log(entry(number, DRAFT_ID)) }) });
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "post_number_ownership_conflict" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("returns on the deadline even if auth is pending and ignores its late result", async () => {
+    const controller = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+    let finishAuth!: (token: string) => void;
+    const auth = new Promise<string>(resolve => { finishAuth = resolve; });
+    const fetch = vi.fn();
+    try {
+      const allocation = allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", {
+        getInstallationToken: vi.fn().mockReturnValue(auth), fetch,
+      });
+      controller.abort();
+      expect(await allocation).toMatchObject({ success: false, reason: "allocator_budget_exceeded" });
+      finishAuth("late-test-token");
+      await auth;
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      timeout.mockRestore();
+    }
+  });
+
+  it("fails within its request cap rather than reaching a Worker subrequest limit", async () => {
+    const files = Object.fromEntries(Array.from({ length: 1600 }, (_, index) =>
+      [`docs/2026/legacy/${index + 1}-1-club-2026-09-01.md`, post(index + 1)]));
+    const git = new FakeGitHub(files);
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "allocator_budget_exceeded" });
+    expect(git.calls).toHaveLength(40);
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("refuses an overflowing counter", async () => {
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: log(entry(Number.MAX_SAFE_INTEGER)) });
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("reports no_installation without any repository request", async () => {
+    const fetch = vi.fn();
+    expect(await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", {
+      getInstallationToken: vi.fn().mockResolvedValue(null), fetch,
+    })).toMatchObject({ success: false, reason: "no_installation" });
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
 
