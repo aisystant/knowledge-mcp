@@ -1072,6 +1072,12 @@ export async function createPersonalPost(
             scaffold: { status: "existing", paths, commit_sha: snapshot.head }, indexing: SCAFFOLD_INDEXING_NOTICE, next_action: SCAFFOLD_NEXT_ACTION };
         }
         files = buildPostScaffold(scaffold, convention, snapshot.files.map(file => file.path as string), postNumber, canonicalDraftId).files;
+        // Version 1 must remain discoverable by the existing allocator and write
+        // gate even if a repository edit changes the shared naming template.
+        if (files.filter(file => CLUB_POST_PATH.test(file.path)).length !== 1
+          || files.some(file => !POST_CHANNEL_FILENAME.test(file.path.split("/").at(-1)!))) {
+          throw new PostScaffoldError("invalid_post_convention", "Generated channel names are incompatible with the version 1 publication protocol.");
+        }
         await withinAllocatorDeadline(dependencies.authorizePaths!([...(existing ? [] : [ALLOCATOR_LOG_PATH]), ...files.map(file => file.path)]), signal);
       }
       const entry: AllocatorLogEntry | undefined = existing ? undefined : { draft_id: canonicalDraftId, artifact_type: "post",

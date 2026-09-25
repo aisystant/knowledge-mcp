@@ -1203,6 +1203,15 @@ describe("allocatePostNumber (WP-560 Ф12)", () => {
     }
   });
 
+  it("rejects a reordered channel template that the version 1 allocator cannot discover", async () => {
+    const changed = { ...POST_CONVENTION_FIXTURE, templates: { ...POST_CONVENTION_FIXTURE.templates,
+      channel_file: "{channel_number}-{channel}-{date}-{sequence}-{month}.md" } };
+    const git = scaffoldRepository({ [POST_CONVENTION_PATH]: JSON.stringify(changed) });
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false, reason: "invalid_post_convention" });
+    expect(git.entries()).toEqual([]);
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
   it("replans names and numbers when concurrent browser drafts race on the branch", async () => {
     const git = scaffoldRepository();
     const results = await Promise.all([
