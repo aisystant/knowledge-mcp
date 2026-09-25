@@ -657,6 +657,7 @@ describe("allocatePostNumber (WP-560 Ф12)", () => {
     afterBlobBatch?: () => void;
     reportedSize?: number;
     patchStatus?: number;
+    loseNextPatchResponse = false;
     readonly branch = "main";
     readonly authorizePaths = vi.fn<(paths: string[]) => Promise<void>>().mockResolvedValue(undefined);
 
@@ -774,6 +775,10 @@ describe("allocatePostNumber (WP-560 Ф12)", () => {
         if (body.force !== false) throw new Error("Force updates are forbidden");
         if (this.commits.get(body.sha)?.parent !== this.head) return responseJson({ message: "Update is not a fast forward" }, 422);
         this.head = body.sha;
+        if (this.loseNextPatchResponse) {
+          this.loseNextPatchResponse = false;
+          throw new Error("Connection lost after GitHub advanced the ref");
+        }
         return responseJson({ object: { sha: this.head } });
       }
       throw new Error(`Unexpected GitHub request ${method} ${path}`);
@@ -1124,6 +1129,42 @@ describe("allocatePostNumber (WP-560 Ф12)", () => {
     expect(git.entries()).toHaveLength(1);
   });
 
+  it.each([undefined, OTHER_DRAFT_ID])("refuses scaffold after a legacy writer occupies a reserved number (owner %s)", async owner => {
+    const git = scaffoldRepository({ [ALLOCATOR_LOG_PATH]: log(entry(232)) });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 233 });
+    const reservedLog = git.files()[ALLOCATOR_LOG_PATH];
+    git.externalWrite(POST_PATH, post(233, owner));
+    const before = git.files();
+    const callCount = git.calls.length;
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false, reason: "post_number_ownership_conflict" });
+    expect(git.files()).toEqual(before);
+    expect(git.files()[ALLOCATOR_LOG_PATH]).toBe(reservedLog);
+    expect(git.calls.slice(callCount).some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+    expect(git.authorizePaths).not.toHaveBeenCalled();
+  });
+
+  it("refuses scaffold on CAS retry after a legacy writer occupies its reserved number", async () => {
+    const git = scaffoldRepository({ [ALLOCATOR_LOG_PATH]: log(entry(232)) });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 233 });
+    const reservedLog = git.files()[ALLOCATOR_LOG_PATH];
+    let afterLegacy!: Record<string, string>;
+    git.beforePatch = () => {
+      git.beforePatch = undefined;
+      git.externalWrite(POST_PATH, post(233));
+      afterLegacy = git.files();
+    };
+    const callCount = git.calls.length;
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false, reason: "post_number_ownership_conflict" });
+    const calls = git.calls.slice(callCount);
+    const rejectedPatch = calls.findIndex(call => call.method === "PATCH");
+    expect(rejectedPatch).toBeGreaterThan(0);
+    expect(calls.filter(call => call.path === "/git/ref/heads/main")).toHaveLength(2);
+    expect(calls.slice(rejectedPatch + 1).some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+    expect(git.files()).toEqual(afterLegacy);
+    expect(git.files()[ALLOCATOR_LOG_PATH]).toBe(reservedLog);
+    expect(Object.keys(git.files()).filter(path => path.includes("browser-draft"))).toEqual([]);
+  });
+
   it("materializes a previous reservation without adding a second log entry", async () => {
     const initialLog = log(entry(233, DRAFT_ID));
     const git = scaffoldRepository({ [ALLOCATOR_LOG_PATH]: initialLog });
@@ -1133,15 +1174,18 @@ describe("allocatePostNumber (WP-560 Ф12)", () => {
     expect(git.authorizePaths.mock.calls[0][0]).not.toContain(ALLOCATOR_LOG_PATH);
   });
 
-  it("replays an existing scaffold without overwriting edited content or appending a reservation", async () => {
+  it("replays after a lost PATCH response without overwriting edited content or appending a reservation", async () => {
     const git = scaffoldRepository();
-    const first = await git.scaffold(scaffoldInput);
-    const club = first.scaffold!.paths[0];
+    git.loseNextPatchResponse = true;
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false, reason: "github_error" });
+    const paths = Object.keys(git.files()).filter(path => path.includes("browser-draft")).sort();
+    expect(paths).toHaveLength(2);
+    const club = paths.find(path => path.includes("-1-club-"))!;
     const edited = git.files()[club].replace('status: "draft"', 'status: "ready"') + "\nАвторский текст.\n";
     git.externalWrite(club, edited);
     const mutations = git.calls.filter(call => call.path !== "/graphql" && call.method !== "GET").length;
     const replay = await git.scaffold(scaffoldInput);
-    expect(replay).toMatchObject({ success: true, reused: true, scaffold: { status: "existing", paths: first.scaffold!.paths } });
+    expect(replay).toMatchObject({ success: true, reused: true, scaffold: { status: "existing", paths } });
     expect(git.files()[club]).toBe(edited);
     expect(git.entries()).toHaveLength(1);
     expect(git.calls.filter(call => call.path !== "/graphql" && call.method !== "GET")).toHaveLength(mutations);
