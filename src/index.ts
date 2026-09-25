@@ -31,7 +31,7 @@ import {
   resolveUserContext,
   writeToGitHub,
   deleteFromGitHub,
-  allocatePostNumber,
+  createPersonalPost,
   personalSearchDocuments,
   personalGetDocument,
   personalGetDocumentWithSha,
@@ -2605,7 +2605,7 @@ const PUBLIC_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set(["resolve_document"]
 const PRIVATE_TOOLS = [
   {
     name: "write",
-    description: "Write a file to a personal knowledge repo via GitHub. Existing files and new ordinary/service Markdown are supported; search indexing is triggered asynchronously by the push and is NOT confirmed in the result (indexing.status: async) — this is expected and needs no follow-up call. When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, a concurrent edit from another session can be silently overwritten. A new publication-like file (frontmatter type: post or a channel filename) under TserenTserenov/DS-Knowledge-Index-Tseren docs/ is server-blocked: create it with scripts/new-post.py; if shell is unavailable, stop instead of using an ASCII/manual fallback.",
+    description: "Write a file to a personal knowledge repo via GitHub. Existing files and new ordinary/service Markdown are supported; search indexing is triggered asynchronously by the push and is NOT confirmed in the result (indexing.status: async) — this is expected and needs no follow-up call. When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, a concurrent edit from another session can be silently overwritten. A new publication-like file (frontmatter type: post or a channel filename) under TserenTserenov/DS-Knowledge-Index-Tseren docs/ is server-blocked: create its canonical draft with new_post(scaffold), then edit the returned existing paths with expected_sha. Local shell clients may use scripts/new-post.py with a validated shared reservation.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2633,13 +2633,28 @@ const PRIVATE_TOOLS = [
   },
   {
     name: "new_post",
-    description: "Atomically allocate the next post number for a new Knowledge Index publication (WP-560 Ф12). Call this BEFORE scripts/new-post.py and pass the returned post_number via that script's existing --post-number flag, instead of letting the script scan for it locally. Idempotent: calling again with the same draft_id (e.g. after an interrupted run) returns the same number instead of allocating a new one, so a draft can sit unpushed for hours without a duplicate.",
+    description: "Reserve a unique Knowledge Index post number, or atomically create its draft publication scaffold. Provide scaffold metadata in browser sessions: the server creates canonical club/channel files and returns paths, without needing shell. Read each returned path with personal_get_document(source, filename, include_sha:true), then fill that existing file with personal_write(expected_sha from the read); this works before search indexing finishes. Without scaffold, returns a reservation for scripts/new-post.py --post-number N --draft-id UUID. Reuse the same draft_id on retry; changed metadata or incomplete existing scaffolds are refused instead of overwritten. Creation leaves status:draft; it does not publish ready content.",
     inputSchema: {
       type: "object",
       properties: {
-        source: { type: "string", description: "Target repo (source name), e.g. the connected DS-Knowledge-Index-Tseren source" },
-        draft_id: { type: "string", pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", description: "UUID generated once per draft (v4/v7). Reusing it on retry returns the already-allocated number instead of a new one." },
-        artifact_type: { type: "string", enum: ["post"], description: "Kind of artifact being scaffolded. Only 'post' is supported today." },
+        source: { type: "string", description: "Connected Knowledge Index source name" },
+        draft_id: { type: "string", pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", description: "Stable UUID generated once per draft; use the same value on retries" },
+        artifact_type: { type: "string", enum: ["post"] },
+        scaffold: {
+          type: "object", additionalProperties: false,
+          description: "Optional metadata to create the draft files server-side; omission only reserves the number",
+          properties: {
+            date: { type: "string", description: "Publication date YYYY-MM-DD" },
+            slug: { type: "string", maxLength: 100, description: "Lowercase ASCII slug with hyphens" },
+            title: { type: "string", minLength: 1, maxLength: 300 },
+            audience: { type: "string", enum: ["wide", "community", "advanced"], default: "community" },
+            channels: { type: "array", items: { type: "string" }, maxItems: 16, description: "Convention channel names; club is always included" },
+            source_knowledge: { type: "string", maxLength: 1000 },
+            content_plan: { type: "string", maxLength: 1000 },
+            related_wp: { type: "integer", minimum: 1 },
+          },
+          required: ["date", "slug", "title"],
+        },
       },
       required: ["source", "draft_id", "artifact_type"],
     },
@@ -2856,8 +2871,9 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             // reuses personal_write's grant rather than a dedicated scope for one narrow op.
             new_post: "personal_write",
           };
-          // new_post carries no file path (it commits to a fixed internal log path, not a
-          // caller-supplied one) — same shape as disconnect_source/purge_source below.
+          // new_post has no caller-selected path. Its allocator-only branch writes the
+          // fixed log; scaffold creation additionally authorizes every generated path
+          // after planning and before any Git mutation (see its handler below).
           // propose_capture returns a preview only (no repo write happens here — the caller
           // confirms with a separate `write` call, which IS path-checked); suggested_path is
           // optional by the tool's own schema and the handler below fills a default when it's
@@ -2946,7 +2962,19 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
             }
 
-            const allocateResult = await allocatePostNumber(env, ctx, source, draftId, artifactType);
+            const allocateResult = await createPersonalPost(env, ctx, {
+              source, draftId, artifactType, scaffold: args.scaffold,
+            }, {
+              authorizePaths: async (paths) => {
+                for (const path of paths) {
+                  await guard.authorize(principal, {
+                    toolName: "personal_write", args: { ...args, source, path }, requestId,
+                    activeSources: ctx.sourceNames, indicatorsDatabaseUrl: env.INDICATORS_DATABASE_URL,
+                    scopeGuardMode: env.SCOPE_GUARD_MODE, requiresPath: true,
+                  });
+                }
+              },
+            });
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(allocateResult, null, 2) }] } };
           }
 

@@ -45,6 +45,7 @@ import {
   POST_SCAFFOLD_NEXT_ACTION,
   resolveSourcePath,
   allocatePostNumber,
+  createPersonalPost,
   ALLOCATOR_LOG_PATH,
   connectSource,
   resolveUserContext,
@@ -63,6 +64,8 @@ import {
   type PersonalEnv,
 } from "./personal.js";
 import { normalizePath as normalizeScopePath } from "../scope.js";
+import { POST_CONVENTION_PATH } from "../post-scaffold.js";
+import { POST_CONVENTION_FIXTURE } from "../post-scaffold.test-fixture.js";
 
 beforeEach(() => {
   queryQueue = [];
@@ -655,6 +658,7 @@ describe("allocatePostNumber (WP-560 Ф12)", () => {
     reportedSize?: number;
     patchStatus?: number;
     readonly branch = "main";
+    readonly authorizePaths = vi.fn<(paths: string[]) => Promise<void>>().mockResolvedValue(undefined);
 
     constructor(files: Record<string, string> = {}) {
       this.head = this.commit(files, null);
@@ -689,6 +693,19 @@ describe("allocatePostNumber (WP-560 Ф12)", () => {
       this.head = this.commit({ ...this.files(), [path]: content }, this.head);
     }
 
+    externalDelete(path: string): void {
+      const files = this.files();
+      delete files[path];
+      this.head = this.commit(files, this.head);
+    }
+
+    scaffold(input: unknown, draftId = DRAFT_ID) {
+      return createPersonalPost(ENV, allocatorContext, {
+        source: knowledgeIndexTarget.source, draftId, artifactType: "post", scaffold: input,
+      }, { getInstallationToken: vi.fn().mockResolvedValue("test-token"), fetch: this.request,
+        authorizePaths: this.authorizePaths });
+    }
+
     entries(): Array<ReturnType<typeof entry>> {
       return (this.files()[ALLOCATOR_LOG_PATH] ?? "").trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
     }
@@ -699,6 +716,18 @@ describe("allocatePostNumber (WP-560 Ф12)", () => {
       const method = init?.method ?? "GET";
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
       this.calls.push({ method, path, body });
+      if (path.startsWith("/contents/")) {
+        const filename = decodeURIComponent(path.slice("/contents/".length));
+        const tree = this.trees.get(this.commits.get(this.head)!.tree)!;
+        if (!tree[filename]) return responseJson({ message: "Not Found" }, 404);
+        if (method === "GET") return responseJson({ sha: tree[filename], encoding: "base64",
+          content: Buffer.from(this.files()[filename]).toString("base64") });
+        if (method === "PUT") {
+          if (body.sha !== tree[filename]) return responseJson({ message: "sha mismatch" }, 409);
+          this.externalWrite(filename, Buffer.from(body.content, "base64").toString("utf8"));
+          return responseJson({ content: { sha: this.trees.get(this.commits.get(this.head)!.tree)![filename], html_url: "https://example.test/file" } });
+        }
+      }
       if (method === "GET" && path === "") return responseJson({ default_branch: this.branch });
       if (method === "GET" && path === `/git/ref/heads/${this.branch}`) {
         return responseJson({ object: { sha: this.head, type: "commit" } });
@@ -1045,6 +1074,157 @@ describe("allocatePostNumber (WP-560 Ф12)", () => {
     const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: log(entry(Number.MAX_SAFE_INTEGER)) });
     expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
     expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  const scaffoldInput = { date: "2026-09-25", slug: "browser-draft", title: 'Заголовок с "кавычками"', channels: ["telegram", "club"] };
+  const scaffoldRepository = (files: Record<string, string> = {}) => new FakeGitHub({
+    [POST_CONVENTION_PATH]: JSON.stringify(POST_CONVENTION_FIXTURE), ...files,
+  });
+
+  it("atomically creates the reservation and all draft channel files after authorizing every path", async () => {
+    const git = scaffoldRepository({ [POST_PATH]: post(233), [ALLOCATOR_LOG_PATH]: log(entry(232)) });
+    git.authorizePaths.mockImplementation(async paths => {
+      expect(paths).toHaveLength(3);
+      expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+    });
+    const result = await git.scaffold(scaffoldInput);
+    expect(result).toMatchObject({ success: true, post_number: 234, reused: false, scaffold: { status: "created", commit_sha: git.head } });
+    const paths = result.scaffold!.paths;
+    expect(paths).toEqual([
+      "docs/2026/04-сентябрь/14-09-2026-09-25-browser-draft/14-09-1-club-2026-09-25.md",
+      "docs/2026/04-сентябрь/14-09-2026-09-25-browser-draft/14-09-4-telegram-2026-09-25.md",
+    ]);
+    expect(git.authorizePaths).toHaveBeenCalledWith([ALLOCATOR_LOG_PATH, ...paths]);
+    expect(git.entries().map(value => value.post_number)).toEqual([232, 234]);
+    expect(paths.every(path => git.files()[path].includes('status: "draft"'))).toBe(true);
+    expect(git.files()[paths[1]]).toContain('source_post: "14-09-1-club-2026-09-25.md"');
+    expect(git.calls.filter(call => call.method === "PATCH")).toHaveLength(1);
+    expect(git.calls.find(call => call.method === "POST" && call.path === "/git/trees")!.body.tree).toHaveLength(3);
+  });
+
+  it("fills a browser scaffold through live SHA reads while the search index remains empty", async () => {
+    const git = scaffoldRepository();
+    const result = await git.scaffold(scaffoldInput);
+    const filename = result.scaffold!.paths[0];
+    expect(result.next_action).toContain("include_sha:true");
+    queryQueue.push([{ installation_id: 42 }]);
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).endsWith("/access_tokens") ? responseJson({ token: "fake-token" }) : git.request(input, init));
+    const live = await personalGetDocumentWithSha(ENV_WITH_APP, allocatorContext, filename, knowledgeIndexTarget.source);
+    expect(live?.kind).toBe("document");
+    if (live?.kind !== "document") throw new Error("Expected live GitHub document");
+    expect(sqlCalls).toHaveLength(1); // Installation metadata only; no knowledge.documents query.
+    expect((sqlCalls[0][0] as TemplateStringsArray).join(" ")).toContain("installation_id");
+    const edited = live.content + "\nГотовый текст автора.\n";
+    const saved = await writeToGitHub(ENV, allocatorContext, knowledgeIndexTarget.source, filename, edited, "fill draft", {
+      getInstallationToken: async () => "fake-token", fetch: git.request,
+    }, live.sha);
+    expect(saved.success).toBe(true);
+    expect(git.files()[filename]).toBe(edited);
+    expect(git.entries()).toHaveLength(1);
+  });
+
+  it("materializes a previous reservation without adding a second log entry", async () => {
+    const initialLog = log(entry(233, DRAFT_ID));
+    const git = scaffoldRepository({ [ALLOCATOR_LOG_PATH]: initialLog });
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: true, post_number: 233, reused: true, scaffold: { status: "created" } });
+    expect(git.files()[ALLOCATOR_LOG_PATH]).toBe(initialLog);
+    expect(git.entries()).toHaveLength(1);
+    expect(git.authorizePaths.mock.calls[0][0]).not.toContain(ALLOCATOR_LOG_PATH);
+  });
+
+  it("replays an existing scaffold without overwriting edited content or appending a reservation", async () => {
+    const git = scaffoldRepository();
+    const first = await git.scaffold(scaffoldInput);
+    const club = first.scaffold!.paths[0];
+    const edited = git.files()[club].replace('status: "draft"', 'status: "ready"') + "\nАвторский текст.\n";
+    git.externalWrite(club, edited);
+    const mutations = git.calls.filter(call => call.path !== "/graphql" && call.method !== "GET").length;
+    const replay = await git.scaffold(scaffoldInput);
+    expect(replay).toMatchObject({ success: true, reused: true, scaffold: { status: "existing", paths: first.scaffold!.paths } });
+    expect(git.files()[club]).toBe(edited);
+    expect(git.entries()).toHaveLength(1);
+    expect(git.calls.filter(call => call.path !== "/graphql" && call.method !== "GET")).toHaveLength(mutations);
+  });
+
+  it.each([
+    { title: "Другой заголовок" }, { slug: "different-draft" }, { date: "2026-09-26" },
+    { channels: ["club"] }, { audience: "advanced" }, { content_plan: "changed" }, { related_wp: 560 },
+  ])("rejects changed scaffold parameters on replay: %j", async changes => {
+    const git = scaffoldRepository();
+    await git.scaffold(scaffoldInput);
+    const head = git.head;
+    expect(await git.scaffold({ ...scaffoldInput, ...changes })).toMatchObject({ success: false, reason: "scaffold_conflict" });
+    expect(git.head).toBe(head);
+    expect(git.entries()).toHaveLength(1);
+  });
+
+  it.each([0, 1])("refuses to silently recreate a missing channel file on replay (index %s)", async index => {
+    const git = scaffoldRepository();
+    const first = await git.scaffold(scaffoldInput);
+    git.externalDelete(first.scaffold!.paths[index]);
+    const head = git.head;
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false, reason: "scaffold_conflict" });
+    expect(git.head).toBe(head);
+    expect(git.files()[first.scaffold!.paths[index]]).toBeUndefined();
+  });
+
+  it("leaves both log and files unpublished when the branch refuses the atomic update", async () => {
+    const git = scaffoldRepository();
+    const files = git.files();
+    git.patchStatus = 403;
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false, reason: "github_error" });
+    expect(git.files()).toEqual(files);
+  });
+
+  it("does not create any Git objects when path scope authorization denies a channel", async () => {
+    const git = scaffoldRepository();
+    git.authorizePaths.mockRejectedValue(new Error("scope denied: path_not_allowed"));
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false });
+    expect(git.authorizePaths).toHaveBeenCalledTimes(1);
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("requires a path authorization callback before accessing GitHub for a scaffold", async () => {
+    const fetch = vi.fn();
+    expect(await createPersonalPost(ENV, allocatorContext, {
+      source: knowledgeIndexTarget.source, draftId: DRAFT_ID, artifactType: "post", scaffold: scaffoldInput,
+    }, { fetch })).toMatchObject({ success: false, reason: "path_authorization_required" });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("fails without allocating when the shared convention is missing or unsupported", async () => {
+    const fixtures: Array<Record<string, string>> = [{}, { [POST_CONVENTION_PATH]: JSON.stringify({ ...POST_CONVENTION_FIXTURE, version: 2 }) }];
+    for (const files of fixtures) {
+      const git = new FakeGitHub(files);
+      expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false, reason: "invalid_post_convention" });
+      expect(git.entries()).toEqual([]);
+      expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+    }
+  });
+
+  it("replans names and numbers when concurrent browser drafts race on the branch", async () => {
+    const git = scaffoldRepository();
+    const results = await Promise.all([
+      git.scaffold(scaffoldInput, DRAFT_ID),
+      git.scaffold({ ...scaffoldInput, slug: "second-draft" }, OTHER_DRAFT_ID),
+    ]);
+    expect(results.every(result => result.success)).toBe(true);
+    expect(results.map(result => result.post_number).sort()).toEqual([1, 2]);
+    const paths = results.flatMap(result => result.scaffold!.paths);
+    expect(new Set(paths).size).toBe(4);
+    expect(paths.every(path => !!git.files()[path])).toBe(true);
+    expect(git.entries()).toHaveLength(2);
+    expect(git.authorizePaths).toHaveBeenCalledTimes(3);
+  });
+
+  it("creates only one scaffold for concurrent requests with the same UUID", async () => {
+    const git = scaffoldRepository();
+    const [first, second] = await Promise.all([git.scaffold(scaffoldInput), git.scaffold(scaffoldInput)]);
+    expect(first.success && second.success).toBe(true);
+    expect(first.post_number).toBe(second.post_number);
+    expect(first.scaffold!.paths).toEqual(second.scaffold!.paths);
+    expect(git.entries()).toHaveLength(1);
   });
 
   it("reports no_installation without any repository request", async () => {
