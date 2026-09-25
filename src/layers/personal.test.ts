@@ -985,6 +985,19 @@ describe("allocatePostNumber (WP-560 Ф12)", () => {
     }
   });
 
+  it("does not write after wall time expires while the abort callback is still pending", async () => {
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    try {
+      const git = new FakeGitHub({ [POST_PATH]: post(233) });
+      git.afterBlobBatch = () => { clock.mockReturnValue(25_001); };
+      expect(await git.allocate()).toMatchObject({ success: false, reason: "allocator_budget_exceeded" });
+      expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+      expect(git.request.mock.calls.every(([, init]) => init?.signal?.aborted === false)).toBe(true);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it("rejects duplicate JSON keys instead of silently taking the last number", async () => {
     const raw = log(entry(233)).replace('"post_number":233', '"post_number":999,"post_number":233');
     const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: raw });

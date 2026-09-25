@@ -763,14 +763,17 @@ class AllocatorGitClient {
   private blobBytes = 0;
 
   constructor(private readonly githubFetch: typeof globalThis.fetch, private readonly owner: string,
-    private readonly repo: string, token: string, private readonly signal: AbortSignal) {
+    private readonly repo: string, token: string, private readonly signal: AbortSignal,
+    private readonly deadline: number) {
     this.baseUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
     this.headers = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json",
       "User-Agent": "aisystant-knowledge", "Content-Type": "application/json" };
   }
 
   private async fetch(url: string, method: string, body?: unknown): Promise<Response> {
-    if (this.signal.aborted || this.requests >= ALLOCATOR_MAX_REQUESTS) {
+    // The abort callback can wait behind synchronous YAML parsing; monotonic time
+    // also prevents a write from starting after the deadline in that same turn.
+    if (this.signal.aborted || performance.now() >= this.deadline || this.requests >= ALLOCATOR_MAX_REQUESTS) {
       throw new AllocatorBudgetError("Allocator deadline or request budget exhausted; no further Git writes allowed.");
     }
     this.requests++;
@@ -930,6 +933,7 @@ export async function allocatePostNumber(
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return { success: false, reason: "unknown_source", error: `Unknown source: ${source}` };
   const canonicalDraftId = draftId.toLowerCase();
+  const deadline = performance.now() + ALLOCATOR_DEADLINE_MS;
   const signal = AbortSignal.timeout(ALLOCATOR_DEADLINE_MS);
   try {
     // Existing authentication has no cancellation parameter. Deadline failure stops
@@ -938,7 +942,7 @@ export async function allocatePostNumber(
       (dependencies.getInstallationToken ?? getInstallationToken)(env, ctx.userId, userSource.githubRepo), signal,
     );
     if (!token) return { success: false, reason: "no_installation", error: "No GitHub App installation found for this repository." };
-    const git = new AllocatorGitClient(dependencies.fetch ?? globalThis.fetch, userSource.githubOwner, userSource.githubRepo, token, signal);
+    const git = new AllocatorGitClient(dependencies.fetch ?? globalThis.fetch, userSource.githubOwner, userSource.githubRepo, token, signal, deadline);
     const repository = await git.object("");
     if (typeof repository.default_branch !== "string" || !repository.default_branch) {
       throw new AllocatorStateError("Repository default branch is unavailable.");
