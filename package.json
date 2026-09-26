@@ -25,6 +25,7 @@
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0",
-    "jose": "^6.2.12"
+    "jose": "^6.2.12",
+    "yaml": "^2.9.1"
   }
 }
