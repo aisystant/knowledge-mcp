@@ -40,6 +40,7 @@ import {
   getManagedKnowledgeIndexPostEvidence,
   githubBlobUrl,
   githubBranchApiUrl,
+  githubCommitsApiUrl,
   githubContentsApiUrl,
   normalizeRepositoryPath,
   POST_SCAFFOLD_NEXT_ACTION,
@@ -57,6 +58,7 @@ import {
   personalGetDocument,
   personalGetDocumentLive,
   personalGetDocumentWithSha,
+  personalGetDocumentHistory,
   disconnectSource,
   purgeSource,
   INDEXING_ASYNC_NOTICE,
@@ -371,7 +373,7 @@ describe("Knowledge Index publication creation guard", () => {
     expect(request).toHaveBeenCalledTimes(2);
   });
 
-  it("allows personal_write to update a confirmed existing publication", async () => {
+  it("allows personal_write to update a confirmed existing publication when expected_sha matches (WP-7 Ф99)", async () => {
     const existingSha = "a".repeat(40);
     const { request, dependencies } = githubDependencies([
       { ok: true, status: 200, json: async () => ({ sha: existingSha }) },
@@ -387,6 +389,7 @@ describe("Knowledge Index publication creation guard", () => {
       postContent,
       "update post",
       dependencies,
+      existingSha,
     );
 
     expect(result.success).toBe(true);
@@ -1317,15 +1320,16 @@ describe("writeToGitHub — optimistic concurrency (WP-7 Ф96, ported from perso
     expect(calls.some(c => c.method === "PUT")).toBe(false);
   });
 
-  it("keeps prior overwrite behavior when expectedSha is omitted", async () => {
+  it("refuses to overwrite an existing file when expectedSha is omitted (WP-7 Ф99)", async () => {
     const calls = queuedFetch([
       ...installationTokenResponses(),
-      responseJson({ sha: VALID_SHA }),
-      responseJson({ content: { sha: "b".repeat(40), html_url: "https://github.com/x" } }),
+      responseJson({ sha: VALID_SHA }), // existence check finds a current file
     ]);
     const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "updated", "update");
-    expect(result.success).toBe(true);
-    expect(calls.filter(c => c.method === "PUT")).toHaveLength(1);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("sha_required");
+    expect(result.current_sha).toBe(VALID_SHA);
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
   });
 
   it("normalizes a GitHub 409 on PUT to version_mismatch instead of a generic error", async () => {
@@ -1417,6 +1421,77 @@ describe("personalGetDocumentLive (WP-7 Ф96)", () => {
     queuedFetch([...installationTokenResponses(), responseJson({ sha: "e".repeat(40) })]);
     const doc = await personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy");
     expect(doc).toBeNull();
+  });
+
+  it("adds ref as a query parameter to read a prior version (WP-7 Ф176)", async () => {
+    const priorSha = "f".repeat(40);
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: priorSha, content: btoa("old body"), encoding: "base64" }),
+    ]);
+    const doc = await personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy", priorSha);
+    expect(doc?.sha).toBe(priorSha);
+    expect(calls.at(-1)?.url).toBe(
+      `https://api.github.com/repos/TserenTserenov/DS-my-strategy/contents/notes/idea.md?ref=${priorSha}`,
+    );
+  });
+
+  it("omits the ref query parameter when ref is not passed", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: "a".repeat(40), content: btoa("body"), encoding: "base64" }),
+    ]);
+    await personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy");
+    expect(calls.at(-1)?.url).toBe("https://api.github.com/repos/TserenTserenov/DS-my-strategy/contents/notes/idea.md");
+  });
+});
+
+describe("personalGetDocumentHistory (WP-7 Ф176)", () => {
+  it("lists commits for a path, most recent first, via GitHub's own history", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson([
+        { sha: "b".repeat(40), commit: { message: "update\n\nlonger body", author: { date: "2026-09-26T07:04:00Z", name: "Marfa" } } },
+        { sha: "a".repeat(40), commit: { message: "create", author: { date: "2026-09-25T10:00:00Z", name: "Marfa" } } },
+      ]),
+    ]);
+    const result = await personalGetDocumentHistory(ENV_WITH_APP, ctx(), "DS-my-strategy", "current/WeekPlan.md");
+    expect(result).toEqual({
+      success: true,
+      entries: [
+        { sha: "b".repeat(40), message: "update", date: "2026-09-26T07:04:00Z", author: "Marfa" },
+        { sha: "a".repeat(40), message: "create", date: "2026-09-25T10:00:00Z", author: "Marfa" },
+      ],
+    });
+    expect(calls.at(-1)?.url).toBe(githubCommitsApiUrl("TserenTserenov", "DS-my-strategy", "current/WeekPlan.md", 10));
+  });
+
+  it("caps an over-large limit to 30", async () => {
+    const calls = queuedFetch([...installationTokenResponses(), responseJson([])]);
+    await personalGetDocumentHistory(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", 999);
+    expect(calls.at(-1)?.url).toContain("per_page=30");
+  });
+
+  // Cold-review finding: `Math.trunc(limit) || 10` treated an explicit 0 (or
+  // anything truncating to 0) as "absent" via JS falsy-coercion and silently
+  // returned the default 10 instead of the documented floor of 1.
+  it.each([0, -5, 0.4])("floors a non-positive or sub-1 limit (%s) to 1, not the default", async limit => {
+    const calls = queuedFetch([...installationTokenResponses(), responseJson([])]);
+    await personalGetDocumentHistory(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", limit);
+    expect(calls.at(-1)?.url).toContain("per_page=1");
+  });
+
+  it("returns an error for an unknown source without touching the network", async () => {
+    queuedFetch([]);
+    const result = await personalGetDocumentHistory(ENV_WITH_APP, ctx(), "not-a-real-source", "notes/idea.md");
+    expect(result).toEqual({ success: false, error: "Unknown source: not-a-real-source" });
+  });
+
+  it("surfaces a GitHub error instead of throwing", async () => {
+    queuedFetch([...installationTokenResponses(), responseJson({ message: "Not Found" }, 404)]);
+    const result = await personalGetDocumentHistory(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/missing.md");
+    expect(result.success).toBe(false);
+    expect((result as { error: string }).error).toContain("404");
   });
 });
 
@@ -1903,21 +1978,22 @@ describe("personalGetDocumentWithSha — single source bypasses the index entire
   });
 });
 
-describe("writeToGitHub — warn-режим при перезаписи без expected_sha (решение 30.08)", () => {
+describe("writeToGitHub — enforced expected_sha on an existing path (WP-7 Ф99, closed 26.09)", () => {
   const CUR = "a".repeat(40);
 
-  it("overwrite of an existing file without expected_sha succeeds with an explicit warning", async () => {
-    queuedFetch([
+  it("rejects overwrite of an existing file with sha_required before any PUT", async () => {
+    const calls = queuedFetch([
       ...installationTokenResponses(),
       responseJson({ sha: CUR }),
-      responseJson({ content: { sha: "b".repeat(40), html_url: "https://github.test/x" } }),
     ]);
     const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "update", "update");
-    expect(result.success).toBe(true);
-    expect(result.warning).toMatch(/expected_sha не передан/);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("sha_required");
+    expect(result.current_sha).toBe(CUR);
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
   });
 
-  it("creating a new file carries no warning", async () => {
+  it("creating a new file needs no expected_sha and succeeds", async () => {
     queuedFetch([
       ...installationTokenResponses(),
       { ok: false, status: 404 } as Response,
@@ -1925,10 +2001,10 @@ describe("writeToGitHub — warn-режим при перезаписи без e
     ]);
     const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/new.md", "body", "create");
     expect(result.success).toBe(true);
-    expect(result.warning).toBeUndefined();
+    expect(result.reason).toBeUndefined();
   });
 
-  it("update with a matching expected_sha carries no warning", async () => {
+  it("update with a matching expected_sha succeeds", async () => {
     queuedFetch([
       ...installationTokenResponses(),
       responseJson({ sha: CUR }),
@@ -1936,6 +2012,6 @@ describe("writeToGitHub — warn-режим при перезаписи без e
     ]);
     const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "update", "update", {}, CUR);
     expect(result.success).toBe(true);
-    expect(result.warning).toBeUndefined();
+    expect(result.reason).toBeUndefined();
   });
 });

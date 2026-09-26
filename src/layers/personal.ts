@@ -18,6 +18,7 @@ import { provisionBridgeScopes } from "../scope.js";
 import { buildPathTree, extractTitle, utf8ByteLength, type PathEntry } from "../path-tree.js";
 import {
   githubBlobUrl,
+  githubCommitsApiUrl,
   githubContentsApiUrl,
   normalizeRepositoryPath,
   resolveSourcePath,
@@ -27,6 +28,7 @@ export {
   encodeGitHubContentsPath,
   githubBlobUrl,
   githubBranchApiUrl,
+  githubCommitsApiUrl,
   githubContentsApiUrl,
   normalizeRepositoryPath,
   resolveSourcePath,
@@ -99,11 +101,10 @@ export interface PersonalWriteResult {
   url?: string;
   indexing?: IndexingNotice;
   error?: string;
-  reason?: "post_scaffold_required" | "existence_check_unavailable" | "version_mismatch" | "invalid_expected_sha" | "github_validation_error";
+  reason?: "post_scaffold_required" | "existence_check_unavailable" | "version_mismatch" | "invalid_expected_sha" | "sha_required" | "github_validation_error";
   next_action?: string;
   evidence?: ManagedPostEvidence;
   current_sha?: string | null;
-  warning?: string;
 }
 
 function frontmatterDeclaresPost(content: string): boolean {
@@ -563,6 +564,20 @@ export async function writeToGitHub(
     if (existingSha?.toLowerCase() !== expectedSha.toLowerCase()) {
       return { success: false, reason: "version_mismatch", current_sha: existingSha ?? null, error: "Файл изменился с момента чтения — перечитай personal_get_document(includeSha: true) и повтори запись." };
     }
+  } else if (existingSha) {
+    // WP-7 Ф99: the rollout gate opened 30.08 was never closed by its own
+    // measured criterion (0 version-mismatch conflicts in a 2-week window) —
+    // it was closed by a live incident instead (external pilot, 26.09):
+    // a missing expectedSha against an existing path used to PUT anyway and
+    // warn only after the fact, so a concurrent edit made between the
+    // caller's (skipped) read and this write was already gone by the time
+    // the warning arrived. Rejecting here, before any PUT, is the only point
+    // a write against an unknown current version can still be stopped — the
+    // caller reads get_document(include_sha: true) and retries with that
+    // sha, exactly like a version_mismatch retry. A deliberate full replace
+    // stays possible the same way — no separate overwrite flag needed.
+    console.warn(JSON.stringify({ phase: "write_sha_required", severity: "warning", repo, path: fullPath }));
+    return { success: false, reason: "sha_required", current_sha: existingSha, error: "Файл уже существует — сначала прочитай personal_get_document(include_sha: true) и передай его sha в expected_sha. Осознанная полная замена содержимого возможна тем же способом: получить актуальный sha и передать его." };
   }
 
   // Create or update file
@@ -591,19 +606,6 @@ export async function writeToGitHub(
   }
 
   const result = (await putResp.json()) as { content: { sha: string; html_url: string } };
-  // Overwriting an existing file without expected_sha succeeded, but any
-  // concurrent edit made after the caller's read is now silently gone. Kept
-  // non-blocking for old clients (pilot decision 30.08: warn now, enforce
-  // later once callers adopt the sha round-trip).
-  if (existingSha && expectedSha === undefined) {
-    return {
-      success: true,
-      sha: result.content.sha,
-      url: result.content.html_url,
-      indexing: INDEXING_ASYNC_NOTICE,
-      warning: "Файл существовал, а expected_sha не передан — параллельные правки могли быть молча перезаписаны. Перед правкой существующего файла читай get_document(include_sha: true) и передавай его sha в expected_sha.",
-    };
-  }
   return { success: true, sha: result.content.sha, url: result.content.html_url, indexing: INDEXING_ASYNC_NOTICE };
 }
 
@@ -1550,6 +1552,7 @@ export async function personalGetDocumentLive(
   ctx: UserContext,
   filename: string,
   source: string,
+  ref?: string,
 ): Promise<{ filename: string; content: string; source: string; source_type: string; github_url: string | null; sha: string } | null> {
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return null;
@@ -1566,7 +1569,15 @@ export async function personalGetDocumentLive(
   const token = await getInstallationToken(env, ctx.userId, repo);
   if (!token) return null;
 
-  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
+  // WP-7 Ф176: ref is a git ref (commit sha, branch, tag) resolved by GitHub
+  // itself — reading a prior version this way needs no history bookkeeping
+  // of our own, only the sha the caller already has (from a previous
+  // include_sha read, or from a version_mismatch/sha_required rejection's
+  // current_sha, or from `history`).
+  // ref !== undefined, not a truthy check — an explicit empty string must still
+  // reach GitHub as an invalid ref (surfacing as null below), not be silently
+  // treated as "no ref, read the current version" (cold-review finding).
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}${ref !== undefined ? `?ref=${encodeURIComponent(ref)}` : ""}`;
 
   // External response parsing (json, atob, UTF-8 decode) can throw; the
   // dispatch layer expects null, not an exception.
@@ -1604,6 +1615,7 @@ export async function personalGetDocumentWithSha(
   ctx: UserContext,
   filename: string,
   source?: string,
+  ref?: string,
 ): Promise<
   | { kind: "document"; filename: string; content: string; source: string; source_type: string; github_url: string | null; sha: string }
   | { kind: "source_required"; sources: string[] }
@@ -1628,8 +1640,68 @@ export async function personalGetDocumentWithSha(
     }
   }
 
-  const live = await personalGetDocumentLive(env, ctx, normalized, resolvedSource);
+  const live = await personalGetDocumentLive(env, ctx, normalized, resolvedSource, ref);
   return live ? { kind: "document", ...live } : null;
+}
+
+/** History for a file's path, most recent first (WP-7 Ф176 — recovery path
+ * after an accidental overwrite: find a prior sha here, then read it back
+ * via get_document(ref: sha)). GitHub's commits-by-path endpoint, not our own
+ * bookkeeping — no history to lose or migrate. */
+export async function personalGetDocumentHistory(
+  env: PersonalEnv,
+  ctx: UserContext,
+  source: string,
+  path: string,
+  limit: number = 10,
+): Promise<
+  | { success: true; entries: { sha: string; message: string; date: string | null; author: string | null }[] }
+  | { success: false; error: string }
+> {
+  const userSource = ctx.sources.find(s => s.source === source);
+  if (!userSource) return { success: false, error: `Unknown source: ${source}` };
+
+  let fullPath: string;
+  try {
+    fullPath = resolveSourcePath(userSource.pathPrefix, path).fullPath;
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : "Invalid repository path" };
+  }
+
+  const owner = userSource.githubOwner;
+  const repo = userSource.githubRepo;
+  const token = await getInstallationToken(env, ctx.userId, repo);
+  if (!token) return { success: false, error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge` };
+
+  // Same shape as normalizeSearchResultLimit (../index.ts) — `|| 10` here would
+  // treat an explicit 0 (truncates to falsy 0) as "absent" and silently return
+  // the default instead of the documented floor of 1 (cold-review finding).
+  const cappedLimit = Number.isFinite(limit) ? Math.min(Math.max(Math.trunc(limit), 1), 30) : 10;
+  const apiUrl = githubCommitsApiUrl(owner, repo, fullPath, cappedLimit);
+
+  let response: Response;
+  try {
+    response = await fetch(apiUrl, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+    });
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : "GitHub request failed" };
+  }
+  if (!response.ok) {
+    const err = await response.text();
+    return { success: false, error: `GitHub API error ${response.status}: ${err}` };
+  }
+
+  const commits = (await response.json()) as Array<{ sha: string; commit: { message: string; author?: { date?: string; name?: string } } }>;
+  return {
+    success: true,
+    entries: commits.map(c => ({
+      sha: c.sha,
+      message: c.commit.message.split("\n")[0],
+      date: c.commit.author?.date ?? null,
+      author: c.commit.author?.name ?? null,
+    })),
+  };
 }
 
 /** Private-mode `list_sources`: personal corpus only. */

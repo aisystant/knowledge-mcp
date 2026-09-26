@@ -35,6 +35,7 @@ import {
   personalSearchDocuments,
   personalGetDocument,
   personalGetDocumentWithSha,
+  personalGetDocumentHistory,
   AmbiguousSourceError,
   personalListSources,
   personalListDocuments,
@@ -2316,7 +2317,7 @@ export const TOOLS = [
   {
     name: "get_document",
     description:
-      "Get a specific document by filename, or extract its heading structure (table of contents). Use format=headings to see the outline without reading the full content. For a personal-source document you intend to edit and write back, pass include_sha: true — the returned sha is what write's expected_sha needs to detect a concurrent edit.",
+      "Get a specific document by filename, or extract its heading structure (table of contents). Use format=headings to see the outline without reading the full content. For a personal-source document you intend to edit and write back, pass include_sha: true — the returned sha is what write's expected_sha needs to detect a concurrent edit. To read a PRIOR version instead of the current one, pass ref (a commit sha from personal_history, or any git ref GitHub accepts) — this implies a live read the same way include_sha does.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2328,6 +2329,7 @@ export const TOOLS = [
           description: "Output format: full (default) returns document content, headings returns h1-h6 outline",
         },
         include_sha: { type: "boolean", description: "Personal sources only: read the live version straight from GitHub (not the search index). The response is then a JSON object {filename, source, sha, content} — use its sha as write's expected_sha. Set true whenever you intend to edit and write this document back. If the document is not in the index yet, pass source explicitly. Not combinable with format=headings." },
+        ref: { type: "string", description: "Personal sources only (WP-7 Ф176): a git ref (commit sha, branch or tag) to read that specific version instead of the current one — e.g. a sha from personal_history, or current_sha returned by a failed write. Forces a live GitHub read, same as include_sha. Not combinable with format=headings." },
       },
       required: ["filename"],
     },
@@ -2605,7 +2607,7 @@ const PUBLIC_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set(["resolve_document"]
 const PRIVATE_TOOLS = [
   {
     name: "write",
-    description: "Write a file to a personal knowledge repo via GitHub. Existing files and new ordinary/service Markdown are supported; search indexing is triggered asynchronously by the push and is NOT confirmed in the result (indexing.status: async) — this is expected and needs no follow-up call. When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, a concurrent edit from another session can be silently overwritten. A new publication-like file (frontmatter type: post or a channel filename) under TserenTserenov/DS-Knowledge-Index-Tseren docs/ is server-blocked: create its canonical draft with new_post(scaffold), then edit the returned existing paths with expected_sha. Local shell clients may use scripts/new-post.py with a validated shared reservation.",
+    description: "Write a file to a personal knowledge repo via GitHub. Existing files and new ordinary/service Markdown are supported; search indexing is triggered asynchronously by the push and is NOT confirmed in the result (indexing.status: async) — this is expected and needs no follow-up call. When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, the write is refused with reason: sha_required rather than overwriting an unknown current version (WP-7 Ф99). A new publication-like file (frontmatter type: post or a channel filename) under TserenTserenov/DS-Knowledge-Index-Tseren docs/ is server-blocked: create its canonical draft with new_post(scaffold), then edit the returned existing paths with expected_sha. Local shell clients may use scripts/new-post.py with a validated shared reservation.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2613,9 +2615,33 @@ const PRIVATE_TOOLS = [
         path: { type: "string", description: "File path relative to repo root (e.g. 'notes/my-note.md')" },
         content: { type: "string", description: "File content (markdown)" },
         message: { type: "string", description: "Commit message (default: 'Update via Aisystant MCP')" },
-        expected_sha: { type: "string", pattern: "^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$", description: "sha from get_document(include_sha: true), required when editing an existing file. If the file changed since you read it, the write is refused with reason: version_mismatch instead of silently overwriting the newer content. Omit only when creating a brand-new file (never pass an empty string)." },
+        expected_sha: { type: "string", pattern: "^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$", description: "sha from get_document(include_sha: true). Required whenever the path already exists — omitting it there is refused with reason: sha_required (not a silent overwrite). If the file changed since you read it, the write is refused with reason: version_mismatch instead. Omit only when creating a brand-new file (never pass an empty string). A deliberate full replace of an existing file's content still works this same way: read it first for its current sha, then write with that sha." },
       },
       required: ["source", "path", "content"],
+    },
+  },
+  {
+    // WP-7 Ф176: recovery path after an accidental overwrite (missing expected_sha used to
+    // silently overwrite before Ф99; sha_required stops the write now, but a version already
+    // lost to the old warn-mode behavior — or to a version_mismatch retry the caller answered
+    // wrong — still needed a way back). List candidate shas here, then read one back with
+    // get_document(ref: sha).
+    name: "history",
+    description: "List recent commits for one file's path in a personal knowledge repo — most recent first. Use to find a prior sha after an accidental overwrite or a version_mismatch/sha_required write error, then read that version with get_document(ref: sha). GitHub's own commit history, not a separate log — nothing to lose track of.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: { type: "string", description: "Target repo (source name)" },
+        path: { type: "string", description: "File path relative to repo root, same as write's path" },
+        limit: { type: "number", minimum: 1, maximum: 30, description: "Maximum number of commits to return (default: 10)" },
+      },
+      required: ["source", "path"],
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
   },
   {
@@ -2917,6 +2943,19 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(writeResult, null, 2) }] } };
           }
 
+          if (toolName === "history") {
+            const source = args.source as string;
+            const path = args.path as string;
+            const limit = args.limit as number | undefined;
+
+            if (!ctx.sourceNames.includes(source)) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
+            }
+
+            const historyResult = await personalGetDocumentHistory(env, ctx, source, path, limit);
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(historyResult, null, 2) }], ...(historyResult.success ? {} : { isError: true }) } };
+          }
+
           if (toolName === "propose_capture") {
             const content = args.content as string;
             const suggestedSource = (args.suggested_source as string) || ctx.sourceNames[0];
@@ -3128,18 +3167,21 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
 
           if (toolName === "get_document") {
             const filename = args.filename as string;
+            const ref = args.ref as string | undefined;
 
-            if (args.include_sha === true) {
+            if (args.include_sha === true || ref !== undefined) {
               // WP-7 Ф96 (reworked after verify peer-session 30.08): live-first,
               // index only as a source hint; sha travels INSIDE the text content
               // as a JSON envelope — a non-standard result sibling is invisible
               // to MCP clients. A headings outline has no meaningful sha pairing.
+              // WP-7 Ф176: a ref forces the same live path — the search index
+              // only ever holds the current version, never a prior one.
               if (args.format === "headings") {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "include_sha и format=headings несовместимы: sha относится к полному содержимому файла. Убери один из параметров." }], isError: true } };
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "include_sha/ref и format=headings несовместимы: оба относятся к полному содержимому конкретной версии файла. Убери один из параметров." }], isError: true } };
               }
               let liveResult;
               try {
-                liveResult = await personalGetDocumentWithSha(env, ctx, filename, args.source as string | undefined);
+                liveResult = await personalGetDocumentWithSha(env, ctx, filename, args.source as string | undefined, ref);
               } catch (e) {
                 if (e instanceof AmbiguousSourceError) {
                   return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `filename exists in multiple sources (${e.sources.join(", ")}) — pass source to disambiguate` }], isError: true } };
@@ -3147,12 +3189,13 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
                 throw e;
               }
               if (!liveResult) {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Документ не найден на GitHub (или недоступен). Проверь filename и source." }], isError: true } };
+                const refHint = ref ? ` Или ref «${ref}» не существует для этого файла — проверь через personal_history.` : "";
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Документ не найден на GitHub (или недоступен). Проверь filename и source.${refHint}` }], isError: true } };
               }
               if (liveResult.kind === "source_required") {
                 return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ error: "source_required", message: "Документа нет в индексе — для живого чтения с GitHub передай source явно.", sources: liveResult.sources }) }], isError: true } };
               }
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ filename: liveResult.filename, source: liveResult.source, sha: liveResult.sha, content: liveResult.content }, null, 2) }] } };
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ filename: liveResult.filename, source: liveResult.source, sha: liveResult.sha, ...(ref ? { ref } : {}), content: liveResult.content }, null, 2) }] } };
             }
 
             let doc;
