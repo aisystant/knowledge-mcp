@@ -79,6 +79,17 @@ vi.mock("./layers/personal.js", () => ({
     { type: "file", source: "DS-my-strategy", path: "PRIVATE_SENTINEL.md", title: null },
   ]),
   personalMemorySearch: vi.fn().mockResolvedValue([]),
+  // WP-7 Ф176: not exercised before this session added the feature — get_document(ref)
+  // and history/personal_history both go through these, distinct from the plain
+  // personalGetDocument above (index-backed, no ref support).
+  personalGetDocumentWithSha: vi.fn().mockResolvedValue({
+    kind: "document", filename: "PRIVATE_SENTINEL.md", content: "private note content",
+    source: "DS-my-strategy", source_type: "ds", github_url: null, sha: "a".repeat(40),
+  }),
+  personalGetDocumentHistory: vi.fn().mockResolvedValue({
+    success: true,
+    entries: [{ sha: "a".repeat(40), message: "PRIVATE_SENTINEL commit", date: "2026-09-26T00:00:00Z", author: "Tester" }],
+  }),
   connectSource: vi.fn(),
   writeToGitHub: vi.fn(),
   deleteFromGitHub: vi.fn(),
@@ -106,7 +117,7 @@ vi.mock("./layers/private.js", async (importOriginal) => {
 });
 
 const { handleMcpRequest, default: worker } = await import("./index.js");
-const { personalSearchDocuments, personalGetDocument, personalListSources, personalListDocuments, personalListPath, writeToGitHub } = await import("./layers/personal.js");
+const { personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalListSources, personalListDocuments, personalListPath, writeToGitHub } = await import("./layers/personal.js");
 
 const ENV = {
   KNOWLEDGE_DATABASE_URL: "postgres://fake-public",
@@ -248,6 +259,44 @@ describe("dual-mode routing: private mode reaches the personal layer, never the 
       {},
       expectedSha,
     );
+  });
+
+  // WP-7 Ф176 cold-review finding (26.09): "history" was schema-declared (tools/list
+  // advertised it) but missing from PRIVATE_TOOL_NAMES, so the dispatch branch below —
+  // gated behind PRIVATE_TOOL_NAMES.has(toolName) — never ran; every real call returned
+  // "Unknown tool" despite personal.test.ts's unit tests for personalGetDocumentHistory
+  // itself passing (that file never goes through the dispatcher). This is the same class
+  // of gap the Ф117 list_documents/list_path regression above already exists to catch —
+  // dispatch reachability, not just the called function's own correctness.
+  it("history: private mode reaches the personal-layer commit history lookup", async () => {
+    const res = await callTool("history", { source: "DS-my-strategy", path: "notes/idea.md" }, "private") as
+      { result: { content: [{ text: string }] } };
+    expect(res.result.content[0].text).toContain("PRIVATE_SENTINEL commit");
+    expect(personalGetDocumentHistory).toHaveBeenCalledTimes(1);
+    expect(personalGetDocumentHistory).toHaveBeenCalledWith(
+      ENV, expect.objectContaining({ userId: "user-private-1" }), "DS-my-strategy", "notes/idea.md", undefined,
+    );
+  });
+
+  it("get_document: ref forces the live sha-aware read, not the index-backed lookup", async () => {
+    const res = await callTool("get_document", { filename: "notes/idea.md", ref: "a".repeat(40) }, "private") as
+      { result: { content: [{ text: string }] } };
+    expect(JSON.parse(res.result.content[0].text)).toMatchObject({ content: "private note content", sha: "a".repeat(40) });
+    expect(personalGetDocumentWithSha).toHaveBeenCalledTimes(1);
+    expect(personalGetDocument).not.toHaveBeenCalled();
+  });
+
+  it("get_document: rejects an empty-string ref before reaching the personal layer", async () => {
+    // GitHub's Contents API treats ?ref= (empty) as "no ref" and returns the
+    // default-branch file — not an error — so this must be caught before ever
+    // calling into the layer that would talk to GitHub (cold-review finding,
+    // verify session 26.09; the earlier attempt at this fix silently passed
+    // an empty ref through, unobserved by any test).
+    const res = await callTool("get_document", { filename: "notes/idea.md", ref: "" }, "private") as
+      { result: { content: [{ text: string }]; isError?: boolean } };
+    expect(res.result.isError).toBe(true);
+    expect(res.result.content[0].text).toContain("ref");
+    expect(personalGetDocumentWithSha).not.toHaveBeenCalled();
   });
 });
 

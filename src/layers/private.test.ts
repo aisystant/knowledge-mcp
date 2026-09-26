@@ -28,6 +28,11 @@ describe("PRIVATE_TOOL_NAMES", () => {
     expect(PRIVATE_TOOL_NAMES.has("reindex_status")).toBe(true);
     expect(PRIVATE_TOOL_NAMES.has("personal_reindex_source")).toBe(false);
     expect(PRIVATE_TOOL_NAMES.has("personal_reindex_status")).toBe(false);
+    // WP-7 Ф176: recent-commits lookup, exposed as personal_history. Missing here left
+    // index.ts's dispatch handler unreachable despite being schema-declared (cold-review
+    // finding, verify session 26.09) — see the PRIVATE_TOOLS-vs-PRIVATE_TOOL_NAMES
+    // symmetry test in index.test.ts, added the same session.
+    expect(PRIVATE_TOOL_NAMES.has("history")).toBe(true);
   });
 
   it("does not mark public tools as private", () => {

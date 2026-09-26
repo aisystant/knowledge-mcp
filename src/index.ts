@@ -2329,7 +2329,7 @@ export const TOOLS = [
           description: "Output format: full (default) returns document content, headings returns h1-h6 outline",
         },
         include_sha: { type: "boolean", description: "Personal sources only: read the live version straight from GitHub (not the search index). The response is then a JSON object {filename, source, sha, content} — use its sha as write's expected_sha. Set true whenever you intend to edit and write this document back. If the document is not in the index yet, pass source explicitly. Not combinable with format=headings." },
-        ref: { type: "string", description: "Personal sources only (WP-7 Ф176): a git ref (commit sha, branch or tag) to read that specific version instead of the current one — e.g. a sha from personal_history, or current_sha returned by a failed write. Forces a live GitHub read, same as include_sha. Not combinable with format=headings." },
+        ref: { type: "string", minLength: 1, description: "Personal sources only (WP-7 Ф176): a git ref (commit sha, branch or tag) to read that specific version instead of the current one — e.g. a sha from personal_history, or current_sha returned by a failed write. Forces a live GitHub read, same as include_sha. Not combinable with format=headings." },
       },
       required: ["filename"],
     },
@@ -2604,7 +2604,7 @@ const PUBLIC_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set(["resolve_document"]
 // No per-user `source` enum here (unlike the original getTools(ctx)): knowledge-mcp's tool
 // list is a static const, not rebuilt per-request; source is validated at runtime instead
 // (isToolAllowedInMode + ctx.sourceNames check in the handler) — same enforcement, no schema hint.
-const PRIVATE_TOOLS = [
+export const PRIVATE_TOOLS = [
   {
     name: "write",
     description: "Write a file to a personal knowledge repo via GitHub. Existing files and new ordinary/service Markdown are supported; search indexing is triggered asynchronously by the push and is NOT confirmed in the result (indexing.status: async) — this is expected and needs no follow-up call. When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, the write is refused with reason: sha_required rather than overwriting an unknown current version (WP-7 Ф99). A new publication-like file (frontmatter type: post or a channel filename) under TserenTserenov/DS-Knowledge-Index-Tseren docs/ is server-blocked: create its canonical draft with new_post(scaffold), then edit the returned existing paths with expected_sha. Local shell clients may use scripts/new-post.py with a validated shared reservation.",
@@ -3168,6 +3168,14 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
           if (toolName === "get_document") {
             const filename = args.filename as string;
             const ref = args.ref as string | undefined;
+
+            // GitHub's Contents API treats an empty ref value as "no ref" and returns the
+            // default-branch (current) version — not an error. Passing that empty ref through
+            // silently, uncaught. Reject it explicitly instead of relying on GitHub's own
+            // resolution (cold-review finding, verify session 26.09).
+            if (ref === "") {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "ref не может быть пустой строкой — передай конкретный sha/ветку/тег из personal_history или не передавай параметр вовсе." }], isError: true } };
+            }
 
             if (args.include_sha === true || ref !== undefined) {
               // WP-7 Ф96 (reworked after verify peer-session 30.08): live-first,

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, PRIVATE_TOOLS, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
+import { PRIVATE_TOOL_NAMES } from "./layers/private.js";
 import { chunkLargeFile, contentHash } from "../scripts/ingest.js";
 import { neon } from "@neondatabase/serverless";
 
@@ -1092,3 +1093,17 @@ describe("list_path tool registration", () => {
     expect(listDocs!.inputSchema.properties).not.toHaveProperty("path_prefix");
   });
 });
+
+// WP-7 Ф176 cold-review finding (26.09): "history" was declared in PRIVATE_TOOLS'
+// schema (so tools/list advertised it) but missing from PRIVATE_TOOL_NAMES — the
+// dispatch handler in the tools/call branch below is gated behind
+// PRIVATE_TOOL_NAMES.has(toolName), so every real call returned "Unknown tool"
+// despite a green test suite. Nothing before this asserted the two lists agree.
+describe("PRIVATE_TOOLS schema vs. PRIVATE_TOOL_NAMES dispatch gate (WP-7 Ф176)", () => {
+  it("every schema-declared private tool name is dispatchable", () => {
+    for (const tool of PRIVATE_TOOLS) {
+      expect(PRIVATE_TOOL_NAMES.has(tool.name), `"${tool.name}" is listed in PRIVATE_TOOLS but missing from PRIVATE_TOOL_NAMES — tools/call would return "Unknown tool"`).toBe(true);
+    }
+  });
+});
+

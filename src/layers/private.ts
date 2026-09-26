@@ -44,6 +44,12 @@ export const PRIVATE_TOOL_NAMES: ReadonlySet<string> = new Set([
   // dispatched name would collide after the gateway's strip (see index.ts comment on "reindex").
   "reindex",
   "reindex_status",
+  // WP-7 Ф176: list recent commits for a file's path — exposed as personal_history.
+  // Missing from this set left the dispatch handler unreachable (index.ts gates it
+  // behind PRIVATE_TOOL_NAMES.has(toolName)): tools/list advertised it, tools/call
+  // returned "Unknown tool" — found by cold-context audit, not caught by the test
+  // suite (no tools/list<->dispatch symmetry test existed).
+  "history",
   // WP-7 Ф97.2: per-file indexing status (personal_index_status). Data layer
   // (buildIndexStatusSuccessQuery/buildIndexStatusErrorQuery) lives in personal.ts;
   // the actual tools/list + dispatch entry is only wired in personal-knowledge-mcp's
