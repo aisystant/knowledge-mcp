@@ -1089,6 +1089,34 @@ describe("allocatePostNumber (WP-560 Ф12)", () => {
     [POST_CONVENTION_PATH]: JSON.stringify(POST_CONVENTION_FIXTURE), ...files,
   });
 
+  it.each([
+    ["reservation", undefined],
+    ["browser scaffold", scaffoldInput],
+  ] as const)("creates a %s with receiver-sensitive Workers fetch", async (_name, scaffold) => {
+    const git = scaffoldRepository();
+    vi.stubGlobal("fetch", function (this: unknown, input: RequestInfo | URL, init?: RequestInit) {
+      if (this !== undefined && this !== null && this !== globalThis) {
+        throw new TypeError("Illegal invocation: function called with incorrect this reference");
+      }
+      return git.request(input, init);
+    });
+
+    const result = await createPersonalPost(ENV, allocatorContext, {
+      source: knowledgeIndexTarget.source, draftId: DRAFT_ID, artifactType: "post", scaffold,
+    }, { getInstallationToken: async () => "test-token", authorizePaths: git.authorizePaths });
+
+    expect(result).toMatchObject({ success: true, post_number: 1, reused: false });
+    expect(git.entries()).toEqual([expect.objectContaining({ draft_id: DRAFT_ID, post_number: 1 })]);
+    expect(git.calls.filter(call => call.method === "PATCH")).toHaveLength(1);
+    if (scaffold) {
+      expect(result.scaffold).toMatchObject({ status: "created", commit_sha: git.head });
+      expect(result.scaffold!.paths).toHaveLength(2);
+      for (const path of result.scaffold!.paths) {
+        expect(git.files()[path]).toContain('status: "draft"');
+      }
+    }
+  });
+
   it("atomically creates the reservation and all draft channel files after authorizing every path", async () => {
     const git = scaffoldRepository({ [POST_PATH]: post(233), [ALLOCATOR_LOG_PATH]: log(entry(232)) });
     git.authorizePaths.mockImplementation(async paths => {

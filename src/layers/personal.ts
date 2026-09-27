@@ -794,7 +794,9 @@ class AllocatorGitClient {
       throw new AllocatorBudgetError("Allocator deadline or request budget exhausted; no further Git writes allowed.");
     }
     this.requests++;
-    return this.githubFetch(url, { method, headers: this.headers, signal: this.signal,
+    // Workers fetch rejects an AllocatorGitClient receiver; invoke it as a function.
+    const githubFetch = this.githubFetch;
+    return githubFetch(url, { method, headers: this.headers, signal: this.signal,
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
   }
