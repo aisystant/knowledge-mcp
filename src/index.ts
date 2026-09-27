@@ -265,7 +265,7 @@ async function fetchEmbeddingOnce(apiKey: string, text: string): Promise<number[
 
     if (!response.ok) {
       const errText = await response.text();
-      throw new Error(`OpenAI Embeddings error: ${response.status} ${errText}`);
+      throw new Error(`OpenRouter embeddings error: ${response.status} ${errText}`);
     }
 
     const data = (await response.json()) as { data: { embedding: number[] }[] };
@@ -288,7 +288,7 @@ function classifyEmbeddingFailure(error: unknown): EmbeddingFailureReason {
   if (error instanceof DOMException && error.name === "AbortError") return "timeout";
 
   const message = error instanceof Error ? error.message : "";
-  const statusMatch = message.match(/^OpenAI Embeddings error: (\d{3})\b/);
+  const statusMatch = message.match(/^OpenRouter embeddings error: (\d{3})\b/);
   if (statusMatch) {
     if (statusMatch[1].startsWith("4")) return "http_4xx";
     if (statusMatch[1].startsWith("5")) return "http_5xx";

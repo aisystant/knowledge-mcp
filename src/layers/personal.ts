@@ -1219,17 +1219,17 @@ export async function personalGetEmbedding(apiKey: string, text: string): Promis
     const errText = await response.text();
     const isRetryable = response.status >= 500 || response.status === 429;
     if (!isRetryable || attempt === OPENAI_MAX_ATTEMPTS) {
-      throw new Error(`OpenAI Embeddings error: ${response.status} ${errText}`);
+      throw new Error(`OpenRouter embeddings error: ${response.status} ${errText}`);
     }
 
     const retryAfterHeader = response.headers.get("retry-after");
     const retryAfterMs = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : 0;
     const backoffMs = OPENAI_BASE_DELAY_MS * Math.pow(2, attempt - 1);
     const delay = Math.min(Math.max(retryAfterMs, backoffMs), OPENAI_MAX_DELAY_MS);
-    lastErr = new Error(`OpenAI ${response.status}: ${errText.slice(0, 200)}`);
+    lastErr = new Error(`OpenRouter embeddings error: ${response.status} ${errText.slice(0, 200)}`);
     await new Promise((r) => setTimeout(r, delay));
   }
-  throw lastErr instanceof Error ? lastErr : new Error("OpenAI Embeddings retry exhausted");
+  throw lastErr instanceof Error ? lastErr : new Error("OpenRouter embeddings retry exhausted");
 }
 
 type PersonalQueryType = "keyword" | "vector";
