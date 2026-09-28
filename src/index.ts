@@ -247,14 +247,13 @@ export function resolveGithubUrl(source: string, filename: string): string | nul
 
 const EMBEDDING_ENDPOINT = "https://openrouter.ai/api/v1/embeddings";
 
-// WP-7 Ф183: из тела ошибки провайдера в лог попадает только машинный код
-// (word-части/точки/дефисы — туда физически не поместится эхо запроса или
-// фрагмент ключа). Произвольный текст message не логируем вовсе (cold review
-// Codex: даже усечённые ≤200 символов сообщения провайдер может заполнить
-// отражёнными данными); вместо него — длина тела для формы ответа.
-// Та же дисциплина для значений, контролируемых ответом провайдера:
-// requestId/cfRay — только если похожи на идентификатор (иначе null),
-// statusText — из локальной таблицы по числовому status, не из ответа.
+// WP-7 F183: from a provider error body only a machine code reaches the log
+// (word chars, dots, hyphens). The free-text message is never logged, even
+// truncated: a provider can fill it with reflected data (cold review, Codex).
+// The body length is logged instead, to show the response shape.
+// The same discipline applies to every value the provider controls:
+// requestId/cfRay are kept only when they look like an identifier (else null),
+// statusText comes from a local table keyed by the numeric status.
 const SAFE_ERROR_CODE_RE = /^[\w.\-]{1,100}$/;
 const SAFE_REQUEST_ID_RE = /^[\w.\-]{1,128}$/;
 const SAFE_CF_RAY_RE = /^[\w.\-]{1,64}$/;
@@ -276,32 +275,43 @@ function safeHeaderValue(value: string | null | undefined, pattern: RegExp): str
   return value && pattern.test(value) ? value : null;
 }
 
-// Последний рубеж (cold review Codex, итерации 3-4): любое строковое значение,
-// пришедшее от провайдера, перед логом проверяется на пересечение с apiKey и
-// входом эмбеддинга — regex формы не спасает от отражённого секрета вида
-// "sk-secret-echo". Ловим: полное эхо, эхо фрагмента (само значение — подстрока
-// секрета/входа) и любое 16-символьное скользящее окно входа (шаг 1 — окно,
-// пересекающее границу блока, не проскочит). Совпадение → поле уходит в null.
-function containsSensitiveFragment(value: string, apiKey: string, text: string): boolean {
-  if (!value) return false;
-  if (apiKey && (value.includes(apiKey) || apiKey.includes(value))) return true;
-  if (text) {
-    if (value.includes(text) || text.includes(value)) return true;
-    const WINDOW = 16;
-    for (let i = 0; i + WINDOW <= text.length; i++) {
-      if (value.includes(text.slice(i, i + WINDOW))) return true;
-    }
+// Last line of defence: a shape regex cannot stop a reflected secret such as
+// "sk-secret-echo", so every provider-controlled string is also checked against
+// both secrets (the API key and the embedding input) before it is logged.
+// A value is treated as an echo when it contains the whole secret, is itself a
+// substring of the secret, or shares a LEAK_WINDOW-char window with it. The
+// window slides by 1, so a fragment that straddles a block boundary is caught.
+// The threshold is deliberate: a wrapper sharing fewer than LEAK_WINDOW chars
+// with a secret is not treated as a leak (short overlaps are coincidence for
+// identifiers). One rule for both secrets.
+const LEAK_WINDOW = 16;
+
+function echoesSecret(value: string, secret: string): boolean {
+  if (!secret) return false;
+  if (value.includes(secret) || secret.includes(value)) return true;
+  // "value contains a window of the secret" is the same statement as "a window of
+  // the value occurs in the secret". Sliding over the short value (<=128 chars)
+  // bounds the number of windows and allocations by the value, not by the secret.
+  // Each includes() over a huge secret is still linear, so an unbounded query is
+  // a cost to cap upstream, not here.
+  for (let i = 0; i + LEAK_WINDOW <= value.length; i++) {
+    if (secret.includes(value.slice(i, i + LEAK_WINDOW))) return true;
   }
   return false;
+}
+
+function containsSensitiveFragment(value: string, apiKey: string, text: string): boolean {
+  return !!value && (echoesSecret(value, apiKey) || echoesSecret(value, text));
 }
 
 function extractEmbeddingErrorCode(errText: string): string | null {
   try {
     const parsed = JSON.parse(errText) as { error?: { code?: unknown } };
     const code = parsed.error?.code;
-    if (typeof code === "string" && SAFE_ERROR_CODE_RE.test(code)) return code;
-    if (typeof code === "number") return String(code);
-    return null;
+    // A numeric code goes through the same charset filter as a string one:
+    // String(1e100) is "1e+100", and "+" is outside the allowed set.
+    const asText = typeof code === "number" ? String(code) : code;
+    return typeof asText === "string" && SAFE_ERROR_CODE_RE.test(asText) ? asText : null;
   } catch {
     return null;
   }
@@ -339,15 +349,15 @@ async function fetchEmbeddingOnce(apiKey: string, text: string, attempt: number)
     });
 
     if (!response.ok) {
-      // Тело читаем отказоустойчиво: лог и status/requestId обязаны
-      // материализоваться, даже если response.text() отклонился.
+      // Read the body defensively: the log and status/requestId must materialise
+      // even when response.text() rejects.
       const errText = await response.text().catch(() => "");
-      // WP-7 Ф183: до этого лога у ошибок эмбеддинга не было ни одного
-      // диагностического поля — 403 в проде было нечем разобрать.
-      // requestId только из заголовков OpenRouter; cf-ray — отдельное поле
-      // (луч Cloudflare не ищется в кабинете OpenRouter как id запроса).
-      // Текст входа эмбеддинга и apiKey не логируются; сырое тело провайдера
-      // в лог и в текст ошибки не попадает.
+      // WP-7 F183: before this log an embedding failure had no diagnostic field at
+      // all, so a production 403 could not be traced. requestId comes only from
+      // OpenRouter headers; cf-ray is a separate field (a Cloudflare ray is not a
+      // request id in the OpenRouter dashboard). Neither the embedding input nor
+      // the apiKey is logged, and the raw provider body reaches neither the log
+      // nor the error text.
       const rawRequestId =
         safeHeaderValue(response.headers?.get?.("x-openrouter-request-id"), SAFE_REQUEST_ID_RE) ??
         safeHeaderValue(response.headers?.get?.("x-request-id"), SAFE_REQUEST_ID_RE);
@@ -1133,6 +1143,9 @@ export async function searchDocuments(
       console.warn(JSON.stringify({
         event: "knowledge_search_embedding_fallback",
         reason: error.reason,
+        // Correlation keys: they match the "embedding_http_error" record of the last attempt.
+        status: error.status,
+        request_id: error.requestId,
         embedding_attempts: 2,
         fallback: "keyword",
         source_filter_present: source !== undefined,
@@ -2713,12 +2726,13 @@ export const TOOLS = [
   },
 ];
 
-// WP-7 Ф183: в личном режиме эти публичные инструменты не имеют личной реализации
-// (на личной базе нет платформенных таблиц knowledge.*) и падали сырой ошибкой
-// Postgres — дословно текст жалобы пользователя. Сняты как неподдерживаемый личный
-// контракт: замена — personal_reindex (личные источники) и feedback в публичном
-// режиме (платформенные документы). load_skill намеренно НЕ в наборе: шлюз строит
-// personal_* из tools/list бэкенда, иначе исчез бы personal_load_skill (WP-560 Ф10/Ф11).
+// WP-7 F183: in private mode these public tools have no personal implementation
+// (the personal DB has no platform knowledge.* tables) and failed with a raw
+// Postgres error, verbatim the user's complaint. They are withdrawn as an
+// unsupported personal contract: use personal_reindex for personal sources and
+// the public-mode feedback for platform documents. load_skill is deliberately
+// NOT in the set: the gateway builds personal_* from the backend tools/list, so
+// hiding it would drop personal_load_skill (WP-560 F10/F11).
 const PUBLIC_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
   "resolve_document",
   "feedback",

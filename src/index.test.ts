@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, PRIVATE_TOOLS, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
+import worker from "./index.js";
 import { PRIVATE_TOOL_NAMES } from "./layers/private.js";
 import { chunkLargeFile, contentHash } from "../scripts/ingest.js";
 import { neon } from "@neondatabase/serverless";
@@ -255,29 +256,75 @@ describe("public-only tools in private mode (WP-7 Ф183)", () => {
     expect([...names].sort()).toEqual([...allowed].sort());
   });
 
-  it("keeps all public-only names in public tools/list and routes the public feedback call", async () => {
+  it("does not apply the private withdrawal to the public tools/list", async () => {
     const names = await listToolNames("public");
     for (const name of PUBLIC_ONLY) expect(names).toContain(name);
+  });
 
-    let called;
-    try {
-      called = await handleMcpRequest(
-        { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "feedback", arguments: { document_id: 1, query: "q", helpfulness: true } } },
-        {} as Env,
-        undefined,
-        "public",
-      );
-    } catch (error) {
-      // Вызов дошёл до обработчика и упал на отсутствующей тестовой БД —
-      // строго ожидаемая ошибка конфигурации; любая другая (например,
-      // сломанная маршрутизация) проваливает тест.
-      expect(String(error)).toContain("KNOWLEDGE_DATABASE_URL is required");
-      return;
+  // Public mode must reach each withdrawn tool's own handler. The env carries mock
+  // DSNs so the feedback handlers finish against the mocked DB layer. Every row
+  // expects a different, handler-specific outcome, so a mis-routed dispatch cannot
+  // pass by returning an error shared with another handler.
+  it.each<[string, Record<string, unknown>, string]>([
+    ["feedback", { document_id: 7, query: "q", helpfulness: true }, '{"recorded":false}'],
+    ["feedback_stats", {}, "[]"],
+    ["reindex_source", {}, "use personal_reindex instead"],
+    ["resolve_document", {}, "invalid resolve_document arguments"],
+  ])("routes %s to its own handler in public mode", async (name, args, marker) => {
+    const env = { KNOWLEDGE_DATABASE_URL: "mock-knowledge-dsn", HEALTH_DATABASE_URL: "mock-health-dsn" } as unknown as Env;
+    const called = await handleMcpRequest(
+      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name, arguments: args } },
+      env,
+      undefined,
+      "public",
+    );
+    expect(called.error).toBeUndefined();
+    const text = (called.result as { content: Array<{ text: string }> }).content[0].text;
+    expect(text).toContain(marker);
+  });
+
+  // The tests above pass the mode to handleMcpRequest directly. This block goes
+  // through the worker's HTTP entry point, where the mode comes from env.MCP_MODE.
+  describe("via the worker HTTP entry point", () => {
+    async function postMcp(mcpMode: string, body: object): Promise<Response> {
+      const request = new Request("https://knowledge.test/mcp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return worker.fetch(request, { MCP_MODE: mcpMode } as unknown as Env);
     }
-    // Маршрутизация дошла до обработчика: гейт не сработал (не -32601),
-    // а ошибка — из слоя БД (текст activeDsn), не из диспетчера.
-    expect(called?.error?.code ?? null).not.toBe(-32601);
-    expect(JSON.stringify(called?.error)).toContain("KNOWLEDGE_DATABASE_URL is required");
+
+    async function httpToolNames(mcpMode: string): Promise<string[]> {
+      const res = await postMcp(mcpMode, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+      expect(res.status).toBe(200);
+      const payload = (await res.json()) as { result: { tools: Array<{ name: string }> } };
+      return payload.result.tools.map((tool) => tool.name);
+    }
+
+    it("MCP_MODE=private hides the withdrawn tools and refuses a direct call with -32601", async () => {
+      const names = await httpToolNames("private");
+      for (const name of PUBLIC_ONLY) expect(names).not.toContain(name);
+
+      const res = await postMcp("private", {
+        jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "feedback", arguments: {} },
+      });
+      expect(res.status).toBe(200);
+      const payload = (await res.json()) as { error?: { code: number } };
+      expect(payload.error?.code).toBe(-32601);
+    });
+
+    it("MCP_MODE=public does not apply the private withdrawal", async () => {
+      const names = await httpToolNames("public");
+      for (const name of PUBLIC_ONLY) expect(names).toContain(name);
+    });
+
+    it("an invalid MCP_MODE fails closed with HTTP 500", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const res = await postMcp("bogus", { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+      expect(res.status).toBe(500);
+      errorSpy.mockRestore();
+    });
   });
 });
 
@@ -918,29 +965,117 @@ describe("getEmbedding", () => {
     errorSpy.mockRestore();
   });
 
-  it("drops fields echoing a boundary-crossing or short input fragment (WP-7 Ф183)", async () => {
+  // Shared setup for the leak tests below: one failed attempt whose provider-controlled
+  // fields are set by the caller. Returns the parsed "embedding_http_error" record.
+  const LEAK_INPUT = "secret-user-query-text-here";
+  const LEAK_API_KEY = "sk-or-v1-0123456789abcdef012345"; // fake, kept under 40 chars so it does not look like a token
+
+  async function logFailedEmbedding(opts: {
+    headers?: Record<string, string>;
+    body?: unknown;
+    apiKey?: string;
+    input?: string;
+  }): Promise<Record<string, unknown>> {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const inputText = "secret-user-query-text-here";
-    const headers = new Map([
-      // Фрагмент, пересекающий границу 16-символьных блоков (позиции 8..24)
-      ["x-openrouter-request-id", inputText.slice(8, 24)],
-      // Короткий фрагмент (<16) — подстрока входа
-      ["cf-ray", inputText.slice(0, 8)],
-    ]);
-    const fetchMock = vi.fn().mockResolvedValue({
+    const headers = new Map(Object.entries(opts.headers ?? {}));
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: false,
       status: 403,
       headers: { get: (key: string) => headers.get(key) ?? null },
-      text: async () => JSON.stringify({ error: { code: "forbidden" } }),
+      text: async () => JSON.stringify(opts.body ?? { error: { code: "forbidden" } }),
     });
-    globalThis.fetch = fetchMock;
-
-    await getEmbedding("fake-key", inputText).catch(() => {});
-    const first = JSON.parse(errorSpy.mock.calls[0][0] as string);
-    expect(first.requestId).toBeNull();
-    expect(first.cfRay).toBeNull();
-    expect(first.errorCode).toBe("forbidden");
+    await getEmbedding(opts.apiKey ?? LEAK_API_KEY, opts.input ?? LEAK_INPUT).catch(() => {});
+    const logged = JSON.parse(errorSpy.mock.calls[0][0] as string) as Record<string, unknown>;
     errorSpy.mockRestore();
+    return logged;
+  }
+
+  it("keeps well-formed provider identifiers (guards against over-blocking)", async () => {
+    const logged = await logFailedEmbedding({
+      headers: { "x-openrouter-request-id": "gen-abc123xyz", "cf-ray": "8a1b2c3d4e5f6a7b-FRA" },
+      body: { error: { code: 403 } },
+    });
+    expect(logged).toMatchObject({ requestId: "gen-abc123xyz", cfRay: "8a1b2c3d4e5f6a7b-FRA", errorCode: "403" });
+  });
+
+  // These two cases hand over a value that is itself a substring of the input, so the
+  // substring rule catches them. They do NOT exercise the sliding window (see below).
+  it("drops a field that is itself a fragment of the input (substring rule)", async () => {
+    const logged = await logFailedEmbedding({
+      headers: {
+        // straddles the 16-char block boundary (offsets 8..24)
+        "x-openrouter-request-id": LEAK_INPUT.slice(8, 24),
+        // short fragment (<16 chars)
+        "cf-ray": LEAK_INPUT.slice(0, 8),
+      },
+    });
+    expect(logged.requestId).toBeNull();
+    expect(logged.cfRay).toBeNull();
+    expect(logged.errorCode).toBe("forbidden");
+  });
+
+  // Each row wraps a 16-char window of a secret in text that is NOT a substring of the
+  // secret, so only the sliding-window rule can catch it. The scan slides over the value,
+  // so what matters is where the shared run sits inside it: prefix "r" puts it at index 1,
+  // which no scan step above 1 reaches; "req-" puts it at index 4. Removing the window
+  // loop turns every row red.
+  const carriers = {
+    requestId: (value: string) => ({ headers: { "x-openrouter-request-id": value } }),
+    cfRay: (value: string) => ({ headers: { "cf-ray": value } }),
+    errorCode: (value: string) => ({ body: { error: { code: value } } }),
+  } as const;
+  const wrapWindow = (secret: string, from: number, prefix: string) => `${prefix}${secret.slice(from, from + 16)}-9`;
+
+  it.each(
+    (["requestId", "cfRay", "errorCode"] as const).flatMap((field) => [
+      [field, "embedding input", LEAK_INPUT, 8, "r"] as const,
+      [field, "embedding input", LEAK_INPUT, 8, "req-"] as const,
+      [field, "API key", LEAK_API_KEY, 3, "r"] as const,
+      [field, "API key", LEAK_API_KEY, 3, "req-"] as const,
+    ]),
+  )("drops %s that wraps a window of the %s", async (field, _secretName, secret, from, prefix) => {
+    const value = wrapWindow(secret, from, prefix);
+    expect(secret.includes(value)).toBe(false); // precondition: not a plain substring
+    const logged = await logFailedEmbedding(carriers[field](value));
+    expect(logged[field]).toBeNull();
+    expect(JSON.stringify(logged)).not.toContain(secret.slice(from, from + 16));
+  });
+
+  // Pins the documented threshold from below; the 16-char rows above pin it from above.
+  it("keeps a wrapper that shares one char fewer than the leak window with the input", async () => {
+    const value = `req-${LEAK_INPUT.slice(8, 23)}-9`; // 15 shared chars
+    const logged = await logFailedEmbedding(carriers.requestId(value));
+    expect(logged.requestId).toBe(value);
+  });
+
+  it("drops a numeric error code whose text form leaves the allowed charset (1e100 -> 1e+100)", async () => {
+    const logged = await logFailedEmbedding({ body: { error: { code: 1e100 } } });
+    expect(logged.errorCode).toBeNull();
+  });
+
+  it("does not treat an empty API key as a match for every field", async () => {
+    const logged = await logFailedEmbedding({
+      apiKey: "",
+      headers: { "x-openrouter-request-id": "gen-abc123xyz" },
+    });
+    expect(logged.requestId).toBe("gen-abc123xyz");
+  });
+
+  // A secret shorter than the window has no window to share: only the whole-value and
+  // substring rules apply to it.
+  it("catches a short secret by containment but not by partial overlap", async () => {
+    const whole = await logFailedEmbedding({ apiKey: "fake-key", headers: { "x-openrouter-request-id": "req-fake-key-9" } });
+    expect(whole.requestId).toBeNull();
+    const partial = await logFailedEmbedding({ apiKey: "fake-key", headers: { "x-openrouter-request-id": "req-fake-ke-9" } });
+    expect(partial.requestId).toBe("req-fake-ke-9");
+  });
+
+  it("still catches a wrapped window of a very long input", async () => {
+    const input = `${"x".repeat(200_000)}tail-of-the-user-query`;
+    const value = `req-${input.slice(-20, -4)}-9`;
+    expect(input.includes(value)).toBe(false);
+    const logged = await logFailedEmbedding({ input, headers: { "x-openrouter-request-id": value } });
+    expect(logged.requestId).toBeNull();
   });
 });
 
@@ -1002,6 +1137,8 @@ describe("searchDocuments embedding resilience", () => {
     expect(JSON.parse(logLine)).toEqual({
       event: "knowledge_search_embedding_fallback",
       reason: "http_5xx",
+      status: 503,
+      request_id: null,
       embedding_attempts: 2,
       fallback: "keyword",
       source_filter_present: true,
@@ -1010,6 +1147,36 @@ describe("searchDocuments embedding resilience", () => {
     expect(logLine).not.toContain(query);
     expect(logLine).not.toContain(apiKey);
     expect(logLine).not.toContain(providerBody);
+  });
+
+  it("logs status and request id of the last attempt in the fallback record", async () => {
+    const failure = (status: number, requestId: string) => ({
+      ok: false,
+      status,
+      headers: { get: (key: string) => (key === "x-openrouter-request-id" ? requestId : null) },
+      text: async () => "bad gateway",
+    });
+    // Different metadata per attempt: keeping the first attempt's would fail below.
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce(failure(503, "req-first"))
+      .mockResolvedValueOnce(failure(502, "req-last"));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    mockWithUserContextImpl = (fn) => fn(makeMockSql([]));
+
+    await searchDocuments(
+      { KNOWLEDGE_DATABASE_URL: "mock-knowledge-dsn", HEALTH_DATABASE_URL: "mock-health-dsn", OPENROUTER_API_KEY: "private-api-key" },
+      "how to tell systems from their descriptions",
+      undefined,
+      undefined,
+      5,
+    );
+
+    const fallback = JSON.parse(warnSpy.mock.calls[0][0] as string);
+    expect(fallback).toMatchObject({ event: "knowledge_search_embedding_fallback", status: 502, request_id: "req-last" });
+    // the same id appears in the per-attempt error record, so the two log lines can be joined
+    const lastAttempt = JSON.parse(errorSpy.mock.calls[1][0] as string);
+    expect(lastAttempt).toMatchObject({ event: "embedding_http_error", attempt: 2, requestId: "req-last" });
   });
 
   it("keeps the vector path when embedding succeeds", async () => {
