@@ -2648,20 +2648,6 @@ export const TOOLS = [
     },
   },
   {
-    name: "reindex_source",
-    description:
-      "Trigger full or partial reindex of a knowledge source (platform L2 or personal L4). Scans all .md files from GitHub, chunks, embeds, and upserts to Neon. For large sources (>1000 files) use dry_run to list files, then call in batches via 'files' param. For L2 platform sources — no auth needed. For L4 personal sources — requires user registration in user_sources.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        source: { type: "string", description: "Source name (e.g. 'docs-courses', 'PACK-personal')" },
-        dry_run: { type: "boolean", description: "Preview files to be indexed without DB writes (default: false)" },
-        files: { type: "array", items: { type: "string" }, description: "Explicit list of file paths to reindex (batch mode). If omitted, scans all .md files from GitHub." },
-      },
-      required: ["source"],
-    },
-  },
-  {
     name: "concept_expand",
     description:
       "BFS-обход графа от seed-концептов: возвращает соседей через рёбра specializes/part_of/related/prerequisite. Используй когда пользователь задал термин и тебе нужны связанные понятия для развёрнутого ответа (DP.METHOD.042 сценарии: определение, Pack-обучение, онтологические ответы). Автоматически фильтрует deprecated/superseded в выдаче. Обновляет last_traversed_at на пройденных рёбрах.",
@@ -2729,15 +2715,32 @@ export const TOOLS = [
 // WP-7 F183: in private mode these public tools have no personal implementation
 // (the personal DB has no platform knowledge.* tables) and failed with a raw
 // Postgres error, verbatim the user's complaint. They are withdrawn as an
-// unsupported personal contract: use personal_reindex for personal sources and
-// the public-mode feedback for platform documents. load_skill is deliberately
-// NOT in the set: the gateway builds personal_* from the backend tools/list, so
-// hiding it would drop personal_load_skill (WP-560 F10/F11).
-const PUBLIC_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
+// unsupported personal contract: use the public-mode feedback for platform
+// documents. load_skill is deliberately NOT in the set: the gateway builds
+// personal_* from the backend tools/list, so hiding it would drop
+// personal_load_skill (WP-560 F10/F11).
+export const PUBLIC_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
   "resolve_document",
   "feedback",
   "feedback_stats",
-  "reindex_source",
+]);
+
+// WP-7 F186: withdrawn from the MCP surface in every mode. reindex_source ran a full
+// platform (L2) reindex without any sign-in. A call without an explicit file list, dry_run
+// included, spends the shared GitHub quota to list the source; a real run also reads every
+// file from GitHub and spends the shared embedding key (changed files only). Concurrent
+// runs (delete, then insert per file, no transaction or single-flight) can leave a stale
+// or partial index. Platform sources are reindexed by the secret-protected POST /reindex route
+// and the scheduled job; personal sources use the private-mode "reindex" tool. The
+// refusal comes first in tools/call, before mode handling, so it does not depend on
+// userId, headers or arguments. Not to be confused with PUBLIC_ONLY_TOOL_NAMES,
+// which hides tools in private mode only.
+export const WITHDRAWN_TOOL_MESSAGES: ReadonlyMap<string, string> = new Map([
+  [
+    "reindex_source",
+    'Tool "reindex_source" is withdrawn: platform sources are reindexed by the secret-protected /reindex route ' +
+      'and the scheduled job; personal sources use the private-mode "reindex" tool',
+  ],
 ]);
 
 // Private-only tools (WP-410 срез-2b) — only surfaced in tools/list when MCP_MODE=private.
@@ -2878,7 +2881,7 @@ export const PRIVATE_TOOLS = [
     // mechanically strips "personal_" from the caller-facing name to get this name (see
     // gateway-mcp src/index.ts:1468-1478). Naming this "personal_reindex_source" instead (first
     // draft of this session) meant a call to gateway's "personal_reindex_source" stripped down
-    // to backend name "reindex_source" — the OLD PUBLIC tool below, wrong DB for personal data.
+    // to backend name "reindex_source" — the formerly public tool of that name (withdrawn in F186), wrong DB for personal data.
     // Caught by the live canary, not by review or tests (neither exercises the gateway hop).
     name: "reindex",
     description: "Manually (re)trigger an async reindex of an already-connected personal source. Not needed for newly connected sources — connect_source does this automatically. Use for stuck/stale content, or after a bulk edit in the source repo. Returns a job_id; poll personal_reindex_status with it. (Exposed by the gateway as personal_reindex.)",
@@ -2967,6 +2970,11 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
       case "tools/call": {
         const toolName = (params as { name: string }).name;
         const args = (params as { arguments: Record<string, unknown> }).arguments || {};
+
+        const withdrawnMessage = WITHDRAWN_TOOL_MESSAGES.get(toolName);
+        if (withdrawnMessage) {
+          return { jsonrpc: "2.0", id, error: { code: -32601, message: withdrawnMessage } };
+        }
 
         if (mode === "private" && PUBLIC_ONLY_TOOL_NAMES.has(toolName)) {
           return {
@@ -3658,53 +3666,6 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             jsonrpc: "2.0",
             id,
             result: { content: [{ type: "text", text: JSON.stringify(hits, null, 2) }] },
-          };
-        }
-
-        if (toolName === "reindex_source") {
-          const source = args.source as string;
-          const dryRun = (args.dry_run as boolean) || false;
-          const explicitFiles = args.files as string[] | undefined;
-
-          if (!SOURCE_GITHUB_BASE[source]) {
-            // This tool only knows the fixed platform (L2) corpus map (PACK-*/ZP/FPF/SPF/docs-*).
-            // A personal (L4) GitHub source with the same-looking name is a frequent mix-up —
-            // it bit this code's own author once (see the naming note near "reindex_source" in
-            // tools/list above) and an agent again on 2026-08-31 (WP-7 peer-session
-            // 2026-08-31-46-wp7-reindex-verify-tail) — hence the explicit pointer below instead
-            // of a bare "not found".
-            return {
-              jsonrpc: "2.0",
-              id,
-              result: {
-                content: [{ type: "text", text: JSON.stringify({
-                  error: `Unknown source: ${source}. This tool (reindex_source) is for the shared platform corpus (PACK-*, ZP, FPF, SPF, docs-*) only. For a personal GitHub source, use personal_reindex instead.`,
-                }) }],
-                isError: true,
-              },
-            };
-          }
-
-          const files = explicitFiles ?? await listGitHubFiles(source);
-          if (dryRun) {
-            return {
-              jsonrpc: "2.0",
-              id,
-              result: {
-                content: [{ type: "text", text: JSON.stringify({ source, files_found: files.length, sample_files: files.slice(0, 20) }) }],
-              },
-            };
-          }
-
-          const reindexReq: ReindexRequest = {
-            source,
-            files: files.map((path) => ({ path, action: "modified" })),
-          };
-          const result = await reindexFiles(env, reindexReq);
-          return {
-            jsonrpc: "2.0",
-            id,
-            result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
           };
         }
 
@@ -4719,8 +4680,9 @@ export function partitionFilesBySize<T extends { size: number }>(
  * Scope of this first pass: only additions/modifications. A file removed upstream stays
  * in the index until someone reindexes explicitly — detecting removals here would need a
  * DB-vs-GitHub diff like the PACK-* branch above; deferred to keep this change narrow.
- * Also no single-flight guard against an overlapping manual reindex_source call on the
+ * Also no single-flight guard against an overlapping manual POST /reindex call on the
  * same source — acceptable at once-a-day cron frequency, revisit if that changes.
+ * (The public reindex_source tool that used to add unauthenticated callers was withdrawn, F186.)
  */
 async function syncFullIngestSource(env: Env, source: string): Promise<void> {
   const startedAt = Date.now();

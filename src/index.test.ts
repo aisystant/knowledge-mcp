@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, PRIVATE_TOOLS, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, PRIVATE_TOOLS, PUBLIC_ONLY_TOOL_NAMES, WITHDRAWN_TOOL_MESSAGES, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import worker from "./index.js";
 import { PRIVATE_TOOL_NAMES } from "./layers/private.js";
@@ -216,7 +216,7 @@ describe("deterministic document resolver", () => {
 });
 
 describe("public-only tools in private mode (WP-7 Ф183)", () => {
-  const PUBLIC_ONLY = ["resolve_document", "feedback", "feedback_stats", "reindex_source"];
+  const PUBLIC_ONLY = ["resolve_document", "feedback", "feedback_stats"];
   // Публичные имена, которым разрешено оставаться в private tools/list: личные
   // реализации (Ф117) + live-подтверждённые рабочие на личной базе (Ф183).
   // Любое иное публичное имя здесь — регрессия (непроверенный обработчик с
@@ -268,7 +268,6 @@ describe("public-only tools in private mode (WP-7 Ф183)", () => {
   it.each<[string, Record<string, unknown>, string]>([
     ["feedback", { document_id: 7, query: "q", helpfulness: true }, '{"recorded":false}'],
     ["feedback_stats", {}, "[]"],
-    ["reindex_source", {}, "use personal_reindex instead"],
     ["resolve_document", {}, "invalid resolve_document arguments"],
   ])("routes %s to its own handler in public mode", async (name, args, marker) => {
     const env = { KNOWLEDGE_DATABASE_URL: "mock-knowledge-dsn", HEALTH_DATABASE_URL: "mock-health-dsn" } as unknown as Env;
@@ -325,6 +324,126 @@ describe("public-only tools in private mode (WP-7 Ф183)", () => {
       expect(res.status).toBe(500);
       errorSpy.mockRestore();
     });
+  });
+});
+
+// --- WP-7 F186: reindex_source is withdrawn in every mode ---
+
+describe("withdrawn tools (WP-7 F186)", () => {
+  const WITHDRAWN = "reindex_source";
+  const MODES = ["public", "private"] as const;
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  async function listNames(mode: "public" | "private"): Promise<string[]> {
+    const res = await handleMcpRequest(
+      { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+      {} as Env,
+      undefined,
+      mode,
+    );
+    return (res.result as { tools: Array<{ name: string }> }).tools.map((tool) => tool.name);
+  }
+
+  it.each(MODES)("%s tools/list does not offer the withdrawn tool", async (mode) => {
+    expect(await listNames(mode)).not.toContain(WITHDRAWN);
+  });
+
+  // Pins the two policy sets exactly: a name added to either one by mistake, or
+  // reindex_source slipping back into the private-mode set, fails here (the global
+  // refusal runs first, so no behavioural test could notice the second case).
+  it("the policy sets hold exactly the intended names", () => {
+    expect([...PUBLIC_ONLY_TOOL_NAMES].sort()).toEqual(["feedback", "feedback_stats", "resolve_document"]);
+    expect([...WITHDRAWN_TOOL_MESSAGES.keys()]).toEqual([WITHDRAWN]);
+  });
+
+  it("the tool is gone from both static tool tables", () => {
+    expect(TOOLS.map((tool) => tool.name)).not.toContain(WITHDRAWN);
+    expect(PRIVATE_TOOLS.map((tool) => tool.name)).not.toContain(WITHDRAWN);
+  });
+
+  // Every argument shape and caller identity gets the same refusal, and nothing
+  // downstream runs: no GitHub fetch and no database client.
+  const CALLS: Array<[string, Record<string, unknown>, string | undefined]> = [
+    ["a valid platform source", { source: "docs-courses" }, undefined],
+    ["dry_run", { source: "docs-courses", dry_run: true }, undefined],
+    ["explicit files", { source: "docs-courses", files: ["a.md"] }, undefined],
+    ["a signed-in user id", { source: "docs-courses" }, "user-1"],
+    ["no arguments", {}, undefined],
+  ];
+
+  it.each(MODES.flatMap((mode) => CALLS.map(([label, args, userId]) => [mode, label, args, userId] as const)))(
+    "%s: refuses %s with -32601 and touches nothing",
+    async (mode, _label, args, userId) => {
+      const fetchMock = vi.fn();
+      globalThis.fetch = fetchMock;
+      const dbSpy = vi.fn();
+      mockWithUserContextImpl = async (fn) => {
+        dbSpy();
+        return fn(makeMockSql([]));
+      };
+      vi.mocked(neon).mockClear();
+
+      const called = await handleMcpRequest(
+        { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: WITHDRAWN, arguments: args } },
+        { OPENROUTER_API_KEY: "test-key", KNOWLEDGE_DATABASE_URL: "mock-knowledge-dsn" } as unknown as Env,
+        userId,
+        mode,
+      );
+
+      expect(called.error).toEqual(expect.objectContaining({ code: -32601 }));
+      expect(String(called.error?.message)).toContain("withdrawn");
+      expect(called.result).toBeUndefined();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(dbSpy).not.toHaveBeenCalled();
+      expect(vi.mocked(neon)).not.toHaveBeenCalled();
+    },
+  );
+
+  // The tests above pass the mode to handleMcpRequest directly. This block goes
+  // through the worker's HTTP entry point, with credentials attached.
+  describe("via the worker HTTP entry point", () => {
+    async function postMcp(mcpMode: string, body: object): Promise<Response> {
+      const request = new Request("https://knowledge.test/mcp", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer not-a-real-token",
+          "x-user-id": "user-1",
+        },
+        body: JSON.stringify(body),
+      });
+      return worker.fetch(request, { MCP_MODE: mcpMode } as unknown as Env);
+    }
+
+    it.each(MODES)("MCP_MODE=%s: not listed, and a call with credentials is refused", async (mode) => {
+      const listed = await postMcp(mode, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+      expect(listed.status).toBe(200);
+      const names = ((await listed.json()) as { result: { tools: Array<{ name: string }> } }).result.tools.map((tool) => tool.name);
+      expect(names).not.toContain(WITHDRAWN);
+
+      const res = await postMcp(mode, {
+        jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: WITHDRAWN, arguments: { source: "docs-courses" } },
+      });
+      expect(res.status).toBe(200);
+      const payload = (await res.json()) as { error?: { code: number; message: string } };
+      expect(payload.error?.code).toBe(-32601);
+      expect(payload.error?.message).toContain("withdrawn");
+    });
+  });
+
+  // The replacement path must stay reachable. This only shows the route is still there
+  // and fails closed (401 with a secret configured, 503 without); it does not exercise
+  // the authorized path into reindexFiles().
+  it("the POST /reindex route is still present and fails closed", async () => {
+    const post = (env: object) =>
+      worker.fetch(new Request("https://knowledge.test/reindex", { method: "POST", body: "{}" }), env as unknown as Env);
+    expect((await post({ REINDEX_SECRET: "test-reindex-secret" })).status).toBe(401);
+    expect((await post({})).status).toBe(503);
   });
 });
 
