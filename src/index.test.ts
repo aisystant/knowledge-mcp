@@ -214,6 +214,73 @@ describe("deterministic document resolver", () => {
   });
 });
 
+describe("public-only tools in private mode (WP-7 Ф183)", () => {
+  const PUBLIC_ONLY = ["resolve_document", "feedback", "feedback_stats", "reindex_source"];
+  // Публичные имена, которым разрешено оставаться в private tools/list: личные
+  // реализации (Ф117) + live-подтверждённые рабочие на личной базе (Ф183).
+  // Любое иное публичное имя здесь — регрессия (непроверенный обработчик с
+  // доступом к платформенным таблицам), тест обязан упасть.
+  const ALLOWED_PUBLIC_IN_PRIVATE = [
+    "search", "get_document", "list_sources", "list_documents", "list_path",
+    "analyze_verbalization", "graph_stats", "learner_progress",
+    "concept_status", "concept_search_by_name", "concept_expand", "pack_traverse",
+    "load_skill",
+  ];
+
+  async function listToolNames(mode: "public" | "private"): Promise<string[]> {
+    const res = await handleMcpRequest(
+      { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+      {} as Env,
+      undefined,
+      mode,
+    );
+    return (res.result as { tools: Array<{ name: string }> }).tools.map((tool) => tool.name);
+  }
+
+  it.each(PUBLIC_ONLY)("%s is hidden from private tools/list and refused with -32601", async (name) => {
+    expect(await listToolNames("private")).not.toContain(name);
+
+    const called = await handleMcpRequest(
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name, arguments: {} } },
+      {} as Env,
+      undefined,
+      "private",
+    );
+    expect(called.error).toEqual(expect.objectContaining({ code: -32601 }));
+  });
+
+  it("private tools/list carries only verified public names plus private tools", async () => {
+    const names = await listToolNames("private");
+    const allowed = new Set([...ALLOWED_PUBLIC_IN_PRIVATE, ...PRIVATE_TOOLS.map((tool) => tool.name)]);
+    expect([...names].sort()).toEqual([...allowed].sort());
+  });
+
+  it("keeps all public-only names in public tools/list and routes the public feedback call", async () => {
+    const names = await listToolNames("public");
+    for (const name of PUBLIC_ONLY) expect(names).toContain(name);
+
+    let called;
+    try {
+      called = await handleMcpRequest(
+        { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "feedback", arguments: { document_id: 1, query: "q", helpfulness: true } } },
+        {} as Env,
+        undefined,
+        "public",
+      );
+    } catch (error) {
+      // Вызов дошёл до обработчика и упал на отсутствующей тестовой БД —
+      // строго ожидаемая ошибка конфигурации; любая другая (например,
+      // сломанная маршрутизация) проваливает тест.
+      expect(String(error)).toContain("KNOWLEDGE_DATABASE_URL is required");
+      return;
+    }
+    // Маршрутизация дошла до обработчика: гейт не сработал (не -32601),
+    // а ошибка — из слоя БД (текст activeDsn), не из диспетчера.
+    expect(called?.error?.code ?? null).not.toBe(-32601);
+    expect(JSON.stringify(called?.error)).toContain("KNOWLEDGE_DATABASE_URL is required");
+  });
+});
+
 describe("compact search response", () => {
   it("caps repeated document bodies before MCP serialization", () => {
     const huge = "Ф".repeat(8_000_000);
@@ -737,6 +804,7 @@ describe("getEmbedding", () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
   });
 
   it("returns the embedding on first successful attempt", async () => {
@@ -765,6 +833,114 @@ describe("getEmbedding", () => {
 
     await expect(getEmbedding("fake-key", "test query")).rejects.toThrow("Embedding service unavailable after retry (http_5xx)");
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("logs structured JSON for each failed HTTP attempt and carries status/requestId on the error (WP-7 Ф183)", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const headers = new Map([["x-openrouter-request-id", "req-123"], ["cf-ray", "ray-456"]]);
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+      statusText: "Forbidden",
+      headers: { get: (key: string) => headers.get(key) ?? null },
+      text: async () => JSON.stringify({ error: { code: "forbidden", message: "key sk-secret-echo must not be logged" } }),
+    });
+    globalThis.fetch = fetchMock;
+
+    const failure = await getEmbedding("fake-key", "test query").catch((error) => error);
+    expect(failure.message).toBe("Embedding service unavailable after retry (http_4xx)");
+    expect(failure.status).toBe(403);
+    expect(failure.requestId).toBe("req-123");
+    // Текст ошибки и лог не несут ни тело провайдера, ни эхо ключа.
+    expect(failure.message).not.toContain("sk-secret-echo");
+
+    expect(errorSpy).toHaveBeenCalledTimes(2);
+    const first = JSON.parse(errorSpy.mock.calls[0][0] as string);
+    expect(first).toMatchObject({
+      event: "embedding_http_error",
+      provider: "openrouter",
+      status: 403,
+      statusText: "Forbidden",
+      errorCategory: "http_4xx",
+      attempt: 1,
+      requestId: "req-123",
+      cfRay: "ray-456",
+      url: "https://openrouter.ai/api/v1/embeddings",
+      errorCode: "forbidden",
+    });
+    expect(JSON.stringify(first)).not.toContain("sk-secret-echo");
+    expect(JSON.parse(errorSpy.mock.calls[1][0] as string).attempt).toBe(2);
+    errorSpy.mockRestore();
+  });
+
+  it("logs null errorCode for a non-JSON provider error body, keeping its length (WP-7 Ф183)", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const body = `Bad gateway\n${"k".repeat(500)}`;
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 502,
+      text: async () => body,
+    });
+    globalThis.fetch = fetchMock;
+
+    await getEmbedding("fake-key", "test query").catch(() => {});
+    const first = JSON.parse(errorSpy.mock.calls[0][0] as string);
+    expect(first.errorCode).toBeNull();
+    expect(first.errorBodyLength).toBe(body.length);
+    expect(JSON.stringify(first)).not.toContain("k".repeat(80));
+    errorSpy.mockRestore();
+  });
+
+  it("drops provider-controlled fields that echo the apiKey or embedding input (WP-7 Ф183)", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const apiKey = "sk-livekey-echo";
+    const inputText = "secret-user-query-text-here";
+    const headers = new Map([
+      ["x-openrouter-request-id", apiKey],
+      ["cf-ray", inputText.slice(0, 16)],
+    ]);
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+      headers: { get: (key: string) => headers.get(key) ?? null },
+      text: async () => JSON.stringify({ error: { code: apiKey } }),
+    });
+    globalThis.fetch = fetchMock;
+
+    await getEmbedding(apiKey, inputText).catch(() => {});
+    const first = JSON.parse(errorSpy.mock.calls[0][0] as string);
+    expect(first.requestId).toBeNull();
+    expect(first.cfRay).toBeNull();
+    expect(first.errorCode).toBeNull();
+    const logged = JSON.stringify(first);
+    expect(logged).not.toContain(apiKey);
+    expect(logged).not.toContain(inputText.slice(0, 16));
+    errorSpy.mockRestore();
+  });
+
+  it("drops fields echoing a boundary-crossing or short input fragment (WP-7 Ф183)", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const inputText = "secret-user-query-text-here";
+    const headers = new Map([
+      // Фрагмент, пересекающий границу 16-символьных блоков (позиции 8..24)
+      ["x-openrouter-request-id", inputText.slice(8, 24)],
+      // Короткий фрагмент (<16) — подстрока входа
+      ["cf-ray", inputText.slice(0, 8)],
+    ]);
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+      headers: { get: (key: string) => headers.get(key) ?? null },
+      text: async () => JSON.stringify({ error: { code: "forbidden" } }),
+    });
+    globalThis.fetch = fetchMock;
+
+    await getEmbedding("fake-key", inputText).catch(() => {});
+    const first = JSON.parse(errorSpy.mock.calls[0][0] as string);
+    expect(first.requestId).toBeNull();
+    expect(first.cfRay).toBeNull();
+    expect(first.errorCode).toBe("forbidden");
+    errorSpy.mockRestore();
   });
 });
 

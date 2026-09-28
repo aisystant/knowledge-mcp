@@ -245,11 +245,86 @@ export function resolveGithubUrl(source: string, filename: string): string | nul
 
 // --- Helpers ---
 
-async function fetchEmbeddingOnce(apiKey: string, text: string): Promise<number[]> {
+const EMBEDDING_ENDPOINT = "https://openrouter.ai/api/v1/embeddings";
+
+// WP-7 Ф183: из тела ошибки провайдера в лог попадает только машинный код
+// (word-части/точки/дефисы — туда физически не поместится эхо запроса или
+// фрагмент ключа). Произвольный текст message не логируем вовсе (cold review
+// Codex: даже усечённые ≤200 символов сообщения провайдер может заполнить
+// отражёнными данными); вместо него — длина тела для формы ответа.
+// Та же дисциплина для значений, контролируемых ответом провайдера:
+// requestId/cfRay — только если похожи на идентификатор (иначе null),
+// statusText — из локальной таблицы по числовому status, не из ответа.
+const SAFE_ERROR_CODE_RE = /^[\w.\-]{1,100}$/;
+const SAFE_REQUEST_ID_RE = /^[\w.\-]{1,128}$/;
+const SAFE_CF_RAY_RE = /^[\w.\-]{1,64}$/;
+const STATUS_TEXT_BY_CODE: Readonly<Record<number, string>> = {
+  400: "Bad Request",
+  401: "Unauthorized",
+  403: "Forbidden",
+  404: "Not Found",
+  408: "Request Timeout",
+  409: "Conflict",
+  429: "Too Many Requests",
+  500: "Internal Server Error",
+  502: "Bad Gateway",
+  503: "Service Unavailable",
+  504: "Gateway Timeout",
+};
+
+function safeHeaderValue(value: string | null | undefined, pattern: RegExp): string | null {
+  return value && pattern.test(value) ? value : null;
+}
+
+// Последний рубеж (cold review Codex, итерации 3-4): любое строковое значение,
+// пришедшее от провайдера, перед логом проверяется на пересечение с apiKey и
+// входом эмбеддинга — regex формы не спасает от отражённого секрета вида
+// "sk-secret-echo". Ловим: полное эхо, эхо фрагмента (само значение — подстрока
+// секрета/входа) и любое 16-символьное скользящее окно входа (шаг 1 — окно,
+// пересекающее границу блока, не проскочит). Совпадение → поле уходит в null.
+function containsSensitiveFragment(value: string, apiKey: string, text: string): boolean {
+  if (!value) return false;
+  if (apiKey && (value.includes(apiKey) || apiKey.includes(value))) return true;
+  if (text) {
+    if (value.includes(text) || text.includes(value)) return true;
+    const WINDOW = 16;
+    for (let i = 0; i + WINDOW <= text.length; i++) {
+      if (value.includes(text.slice(i, i + WINDOW))) return true;
+    }
+  }
+  return false;
+}
+
+function extractEmbeddingErrorCode(errText: string): string | null {
+  try {
+    const parsed = JSON.parse(errText) as { error?: { code?: unknown } };
+    const code = parsed.error?.code;
+    if (typeof code === "string" && SAFE_ERROR_CODE_RE.test(code)) return code;
+    if (typeof code === "number") return String(code);
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function classifyEmbeddingHttpStatus(status: number): EmbeddingFailureReason {
+  if (status >= 400 && status < 500) return "http_4xx";
+  if (status >= 500) return "http_5xx";
+  return "http_other";
+}
+
+class EmbeddingHttpError extends Error {
+  constructor(readonly status: number, readonly requestId: string | null, message: string) {
+    super(message);
+    this.name = "EmbeddingHttpError";
+  }
+}
+
+async function fetchEmbeddingOnce(apiKey: string, text: string, attempt: number): Promise<number[]> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), EMBEDDING_TIMEOUT_MS);
   try {
-    const response = await fetch("https://openrouter.ai/api/v1/embeddings", {
+    const response = await fetch(EMBEDDING_ENDPOINT, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -264,8 +339,38 @@ async function fetchEmbeddingOnce(apiKey: string, text: string): Promise<number[
     });
 
     if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`OpenRouter embeddings error: ${response.status} ${errText}`);
+      // Тело читаем отказоустойчиво: лог и status/requestId обязаны
+      // материализоваться, даже если response.text() отклонился.
+      const errText = await response.text().catch(() => "");
+      // WP-7 Ф183: до этого лога у ошибок эмбеддинга не было ни одного
+      // диагностического поля — 403 в проде было нечем разобрать.
+      // requestId только из заголовков OpenRouter; cf-ray — отдельное поле
+      // (луч Cloudflare не ищется в кабинете OpenRouter как id запроса).
+      // Текст входа эмбеддинга и apiKey не логируются; сырое тело провайдера
+      // в лог и в текст ошибки не попадает.
+      const rawRequestId =
+        safeHeaderValue(response.headers?.get?.("x-openrouter-request-id"), SAFE_REQUEST_ID_RE) ??
+        safeHeaderValue(response.headers?.get?.("x-request-id"), SAFE_REQUEST_ID_RE);
+      const rawCfRay = safeHeaderValue(response.headers?.get?.("cf-ray"), SAFE_CF_RAY_RE);
+      const rawErrorCode = extractEmbeddingErrorCode(errText);
+      const requestId = rawRequestId && !containsSensitiveFragment(rawRequestId, apiKey, text) ? rawRequestId : null;
+      const cfRay = rawCfRay && !containsSensitiveFragment(rawCfRay, apiKey, text) ? rawCfRay : null;
+      const errorCode = rawErrorCode && !containsSensitiveFragment(rawErrorCode, apiKey, text) ? rawErrorCode : null;
+      console.error(JSON.stringify({
+        event: "embedding_http_error",
+        provider: "openrouter",
+        model: EMBEDDING_MODEL,
+        status: response.status,
+        statusText: STATUS_TEXT_BY_CODE[response.status] ?? null,
+        errorCategory: classifyEmbeddingHttpStatus(response.status),
+        attempt,
+        requestId,
+        cfRay,
+        url: EMBEDDING_ENDPOINT,
+        errorCode,
+        errorBodyLength: errText.length,
+      }));
+      throw new EmbeddingHttpError(response.status, requestId, `OpenRouter embeddings error: ${response.status}`);
     }
 
     const data = (await response.json()) as { data: { embedding: number[] }[] };
@@ -278,7 +383,12 @@ async function fetchEmbeddingOnce(apiKey: string, text: string): Promise<number[
 type EmbeddingFailureReason = "timeout" | "http_4xx" | "http_5xx" | "http_other" | "request_error";
 
 class EmbeddingUnavailableError extends Error {
-  constructor(readonly reason: EmbeddingFailureReason, cause: unknown) {
+  constructor(
+    readonly reason: EmbeddingFailureReason,
+    cause: unknown,
+    readonly status: number | null = null,
+    readonly requestId: string | null = null,
+  ) {
     super(`Embedding service unavailable after retry (${reason})`, { cause });
     this.name = "EmbeddingUnavailableError";
   }
@@ -286,6 +396,10 @@ class EmbeddingUnavailableError extends Error {
 
 function classifyEmbeddingFailure(error: unknown): EmbeddingFailureReason {
   if (error instanceof DOMException && error.name === "AbortError") return "timeout";
+
+  if (error instanceof EmbeddingHttpError) {
+    return classifyEmbeddingHttpStatus(error.status);
+  }
 
   const message = error instanceof Error ? error.message : "";
   const statusMatch = message.match(/^OpenRouter embeddings error: (\d{3})\b/);
@@ -301,12 +415,14 @@ function classifyEmbeddingFailure(error: unknown): EmbeddingFailureReason {
 // One retry: OpenRouter embeddings occasionally hangs past EMBEDDING_TIMEOUT_MS (issue #231).
 export async function getEmbedding(apiKey: string, text: string): Promise<number[]> {
   try {
-    return await fetchEmbeddingOnce(apiKey, text);
+    return await fetchEmbeddingOnce(apiKey, text, 1);
   } catch {
     try {
-      return await fetchEmbeddingOnce(apiKey, text);
+      return await fetchEmbeddingOnce(apiKey, text, 2);
     } catch (error) {
-      throw new EmbeddingUnavailableError(classifyEmbeddingFailure(error), error);
+      const status = error instanceof EmbeddingHttpError ? error.status : null;
+      const requestId = error instanceof EmbeddingHttpError ? error.requestId : null;
+      throw new EmbeddingUnavailableError(classifyEmbeddingFailure(error), error, status, requestId);
     }
   }
 }
@@ -2597,7 +2713,18 @@ export const TOOLS = [
   },
 ];
 
-const PUBLIC_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set(["resolve_document"]);
+// WP-7 Ф183: в личном режиме эти публичные инструменты не имеют личной реализации
+// (на личной базе нет платформенных таблиц knowledge.*) и падали сырой ошибкой
+// Postgres — дословно текст жалобы пользователя. Сняты как неподдерживаемый личный
+// контракт: замена — personal_reindex (личные источники) и feedback в публичном
+// режиме (платформенные документы). load_skill намеренно НЕ в наборе: шлюз строит
+// personal_* из tools/list бэкенда, иначе исчез бы personal_load_skill (WP-560 Ф10/Ф11).
+const PUBLIC_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "resolve_document",
+  "feedback",
+  "feedback_stats",
+  "reindex_source",
+]);
 
 // Private-only tools (WP-410 срез-2b) — only surfaced in tools/list when MCP_MODE=private.
 // Ported from personal-knowledge-mcp/src/index.ts getTools() write/propose_capture entries.
