@@ -2951,7 +2951,15 @@ export const PRIVATE_TOOLS = [
 
 // --- MCP handler ---
 
-export async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public", rawRequest?: Request): Promise<McpResponse> {
+// WP-7 Ф187: the learner id of learner_progress / analyze_verbalization keys row-level
+// security (withUserContext), so a verified JWT subject always wins over the argument.
+// Without a JWT nothing changes: the argument is used exactly as before, because platform
+// callers such as hw-checker send it directly and carry no token.
+export function resolveLearnerId(jwtSubject: string | undefined, args: Record<string, unknown>): string | undefined {
+  return jwtSubject ?? (typeof args.user_id === "string" && args.user_id !== "" ? args.user_id : undefined);
+}
+
+export async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public", rawRequest?: Request, jwtSubject?: string): Promise<McpResponse> {
   const { id, method, params } = request;
 
   try {
@@ -3587,7 +3595,7 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             args.topic as string | undefined,
             args.domain as string | undefined,
             args.level as string | undefined,
-            args.user_id as string | undefined
+            resolveLearnerId(jwtSubject, args)
           );
           return {
             jsonrpc: "2.0",
@@ -3606,9 +3614,13 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
         }
 
         if (toolName === "learner_progress") {
+          const learnerId = resolveLearnerId(jwtSubject, args);
+          if (!learnerId) {
+            return { jsonrpc: "2.0", id, error: { code: -32602, message: "user_id is required" } };
+          }
           const progress = await getLearnerProgress(
             env,
-            args.user_id as string,
+            learnerId,
             args.domain as string | undefined
           );
           return {
@@ -4261,11 +4273,13 @@ export default {
       // If no Authorization header → fall back to x-user-id for internal/platform requests
       // (e.g. reindexer calls that don't carry a user token).
       let userId: string | undefined;
+      let jwtSubject: string | undefined; // set only by a verified JWT, never by x-user-id
       const authHeader = request.headers.get("Authorization");
       if (authHeader?.startsWith("Bearer ") && env.ORY_URL) {
         const token = authHeader.slice(7);
         const sub = await verifyJwtLocally(env.ORY_URL, token);
         userId = sub ?? undefined;
+        jwtSubject = userId;
         // Note: opaque tokens (from Gateway /userinfo flow) return null sub → userId=undefined,
         // treated as unauthenticated. Gateway should only forward JWTs to knowledge-mcp.
       } else {
@@ -4273,7 +4287,7 @@ export default {
       }
 
       const body = (await request.json()) as McpRequest;
-      const response = await handleMcpRequest(body, env, userId, mode, request);
+      const response = await handleMcpRequest(body, env, userId, mode, request, jwtSubject);
       const responseHeaders: Record<string, string> = {
         ...corsHeaders,
         "Content-Type": "application/json",
