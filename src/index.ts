@@ -1804,26 +1804,37 @@ ${miscCatalog}
     recommendations.push("Понятия упомянуты, но слабо связаны между собой. Попробуйте объяснить связи.");
   }
 
-  // 6. Update learner mastery (Ф5) — Bayesian update per matched concept
+  // 6. Update learner mastery (Ф5) — Bayesian update per matched concept.
+  // The write runs inside withUserContext: the mastery table is under row-level security keyed
+  // by app.user_id and the worker's role does not bypass it (WP-7 Ф188), so a write from the
+  // plain connection is rejected. A failed write must not discard the analysis already computed.
+  let masteryUpdated = false;
   if (userId && matched.length > 0) {
     const ALPHA = 0.3; // learning rate
-    for (const m of matched) {
-      const conceptRow = topicConcepts.find((c) => c.code === m.code);
-      if (!conceptRow) continue;
+    try {
+      await withUserContext(activeDsn(env), userId, async (tx) => {
+        for (const m of matched) {
+          const conceptRow = topicConcepts.find((c) => c.code === m.code);
+          if (!conceptRow) continue;
 
-      // Bayesian update: M_new = M_old + α * (score - M_old)
-      await sql`
-        INSERT INTO ${sql.unsafe(masteryTable)}
-          (user_id, concept_id, mastery, attempts, last_score, last_assessed_at)
-        VALUES (${userId}, ${conceptRow.id}, ${ALPHA * m.score}, 1, ${m.score}, NOW())
-        ON CONFLICT (user_id, concept_id) DO UPDATE SET
-          mastery = ${sql.unsafe(masteryTable)}.mastery +
-            ${ALPHA} * (${m.score} - ${sql.unsafe(masteryTable)}.mastery),
-          attempts = ${sql.unsafe(masteryTable)}.attempts + 1,
-          last_score = ${m.score},
-          last_assessed_at = NOW(),
-          updated_at = NOW()
-      `;
+          // Bayesian update: M_new = M_old + α * (score - M_old)
+          await tx`
+            INSERT INTO ${tx.unsafe(masteryTable)}
+              (user_id, concept_id, mastery, attempts, last_score, last_assessed_at)
+            VALUES (${userId}, ${conceptRow.id}, ${ALPHA * m.score}, 1, ${m.score}, NOW())
+            ON CONFLICT (user_id, concept_id) DO UPDATE SET
+              mastery = ${tx.unsafe(masteryTable)}.mastery +
+                ${ALPHA} * (${m.score} - ${tx.unsafe(masteryTable)}.mastery),
+              attempts = ${tx.unsafe(masteryTable)}.attempts + 1,
+              last_score = ${m.score},
+              last_assessed_at = NOW(),
+              updated_at = NOW()
+          `;
+        }
+      });
+      masteryUpdated = true;
+    } catch (err) {
+      console.error(JSON.stringify({ event: "mastery_update_failed", error: err instanceof Error ? err.message : String(err) }));
     }
   }
 
@@ -1836,7 +1847,7 @@ ${miscCatalog}
     edge_coverage: Math.round(edgeCoverage * 1000) / 1000,
     misconceptions_found: foundMisconceptions,
     recommendations,
-    mastery_updated: !!userId,
+    mastery_updated: masteryUpdated,
   };
 }
 
