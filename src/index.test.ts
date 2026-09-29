@@ -507,7 +507,7 @@ describe("compact search response", () => {
 describe("resolveGithubUrl", () => {
   it("returns correct URL for known source", () => {
     const url = resolveGithubUrl("PACK-digital-platform", "digital-platform/02-domain-entities/DP.AGENT.001.md");
-    expect(url).toContain("github.com/TserenTserenov/PACK-digital-platform");
+    expect(url).toContain("github.com/MimEcoSys/PACK-digital-platform");
     expect(url).toContain("pack/digital-platform/02-domain-entities/DP.AGENT.001.md");
   });
 

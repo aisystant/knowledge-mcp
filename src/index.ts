@@ -199,9 +199,9 @@ const RERANK_LLM_WEIGHT = 0.7;
 // GitHub URL mapping: source name → base URL + path prefix.
 // Enables clickable source links in search results.
 const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> = {
-  "PACK-digital-platform": { base: "https://github.com/TserenTserenov/PACK-digital-platform/blob/main", pathPrefix: "pack/" },
+  "PACK-digital-platform": { base: "https://github.com/MimEcoSys/PACK-digital-platform/blob/main", pathPrefix: "pack/" },
   "PACK-personal": { base: "https://github.com/aisystant/PACK-personal/blob/main", pathPrefix: "pack/" },
-  "PACK-MIM": { base: "https://github.com/TserenTserenov/PACK-MIM/blob/main", pathPrefix: "pack/" },
+  "PACK-MIM": { base: "https://github.com/MimEcoSys/PACK-MIM/blob/main", pathPrefix: "pack/" },
   "SPF": { base: "https://github.com/TserenTserenov/SPF/blob/main", pathPrefix: "" },
   "FPF": { base: "https://github.com/ailev/FPF/blob/main", pathPrefix: "" },
   "DS-ecosystem-development": { base: "https://github.com/aisystant/DS-ecosystem-development/blob/main", pathPrefix: "" },
@@ -212,7 +212,7 @@ const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> =
   "FMT-exocortex-template": { base: "https://github.com/TserenTserenov/FMT-exocortex-template/blob/main", pathPrefix: "" },
   "FMT-s2r": { base: "https://github.com/TserenTserenov/FMT-s2r/blob/main", pathPrefix: "" },
   "DS-autonomous-agents": { base: "https://github.com/TserenTserenov/DS-autonomous-agents/blob/main", pathPrefix: "" },
-  "PACK-ecosystem": { base: "https://github.com/TserenTserenov/PACK-ecosystem/blob/main", pathPrefix: "pack/" },
+  "PACK-ecosystem": { base: "https://github.com/MimEcoSys/PACK-ecosystem/blob/main", pathPrefix: "pack/" },
   // WP-532 (2026-09-02): PACK-rhetoric is public — safe to add via the unauthenticated
   // readFromGitHubPublic() fetch this map feeds. PACK-systems-art, PACK-agent-rules,
   // PACK-verification and PACK-autonomous-agents (WP-545, 2026-09-10: the latter two
