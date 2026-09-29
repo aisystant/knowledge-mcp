@@ -2953,10 +2953,15 @@ export const PRIVATE_TOOLS = [
 
 // WP-7 Ф187: the learner id of learner_progress / analyze_verbalization keys row-level
 // security (withUserContext), so a verified JWT subject always wins over the argument.
+// A verified but blank subject still wins: it never falls through to the caller's value.
 // Without a JWT nothing changes: the argument is used exactly as before, because platform
-// callers such as hw-checker send it directly and carry no token.
+// callers such as hw-checker send it directly and carry no token, and the gateway forwards
+// opaque tokens this worker cannot verify after binding the argument itself.
+// Whitespace-only values are no id (the gateway trims the verified subject the same way).
 export function resolveLearnerId(jwtSubject: string | undefined, args: Record<string, unknown>): string | undefined {
-  return jwtSubject ?? (typeof args.user_id === "string" && args.user_id !== "" ? args.user_id : undefined);
+  if (jwtSubject !== undefined) return jwtSubject.trim() || undefined;
+  const argument = typeof args.user_id === "string" ? args.user_id.trim() : "";
+  return argument || undefined;
 }
 
 export async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public", rawRequest?: Request, jwtSubject?: string): Promise<McpResponse> {
