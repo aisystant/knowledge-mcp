@@ -4611,9 +4611,21 @@ const STALENESS_ALERT_HOURS = 48;
 //     knowledge_chunk rows knowledge_search actually reads (concept-indexer.ts says as
 //     much: "Non-Pack sources ... remain in full ingest").
 // This is a daily full pass through reindexFiles() instead — see syncFullIngestSource().
-// Scope: FPF only for now (SPF deferred — internal source, pilot can reindex manually
-// after a push; revisit once this has run stably for a while).
-const FULL_INGEST_SOURCES = ["FPF"];
+//
+// SPF added 2026-09-29 (peer-session Claude+Kimi+Codex, WP-532): same gap as FPF —
+// SPF has no GitHub App installed and isn't a PACK-* name, so neither the webhook nor
+// the drift-heartbeat above ever touches it. Unlike FPF, SPF is the pilot's own repo
+// (TserenTserenov/SPF, not an external author's) — pushing to it is the pilot's own
+// action, so there's no cross-owner consistency question, only "server sees only what
+// was pushed, not uncommitted local edits" (same as every other source here). Measured
+// before adding: 46 .md files, 288KB total (github API, 2026-09-29) — same order of
+// magnitude as FPF's 7 files, well inside the per-file MAX_FILE_CHARS limit and no
+// concern for Worker CPU time. Not gated on "FPF has run stably for a while" as the
+// previous comment here planned — that couldn't be checked (see syncFullIngestSource's
+// health-write addition, same commit): there was no queryable row for FPF's daily run
+// at all until this change, only Worker console logs. Going in in the same commit as
+// that observability fix rather than waiting on a signal nothing was producing.
+export const FULL_INGEST_SOURCES = ["FPF", "SPF"];
 
 interface GitHubFileMeta {
   path: string;
@@ -4675,7 +4687,8 @@ export function partitionFilesBySize<T extends { size: number }>(
  * Unchanged files cost one GitHub fetch + one hash SELECT each — reindexFiles() checks
  * the content hash before any DELETE/INSERT or embedding call — so running this against
  * every file every day is cheap as long as the file count stays small (checked live for
- * FPF: 7 total .md files, 2026-09-02).
+ * FPF: 7 total .md files, 2026-09-02; SPF: 46 files / 288KB total, 2026-09-29 — same
+ * order of magnitude, well under a size or CPU-time concern).
  *
  * Scope of this first pass: only additions/modifications. A file removed upstream stays
  * in the index until someone reindexes explicitly — detecting removals here would need a
@@ -4683,12 +4696,46 @@ export function partitionFilesBySize<T extends { size: number }>(
  * Also no single-flight guard against an overlapping manual POST /reindex call on the
  * same source — acceptable at once-a-day cron frequency, revisit if that changes.
  * (The public reindex_source tool that used to add unauthenticated callers was withdrawn, F186.)
+ *
+ * Freshness write (2026-09-29, peer-session Claude+Kimi+Codex, WP-532): before this,
+ * the only record of a run was console.log/console.error inside the Worker — with no
+ * queryable row, nobody could tell a healthy daily cron from a cron that silently
+ * stopped firing after the first run (found live: health.graph_freshness_events had
+ * zero rows for source=FPF, 27 days after this function first shipped). Same table,
+ * same non-blocking pattern as rebuildSkillsIndex() below — reused under the real
+ * source name (FPF/SPF), not a pseudo-label, since neither name collides with the
+ * PACK-* heartbeat rows already in that table.
+ *
+ * github_count/db_count keep the SAME meaning here as in runHeartbeatForSource() for
+ * PACK-* sources ("files GitHub has" vs "files the index has"), not this function's
+ * own found/eligible split — a cold review caught the first version of this write
+ * putting eligibleCount (files that passed the size pre-filter) into db_count. That
+ * silently changes what `drift` (GENERATED ALWAYS AS github_count - db_count, migration
+ * 015, indexed and read by the Metabase drift dashboard) means for these two rows
+ * versus every other row in the same table — a size-prefilter exclusion isn't GitHub-
+ * vs-DB drift, and a dashboard filtering `ABS(drift) > 5` across all sources uniformly
+ * would get a number that means something different for FPF/SPF than for PACK-*
+ * without any way to tell the two apart from the column alone. db_count here is a real
+ * `count(DISTINCT source_uri)` against knowledge_chunk, mirroring the concept_graph
+ * artifact count PACK-* rows use — genuinely comparable, not reused for convenience.
  */
 async function syncFullIngestSource(env: Env, source: string): Promise<void> {
   const startedAt = Date.now();
+  let foundCount = 0;
+  let eligibleCount = 0;
+  let processed = 0;
+  let skipped = 0;
+  let errors: string[] = [];
+  // Same distinction as rebuildSkillsIndex()'s ranToCompletion: whether the RUN
+  // finished, not whether every file in it was clean. A single persistently bad
+  // file must not make the freshness signal look permanently stuck.
+  let ranToCompletion = false;
+
   try {
     const allFiles = await listGitHubFilesWithSize(source);
+    foundCount = allFiles.length;
     const { eligible, excluded } = partitionFilesBySize(allFiles, MAX_FILE_CHARS);
+    eligibleCount = eligible.length;
 
     for (const f of excluded) {
       console.log(JSON.stringify({ phase: "full_ingest_excluded", source, path: f.path, size_bytes: f.size, reason: `over MAX_FILE_CHARS prefilter (limit ${MAX_FILE_CHARS} bytes)` }));
@@ -4698,25 +4745,65 @@ async function syncFullIngestSource(env: Env, source: string): Promise<void> {
       source,
       files: eligible.map((f) => ({ path: f.path, action: "modified" as const })),
     });
+    processed = result.processed;
+    skipped = result.skipped;
+    errors = result.errors;
+    ranToCompletion = true;
 
     console.log(JSON.stringify({
-      phase: result.errors.length > 0 ? "full_ingest_partial" : "full_ingest_ok",
+      phase: errors.length > 0 ? "full_ingest_partial" : "full_ingest_ok",
       source,
-      found: allFiles.length,
-      eligible: eligible.length,
+      found: foundCount,
+      eligible: eligibleCount,
       excluded: excluded.length,
-      processed: result.processed,
-      skipped: result.skipped,
-      errors: result.errors,
+      processed,
+      skipped,
+      errors,
       duration_ms: Date.now() - startedAt,
     }));
   } catch (e) {
+    errors = [e instanceof Error ? e.message : String(e)];
     console.error(JSON.stringify({
       phase: "full_ingest_error",
       source,
-      error: e instanceof Error ? e.message : String(e),
+      error: errors[0],
       duration_ms: Date.now() - startedAt,
     }));
+  }
+
+  // Real DB artifact count for drift semantics — see the function comment above for
+  // why this can't be eligibleCount. Its own try/catch: a failed count must not lose
+  // the freshness row entirely (falls back to eligibleCount, the best count already in
+  // hand, rather than skipping the INSERT below and losing the whole signal for today).
+  let dbCount = eligibleCount;
+  try {
+    const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
+    const chunkTable = KNOWLEDGE_TABLES.knowledge_chunk(getKnowledgeSchema(env));
+    const [row] = await knowledgeSql`
+      SELECT count(DISTINCT source_uri)::int AS cnt
+      FROM ${knowledgeSql.unsafe(chunkTable)}
+      WHERE source = ${source}
+    `;
+    dbCount = row.cnt as number;
+  } catch (e) {
+    console.error(JSON.stringify({ phase: "full_ingest_db_count_failed", source, error: e instanceof Error ? e.message : String(e) }));
+  }
+
+  try {
+    const healthSql = neon(env.HEALTH_DATABASE_URL.replace("-pooler", ""));
+    const healthSchema = getHealthSchema(env);
+    const freshTable = HEALTH_TABLES.graph_freshness_events(healthSchema);
+    await healthSql`
+      INSERT INTO ${healthSql.unsafe(freshTable)}
+        (source, github_count, db_count, reindexed, reindex_processed, reindex_skipped, error)
+      VALUES (
+        ${source}, ${foundCount}, ${dbCount},
+        ${ranToCompletion}, ${processed}, ${skipped},
+        ${errors.length > 0 ? errors.join("; ") : null}
+      )
+    `;
+  } catch (e) {
+    console.error(JSON.stringify({ phase: "full_ingest_health_write_failed", source, error: e instanceof Error ? e.message : String(e) }));
   }
 }
 
