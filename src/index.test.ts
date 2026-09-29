@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, PRIVATE_TOOLS, PUBLIC_ONLY_TOOL_NAMES, WITHDRAWN_TOOL_MESSAGES, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob, FULL_INGEST_SOURCES, buildFullIngestBatchRanges } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, PRIVATE_TOOLS, PUBLIC_ONLY_TOOL_NAMES, WITHDRAWN_TOOL_MESSAGES, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob, FULL_INGEST_SOURCES, buildFullIngestBatchRanges, fullIngestDisabled, splitForSendBatch, groupStagingRows, fullIngestRetryDelaySeconds, dedupeChunkFilenames } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import worker from "./index.js";
 import { PRIVATE_TOOL_NAMES } from "./layers/private.js";
@@ -650,6 +650,99 @@ describe("buildFullIngestBatchRanges", () => {
     }
     expect(ranges[0].batch_start).toBe(1);
     expect(ranges[ranges.length - 1].batch_end).toBe(47);
+  });
+});
+
+// --- WP-532 Ф9 pure helpers of the batched full-ingest (peer-session 2026-09-29-09) ---
+// Each of these guards a failure that was found BEFORE the first live run: a single sendBatch of
+// 590 messages (Queues accept 100), an emergency flag that must not be truthy by accident, a
+// retry delay that must grow and stop growing, and repeated section titles that would violate the
+// unique index on (source_uri, source, account) and roll the whole swap back.
+describe("fullIngestDisabled", () => {
+  it("is true only for the exact string 'true'", () => {
+    expect(fullIngestDisabled({ FULL_INGEST_DISABLED: "true" })).toBe(true);
+    for (const value of [undefined, "", "false", "1", "TRUE", "yes"]) {
+      expect(fullIngestDisabled({ FULL_INGEST_DISABLED: value })).toBe(false);
+    }
+  });
+});
+
+describe("splitForSendBatch", () => {
+  const message = (i: number) => ({ run_id: "00000000-0000-4000-8000-000000000000", source: "FPF", document_path: "FPF-Spec.md", batch_start: i, batch_end: i + 10 });
+
+  it("splits the 590 messages of FPF-Spec.md into calls of at most 100, keeping order and losing nothing", () => {
+    const messages = Array.from({ length: 590 }, (_, i) => message(i));
+    const groups = splitForSendBatch(messages);
+    expect(groups.length).toBe(6);
+    expect(groups.every((g) => g.length <= 100)).toBe(true);
+    expect(groups.flat().map((m) => m.batch_start)).toEqual(messages.map((m) => m.batch_start));
+  });
+
+  it("also splits by total bytes: three ~60 KB items fit a 200 KB call, a fourth starts the next one", () => {
+    const item = (i: number) => ({ i, pad: "x".repeat(60_000) });
+    const groups = splitForSendBatch(Array.from({ length: 10 }, (_, i) => item(i)), 100, 200 * 1024);
+    expect(groups.map((g) => g.length)).toEqual([3, 3, 3, 1]);
+  });
+
+  it("sends a single oversized item alone instead of dropping it", () => {
+    const groups = splitForSendBatch([{ pad: "x".repeat(300_000) }, { pad: "y" }], 100, 200 * 1024);
+    expect(groups.map((g) => g.length)).toEqual([1, 1]);
+  });
+
+  it("returns no calls for no messages", () => {
+    expect(splitForSendBatch([])).toEqual([]);
+  });
+});
+
+describe("groupStagingRows", () => {
+  const row = (i: number, chars: number) => ({ i, content: "x".repeat(chars) });
+
+  it("caps a group at 50 rows", () => {
+    const groups = groupStagingRows(Array.from({ length: 120 }, (_, i) => row(i, 10)));
+    expect(groups.map((g) => g.length)).toEqual([50, 50, 20]);
+  });
+
+  it("caps a group by total characters, so 78 K-char chunks never make a huge request", () => {
+    const groups = groupStagingRows(Array.from({ length: 30 }, (_, i) => row(i, 78_334)), 50, 2_000_000);
+    expect(groups.every((g) => g.length <= 25)).toBe(true);
+    expect(groups.flat().length).toBe(30);
+  });
+
+  it("keeps row order across groups", () => {
+    const rows = Array.from({ length: 130 }, (_, i) => row(i, 5));
+    expect(groupStagingRows(rows).flat().map((r) => r.i)).toEqual(rows.map((r) => r.i));
+  });
+});
+
+describe("fullIngestRetryDelaySeconds", () => {
+  it("doubles from 30 s and stops at 300 s", () => {
+    expect([1, 2, 3, 4, 5, 6, 12].map(fullIngestRetryDelaySeconds)).toEqual([30, 60, 120, 240, 300, 300, 300]);
+  });
+
+  it("treats a missing or zero attempt count as the first attempt", () => {
+    expect(fullIngestRetryDelaySeconds(0)).toBe(30);
+    expect(fullIngestRetryDelaySeconds(-3)).toBe(30);
+  });
+});
+
+describe("dedupeChunkFilenames", () => {
+  it("suffixes repeated names with #2, #3 exactly like scripts/ingest.ts and leaves unique names alone", () => {
+    const chunks = ["a.md::Sources", "a.md::Intro", "a.md::Sources", "a.md::Sources"].map((filename, i) => ({ filename, content: `c${i}` }));
+    const out = dedupeChunkFilenames(chunks);
+    expect(out.map((c) => c.filename)).toEqual(["a.md::Sources", "a.md::Intro", "a.md::Sources#2", "a.md::Sources#3"]);
+    expect(out.map((c) => c.content)).toEqual(["c0", "c1", "c2", "c3"]);
+  });
+
+  it("does not mutate its input", () => {
+    const chunks = [{ filename: "x", content: "1" }, { filename: "x", content: "2" }];
+    dedupeChunkFilenames(chunks);
+    expect(chunks.map((c) => c.filename)).toEqual(["x", "x"]);
+  });
+
+  it("makes every name unique, so the swap cannot hit the unique index", () => {
+    const chunks = Array.from({ length: 40 }, (_, i) => ({ filename: i % 4 === 0 ? "d::dup" : `d::u${i}`, content: "c" }));
+    const names = dedupeChunkFilenames(chunks).map((c) => c.filename);
+    expect(new Set(names).size).toBe(names.length);
   });
 });
 
