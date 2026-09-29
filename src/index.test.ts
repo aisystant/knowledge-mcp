@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, PRIVATE_TOOLS, PUBLIC_ONLY_TOOL_NAMES, WITHDRAWN_TOOL_MESSAGES, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob, FULL_INGEST_SOURCES } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, PRIVATE_TOOLS, PUBLIC_ONLY_TOOL_NAMES, WITHDRAWN_TOOL_MESSAGES, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob, FULL_INGEST_SOURCES, buildFullIngestBatchRanges } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import worker from "./index.js";
 import { PRIVATE_TOOL_NAMES } from "./layers/private.js";
@@ -609,6 +609,47 @@ describe("SKILL_FILE_PATTERN", () => {
 describe("FULL_INGEST_SOURCES", () => {
   it("covers FPF and SPF, and nothing else", () => {
     expect(FULL_INGEST_SOURCES).toEqual(["FPF", "SPF"]);
+  });
+});
+
+// --- buildFullIngestBatchRanges (WP-532 Ф9, peer-session 2026-09-29) — pure range math
+// for fanning a large document's chunks out over queue messages. Index 0 is the parent
+// row (written directly by the caller, never part of a range); ranges cover children
+// 1..totalChunks-1. An earlier draft got this arithmetic wrong (a critical bug the design
+// round's cold review caught before it reached code) — this is exactly the surface where
+// an off-by-one silently drops or duplicates a chunk. ---
+describe("buildFullIngestBatchRanges", () => {
+  it("splits children evenly when the count divides the batch size", () => {
+    // 1 parent + 20 children, batch size 10 → totalChunks=21, children 1..20
+    expect(buildFullIngestBatchRanges(21, 10)).toEqual([
+      { batch_start: 1, batch_end: 11 },
+      { batch_start: 11, batch_end: 21 },
+    ]);
+  });
+
+  it("gives the last batch the remainder when the count doesn't divide evenly", () => {
+    // 1 parent + 15 children, batch size 10 → children 1..15
+    expect(buildFullIngestBatchRanges(16, 10)).toEqual([
+      { batch_start: 1, batch_end: 11 },
+      { batch_start: 11, batch_end: 16 },
+    ]);
+  });
+
+  it("returns one batch covering the single child when totalChunks is 2 (1 parent + 1 child)", () => {
+    expect(buildFullIngestBatchRanges(2, 10)).toEqual([{ batch_start: 1, batch_end: 2 }]);
+  });
+
+  it("returns no batches when totalChunks is 1 (parent only, no children)", () => {
+    expect(buildFullIngestBatchRanges(1, 10)).toEqual([]);
+  });
+
+  it("every range's batch_end matches the next range's batch_start — no gap, no overlap", () => {
+    const ranges = buildFullIngestBatchRanges(47, 10);
+    for (let i = 1; i < ranges.length; i++) {
+      expect(ranges[i].batch_start).toBe(ranges[i - 1].batch_end);
+    }
+    expect(ranges[0].batch_start).toBe(1);
+    expect(ranges[ranges.length - 1].batch_end).toBe(47);
   });
 });
 
