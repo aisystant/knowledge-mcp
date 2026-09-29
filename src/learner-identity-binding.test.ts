@@ -9,11 +9,15 @@ import { neon } from "@neondatabase/serverless";
 vi.mock("@neondatabase/serverless", () => ({ neon: vi.fn(), neonConfig: {}, Pool: vi.fn() }));
 
 const userContexts: Array<string | null | undefined> = [];
+// The SQL tag handed to code that runs inside withUserContext; a test replaces it to record
+// or fail the statements issued in the user's context.
+type SqlTag = (strings: TemplateStringsArray, ...values: unknown[]) => Promise<unknown[]>;
+let contextSql: SqlTag = () => Promise.resolve([{ cnt: 0 }]);
 vi.mock("./rls.js", () => ({
   createRequestPool: vi.fn(() => ({ end: vi.fn().mockResolvedValue(undefined) })),
   withUserContext: vi.fn(async (_dsn: string, userId: string | null | undefined, fn: (sql: unknown) => Promise<unknown>) => {
     userContexts.push(userId);
-    return fn(Object.assign(() => Promise.resolve([{ cnt: 0 }]), { unsafe: (value: string) => value }));
+    return fn(Object.assign((strings: TemplateStringsArray, ...values: unknown[]) => contextSql(strings, ...values), { unsafe: (value: string) => value }));
   }),
 }));
 
@@ -58,14 +62,28 @@ async function callTool(name: string, args: Record<string, unknown>, who: Caller
 
 // A stand-in for the concept-graph database that lets analyze_verbalization reach its
 // mastery write: one concept whose name occurs in the text, no edges, no misconceptions.
-// Every INSERT it receives is recorded together with its bound values.
-function stubConceptGraphDatabase(): Array<{ values: unknown[] }> {
-  const inserts: Array<{ values: unknown[] }> = [];
+// The worker's database role does not bypass row-level security (WP-7 Ф188), so a mastery
+// write is only valid inside withUserContext: writes are recorded separately for the plain
+// connection (must stay empty) and for the user context (the real one). `failContextWrite`
+// makes the write in the user context fail the way a rejected row would.
+function stubConceptGraphDatabase(options: { failContextWrite?: boolean } = {}): {
+  plainInserts: Array<{ values: unknown[] }>;
+  contextInserts: Array<{ values: unknown[] }>;
+} {
+  const plainInserts: Array<{ values: unknown[] }> = [];
+  const contextInserts: Array<{ values: unknown[] }> = [];
+  contextSql = (strings, ...values) => {
+    if (strings.join("?").includes("INSERT INTO")) {
+      if (options.failContextWrite) return Promise.reject(new Error("new row violates row-level security policy"));
+      contextInserts.push({ values });
+    }
+    return Promise.resolve([]);
+  };
   const sql = Object.assign(
     (strings: TemplateStringsArray, ...values: unknown[]) => {
       const text = strings.join("?");
       if (text.includes("INSERT INTO")) {
-        inserts.push({ values });
+        plainInserts.push({ values });
         return Promise.resolve([]);
       }
       if (text.includes("SELECT id, code, name")) {
@@ -79,7 +97,7 @@ function stubConceptGraphDatabase(): Array<{ values: unknown[] }> {
   vi.mocked(neon).mockReturnValue(sql as never);
   // The LLM judge is unavailable, so the handler falls back to plain name matching.
   vi.stubGlobal("fetch", vi.fn(async () => new Response("unavailable", { status: 503 })));
-  return inserts;
+  return { plainInserts, contextInserts };
 }
 
 function verbalizationResult(body: any): { mastery_updated: boolean; total_concepts: number; coverage: number } {
@@ -88,6 +106,7 @@ function verbalizationResult(body: any): { mastery_updated: boolean; total_conce
 
 beforeEach(() => {
   userContexts.length = 0;
+  contextSql = () => Promise.resolve([{ cnt: 0 }]);
   vi.mocked(neon).mockReset();
   vi.unstubAllGlobals();
 });
@@ -142,24 +161,41 @@ describe("analyze_verbalization through the HTTP entry point", () => {
   const args = { text: "Ученик объясняет модель своими словами", user_id: "argument-user" };
 
   it("writes the mastery row for the verified subject, not for the argument", async () => {
-    const inserts = stubConceptGraphDatabase();
+    const { plainInserts, contextInserts } = stubConceptGraphDatabase();
     const { body } = await callTool("analyze_verbalization", args, { bearer: "good" });
     expect(body.error).toBeUndefined();
     expect(verbalizationResult(body).mastery_updated).toBe(true);
-    expect(inserts).toHaveLength(1);
-    expect(inserts[0].values).toContain("jwt-subject");
-    expect(inserts[0].values).not.toContain("argument-user");
+    expect(contextInserts).toHaveLength(1);
+    expect(contextInserts[0].values).toContain("jwt-subject");
+    expect(contextInserts[0].values).not.toContain("argument-user");
+    expect(userContexts).toEqual(["jwt-subject"]);
+    expect(plainInserts).toHaveLength(0);
+  });
+
+  it("never writes mastery over the plain connection, which the row-level security rejects", async () => {
+    const { plainInserts } = stubConceptGraphDatabase();
+    await callTool("analyze_verbalization", args, { bearer: "good" });
+    await callTool("analyze_verbalization", args, {});
+    expect(plainInserts).toHaveLength(0);
+  });
+
+  it("a rejected mastery write does not discard the analysis", async () => {
+    stubConceptGraphDatabase({ failContextWrite: true });
+    const { body } = await callTool("analyze_verbalization", args, { bearer: "good" });
+    expect(body.error).toBeUndefined();
+    expect(verbalizationResult(body)).toMatchObject({ mastery_updated: false, total_concepts: 1, coverage: 1 });
   });
 
   it.each<[string, CallerHeaders]>([
     ["without a JWT (hw-checker)", {}],
     ["with an unverifiable token and the gateway's X-User-Id", { bearer: "opaque", headerUserId: "argument-user" }],
   ])("%s keeps writing for the id the caller sent", async (_title, who) => {
-    const inserts = stubConceptGraphDatabase();
+    const { contextInserts } = stubConceptGraphDatabase();
     const { body } = await callTool("analyze_verbalization", args, who);
     expect(body.error).toBeUndefined();
-    expect(inserts).toHaveLength(1);
-    expect(inserts[0].values).toContain("argument-user");
+    expect(contextInserts).toHaveLength(1);
+    expect(contextInserts[0].values).toContain("argument-user");
+    expect(userContexts).toEqual(["argument-user"]);
   });
 
   // The analysis itself must still complete: a handler that crashed before the mastery
@@ -169,10 +205,11 @@ describe("analyze_verbalization through the HTTP entry point", () => {
     ["a whitespace-only argument", { text: args.text, user_id: "   " }, {}],
     ["a verified but blank subject", args, { bearer: "blank" }],
   ])("with %s analyses the text but writes nothing", async (_title, callArgs, who) => {
-    const inserts = stubConceptGraphDatabase();
+    const { plainInserts, contextInserts } = stubConceptGraphDatabase();
     const { body } = await callTool("analyze_verbalization", callArgs, who);
     expect(body.error).toBeUndefined();
     expect(verbalizationResult(body)).toMatchObject({ mastery_updated: false, total_concepts: 1, coverage: 1 });
-    expect(inserts).toHaveLength(0);
+    expect(contextInserts).toHaveLength(0);
+    expect(plainInserts).toHaveLength(0);
   });
 });
