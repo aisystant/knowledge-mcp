@@ -90,6 +90,15 @@ export interface Env {
   // WP-410 срез-2b Деплой-2 группа Б: reindex queue producer/consumer binding, same queue name
   // ("reindex") the personal-knowledge-mcp worker already runs under (inherit-secrets cut-over).
   REINDEX_QUEUE?: Queue<ReindexBatchMessage>;
+  // WP-532 Ф9: separate queue for batched full-ingest of oversized platform documents
+  // (e.g. FPF-Spec.md). Not REINDEX_QUEUE — that one is fenced on user_id/index_generation
+  // for personal sources; this path has no user, only a source+document_path pair, and
+  // its own single-writer guarantee lives in full_ingest_runs (migration 024), not a
+  // per-user fence. Optional: code degrades to logging-and-skipping oversized files when
+  // unbound, same pattern as REINDEX_QUEUE above — provisioning the actual Cloudflare
+  // Queue and wiring [[queues]] in wrangler.toml is a deploy-time step, not done by this
+  // change (see PR description).
+  FULL_INGEST_QUEUE?: Queue<FullIngestBatchMessage>;
   /** Watchdog stale-job threshold override, minutes. Default 30 (see reindex.ts). Деплой-2 группа В. */
   WATCHDOG_STALE_MINUTES?: string;
 }
@@ -4571,6 +4580,9 @@ export default {
       ctx.waitUntil((async () => {
         await rebuildSkillsIndex(env);
         await retryPendingHeartbeatSources(env);
+        // WP-532 Ф9: DB-only, no GitHub calls — doesn't compete for the rate-limit
+        // window the two calls above are sequenced to protect.
+        await abandonStaleFullIngestRuns(env);
       })());
     } else {
       ctx.waitUntil(runHeartbeat(env));
@@ -4581,12 +4593,25 @@ export default {
   // (see ./layers/reindex.ts). Only private-mode deploys bind REINDEX_QUEUE at all (public
   // knowledge-mcp's wrangler.toml has no [[queues]] section) — the mode check is defensive,
   // matching the scheduled() heartbeat-skip pattern above, not an expected runtime path.
-  async queue(batch: MessageBatch<ReindexBatchMessage>, env: Env): Promise<void> {
+  async queue(batch: MessageBatch<ReindexBatchMessage | FullIngestBatchMessage>, env: Env): Promise<void> {
+    // WP-532 Ф9: attemptFullIngestSwap() reads the shared knowledgeChunkTable module-
+    // level variable (see initTables() and the WP-560 Ф11 incident note on it) — queue()
+    // never needed it before (handleQueue()/layers/reindex.ts resolve their own table
+    // references per-call), so this entry point never called initTables(). Same bug
+    // class Ф11 already fixed for scheduled(), just not here since nothing exercised it.
+    initTables(env);
+    // WP-532 Ф9: FULL_INGEST_QUEUE_NAME is bound only on the public deployment (unlike
+    // REINDEX_QUEUE below, which is private-only) — routed first, by queue name, before
+    // the private-mode gate that would otherwise reject it.
+    if (batch.queue === FULL_INGEST_QUEUE_NAME) {
+      await handleFullIngestBatch(batch as MessageBatch<FullIngestBatchMessage>, env);
+      return;
+    }
     if (resolveMode(env.MCP_MODE) !== "private") {
       console.warn(JSON.stringify({ phase: "reindex_queue_skipped_public_mode", batch_size: batch.messages.length }));
       return;
     }
-    await handleQueue(batch, env);
+    await handleQueue(batch as MessageBatch<ReindexBatchMessage>, env);
   },
 };
 
@@ -4632,6 +4657,11 @@ interface GitHubFileMeta {
   /** Bytes, from the GitHub Trees API — not the same unit as MAX_FILE_CHARS (JS string
    *  length). See partitionFilesBySize(). */
   size: number;
+  /** Git blob SHA — content-addressed, immutable. WP-532 Ф9: batched full-ingest pins
+   *  this before enqueueing so every batch fetches the exact same bytes regardless of
+   *  what happens on the branch afterward (readGitHubBlobBySha), not a second read of
+   *  "whatever HEAD is now". */
+  sha: string;
 }
 
 async function listGitHubFilesWithSize(source: string): Promise<GitHubFileMeta[]> {
@@ -4647,7 +4677,7 @@ async function listGitHubFilesWithSize(source: string): Promise<GitHubFileMeta[]
   });
 
   if (!resp.ok) throw new Error(`GitHub Trees API ${resp.status} for ${source}`);
-  const data = await resp.json() as { tree: Array<{ path: string; type: string; size?: number }>; truncated?: boolean };
+  const data = await resp.json() as { tree: Array<{ path: string; type: string; size?: number; sha: string }>; truncated?: boolean };
   if (data.truncated) {
     throw new Error(`GitHub tree truncated for ${source} — too many files.`);
   }
@@ -4657,7 +4687,33 @@ async function listGitHubFilesWithSize(source: string): Promise<GitHubFileMeta[]
       f.path.endsWith(".md") &&
       (!config.pathPrefix || f.path.startsWith(config.pathPrefix))
     )
-    .map((f) => ({ path: f.path, size: f.size ?? 0 }));
+    .map((f) => ({ path: f.path, size: f.size ?? 0, sha: f.sha }));
+}
+
+/**
+ * Read a file's exact content by its immutable Git blob SHA — not by branch, which can
+ * move while a batched full-ingest run (WP-532 Ф9) is still in progress. GitHub's Blobs
+ * API returns base64; readFromGitHubPublic()'s raw.githubusercontent.com path only
+ * fetches by branch and has no blob-SHA equivalent.
+ */
+async function readGitHubBlobBySha(source: string, sha: string): Promise<string | null> {
+  const config = SOURCE_GITHUB_BASE[source];
+  if (!config) return null;
+  const match = config.base.match(/github\.com\/([^/]+)\/([^/]+)\/blob\//);
+  if (!match) return null;
+  const [, owner, repo] = match;
+
+  const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/blobs/${sha}`, {
+    headers: { "User-Agent": "aisystant-knowledge-mcp", Accept: "application/vnd.github+json" },
+  });
+  if (!resp.ok) return null;
+  const data = await resp.json() as { content: string; encoding: string };
+  if (data.encoding !== "base64") return null;
+  // atob() is available in the Workers runtime; content arrives with embedded newlines
+  // GitHub inserts every 60 chars, which atob() tolerates.
+  const binary = atob(data.content);
+  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  return new TextDecoder("utf-8").decode(bytes);
 }
 
 /**
@@ -4680,6 +4736,310 @@ export function partitionFilesBySize<T extends { size: number }>(
     (f.size <= maxBytes ? eligible : excluded).push(f);
   }
   return { eligible, excluded };
+}
+
+// --- WP-532 Ф9: batched full-ingest for files over MAX_FILE_CHARS ---
+//
+// A file this large can't go through reindexFiles()'s normal per-chunk sequential path
+// (a document the size of FPF-Spec.md is ~1500 chunks — one Worker invocation embedding
+// and inserting them one at a time either times out mid-file, or, worse, times out after
+// the DELETE of the old rows but before all the new ones land, leaving the document
+// genuinely missing from search until the next run). This path instead: chunks once,
+// creates one `full_ingest_runs` row (the single-writer claim — see migration 024's
+// partial unique index), fans the chunk range out over several small queue messages,
+// and only moves anything into the live `knowledge_chunk` table once every chunk for
+// the run is confirmed present in `knowledge_chunk_staging` (peer-session 2026-09-29,
+// Claude+Kimi+Codex — see MC-sessions:2026-09/29/2026-09-29-02-reindex-control-mandatory/
+// for the design round, the race Codex found in an earlier draft, and why).
+
+const FULL_INGEST_QUEUE_NAME = "full-ingest-batches";
+// Conservative starting point (Kimi, design round), not a measured value — CPU-time and
+// embedding-API payload budgets per Cloudflare Workers pricing tier both bound this, and
+// neither is being computed here. Revisit once this has run against a real oversized file.
+const FULL_INGEST_BATCH_SIZE = 10;
+// A run that's been "running" this long without completing is treated as dead, not still
+// working — generous against the actual expected duration (a few tens of minutes even for
+// FPF-Spec.md-sized documents at 10 chunks/batch), see abandonStaleFullIngestRuns().
+const FULL_INGEST_RUN_TTL_HOURS = 2;
+
+interface FullIngestBatchMessage {
+  run_id: string;
+  source: string;
+  document_path: string;
+  /** Git blob SHA, pinned by the producer — every batch reads this exact content via
+   *  readGitHubBlobBySha(), never "whatever the branch has now". */
+  source_revision: string;
+  /** Half-open range over the CHILD chunk indices (the parent row is index 0, written
+   *  by the producer itself — see startBatchedFullIngest). */
+  batch_start: number;
+  batch_end: number;
+}
+
+/**
+ * Half-open [batch_start, batch_end) ranges over child indices 1..totalChunks-1 (index 0
+ * is the parent row, written directly by the caller, never part of a range here). Pure
+ * and separated from startBatchedFullIngest() specifically to be unit-tested without a
+ * DB/GitHub/queue — this range math is exactly the kind of off-by-one surface that broke
+ * silently in an earlier draft of this function.
+ */
+export function buildFullIngestBatchRanges(totalChunks: number, batchSize: number): { batch_start: number; batch_end: number }[] {
+  const ranges: { batch_start: number; batch_end: number }[] = [];
+  for (let start = 1; start < totalChunks; start += batchSize) {
+    ranges.push({ batch_start: start, batch_end: Math.min(start + batchSize, totalChunks) });
+  }
+  return ranges;
+}
+
+/**
+ * Producer: chunks the file once, claims the single-writer slot, writes the parent row,
+ * and fans the child chunks out over the queue. No-ops (logs and returns) when
+ * env.FULL_INGEST_QUEUE isn't bound — same degrade-when-unprovisioned pattern as
+ * REINDEX_QUEUE elsewhere in this file; provisioning the actual Cloudflare Queue is a
+ * deploy-time step (see PR description), not something this code path does.
+ */
+async function startBatchedFullIngest(env: Env, source: string, file: GitHubFileMeta): Promise<void> {
+  if (!env.FULL_INGEST_QUEUE) {
+    console.log(JSON.stringify({ phase: "full_ingest_batch_queue_unbound", source, path: file.path }));
+    return;
+  }
+
+  const content = await readGitHubBlobBySha(source, file.sha);
+  if (content === null) {
+    console.error(JSON.stringify({ phase: "full_ingest_batch_fetch_failed", source, path: file.path, sha: file.sha }));
+    return;
+  }
+
+  const chunks = chunkLargeFile(content, file.path);
+  // Parent occupies index 0 (written here, once, by the sole process holding the
+  // single-writer claim — no race to insert it, unlike the child chunks that fan out
+  // across independent consumer invocations). Children occupy 1..chunks.length.
+  const totalChunks = chunks.length + 1;
+  const runId = crypto.randomUUID();
+  const parentHash = await contentHash(content);
+
+  // Both new tables live in the KNOWLEDGE database, not health — the swap below moves
+  // rows into knowledge_chunk within one transaction, which is only possible when
+  // source and destination are the same Postgres database. HEALTH_DATABASE_URL is a
+  // separate Neon project (confirmed live, 2026-09-29): a first draft of this function
+  // used it for these two tables, matching graph_freshness_events' location by
+  // reflex — caught before typecheck, since knowledge_chunk itself was never going to
+  // exist on that connection.
+  const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
+  const runsTable = KNOWLEDGE_TABLES.full_ingest_runs(getKnowledgeSchema(env));
+  const stagingTable = KNOWLEDGE_TABLES.knowledge_chunk_staging(getKnowledgeSchema(env));
+
+  let claimed: unknown[];
+  try {
+    claimed = await knowledgeSql`
+      INSERT INTO ${knowledgeSql.unsafe(runsTable)}
+        (run_id, source, document_path, source_revision, total_chunks, status)
+      VALUES (${runId}, ${source}, ${file.path}, ${file.sha}, ${totalChunks}, 'running')
+      ON CONFLICT (source, document_path) WHERE status = 'running' DO NOTHING
+      RETURNING run_id
+    `;
+  } catch (e) {
+    console.error(JSON.stringify({ phase: "full_ingest_batch_claim_failed", source, path: file.path, error: e instanceof Error ? e.message : String(e) }));
+    return;
+  }
+  if (claimed.length === 0) {
+    console.log(JSON.stringify({ phase: "full_ingest_batch_already_running", source, path: file.path }));
+    return;
+  }
+
+  try {
+    await knowledgeSql`
+      INSERT INTO ${knowledgeSql.unsafe(stagingTable)}
+        (run_id, chunk_index, role, chunk_uuid, parent_chunk_uuid, chunk_id, document_path,
+         paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, collection_kind)
+      VALUES (
+        ${runId}, 0, 'parent', ${runId}, NULL, ${file.path + "::p0"}, ${file.path},
+        0, ${parentHash}, ${file.path}, ${content}, ${source}, ${"pack"}, ${parentHash}, 'platform'
+      )
+    `;
+
+    const messages: FullIngestBatchMessage[] = buildFullIngestBatchRanges(totalChunks, FULL_INGEST_BATCH_SIZE).map((r) => ({
+      run_id: runId,
+      source,
+      document_path: file.path,
+      source_revision: file.sha,
+      batch_start: r.batch_start,
+      batch_end: r.batch_end,
+    }));
+    await env.FULL_INGEST_QUEUE.sendBatch(messages.map((m) => ({ body: m })));
+
+    console.log(JSON.stringify({
+      phase: "full_ingest_batch_started", source, path: file.path, run_id: runId,
+      total_chunks: totalChunks, batches: messages.length,
+    }));
+  } catch (e) {
+    // Parent row and/or enqueue failed partway — abandon rather than leave a 'running'
+    // claim that nothing will ever complete (it would otherwise sit until the TTL sweep,
+    // needlessly blocking a retry for up to FULL_INGEST_RUN_TTL_HOURS).
+    await knowledgeSql`UPDATE ${knowledgeSql.unsafe(runsTable)} SET status = 'abandoned' WHERE run_id = ${runId}`
+      .catch((e2) => console.error(JSON.stringify({ phase: "full_ingest_abandon_mark_failed", run_id: runId, error: e2 instanceof Error ? e2.message : String(e2) })));
+    console.error(JSON.stringify({ phase: "full_ingest_batch_start_failed", source, path: file.path, run_id: runId, error: e instanceof Error ? e.message : String(e) }));
+  }
+}
+
+/**
+ * Consumer: embeds and stages this message's slice of children, then attempts the
+ * completion CAS. Losing the CAS (another batch already completed, or the run was
+ * abandoned) is a normal, silent outcome, not an error — see the design round for why
+ * every step past the CAS is conditioned on it, not just guarded by an application-level
+ * "count == total" check (that check alone raced two consumers into emptying the live
+ * document, per Codex's finding on the first draft).
+ */
+async function handleFullIngestBatch(batch: MessageBatch<FullIngestBatchMessage>, env: Env): Promise<void> {
+  const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
+  const runsTable = KNOWLEDGE_TABLES.full_ingest_runs(getKnowledgeSchema(env));
+  const stagingTable = KNOWLEDGE_TABLES.knowledge_chunk_staging(getKnowledgeSchema(env));
+
+  for (const msg of batch.messages) {
+    const { run_id, source, document_path, source_revision, batch_start, batch_end } = msg.body;
+    try {
+      const [run] = await knowledgeSql`
+        SELECT status, total_chunks FROM ${knowledgeSql.unsafe(runsTable)} WHERE run_id = ${run_id}
+      ` as { status: string; total_chunks: number }[];
+      if (!run || run.status !== "running") {
+        console.log(JSON.stringify({ phase: "full_ingest_batch_skip_not_running", run_id, status: run?.status ?? "missing" }));
+        msg.ack();
+        continue;
+      }
+
+      const content = await readGitHubBlobBySha(source, source_revision);
+      if (content === null) throw new Error(`blob fetch failed for ${document_path}@${source_revision}`);
+      const chunks = chunkLargeFile(content, document_path);
+      const parentChunkUuid = deriveParentChunkUuid(run_id); // stable per run_id, not re-fetched from DB — see helper
+
+      for (let i = batch_start; i < batch_end && i - 1 < chunks.length; i++) {
+        const chunk = chunks[i - 1]; // child indices are 1-based; chunks[] is 0-based
+        const embedding = await getEmbedding(env.OPENROUTER_API_KEY, chunk.content.slice(0, CHUNK_CHAR_LIMIT));
+        const vec = `[${embedding.join(",")}]`;
+        const chunkHash = await contentHash(chunk.content);
+        const chunkUuid = crypto.randomUUID();
+        await knowledgeSql`
+          INSERT INTO ${knowledgeSql.unsafe(stagingTable)}
+            (run_id, chunk_index, role, chunk_uuid, parent_chunk_uuid, chunk_id, document_path,
+             paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, collection_kind)
+          VALUES (
+            ${run_id}, ${i}, 'child', ${chunkUuid}, ${parentChunkUuid}, ${chunk.filename + "::p" + i}, ${chunk.filename},
+            ${i}, ${chunkHash}, ${chunk.filename}, ${chunk.content}, ${source}, 'pack', ${chunkHash}, ${vec}::vector, 'platform'
+          )
+          ON CONFLICT (run_id, chunk_index) DO NOTHING
+        `;
+      }
+
+      await attemptFullIngestSwap(env, run_id, source, document_path);
+      msg.ack();
+    } catch (e) {
+      console.error(JSON.stringify({ phase: "full_ingest_batch_error", run_id, source, document_path, error: e instanceof Error ? e.message : String(e) }));
+      msg.retry();
+    }
+  }
+}
+
+/**
+ * Every child row staged for a run carries the SAME parent_chunk_uuid so the final
+ * INSERT...SELECT can set parent_chunk_id without a second UPDATE pass (see migration
+ * 024's comment on knowledge_chunk_staging). It has to be derivable identically by
+ * whichever consumer invocation processes batch_start=1..N without a DB round-trip per
+ * chunk — run_id (already a UUID, v4, from startBatchedFullIngest) is reused directly
+ * as the parent's own chunk_uuid, which startBatchedFullIngest writes as-is (no second,
+ * independently-generated UUID for the parent — a cold review caught an earlier draft
+ * doing exactly that: producer and consumer each minted their own random UUID for "the
+ * parent", the two never matched, and every child's parent_chunk_id would have pointed
+ * at a row that doesn't exist post-swap — silent, no error anywhere, only found by
+ * reading the producer and consumer side by side).
+ */
+function deriveParentChunkUuid(runId: string): string {
+  return runId;
+}
+
+/**
+ * CAS + atomic swap. All statements after the first are guarded by `EXISTS (...status =
+ * 'swapping')` so a lost race (another batch already flipped the status, or the run was
+ * abandoned between this consumer's SELECT above and here) makes every remaining
+ * statement a no-op within the SAME transaction — not a separate check an application
+ * bug could skip. A mid-transaction failure rolls the CAS back too, returning the run to
+ * 'running' for a legitimate retry (Codex, design round).
+ */
+async function attemptFullIngestSwap(env: Env, runId: string, source: string, documentPath: string): Promise<void> {
+  const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
+  const runsTable = KNOWLEDGE_TABLES.full_ingest_runs(getKnowledgeSchema(env));
+  const stagingTable = KNOWLEDGE_TABLES.knowledge_chunk_staging(getKnowledgeSchema(env));
+  // The shared module-level table, not a locally-resolved one: scripts/check-account-id-
+  // filter.sh (WP-7 Ф-L2-PRIVACY guard) matches queries against knowledgeChunkTable by
+  // name specifically — a local variable of the same table would compile and run fine
+  // but stay invisible to it, silently opting this code out of the isolation check every
+  // other read of this table goes through.
+
+  await knowledgeSql.transaction([
+    knowledgeSql`
+      UPDATE ${knowledgeSql.unsafe(runsTable)} r
+      SET status = 'swapping'
+      WHERE r.run_id = ${runId} AND r.status = 'running'
+        AND (SELECT count(*) FROM ${knowledgeSql.unsafe(stagingTable)} s WHERE s.run_id = r.run_id) = r.total_chunks
+        AND (SELECT count(*) FROM ${knowledgeSql.unsafe(stagingTable)} s
+             WHERE s.run_id = r.run_id AND (s.chunk_index < 0 OR s.chunk_index >= r.total_chunks)) = 0
+    `,
+    // account_id IS NULL, not a variable: every source in FULL_INGEST_SOURCES is a
+    // platform Pack name (kc_kind_consistency requires collection_kind='platform' rows
+    // to carry account_id IS NULL) — there is no personal-content case on this path to
+    // branch on, unlike reindexFiles()'s accountUuid.
+    knowledgeSql`
+      DELETE FROM ${knowledgeSql.unsafe(knowledgeChunkTable)}
+      WHERE source = ${source} AND (source_uri = ${documentPath} OR source_uri LIKE ${documentPath + "::%"})
+        AND account_id IS NULL
+        AND EXISTS (SELECT 1 FROM ${knowledgeSql.unsafe(runsTable)} WHERE run_id = ${runId} AND status = 'swapping')
+    `,
+    knowledgeSql`
+      INSERT INTO ${knowledgeSql.unsafe(knowledgeChunkTable)}
+        (chunk_uuid, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, parent_chunk_id, account_id, collection_kind)
+      SELECT chunk_uuid, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, parent_chunk_uuid, NULL, collection_kind
+      FROM ${knowledgeSql.unsafe(stagingTable)}
+      WHERE run_id = ${runId}
+        AND EXISTS (SELECT 1 FROM ${knowledgeSql.unsafe(runsTable)} WHERE run_id = ${runId} AND status = 'swapping')
+      ORDER BY chunk_index
+    `,
+    knowledgeSql`DELETE FROM ${knowledgeSql.unsafe(stagingTable)} WHERE run_id = ${runId}`,
+    knowledgeSql`UPDATE ${knowledgeSql.unsafe(runsTable)} SET status = 'swapped', swapped_at = now() WHERE run_id = ${runId} AND status = 'swapping'`,
+  ]);
+}
+
+/**
+ * Scheduled sweep (wired into the existing 15-min "skills" tick, not a new cron trigger
+ * — see scheduled()): a run stuck in 'running' or 'swapping' past its TTL is dead, not
+ * still working. Deletes its orphaned staging rows explicitly — status alone doesn't
+ * cascade-delete them, only removing the full_ingest_runs row itself would, and that
+ * row is kept for observability (same reasoning as graph_freshness_events being a log,
+ * not deleted after use).
+ */
+async function abandonStaleFullIngestRuns(env: Env): Promise<void> {
+  const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
+  const runsTable = KNOWLEDGE_TABLES.full_ingest_runs(getKnowledgeSchema(env));
+  const stagingTable = KNOWLEDGE_TABLES.knowledge_chunk_staging(getKnowledgeSchema(env));
+  try {
+    // One statement (CTE), not UPDATE-then-DELETE — a crash between two separate
+    // round-trips would mark a run abandoned but never clean up its staging rows, and
+    // the next sweep's WHERE (status IN ('running','swapping')) would no longer find it
+    // to retry the cleanup (cold review, Medium).
+    const stale = await knowledgeSql`
+      WITH stale AS (
+        UPDATE ${knowledgeSql.unsafe(runsTable)}
+        SET status = 'abandoned'
+        WHERE status IN ('running', 'swapping')
+          AND created_at < now() - (${FULL_INGEST_RUN_TTL_HOURS} || ' hours')::interval
+        RETURNING run_id
+      )
+      DELETE FROM ${knowledgeSql.unsafe(stagingTable)}
+      WHERE run_id IN (SELECT run_id FROM stale)
+      RETURNING run_id
+    ` as { run_id: string }[];
+    if (stale.length === 0) return;
+    console.log(JSON.stringify({ phase: "full_ingest_stale_runs_abandoned", run_ids: stale.map((r) => r.run_id) }));
+  } catch (e) {
+    console.error(JSON.stringify({ phase: "full_ingest_stale_sweep_failed", error: e instanceof Error ? e.message : String(e) }));
+  }
 }
 
 /**
@@ -4739,6 +5099,11 @@ async function syncFullIngestSource(env: Env, source: string): Promise<void> {
 
     for (const f of excluded) {
       console.log(JSON.stringify({ phase: "full_ingest_excluded", source, path: f.path, size_bytes: f.size, reason: `over MAX_FILE_CHARS prefilter (limit ${MAX_FILE_CHARS} bytes)` }));
+      // WP-532 Ф9: route through the batched path instead of just logging-and-dropping.
+      // Kicking off a run is one GitHub fetch + one INSERT + one queue sendBatch — the
+      // actual per-chunk embedding work happens in handleFullIngestBatch(), not here, so
+      // awaiting this doesn't meaningfully extend the daily tick's own duration.
+      await startBatchedFullIngest(env, source, f);
     }
 
     const result = await reindexFiles(env, {
