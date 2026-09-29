@@ -4530,11 +4530,11 @@ export default {
       }
       let body: { source?: string; path?: string; dry_run?: boolean };
       try {
-        body = (await request.json()) as typeof body;
+        body = ((await request.json()) ?? {}) as typeof body;
       } catch {
         return json(400, { error: "Bad Request", reason: "invalid_json" });
       }
-      const source = body.source ?? "";
+      const source = typeof body.source === "string" ? body.source : "";
       if (!FULL_INGEST_SOURCES.includes(source)) {
         return json(400, { error: "Bad Request", reason: "source_not_in_full_ingest_sources", allowed: FULL_INGEST_SOURCES });
       }
@@ -4628,6 +4628,7 @@ export default {
         await retryPendingHeartbeatSources(env);
         // WP-532 Ф9: DB-only, no GitHub calls — doesn't compete for the rate-limit
         // window the two calls above are sequenced to protect.
+        await retryStalledFullIngestSwaps(env);
         await abandonStaleFullIngestRuns(env);
       })());
     } else {
@@ -4649,12 +4650,11 @@ export default {
     // WP-532 Ф9: FULL_INGEST_QUEUE_NAME is bound only on the public deployment (unlike
     // REINDEX_QUEUE below, which is private-only) — routed first, by queue name, before
     // the private-mode gate that would otherwise reject it.
-    if (batch.queue === FULL_INGEST_QUEUE_NAME) {
+    // A public deployment binds exactly one queue consumer (this one), so any batch it receives
+    // belongs here even if the queue was created under another name — silently acknowledging an
+    // unknown queue's messages would hide a naming slip until the run times out.
+    if (batch.queue === FULL_INGEST_QUEUE_NAME || resolveMode(env.MCP_MODE) !== "private") {
       await handleFullIngestBatch(batch as MessageBatch<FullIngestBatchMessage>, env);
-      return;
-    }
-    if (resolveMode(env.MCP_MODE) !== "private") {
-      console.warn(JSON.stringify({ phase: "reindex_queue_skipped_public_mode", batch_size: batch.messages.length }));
       return;
     }
     await handleQueue(batch as MessageBatch<ReindexBatchMessage>, env);
@@ -4822,6 +4822,8 @@ const QUEUE_SEND_BATCH_MAX_BYTES = 200 * 1024;
 // a group of worst-case chunks (78 K chars each) stays far below the 64 MB Neon HTTP body limit.
 const STAGING_INSERT_GROUP_MAX_ROWS = 50;
 const STAGING_INSERT_GROUP_MAX_CHARS = 2_000_000;
+// The parent row (whole document) is appended in slices of this many characters.
+const PARENT_PIECE_CHARS = 1_000_000;
 const FULL_INGEST_RETRY_BASE_SECONDS = 30;
 const FULL_INGEST_RETRY_MAX_SECONDS = 300;
 
@@ -5017,8 +5019,11 @@ async function claimFullIngestRun(ctx: FullIngestRunContext, sha: string, totalC
   return claimed.length > 0;
 }
 
-/** Parent row (index 0): the whole document in one INSERT (measured: 15.7 MB request body). Inserted
- *  only while the run is still 'running', so a sweep that abandoned a slow start stops all further inserts. */
+/** Parent row (index 0): the whole document. It goes in PIECES (an empty row, then appended slices):
+ *  one INSERT carrying 15.6 MB would put a second and third copy of the text (JSON body, encoded
+ *  bytes) in memory exactly when the chunks already exist, the worst moment for a 128 MB isolate.
+ *  Every statement is conditional on the run still being 'running', so a sweep that abandoned a
+ *  slow start stops all further writes. */
 async function insertStagingParent(ctx: FullIngestRunContext, content: string, contentHashValue: string): Promise<void> {
   const { knowledgeSql, runsTable, stagingTable, runId, source, sourceKind, path } = ctx;
   await knowledgeSql`
@@ -5026,11 +5031,19 @@ async function insertStagingParent(ctx: FullIngestRunContext, content: string, c
       (run_id, chunk_index, role, chunk_uuid, parent_chunk_uuid, chunk_id, document_path,
        paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, collection_kind)
     SELECT ${runId}::text, 0, 'parent', ${runId}::uuid, NULL::uuid, ${path + "::p0"}::text, ${path}::text,
-           0, ${contentHashValue}::text, ${path}::text, ${content}::text, ${source}::text, ${sourceKind}::text, ${contentHashValue}::text,
+           0, ${contentHashValue}::text, ${path}::text, ''::text, ${source}::text, ${sourceKind}::text, ${contentHashValue}::text,
            NULL, 'platform'
     FROM ${knowledgeSql.unsafe(runsTable)} r
     WHERE r.run_id = ${runId} AND r.status = 'running'
   `;
+  for (let offset = 0; offset < content.length; offset += PARENT_PIECE_CHARS) {
+    const piece = content.slice(offset, offset + PARENT_PIECE_CHARS);
+    await knowledgeSql`
+      UPDATE ${knowledgeSql.unsafe(stagingTable)} s SET content = s.content || ${piece}::text
+      WHERE s.run_id = ${runId} AND s.chunk_index = 0
+        AND EXISTS (SELECT 1 FROM ${knowledgeSql.unsafe(runsTable)} r WHERE r.run_id = s.run_id AND r.status = 'running')
+    `;
+  }
 }
 
 /** Child rows (indices 1..N): every chunk's text with embedding NULL, in bounded transactions.
@@ -5144,6 +5157,13 @@ async function startBatchedFullIngest(
   }
 
   try {
+    // The download and chunking took seconds: look again before claiming, so a run that finished
+    // or started meanwhile does not cause a pointless rebuild.
+    const again = await readFullIngestState(knowledgeSql, ctx.runsTable, source, file.path);
+    if (again.active > 0 || again.installedRevision === file.sha) {
+      console.log(JSON.stringify({ phase: "full_ingest_state_changed_meanwhile", source, path: file.path }));
+      return result({ outcome: again.active > 0 ? "in_progress" : "unchanged", source_revision: file.sha });
+    }
     if (!(await claimFullIngestRun(ctx, file.sha, totalChunks))) {
       console.log(JSON.stringify({ phase: "full_ingest_batch_already_running", source, path: file.path }));
       return result({ outcome: "in_progress" });
@@ -5163,10 +5183,11 @@ async function startBatchedFullIngest(
 
     // Publish only a fully staged run: a half-staged run must never reach a consumer.
     const [staged] = await knowledgeSql`
-      SELECT count(*)::int AS cnt FROM ${knowledgeSql.unsafe(ctx.stagingTable)} WHERE run_id = ${ctx.runId}
-    ` as { cnt: number }[];
-    if (staged.cnt !== totalChunks) {
-      throw new Error(`staging incomplete: ${staged.cnt} of ${totalChunks} rows`);
+      SELECT (SELECT count(*) FROM ${knowledgeSql.unsafe(ctx.stagingTable)} WHERE run_id = ${ctx.runId})::int AS cnt,
+             (SELECT status FROM ${knowledgeSql.unsafe(ctx.runsTable)} WHERE run_id = ${ctx.runId}) AS status
+    ` as { cnt: number; status: string | null }[];
+    if (staged.cnt !== totalChunks || staged.status !== "running") {
+      throw new Error(`staging incomplete: ${staged.cnt} of ${totalChunks} rows, run status ${staged.status}`);
     }
 
     const messages: FullIngestBatchMessage[] = ranges.map((r) => ({
@@ -5367,6 +5388,36 @@ export async function abandonStaleFullIngestRuns(env: Env): Promise<void> {
     console.log(JSON.stringify({ phase: "full_ingest_staging_cleaned", runs: cleaned }));
   } catch (e) {
     console.error(JSON.stringify({ phase: "full_ingest_stale_sweep_failed", error: e instanceof Error ? e.message : String(e) }));
+  }
+}
+
+/**
+ * Recovery for a run that is fully embedded but was never swapped (its last message failed the
+ * swap and exhausted its retries, or was lost): try the swap again from the scheduled tick instead
+ * of letting the run expire after the TTL and paying for the whole document again tomorrow.
+ * minAgeMinutes keeps it away from runs whose last messages are still being delivered.
+ */
+export async function retryStalledFullIngestSwaps(env: Env, minAgeMinutes: number = 10): Promise<void> {
+  const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
+  const runsTable = KNOWLEDGE_TABLES.full_ingest_runs(getKnowledgeSchema(env));
+  const stagingTable = KNOWLEDGE_TABLES.knowledge_chunk_staging(getKnowledgeSchema(env));
+  try {
+    const ready = await knowledgeSql`
+      SELECT r.run_id FROM ${knowledgeSql.unsafe(runsTable)} r
+      WHERE r.status = 'running' AND r.created_at < now() - make_interval(mins => ${minAgeMinutes}::int)
+        AND (SELECT count(*) FROM ${knowledgeSql.unsafe(stagingTable)} s WHERE s.run_id = r.run_id) = r.total_chunks
+        AND NOT EXISTS (SELECT 1 FROM ${knowledgeSql.unsafe(stagingTable)} s
+                        WHERE s.run_id = r.run_id AND s.role = 'child' AND s.embedding IS NULL)
+    ` as { run_id: string }[];
+    for (const { run_id } of ready) {
+      try {
+        await attemptFullIngestSwap(env, run_id);
+      } catch (e) {
+        console.error(JSON.stringify({ phase: "full_ingest_swap_recovery_failed", run_id, error: e instanceof Error ? e.message : String(e) }));
+      }
+    }
+  } catch (e) {
+    console.error(JSON.stringify({ phase: "full_ingest_swap_recovery_query_failed", error: e instanceof Error ? e.message : String(e) }));
   }
 }
 

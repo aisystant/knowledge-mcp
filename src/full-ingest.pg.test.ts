@@ -23,7 +23,7 @@
 import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import worker, { abandonStaleFullIngestRuns } from "./index.js";
+import worker, { abandonStaleFullIngestRuns, retryStalledFullIngestSwaps } from "./index.js";
 import type { Env } from "./index.js";
 
 const PG_URL = process.env.FULL_INGEST_PG_URL;
@@ -145,7 +145,7 @@ interface FetchStub {
 
 /** GitHub tree/blob and the embedding endpoint. The tree reports FPF-Spec.md as > 1 MB so the
  *  daily/manual path treats it as oversized whatever the (small) test body really is. */
-function stubNetwork(doc: { sha: string; text: string }): FetchStub {
+function stubNetwork(doc: { sha: string; text: string }, opts: { failEmbedCalls?: number[] } = {}): FetchStub {
   const counters: FetchStub = { blobFetches: 0, embedCalls: 0 };
   vi.stubGlobal("fetch", vi.fn(async (input: any) => {
     const url = typeof input === "string" ? input : input.url;
@@ -164,6 +164,7 @@ function stubNetwork(doc: { sha: string; text: string }): FetchStub {
     }
     if (url === "https://openrouter.ai/api/v1/embeddings") {
       counters.embedCalls++;
+      if (opts.failEmbedCalls?.includes(counters.embedCalls)) return new Response("upstream error", { status: 500 });
       return new Response(JSON.stringify({ data: [{ embedding: [0.25, 0.5, 0.75] }] }));
     }
     throw new Error(`unexpected fetch: ${url}`);
@@ -215,8 +216,8 @@ const stagingCount = async (runId?: string) =>
 
 const runStatus = async (runId: string) => (await q(`SELECT status FROM full_ingest_runs WHERE run_id = $1`, [runId]))[0].status as string;
 
-async function startRun(env: Env, doc: { sha: string; text: string }): Promise<{ runId: string; totalChunks: number; net: FetchStub }> {
-  const net = stubNetwork(doc);
+async function startRun(env: Env, doc: { sha: string; text: string }, netOpts: { failEmbedCalls?: number[] } = {}): Promise<{ runId: string; totalChunks: number; net: FetchStub }> {
+  const net = stubNetwork(doc, netOpts);
   const res = await postFullIngest(env, { source: SOURCE, path: DOC, dry_run: false });
   expect(res.status).toBe(200);
   expect(res.json.results[0].outcome).toBe("queued");
@@ -262,8 +263,11 @@ describe.skipIf(!PG_URL)("batched full-ingest on real PostgreSQL (WP-532 Ф9)", 
     await seedOldEdition();
     const queue = makeQueue();
     const env = makeEnv({ FULL_INGEST_QUEUE: queue });
-    const { runId, totalChunks } = await startRun(env, { sha: "sha-1", text: syntheticDoc(45) });
+    const doc1 = { sha: "sha-1", text: syntheticDoc(45) };
+    const { runId, totalChunks } = await startRun(env, doc1);
     expect(totalChunks).toBe(47);
+    // The parent row is appended in pieces; the assembled text must equal the document exactly.
+    expect((await q(`SELECT content FROM knowledge_chunk_staging WHERE run_id = $1 AND chunk_index = 0`, [runId]))[0].content).toBe(doc1.text);
     expect(queue.sent.length).toBe(5);
     // Everything is staged before the first message exists: the texts are frozen.
     expect(await stagingCount(runId)).toBe(47);
@@ -298,7 +302,7 @@ describe.skipIf(!PG_URL)("batched full-ingest on real PostgreSQL (WP-532 Ф9)", 
     expect(phases().filter((p: string) => p === "full_ingest_swapped").length).toBe(1);
   });
 
-  it("does not pay for embeddings twice when a message is delivered twice", async () => {
+  it("does not pay for embeddings twice when a finished message is redelivered (sequential redelivery)", async () => {
     const queue = makeQueue();
     const env = makeEnv({ FULL_INGEST_QUEUE: queue });
     const { net } = await startRun(env, { sha: "sha-2", text: syntheticDoc(25) });
@@ -436,6 +440,74 @@ describe.skipIf(!PG_URL)("batched full-ingest on real PostgreSQL (WP-532 Ф9)", 
     expect(await stagingCount()).toBe(0);
   });
 
+  it("a consumer holding a message for an abandoned run does no work even though staging rows still exist", async () => {
+    const queue = makeQueue();
+    const env = makeEnv({ FULL_INGEST_QUEUE: queue });
+    const { runId, net } = await startRun(env, { sha: "sha-15", text: syntheticDoc(25) });
+    await q(`UPDATE full_ingest_runs SET status = 'abandoned' WHERE run_id = $1`, [runId]);
+    const [msg] = await deliver(env, [queue.sent[0]]);
+    expect(msg.ack).toHaveBeenCalledTimes(1);
+    expect(net.embedCalls).toBe(0);
+    expect((await q(`SELECT count(*)::int AS n FROM knowledge_chunk_staging WHERE run_id = $1 AND embedding IS NOT NULL`, [runId]))[0].n).toBe(0);
+  });
+
+  it("a failed swap changes nothing, and the scheduled recovery finishes the run once the cause is gone", async () => {
+    await seedOldEdition();
+    const queue = makeQueue();
+    const env = makeEnv({ FULL_INGEST_QUEUE: queue });
+    const { runId } = await startRun(env, { sha: "sha-16", text: syntheticDoc(15) });
+    await q(`CREATE FUNCTION f9_fail() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'simulated swap failure'; END $$ LANGUAGE plpgsql`);
+    await q(`CREATE TRIGGER f9_fail_trg BEFORE INSERT ON knowledge_chunk FOR EACH ROW WHEN (NEW.source = 'FPF') EXECUTE FUNCTION f9_fail()`);
+    try {
+      for (const body of queue.sent.slice(0, -1)) await deliver(env, [body]);
+      const [last] = await deliver(env, [queue.sent[queue.sent.length - 1]]);
+      // The swap transaction rolled back as a whole: retry requested, nothing acknowledged.
+      expect(last.retry).toHaveBeenCalledTimes(1);
+      expect(last.ack).not.toHaveBeenCalled();
+      expect(await runStatus(runId)).toBe("running");
+      expect(await stagingCount(runId)).toBe(17);
+      expect((await liveDoc()).map((r) => r.content)).toContain("OLD parent");
+    } finally {
+      await q(`DROP TRIGGER f9_fail_trg ON knowledge_chunk`);
+      await q(`DROP FUNCTION f9_fail()`);
+    }
+    // No message is left to retry the swap (as when max_retries is exhausted): the tick does it.
+    await retryStalledFullIngestSwaps(env, 0);
+    expect(await runStatus(runId)).toBe("swapped");
+    const live = await liveDoc();
+    expect(live.length).toBe(17);
+    expect(live.some((r) => r.content.startsWith("OLD"))).toBe(false);
+  });
+
+  it("the swap recovery leaves a run alone while embeddings are still missing", async () => {
+    const queue = makeQueue();
+    const env = makeEnv({ FULL_INGEST_QUEUE: queue });
+    const { runId } = await startRun(env, { sha: "sha-17", text: syntheticDoc(25) });
+    await deliver(env, [queue.sent[0]]);
+    await retryStalledFullIngestSwaps(env, 0);
+    expect(await runStatus(runId)).toBe("running");
+    expect(await stagingCount(runId)).toBe(27);
+  });
+
+  it("after a partial embedding failure the retry embeds only what is still empty", async () => {
+    const queue = makeQueue();
+    const env = makeEnv({ FULL_INGEST_QUEUE: queue });
+    // Calls 5 and 6 are the two attempts (one retry) for the fifth chunk of the first message.
+    const { runId, net } = await startRun(env, { sha: "sha-18", text: syntheticDoc(25) }, { failEmbedCalls: [5, 6] });
+    const first = queue.sent[0];
+    const [failed] = await deliver(env, [first]);
+    expect(failed.retry).toHaveBeenCalledTimes(1);
+    expect(failed.retry).toHaveBeenCalledWith({ delaySeconds: 30 });
+    expect(net.embedCalls).toBe(6);
+    const embeddedNow = () => q(`SELECT count(*)::int AS n FROM knowledge_chunk_staging WHERE run_id = $1 AND role = 'child' AND embedding IS NOT NULL AND chunk_index >= $2 AND chunk_index < $3`, [runId, first.batch_start, first.batch_end]);
+    expect((await embeddedNow())[0].n).toBe(4);
+    const [ok] = await deliver(env, [first]);
+    expect(ok.ack).toHaveBeenCalledTimes(1);
+    // Six rows were still empty; the four finished ones were not paid for again.
+    expect(net.embedCalls).toBe(12);
+    expect((await embeddedNow())[0].n).toBe(10);
+  });
+
   it("does not start a second run while one is in flight", async () => {
     const env = makeEnv({ FULL_INGEST_QUEUE: makeQueue() });
     await startRun(env, { sha: "sha-9", text: syntheticDoc(15) });
@@ -491,6 +563,8 @@ describe.skipIf(!PG_URL)("batched full-ingest on real PostgreSQL (WP-532 Ф9)", 
     expect((await postFullIngest(env, { source: SOURCE }, "wrong")).status).toBe(401);
     expect((await postFullIngest(makeEnv({ MCP_MODE: "private" }), { source: SOURCE })).status).toBe(503);
     expect((await postFullIngest(makeEnv({ REINDEX_SECRET: undefined }), { source: SOURCE })).status).toBe(503);
+    const nullBody = await worker.fetch(new Request("https://kb.test/full-ingest", { method: "POST", headers: { Authorization: `Bearer ${SECRET}` }, body: "null" }), env);
+    expect(nullBody.status).toBe(400);
     const unknown = await postFullIngest(env, { source: "PACK-secret" });
     expect(unknown.status).toBe(400);
     expect(unknown.json.reason).toBe("source_not_in_full_ingest_sources");
