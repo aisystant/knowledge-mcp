@@ -87,6 +87,12 @@ export interface Env {
   // carried over from personal-knowledge-mcp (inherit-secrets cut-over — already live on
   // the worker, these two routes just never read it in the unified tree until now).
   INTERNAL_SERVICE_SECRET?: string;
+  // WP-7 Ф190: credentials of platform callers (gateway, n8n) that may call the learner tools
+  // without a user token, as comma-separated "name:secret" pairs so each can be revoked alone.
+  LEARNER_TOOLS_SERVICE_SECRETS?: string;
+  // "enforce": the learner tools refuse callers that present neither a verified JWT nor a
+  // service credential. Anything else (unset, "off"): observe only.
+  LEARNER_TOOLS_SERVICE_AUTH?: string;
   // WP-410 срез-2b Деплой-2 группа Б: reindex queue producer/consumer binding, same queue name
   // ("reindex") the personal-knowledge-mcp worker already runs under (inherit-secrets cut-over).
   REINDEX_QUEUE?: Queue<ReindexBatchMessage>;
@@ -2975,6 +2981,46 @@ export function resolveLearnerId(jwtSubject: string | undefined, args: Record<st
   return argument || undefined;
 }
 
+// WP-7 Ф190: who is calling a learner tool. Three outcomes only: a verified JWT, a verified
+// service credential, or neither. An Authorization header that did not verify (a forged JWT, an
+// opaque gateway token) counts as neither: the worker cannot tell it from garbage.
+export const SERVICE_AUTH_HEADER = "X-IWE-Service-Auth";
+export type LearnerCaller = { kind: "jwt" } | { kind: "service"; name: string } | { kind: "unauthenticated" };
+
+export function classifyLearnerCaller(env: Env, jwtSubject: string | undefined, rawRequest: Request | undefined): LearnerCaller {
+  if (jwtSubject !== undefined) return { kind: "jwt" };
+  const presented = rawRequest?.headers.get(SERVICE_AUTH_HEADER);
+  if (presented && env.LEARNER_TOOLS_SERVICE_SECRETS) {
+    let matched: string | undefined;
+    // Compare against every configured secret without stopping at the first match.
+    for (const pair of env.LEARNER_TOOLS_SERVICE_SECRETS.split(",")) {
+      const separator = pair.indexOf(":");
+      if (separator <= 0) continue;
+      const secret = pair.slice(separator + 1).trim();
+      if (secret && secretsEqual(presented, secret)) matched ??= pair.slice(0, separator).trim();
+    }
+    if (matched) return { kind: "service", name: matched };
+  }
+  return { kind: "unauthenticated" };
+}
+
+// Records who called a learner tool (no ids, no secrets) and, in enforce mode, refuses callers
+// that are neither a verified user nor a platform service. Returns an error message or null.
+export function gateLearnerCall(env: Env, tool: string, caller: LearnerCaller, argumentIdPresent: boolean): string | null {
+  console.log(JSON.stringify({
+    event: "learner_tool_caller",
+    tool,
+    caller: caller.kind,
+    service: caller.kind === "service" ? caller.name : undefined,
+    argument_id_present: argumentIdPresent,
+    mode: env.LEARNER_TOOLS_SERVICE_AUTH === "enforce" ? "enforce" : "off",
+  }));
+  if (caller.kind === "unauthenticated" && env.LEARNER_TOOLS_SERVICE_AUTH === "enforce") {
+    return `${tool} requires a verified user token or a platform service credential`;
+  }
+  return null;
+}
+
 export async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public", rawRequest?: Request, jwtSubject?: string): Promise<McpResponse> {
   const { id, method, params } = request;
 
@@ -3605,6 +3651,8 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
         }
 
         if (toolName === "analyze_verbalization") {
+          const refusal = gateLearnerCall(env, toolName, classifyLearnerCaller(env, jwtSubject, rawRequest), typeof args.user_id === "string" && args.user_id.trim() !== "");
+          if (refusal) return { jsonrpc: "2.0", id, error: { code: -32001, message: refusal } };
           const result = await analyzeVerbalization(
             env,
             args.text as string,
@@ -3630,6 +3678,8 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
         }
 
         if (toolName === "learner_progress") {
+          const refusal = gateLearnerCall(env, toolName, classifyLearnerCaller(env, jwtSubject, rawRequest), typeof args.user_id === "string" && args.user_id.trim() !== "");
+          if (refusal) return { jsonrpc: "2.0", id, error: { code: -32001, message: refusal } };
           const learnerId = resolveLearnerId(jwtSubject, args);
           if (!learnerId) {
             return { jsonrpc: "2.0", id, error: { code: -32602, message: "user_id is required" } };
