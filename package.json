@@ -27,5 +27,8 @@
     "@neondatabase/serverless": "^1.1.0",
     "jose": "^6.2.12",
     "yaml": "^2.9.1"
+  },
+  "overrides": {
+    "undici": "^7.29.1"
   }
 }
