@@ -8,14 +8,17 @@
  * permissions, for public repositories) moves the caller onto its own 5000 requests per hour.
  *
  * Rules kept here, not at the call sites:
- *  - the token goes only to api.github.com, never to another host;
+ *  - the token goes only to https://api.github.com/, never to another host, and redirects are
+ *    followed by hand so the token cannot ride along to a different host;
  *  - a rejected token (401: expired or revoked) retries once anonymously, so an expired secret
  *    degrades to the previous behaviour instead of breaking reads that worked without it;
  *  - the token value never reaches a log line.
  */
 
 const USER_AGENT = "aisystant-knowledge-mcp";
-const API_HOST = "api.github.com";
+const API_ORIGIN = "https://api.github.com/";
+/** GitHub answers a renamed or transferred repository with a redirect to the same host. */
+const MAX_REDIRECTS = 3;
 /** Log a warning once the remaining quota drops to this share of the limit. */
 const LOW_QUOTA_FRACTION = 0.1;
 
@@ -39,6 +42,33 @@ function warnWhenQuotaLow(resp: Response, authenticated: boolean): void {
   }
 }
 
+/** The same-host target of a redirect response, or null when it must not be followed with the token. */
+function sameHostRedirectTarget(resp: Response, from: string): string | null {
+  const location = resp.headers.get("Location");
+  if (resp.status < 300 || resp.status >= 400 || !location) return null;
+  let target: string;
+  try {
+    target = new URL(location, from).toString();
+  } catch {
+    return null;
+  }
+  return target.startsWith(API_ORIGIN) ? target : null;
+}
+
+/** Sends the token on every hop, but only to api.github.com: a redirect elsewhere is returned to
+ *  the caller as the 3xx response it is, never followed. */
+async function fetchWithToken(url: string, token: string, extraHeaders: Record<string, string>): Promise<Response> {
+  let target = url;
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const resp = await fetch(target, { headers: githubApiHeaders(token, extraHeaders), redirect: "manual" });
+    const next = sameHostRedirectTarget(resp, target);
+    if (next === null) return resp;
+    await resp.body?.cancel();
+    target = next;
+  }
+  throw new Error(`GitHub redirect limit (${MAX_REDIRECTS}) exceeded`);
+}
+
 /**
  * fetch() for a GitHub REST URL. Pass `token` as `env.GITHUB_TOKEN`; undefined keeps the
  * anonymous behaviour of the worker before this change.
@@ -48,17 +78,21 @@ export async function fetchGitHubApi(
   token: string | undefined,
   extraHeaders: Record<string, string> = {},
 ): Promise<Response> {
-  const useToken = Boolean(token) && new URL(url).host === API_HOST;
-  const resp = await fetch(url, { headers: githubApiHeaders(useToken ? token : undefined, extraHeaders) });
+  if (!token || !url.startsWith(API_ORIGIN)) {
+    const anonymous = await fetch(url, { headers: githubApiHeaders(undefined, extraHeaders) });
+    warnWhenQuotaLow(anonymous, false);
+    return anonymous;
+  }
 
-  if (useToken && resp.status === 401) {
-    console.error(JSON.stringify({ phase: "github_token_rejected", host: API_HOST }));
+  const resp = await fetchWithToken(url, token, extraHeaders);
+  if (resp.status === 401) {
+    console.error(JSON.stringify({ phase: "github_token_rejected", host: "api.github.com" }));
     await resp.body?.cancel();
     const anonymous = await fetch(url, { headers: githubApiHeaders(undefined, extraHeaders) });
     warnWhenQuotaLow(anonymous, false);
     return anonymous;
   }
 
-  warnWhenQuotaLow(resp, useToken);
+  warnWhenQuotaLow(resp, true);
   return resp;
 }

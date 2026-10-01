@@ -9,13 +9,14 @@ const TREE_URL = "https://api.github.com/repos/ailev/FPF/git/trees/main?recursiv
 interface Call {
   url: string;
   headers: Record<string, string>;
+  redirect: string | undefined;
 }
 
 /** Stubs global fetch with a queue of responses and records what each call sent. */
 function stubFetch(responses: Response[]): Call[] {
   const calls: Call[] = [];
-  vi.stubGlobal("fetch", vi.fn(async (input: string, init?: { headers?: Record<string, string> }) => {
-    calls.push({ url: input, headers: { ...(init?.headers ?? {}) } });
+  vi.stubGlobal("fetch", vi.fn(async (input: string, init?: { headers?: Record<string, string>; redirect?: string }) => {
+    calls.push({ url: input, headers: { ...(init?.headers ?? {}) }, redirect: init?.redirect });
     const next = responses.shift();
     if (!next) throw new Error(`unexpected extra fetch: ${input}`);
     return next;
@@ -59,6 +60,17 @@ describe("fetchGitHubApi", () => {
     const calls = stubFetch([new Response("{}")]);
     await fetchGitHubApi(TREE_URL, TOKEN);
     expect(calls[0].headers.Authorization).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it("takes over redirects itself only while a token is attached", async () => {
+    const withToken = stubFetch([new Response("{}")]);
+    await fetchGitHubApi(TREE_URL, TOKEN);
+    expect(withToken[0].redirect).toBe("manual");
+
+    vi.unstubAllGlobals();
+    const anonymous = stubFetch([new Response("{}")]);
+    await fetchGitHubApi(TREE_URL, undefined);
+    expect(anonymous[0].redirect).toBeUndefined();
   });
 
   it("never sends the token to another host", async () => {
@@ -145,5 +157,79 @@ describe("api.github.com reads in index.ts", () => {
       .filter(({ text }) => text.includes("https://api.github.com") && !text.startsWith("//") && !text.startsWith("*"))
       .filter(({ text }) => !text.includes("fetchGitHubApi("));
     expect(bypasses).toEqual([]);
+  });
+});
+
+describe("fetchGitHubApi and redirects", () => {
+  const redirect = (location: string, status = 301) => new Response(null, { status, headers: { Location: location } });
+
+  it("follows a same-host redirect by hand and sends the token on both hops", async () => {
+    const calls = stubFetch([
+      redirect("https://api.github.com/repositories/42/git/trees/main?recursive=1"),
+      new Response("{}", { status: 200 }),
+    ]);
+    const resp = await fetchGitHubApi(TREE_URL, TOKEN);
+    expect(resp.status).toBe(200);
+    expect(calls.map((c) => c.url)).toEqual([TREE_URL, "https://api.github.com/repositories/42/git/trees/main?recursive=1"]);
+    expect(calls.map((c) => c.headers.Authorization)).toEqual([`Bearer ${TOKEN}`, `Bearer ${TOKEN}`]);
+  });
+
+  it.each([301, 302, 303, 307, 308])("follows a same-host %i redirect with the token", async (status) => {
+    const calls = stubFetch([redirect("https://api.github.com/repositories/42/git/trees/main", status), new Response("{}")]);
+    const resp = await fetchGitHubApi(TREE_URL, TOKEN);
+    expect(resp.status).toBe(200);
+    expect(calls).toHaveLength(2);
+    expect(calls[1].headers.Authorization).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it("resolves a relative Location against the API host", async () => {
+    const calls = stubFetch([redirect("/repositories/42/git/trees/main"), new Response("{}")]);
+    const resp = await fetchGitHubApi(TREE_URL, TOKEN);
+    expect(resp.status).toBe(200);
+    expect(calls[1].url).toBe("https://api.github.com/repositories/42/git/trees/main");
+    expect(calls[1].headers.Authorization).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it("does not follow a redirect to another host: the caller gets the 3xx and no second request is made", async () => {
+    const calls = stubFetch([redirect("https://evil.example/steal", 302)]);
+    const resp = await fetchGitHubApi(TREE_URL, TOKEN);
+    expect(resp.status).toBe(302);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("does not follow a redirect to a look-alike host", async () => {
+    const calls = stubFetch([redirect("https://api.github.com.evil.example/x", 307)]);
+    const resp = await fetchGitHubApi(TREE_URL, TOKEN);
+    expect(resp.status).toBe(307);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("does not follow a redirect that downgrades to http", async () => {
+    const calls = stubFetch([redirect("http://api.github.com/x", 302)]);
+    const resp = await fetchGitHubApi(TREE_URL, TOKEN);
+    expect(resp.status).toBe(302);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("returns a redirect without a usable Location as it is", async () => {
+    const calls = stubFetch([new Response(null, { status: 302 })]);
+    const resp = await fetchGitHubApi(TREE_URL, TOKEN);
+    expect(resp.status).toBe(302);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("gives up after too many same-host redirects", async () => {
+    stubFetch(Array.from({ length: 5 }, () => redirect("https://api.github.com/loop")));
+    await expect(fetchGitHubApi(TREE_URL, TOKEN)).rejects.toThrow("redirect limit");
+  });
+
+  it.each([
+    ["a look-alike host", "https://api.github.com.evil.example/repos/x"],
+    ["userinfo before another host", "https://api.github.com@evil.example/repos/x"],
+    ["plain http", "http://api.github.com/repos/x"],
+  ])("sends no token to %s", async (_label, url) => {
+    const calls = stubFetch([new Response("{}")]);
+    await fetchGitHubApi(url, TOKEN);
+    expect(calls[0].headers).not.toHaveProperty("Authorization");
   });
 });
