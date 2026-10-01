@@ -22,8 +22,15 @@ const MAX_REDIRECTS = 3;
 /** Log a warning once the remaining quota drops to this share of the limit. */
 const LOW_QUOTA_FRACTION = 0.1;
 
+/** Credentials come from the `token` argument only; a caller cannot pass them as "extra" headers,
+ *  or they would survive into the anonymous retry and into requests that must carry no token. */
+const RESERVED_HEADERS = new Set(["authorization", "cookie", "proxy-authorization"]);
+
 export function githubApiHeaders(token: string | undefined, extra: Record<string, string> = {}): Record<string, string> {
-  const headers: Record<string, string> = { "User-Agent": USER_AGENT, ...extra };
+  const headers: Record<string, string> = { "User-Agent": USER_AGENT };
+  for (const [name, value] of Object.entries(extra)) {
+    if (!RESERVED_HEADERS.has(name.toLowerCase())) headers[name] = value;
+  }
   if (token) headers.Authorization = `Bearer ${token}`;
   return headers;
 }
@@ -88,6 +95,8 @@ export async function fetchGitHubApi(
   if (resp.status === 401) {
     console.error(JSON.stringify({ phase: "github_token_rejected", host: "api.github.com" }));
     await resp.body?.cancel();
+    // Deliberately the original URL, not the last redirect hop: a GET resolves its own chain again,
+    // and the anonymous request leaves redirect handling to fetch because it carries no secret.
     const anonymous = await fetch(url, { headers: githubApiHeaders(undefined, extraHeaders) });
     warnWhenQuotaLow(anonymous, false);
     return anonymous;

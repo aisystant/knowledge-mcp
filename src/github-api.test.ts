@@ -42,6 +42,17 @@ describe("githubApiHeaders", () => {
     });
   });
 
+  it.each(["Authorization", "authorization", "COOKIE", "Proxy-Authorization"])("drops a caller-supplied %s header", (name) => {
+    const headers = githubApiHeaders(undefined, { [name]: "secret-value", Accept: "application/json" });
+    expect(Object.keys(headers).map((k) => k.toLowerCase())).not.toContain(name.toLowerCase());
+    expect(headers.Accept).toBe("application/json");
+  });
+
+  it("lets only the token argument set Authorization, even if the caller passed another one", () => {
+    expect(githubApiHeaders(TOKEN, { authorization: "Bearer other" }).Authorization).toBe(`Bearer ${TOKEN}`);
+    expect(Object.keys(githubApiHeaders(TOKEN, { authorization: "Bearer other" })).filter((k) => k.toLowerCase() === "authorization")).toHaveLength(1);
+  });
+
   it("treats an empty token like a missing one", () => {
     expect(githubApiHeaders("")).not.toHaveProperty("Authorization");
   });
@@ -86,6 +97,14 @@ describe("fetchGitHubApi", () => {
     });
     expect(calls[0].headers.Accept).toBe("application/vnd.github.raw+json");
     expect(calls[0].headers.Authorization).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it("never resends a rejected token on the anonymous retry, even if the caller passed it as an extra header", async () => {
+    const calls = stubFetch([new Response("bad credentials", { status: 401 }), new Response("{}")]);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await fetchGitHubApi(TREE_URL, TOKEN, { Authorization: `Bearer ${TOKEN}` });
+    expect(calls).toHaveLength(2);
+    expect(Object.keys(calls[1].headers).map((k) => k.toLowerCase())).not.toContain("authorization");
   });
 
   it("retries once anonymously when the token is rejected, and keeps the token out of the log", async () => {
