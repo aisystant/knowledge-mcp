@@ -141,14 +141,17 @@ function syntheticDoc(sections: number, titleOf: (i: number) => string = (i) => 
 interface FetchStub {
   blobFetches: number;
   embedCalls: number;
+  /** Authorization header of each api.github.com call (tree listing, blob read) in call order. */
+  githubAuthorization: Array<string | undefined>;
 }
 
 /** GitHub tree/blob and the embedding endpoint. The tree reports FPF-Spec.md as > 1 MB so the
  *  daily/manual path treats it as oversized whatever the (small) test body really is. */
 function stubNetwork(doc: { sha: string; text: string }, opts: { failEmbedCalls?: number[] } = {}): FetchStub {
-  const counters: FetchStub = { blobFetches: 0, embedCalls: 0 };
-  vi.stubGlobal("fetch", vi.fn(async (input: any) => {
+  const counters: FetchStub = { blobFetches: 0, embedCalls: 0, githubAuthorization: [] };
+  vi.stubGlobal("fetch", vi.fn(async (input: any, init?: { headers?: Record<string, string> }) => {
     const url = typeof input === "string" ? input : input.url;
+    if (url.startsWith("https://api.github.com/")) counters.githubAuthorization.push(init?.headers?.Authorization);
     if (url.startsWith("https://api.github.com/repos/ailev/FPF/git/trees/")) {
       return new Response(JSON.stringify({
         tree: [
@@ -535,6 +538,22 @@ describe.skipIf(!PG_URL)("batched full-ingest on real PostgreSQL (WP-532 Ф9)", 
     expect(res.json.results).toEqual([{ path: DOC, outcome: "dry_run", total_chunks: 47, messages: 5, source_revision: "sha-11" }]);
     expect((await q(`SELECT count(*)::int AS n FROM full_ingest_runs`))[0].n).toBe(0);
     expect(await stagingCount()).toBe(0);
+  });
+
+  it("sends env.GITHUB_TOKEN with both GitHub reads of a run: the tree listing and the blob", async () => {
+    const env = makeEnv({ FULL_INGEST_QUEUE: makeQueue(), GITHUB_TOKEN: "ghp_test_token" });
+    const net = stubNetwork({ sha: "sha-gh-1", text: syntheticDoc(15) });
+    const res = await postFullIngest(env, { source: SOURCE, path: DOC, dry_run: false });
+    expect(res.json.results[0].outcome).toBe("queued");
+    expect(net.githubAuthorization).toEqual(["Bearer ghp_test_token", "Bearer ghp_test_token"]);
+  });
+
+  it("stays anonymous toward GitHub when no GITHUB_TOKEN is configured", async () => {
+    const env = makeEnv({ FULL_INGEST_QUEUE: makeQueue() });
+    const net = stubNetwork({ sha: "sha-gh-2", text: syntheticDoc(15) });
+    const res = await postFullIngest(env, { source: SOURCE, path: DOC, dry_run: false });
+    expect(res.json.results[0].outcome).toBe("queued");
+    expect(net.githubAuthorization).toEqual([undefined, undefined]);
   });
 
   it("reports queue_unbound for a real run until the queue is bound", async () => {
