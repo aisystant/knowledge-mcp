@@ -468,6 +468,21 @@ describe("detectPersonalQueryType", () => {
 });
 
 describe("personalListSources", () => {
+  it("counts distinct discoverable filenames without weakening caller/source isolation", async () => {
+    queryQueue.push([{ source: "notes", source_type: "ds", doc_count: 2 }]);
+    const context = ctx({ sourceNames: ["notes"] });
+    expect(await personalListSources(ENV, context)).toEqual([{ source: "notes", source_type: "ds", doc_count: 2 }]);
+    const [strings, table, userId, sources] = sqlCalls[0];
+    const query = (strings as string[]).join("?").replace(/\s+/g, " ");
+    expect(query).toContain("COUNT(DISTINCT filename)::int AS doc_count");
+    expect(query).toContain("filename NOT LIKE '%::%'");
+    expect(query).toContain("WHERE user_id = ? AND source = ANY(?)");
+    expect(query).toContain("GROUP BY source, source_type");
+    expect(table).toBe("knowledge.documents");
+    expect(userId).toBe(context.userId);
+    expect(sources).toEqual(["notes"]);
+  });
+
   it("maps rows scoped to the caller's sourceNames", async () => {
     queryQueue.push([{ source: "DS-my-strategy", source_type: "ds", doc_count: 3 }]);
     const result = await personalListSources(ENV, ctx());
