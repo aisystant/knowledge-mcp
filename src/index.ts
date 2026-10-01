@@ -27,6 +27,7 @@ import { resolveMode, type McpMode } from "./mode.js";
 import { isToolAllowedInMode, JwtScopeGuard, ScopeDeniedError, PRIVATE_TOOL_NAMES, DUAL_MODE_TOOL_NAMES } from "./layers/private.js";
 import { provisionBridgeScopes } from "./scope.js";
 import { verifyJwtLocally, secretsEqual } from "./auth.js";
+import { fetchGitHubApi } from "./github-api.js";
 import {
   resolveUserContext,
   writeToGitHub,
@@ -83,6 +84,10 @@ export interface Env {
   SCOPE_GUARD_MODE?: string;
   GITHUB_APP_ID?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
+  /** WP-532 Ф9 follow-up (2026-10-01): optional token for api.github.com reads of the platform
+   *  sources (tree listing, blobs). Read access to public repositories is enough. Without it the
+   *  worker shares the anonymous 60/h quota of its egress address and the heartbeats starve. */
+  GITHUB_TOKEN?: string;
   // WP-545 Ф5: service-to-service secret for /reindex-full and /provision-bridge-scopes,
   // carried over from personal-knowledge-mcp (inherit-secrets cut-over — already live on
   // the worker, these two routes just never read it in the unified tree until now).
@@ -3972,14 +3977,12 @@ async function readFromGitHubPublic(source: string, filePath: string): Promise<s
   return await resp.text();
 }
 
-async function fetchGitHubTree(owner: string, repo: string, branch: string): Promise<Response> {
-  return fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, {
-    headers: { "User-Agent": "aisystant-knowledge-mcp" },
-  });
+function fetchGitHubTree(owner: string, repo: string, branch: string, token: string | undefined): Promise<Response> {
+  return fetchGitHubApi(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, token);
 }
 
-// WP-545 (2026-09-10): this endpoint is called unauthenticated (60 req/hour per IP,
-// shared across every Worker invocation on this account/region) — a failed response
+// WP-545 (2026-09-10): without env.GITHUB_TOKEN this endpoint is called unauthenticated (60 req/hour
+// per IP, shared across every Worker invocation on this account/region) — a failed response
 // needs to say WHETHER retrying makes sense, not just that it failed. A 5xx or network
 // hiccup is worth one immediate retry; a rate-limit (403 + Remaining=0, or an explicit
 // Retry-After) is not — hammering it again a few hundred ms later only makes the
@@ -4009,7 +4012,7 @@ function classifyGitHubTreeFailure(resp: Response): { retryable: boolean; resetA
  * List all .md files from a GitHub repo via Trees API (recursive).
  * Returns paths relative to repo root (including pathPrefix if present).
  */
-async function listGitHubFiles(source: string): Promise<string[]> {
+async function listGitHubFiles(source: string, token: string | undefined): Promise<string[]> {
   const config = SOURCE_GITHUB_BASE[source];
   // Both of these are static config errors (missing/malformed registry entry) — a
   // 15-minute retry can't fix a typo, tag terminal same as the HTTP-failure paths below.
@@ -4019,11 +4022,11 @@ async function listGitHubFiles(source: string): Promise<string[]> {
   if (!match) throw new Error(`Invalid GitHub base URL for source: ${source} ${TERMINAL_ERROR_TAG}`);
   const [, owner, repo, branch] = match;
 
-  let resp = await fetchGitHubTree(owner, repo, branch);
+  let resp = await fetchGitHubTree(owner, repo, branch, token);
   let failure = resp.ok ? null : classifyGitHubTreeFailure(resp);
   if (failure?.retryable) {
     await new Promise((r) => setTimeout(r, 300 + Math.random() * 500));
-    resp = await fetchGitHubTree(owner, repo, branch);
+    resp = await fetchGitHubTree(owner, repo, branch, token);
     failure = resp.ok ? null : classifyGitHubTreeFailure(resp);
   }
   if (!resp.ok) {
@@ -4790,7 +4793,7 @@ interface GitHubFileMeta {
   sha: string;
 }
 
-async function listGitHubFilesWithSize(source: string): Promise<GitHubFileMeta[]> {
+async function listGitHubFilesWithSize(source: string, token: string | undefined): Promise<GitHubFileMeta[]> {
   const config = SOURCE_GITHUB_BASE[source];
   if (!config) throw new Error(`Unknown source: ${source}`);
 
@@ -4798,9 +4801,7 @@ async function listGitHubFilesWithSize(source: string): Promise<GitHubFileMeta[]
   if (!match) throw new Error(`Invalid GitHub base URL for source: ${source}`);
 
   const [, owner, repo, branch] = match;
-  const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, {
-    headers: { "User-Agent": "aisystant-knowledge-mcp" },
-  });
+  const resp = await fetchGitHubTree(owner, repo, branch, token);
 
   if (!resp.ok) throw new Error(`GitHub Trees API ${resp.status} for ${source}`);
   const data = await resp.json() as { tree: Array<{ path: string; type: string; size?: number; sha: string }>; truncated?: boolean };
@@ -4823,15 +4824,15 @@ async function listGitHubFilesWithSize(source: string): Promise<GitHubFileMeta[]
  * grew the heap to 526 MB on the 15.6 MB FPF-Spec.md (Worker isolate limit: 128 MB), measured
  * 2026-09-29. One anonymous API call per run — see the 60 requests/hour note above.
  */
-async function readGitHubBlobBySha(source: string, sha: string): Promise<string | null> {
+async function readGitHubBlobBySha(source: string, sha: string, token: string | undefined): Promise<string | null> {
   const config = SOURCE_GITHUB_BASE[source];
   if (!config) return null;
   const match = config.base.match(/github\.com\/([^/]+)\/([^/]+)\/blob\//);
   if (!match) return null;
   const [, owner, repo] = match;
 
-  const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/blobs/${sha}`, {
-    headers: { "User-Agent": "aisystant-knowledge-mcp", Accept: "application/vnd.github.raw+json" },
+  const resp = await fetchGitHubApi(`https://api.github.com/repos/${owner}/${repo}/git/blobs/${sha}`, token, {
+    Accept: "application/vnd.github.raw+json",
   });
   if (!resp.ok) return null;
   return await resp.text();
@@ -5211,7 +5212,7 @@ async function startBatchedFullIngest(
 
   let content: string | null;
   try {
-    content = await readGitHubBlobBySha(source, file.sha);
+    content = await readGitHubBlobBySha(source, file.sha, env.GITHUB_TOKEN);
   } catch (e) {
     const detail = e instanceof Error ? e.message : String(e);
     console.error(JSON.stringify({ phase: "full_ingest_batch_fetch_failed", source, path: file.path, sha: file.sha, error: detail }));
@@ -5530,7 +5531,7 @@ async function startOversizedFullIngests(env: Env, source: string, excluded: Git
  * startBatchedFullIngest() through syncFullIngestSource().
  */
 async function runOversizedFullIngest(env: Env, source: string, opts: { dryRun: boolean; path?: string }): Promise<FullIngestStartResult[]> {
-  const { excluded } = partitionFilesBySize(await listGitHubFilesWithSize(source), MAX_FILE_CHARS);
+  const { excluded } = partitionFilesBySize(await listGitHubFilesWithSize(source, env.GITHUB_TOKEN), MAX_FILE_CHARS);
   const targets = opts.path ? excluded.filter((f) => f.path === opts.path) : excluded;
   const results: FullIngestStartResult[] = [];
   for (const file of targets) {
@@ -5589,7 +5590,7 @@ async function syncFullIngestSource(env: Env, source: string): Promise<void> {
   let ranToCompletion = false;
 
   try {
-    const allFiles = await listGitHubFilesWithSize(source);
+    const allFiles = await listGitHubFilesWithSize(source, env.GITHUB_TOKEN);
     foundCount = allFiles.length;
     const { eligible, excluded } = partitionFilesBySize(allFiles, MAX_FILE_CHARS);
     eligibleCount = eligible.length;
@@ -5703,7 +5704,7 @@ async function rebuildSkillsIndex(env: Env): Promise<void> {
   let ranToCompletion = false;
 
   try {
-    const allFiles = await listGitHubFilesWithSize(SKILLS_SOURCE);
+    const allFiles = await listGitHubFilesWithSize(SKILLS_SOURCE, env.GITHUB_TOKEN);
     const skillFiles = allFiles.filter((f) => SKILL_FILE_PATTERN.test(f.path));
     foundCount = skillFiles.length;
     const { eligible, excluded } = partitionFilesBySize(skillFiles, MAX_FILE_CHARS);
@@ -5819,7 +5820,7 @@ async function runHeartbeatForSource(
 
   try {
     // 1. GitHub file count — O(1) API call via Trees endpoint
-    const files = await listGitHubFiles(source);
+    const files = await listGitHubFiles(source, env.GITHUB_TOKEN);
     githubCount = files.length;
 
     // 2. DB artifact count

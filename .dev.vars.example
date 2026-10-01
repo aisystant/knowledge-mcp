@@ -6,3 +6,9 @@ DATABASE_URL=postgresql://user:pass@ep-xxx.us-east-2.aws.neon.tech/knowledge?ssl
 
 # OpenRouter API key (routes to openai/text-embedding-3-small + openai/gpt-4o-mini)
 OPENROUTER_API_KEY=sk-or-your_openrouter_api_key
+
+# GitHub token for api.github.com reads of the platform sources (optional, WP-532 Ф9 follow-up).
+# A fine-grained token with read access to public repositories is enough. Without it the worker
+# shares the anonymous 60 requests/hour quota of its egress address and the heartbeats starve.
+# Production: `wrangler secret put GITHUB_TOKEN`.
+GITHUB_TOKEN=github_pat_your_token
