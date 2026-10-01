@@ -1706,7 +1706,7 @@ export async function personalGetDocumentHistory(
   };
 }
 
-/** Private-mode `list_sources`: personal corpus only. */
+/** Private-mode `list_sources`: count the same distinct files as `list_documents`, not chunks. */
 export async function personalListSources(
   env: PersonalEnv,
   ctx: UserContext
@@ -1716,10 +1716,11 @@ export async function personalListSources(
   const docsTable = KNOWLEDGE_TABLES.documents(getKnowledgeSchema(env));
 
   const rows = await sql`
-    SELECT source, source_type, COUNT(*)::int AS doc_count
+    SELECT source, source_type, COUNT(DISTINCT filename)::int AS doc_count
     FROM ${sql.unsafe(docsTable)}
     WHERE user_id = ${ctx.userId}
       AND source = ANY(${sourceNames})
+      AND filename NOT LIKE '%::%'
     GROUP BY source, source_type
     ORDER BY source_type, source
   `;
