@@ -4747,7 +4747,7 @@ export default {
 // --- WP-339 Ф5+Ф6: Heartbeat + drift detector ---
 
 // Pack sources checked on every heartbeat run. Mirrors PACK-* keys in SOURCE_GITHUB_BASE.
-const HEARTBEAT_PACK_SOURCES = Object.keys(SOURCE_GITHUB_BASE).filter(
+export const HEARTBEAT_PACK_SOURCES = Object.keys(SOURCE_GITHUB_BASE).filter(
   (s) => s.startsWith("PACK-")
 );
 
@@ -4780,6 +4780,27 @@ const STALENESS_ALERT_HOURS = 48;
 // at all until this change, only Worker console logs. Going in in the same commit as
 // that observability fix rather than waiting on a signal nothing was producing.
 export const FULL_INGEST_SOURCES = ["FPF", "SPF"];
+
+// WP-532 Ф10 (2026-10-02): pure decision extracted out of runHeartbeat() so the order is
+// unit-testable without mocking GitHub, OpenRouter and two Neon databases — same reasoning
+// as resolveScheduledJob() above (WP-560 Ф11: "a silent fallthrough/reorder here is exactly
+// the bug class that nearly dropped the daily PACK/FPF heartbeat"). FULL_INGEST_SOURCES first:
+// FPF/SPF get one chance a day to run the batched full-ingest of oversized documents, and a
+// pack source whose own reindex overruns this invocation's time budget (live case,
+// 2026-10-02: PACK-digital-platform, 1735 files, four consecutive timeouts) must not be able
+// to consume the whole budget before FPF/SPF even start.
+//
+// Temporary mitigation, not a fix: both groups still run sequentially, one `await` after
+// another, inside the same invocation's time budget — this only changes WHICH group goes
+// first, not whether a slow one can still exhaust that budget. If FPF or SPF's ordinary
+// (non-batched) reindexFiles() path ever has to process a large diff the same way
+// PACK-digital-platform does today, it would now delay or block every pack source instead.
+// The real fix is the same kind of batched, resumable, time-boxed processing WP-532 Ф9
+// already built for one oversized document, generalized to a source's whole file list —
+// tracked as a capture, not a new work item invented here.
+export function heartbeatSourceOrder(): { first: readonly string[]; second: readonly string[] } {
+  return { first: FULL_INGEST_SOURCES, second: HEARTBEAT_PACK_SOURCES };
+}
 
 interface GitHubFileMeta {
   path: string;
@@ -5909,7 +5930,15 @@ async function runHeartbeat(env: Env): Promise<void> {
   const freshTable = HEALTH_TABLES.graph_freshness_events(healthSchema);
   const healthSql = neon(env.HEALTH_DATABASE_URL.replace("-pooler", ""));
 
-  for (const source of HEARTBEAT_PACK_SOURCES) {
+  // WP-532 Ф10: order is heartbeatSourceOrder()'s call, not a literal list here — see its
+  // comment for why FULL_INGEST_SOURCES must go first.
+  const { first, second } = heartbeatSourceOrder();
+
+  for (const source of first) {
+    await syncFullIngestSource(env, source);
+  }
+
+  for (const source of second) {
     // Mirrors the guard retryPendingHeartbeatSources() applies — without this, a
     // catch-up tick's still-running reindex would get a second, concurrent nightly
     // run of the same source colliding with it (WP-545, cold review found this gap
@@ -5928,10 +5957,6 @@ async function runHeartbeat(env: Env): Promise<void> {
       console.error(`[heartbeat] in-progress check failed for ${source}, proceeding anyway:`, e instanceof Error ? e.message : e);
     }
     await runHeartbeatForSource(env, source, ct, freshTable);
-  }
-
-  for (const source of FULL_INGEST_SOURCES) {
-    await syncFullIngestSource(env, source);
   }
 
   console.log("[heartbeat] complete");
