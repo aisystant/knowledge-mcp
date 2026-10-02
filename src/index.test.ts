@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, PRIVATE_TOOLS, PUBLIC_ONLY_TOOL_NAMES, WITHDRAWN_TOOL_MESSAGES, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob, FULL_INGEST_SOURCES, buildFullIngestBatchRanges, fullIngestDisabled, splitForSendBatch, groupStagingRows, fullIngestRetryDelaySeconds, dedupeChunkFilenames } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, PRIVATE_TOOLS, PUBLIC_ONLY_TOOL_NAMES, WITHDRAWN_TOOL_MESSAGES, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob, FULL_INGEST_SOURCES, HEARTBEAT_PACK_SOURCES, heartbeatSourceOrder, buildFullIngestBatchRanges, fullIngestDisabled, splitForSendBatch, groupStagingRows, fullIngestRetryDelaySeconds, dedupeChunkFilenames } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import worker from "./index.js";
 import { PRIVATE_TOOL_NAMES } from "./layers/private.js";
@@ -609,6 +609,26 @@ describe("SKILL_FILE_PATTERN", () => {
 describe("FULL_INGEST_SOURCES", () => {
   it("covers FPF and SPF, and nothing else", () => {
     expect(FULL_INGEST_SOURCES).toEqual(["FPF", "SPF"]);
+  });
+});
+
+// --- heartbeatSourceOrder (WP-532 Ф10, 2026-10-02) — live incident: PACK-digital-platform
+// (1735 files) overran four consecutive heartbeat attempts without ever reaching its
+// completion write, and because it used to run before FULL_INGEST_SOURCES in the same
+// sequential invocation, FPF/SPF's one daily batched-ingest opportunity never started either.
+describe("heartbeatSourceOrder", () => {
+  it("runs FULL_INGEST_SOURCES before any pack source", () => {
+    const { first, second } = heartbeatSourceOrder();
+    expect(first).toEqual(FULL_INGEST_SOURCES);
+    expect(second.length).toBeGreaterThan(0);
+    expect(second).not.toEqual(expect.arrayContaining(FULL_INGEST_SOURCES));
+  });
+
+  it("passes HEARTBEAT_PACK_SOURCES through unchanged as the second group", () => {
+    // Codex review (round 6): a length/uniqueness check alone cannot tell a dropped pack
+    // source from one that was never there — only comparing against the actual constant does.
+    const { second } = heartbeatSourceOrder();
+    expect(second).toEqual(HEARTBEAT_PACK_SOURCES);
   });
 });
 
