@@ -882,40 +882,16 @@ async function keywordSearch(
     : null;
   const sectionPattern = sectionRest ? `%${sectionRest}%` : null;
 
-  // WP-268: knowledge_chunk schema. Aliases preserve external API contract:
-  //   legacy_id AS id, source_uri AS filename, source_kind AS source_type
-  // WP-410 Ф-knowledge-cleanup: public knowledge-mcp serves PLATFORM docs only.
-  //   account_id IS NULL = platform doc (visible to all). Personal docs (account_id set)
-  //   are served exclusively by personal-knowledge-mcp, never here — even with a token.
+  // Migration 029 exposes only platform candidates (account_id IS NULL), so GIN
+  // can filter before heap reads without broadening the worker's RLS privileges.
+  // The function keeps ranking and the global limit before materialization; its
+  // sort keys preserve the original order after truncating response excerpts.
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
-    SELECT legacy_id AS id, source_uri AS filename,
-           CASE WHEN length(content) > ${SEARCH_RESPONSE_EXCERPT_CHARACTERS}
-                THEN left(content, ${SEARCH_RESPONSE_EXCERPT_CHARACTERS}) || ${SEARCH_RESPONSE_TRUNCATION_MARKER}
-                ELSE content END AS content,
-           source, source_kind AS source_type,
-           CASE
-             WHEN source_uri ILIKE ${pattern} THEN 1.0
-             WHEN ${entityPattern}::text IS NOT NULL
-                  AND source_uri ILIKE ${entityPattern}
-                  AND ${sectionPattern}::text IS NOT NULL
-                  AND content ILIKE ${sectionPattern} THEN 0.98
-             WHEN source_uri ILIKE ${entityPattern} AND ${entityPattern}::text IS NOT NULL THEN 0.95
-             WHEN content ILIKE ${pattern} THEN 0.90
-             WHEN search_vector @@ plainto_tsquery('simple', ${ftsQuery}) THEN 0.8
-             ELSE 0.5
-           END AS score
-    FROM ${sql.unsafe(knowledgeChunkTable)}
-    WHERE (content ILIKE ${pattern}
-           OR source_uri ILIKE ${pattern}
-           OR search_vector @@ plainto_tsquery('simple', ${ftsQuery})
-           OR (${entityPattern}::text IS NOT NULL AND source_uri ILIKE ${entityPattern}))
-      AND (${src}::text IS NULL OR source = ${src})
-      AND (${stype}::text IS NULL OR source_kind = ${stype})
-      AND account_id IS NULL
-    ORDER BY score DESC,
-             CASE WHEN source_uri ILIKE ${pattern} THEN 0 ELSE 1 END,
-             length(content) DESC
-    LIMIT ${limit}
+    SELECT id, filename, content, source, source_type, score
+    FROM ${sql.unsafe(`${getKnowledgeSchema(env)}.search_platform_keyword_candidates`)}(
+      ${pattern}, ${entityPattern}, ${sectionPattern}, ${ftsQuery}, ${src}, ${stype}, ${limit}
+    )
+    ORDER BY score DESC, sort_path_priority, sort_content_length DESC
   `, pool, trace);
 
   return rows.map((r) => {
