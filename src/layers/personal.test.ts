@@ -2373,3 +2373,23 @@ it("reads all v2 chunks and legacy fallback in one document snapshot", async () 
   expect(statement).toContain("PARTITION BY source");
   expect(statement).toContain("OR representation_rank = 1");
 });
+
+describe("private search stage diagnostics", () => {
+  it("marks a stalled keyword read and returns a typed timeout without logging private inputs", async () => {
+    vi.useFakeTimers();
+    const logs = vi.spyOn(console, "info").mockImplementation(() => {});
+    queryQueue.push(new Promise(() => {}));
+    const pending = personalSearchDocuments(ENV, ctx(), "DP.ROLE.039 PRIVATE-QUERY", undefined);
+    const assertion = expect(pending).rejects.toMatchObject({ code: "dependency_timeout", stage: "database" });
+    expect(logs.mock.calls.map(([line]) => JSON.parse(line).stage)).toEqual(["search", "keyword"]);
+    await vi.advanceTimersByTimeAsync(20_000);
+    await assertion;
+    const events = logs.mock.calls.map(([line]) => JSON.parse(line));
+    expect(events.filter(row => row.phase === "end").map(row => [row.stage, row.outcome])).toEqual([["keyword", "error"], ["search", "error"]]);
+    expect(new Set(events.map(row => row.trace_id)).size).toBe(1);
+    expect(JSON.stringify(events)).not.toContain("PRIVATE-QUERY");
+    expect(JSON.stringify(events)).not.toContain(ctx().userId);
+    expect(sqlCalls).toHaveLength(1);
+    logs.mockRestore();
+  });
+});

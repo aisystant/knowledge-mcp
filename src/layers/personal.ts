@@ -1,4 +1,4 @@
-import { ReadFailure, fetchReadResponse, readHttpFailure, readJson, withReadDeadline } from "../read-failure.js";
+import { ReadFailure, createReadTrace, fetchReadResponse, readHttpFailure, readJson, withReadDeadline, type ReadTrace } from "../read-failure.js";
 // Personal-corpus data layer for the private MCP mode (WP-410 срез-2b).
 // Ported from personal-knowledge-mcp/src/index.ts, then hardened in this private-mode layer:
 // resolveUserContext, GitHub App JWT signing, writeToGitHub, getInstallationToken.
@@ -1374,8 +1374,9 @@ async function personalVectorSearch(
   source: string | undefined,
   limit: number,
   deadlineAt: number,
+  trace: ReadTrace,
 ): Promise<PersonalSearchResult[]> {
-  const embedding = await personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query, deadlineAt);
+  const embedding = await trace.run("embedding", () => personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query, deadlineAt));
   const vec = `[${embedding.join(",")}]`;
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
@@ -1383,7 +1384,7 @@ async function personalVectorSearch(
   const src = source ?? null;
   const sourceNames = ctx.sourceNames;
 
-  const rows = await withReadDeadline("database", async () => sql`
+  const rows = await trace.run("db_query", () => withReadDeadline("database", async () => sql`
     SELECT filename, content, source, source_type,
            1 - (embedding <=> ${vec}::vector) AS score
     FROM ${sql.unsafe(documentsTable)}
@@ -1392,7 +1393,7 @@ async function personalVectorSearch(
       AND (${src}::text IS NULL OR source = ${src})
     ORDER BY embedding <=> ${vec}::vector
     LIMIT ${limit}
-  `, remainingSearchBudget(deadlineAt, "database"));
+  `, remainingSearchBudget(deadlineAt, "database")));
 
   return rows.map((r) => ({
     filename: r.filename as string,
@@ -1413,36 +1414,40 @@ export async function personalSearchDocuments(
   limit: number = 5
 ): Promise<PersonalSearchResult[] & { degradation?: ReturnType<ReadFailure["toJSON"]> }> {
   const deadlineAt = Date.now() + PERSONAL_SEARCH_BUDGET_MS;
-  const queryType = detectPersonalQueryType(query);
+  const trace = createReadTrace("personal_search");
+  const keyword = () => trace.run("keyword", () => personalKeywordSearch(env, ctx, query, source, limit, deadlineAt));
+  return trace.run("search", async () => {
+    const queryType = detectPersonalQueryType(query);
 
-  if (queryType === "keyword") {
-    const kwResults = await personalKeywordSearch(env, ctx, query, source, limit, deadlineAt);
-    if (kwResults.length > 0) return kwResults;
-  }
-
-  let vectorResults: PersonalSearchResult[];
-  try {
-    vectorResults = await personalVectorSearch(env, ctx, query, source, limit, deadlineAt);
-  } catch (error) {
-    if (!(error instanceof ReadFailure) || error.stage !== "embeddings") throw error;
-    console.warn(JSON.stringify({ event: "personal_search_keyword_fallback", ...error.toJSON() }));
-    const fallback = await personalKeywordSearch(env, ctx, query, source, limit, deadlineAt);
-    return Object.assign(fallback, { degradation: error.toJSON() });
-  }
-
-  if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
-    const kwFallback = await personalKeywordSearch(env, ctx, query, source, limit, deadlineAt);
-    if (kwFallback.length > 0) {
-      const seen = new Map<string, PersonalSearchResult>();
-      for (const r of [...kwFallback, ...vectorResults]) {
-        const existing = seen.get(r.filename);
-        if (!existing || r.score > existing.score) seen.set(r.filename, r);
-      }
-      return [...seen.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+    if (queryType === "keyword") {
+      const kwResults = await keyword();
+      if (kwResults.length > 0) return kwResults;
     }
-  }
 
-  return vectorResults;
+    let vectorResults: PersonalSearchResult[];
+    try {
+      vectorResults = await trace.run("vector", () => personalVectorSearch(env, ctx, query, source, limit, deadlineAt, trace));
+    } catch (error) {
+      if (!(error instanceof ReadFailure) || error.stage !== "embeddings") throw error;
+      console.warn(JSON.stringify({ event: "personal_search_keyword_fallback", ...error.toJSON() }));
+      const fallback = await keyword();
+      return Object.assign(fallback, { degradation: error.toJSON() });
+    }
+
+    if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
+      const kwFallback = await keyword();
+      if (kwFallback.length > 0) {
+        const seen = new Map<string, PersonalSearchResult>();
+        for (const r of [...kwFallback, ...vectorResults]) {
+          const existing = seen.get(r.filename);
+          if (!existing || r.score > existing.score) seen.set(r.filename, r);
+        }
+        return [...seen.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+      }
+    }
+
+    return vectorResults;
+  });
 }
 
 /** Private-mode `memory_search`: recency-weighted personal search. No public equivalent. */
@@ -1454,43 +1459,46 @@ export async function personalMemorySearch(
   limit: number = 5
 ): Promise<PersonalMemorySearchResult[]> {
   const deadlineAt = Date.now() + PERSONAL_SEARCH_BUDGET_MS;
-  const embedding = await personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query, deadlineAt);
-  const vec = `[${embedding.join(",")}]`;
-  const sql = personalDb(env);
-  const schema = getKnowledgeSchema(env);
-  const documentsTable = KNOWLEDGE_TABLES.documents(schema);
-  const sourceNames = ctx.sourceNames;
-  const cutoff = recencyDays ? new Date(Date.now() - recencyDays * 24 * 60 * 60 * 1000).toISOString() : null;
+  const trace = createReadTrace("memory_search");
+  return trace.run("search", async () => {
+    const embedding = await trace.run("embedding", () => personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query, deadlineAt));
+    const vec = `[${embedding.join(",")}]`;
+    const sql = personalDb(env);
+    const schema = getKnowledgeSchema(env);
+    const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+    const sourceNames = ctx.sourceNames;
+    const cutoff = recencyDays ? new Date(Date.now() - recencyDays * 24 * 60 * 60 * 1000).toISOString() : null;
 
-  const rows = await withReadDeadline("database", async () => sql`
-    SELECT filename, content, source, source_type, updated_at,
-           1 - (embedding <=> ${vec}::vector) AS base_score
-    FROM ${sql.unsafe(documentsTable)}
-    WHERE user_id = ${ctx.userId}
-      AND source = ANY(${sourceNames})
-      AND (${cutoff}::timestamptz IS NULL OR updated_at >= ${cutoff}::timestamptz)
-    ORDER BY embedding <=> ${vec}::vector
-    LIMIT ${limit * 3}
-  `, remainingSearchBudget(deadlineAt, "database"));
+    const rows = await trace.run("vector", () => withReadDeadline("database", async () => sql`
+      SELECT filename, content, source, source_type, updated_at,
+             1 - (embedding <=> ${vec}::vector) AS base_score
+      FROM ${sql.unsafe(documentsTable)}
+      WHERE user_id = ${ctx.userId}
+        AND source = ANY(${sourceNames})
+        AND (${cutoff}::timestamptz IS NULL OR updated_at >= ${cutoff}::timestamptz)
+      ORDER BY embedding <=> ${vec}::vector
+      LIMIT ${limit * 3}
+    `, remainingSearchBudget(deadlineAt, "database")));
 
-  const now = Date.now();
-  return rows
-    .map((r) => {
-      const ageDays = (now - new Date(r.updated_at as string).getTime()) / (1000 * 60 * 60 * 24);
-      const decayFactor = ageDays <= 14 ? 1.0 : ageDays <= 30 ? 0.7 : 0.4;
-      return {
-        filename: r.filename as string,
-        content: r.content as string,
-        source: (r.source as string) || "",
-        source_type: (r.source_type as string) || "",
-        score: (r.base_score as number) * decayFactor,
-        github_url: personalGithubUrl(ctx, (r.source as string) || "", r.filename as string),
-        updated_at: r.updated_at as string,
-        age_days: Math.round(ageDays),
-      };
-    })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+    const now = Date.now();
+    return rows
+      .map((r) => {
+        const ageDays = (now - new Date(r.updated_at as string).getTime()) / (1000 * 60 * 60 * 24);
+        const decayFactor = ageDays <= 14 ? 1.0 : ageDays <= 30 ? 0.7 : 0.4;
+        return {
+          filename: r.filename as string,
+          content: r.content as string,
+          source: (r.source as string) || "",
+          source_type: (r.source_type as string) || "",
+          score: (r.base_score as number) * decayFactor,
+          github_url: personalGithubUrl(ctx, (r.source as string) || "", r.filename as string),
+          updated_at: r.updated_at as string,
+          age_days: Math.round(ageDays),
+        };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
+  });
 }
 
 /** Read one scoped snapshot: all v2 chunks, or the first legacy fragment while backfill is pending. */

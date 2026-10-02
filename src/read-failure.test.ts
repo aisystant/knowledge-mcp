@@ -1,7 +1,49 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fetchReadResponse, readHttpFailure, readJson, withReadDeadline } from "./read-failure.js";
+import { ReadFailure, createReadTrace, fetchReadResponse, readHttpFailure, readJson, withReadDeadline } from "./read-failure.js";
 
-afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+
+describe("read-stage diagnostics", () => {
+  it("shows the outstanding stage before a dependency finishes, preserving its result", async () => {
+    const logs = vi.spyOn(console, "info").mockImplementation(() => {});
+    let complete!: (value: object) => void;
+    const payload = { content: "PRIVATE-DOCUMENT", query: "PRIVATE-QUERY" };
+    const trace = createReadTrace("personal_search");
+    const pending = trace.run("keyword", () => new Promise<object>(resolve => { complete = resolve; }));
+    expect(logs.mock.calls.map(([line]) => JSON.parse(line))).toEqual([
+      expect.objectContaining({ event: "read_stage", operation: "personal_search", stage: "keyword", phase: "start" }),
+    ]);
+    complete(payload);
+    expect(await pending).toBe(payload);
+    const [start, end] = logs.mock.calls.map(([line]) => JSON.parse(line));
+    expect(end).toMatchObject({ trace_id: start.trace_id, phase: "end", outcome: "success", elapsed_ms: expect.any(Number) });
+    expect(end.elapsed_ms).toBeGreaterThanOrEqual(0);
+    expect(JSON.stringify(logs.mock.calls)).not.toContain("PRIVATE-");
+  });
+
+  it("correlates stages internally without exposing exception details or altering the exception", async () => {
+    const logs = vi.spyOn(console, "info").mockImplementation(() => {});
+    const failure = new Error("PRIVATE-TOKEN in PRIVATE-URL");
+    const trace = createReadTrace("platform_search");
+    await expect(trace.run("db_query", async () => { throw failure; })).rejects.toBe(failure);
+    await trace.run("db_rollback", async () => undefined);
+    await createReadTrace("platform_search").run("db_connect", async () => undefined);
+    const events = logs.mock.calls.map(([line]) => JSON.parse(line));
+    expect(events[1]).toMatchObject({ phase: "end", outcome: "error", error_kind: "unclassified" });
+    expect(new Set(events.slice(0, 4).map(row => row.trace_id)).size).toBe(1);
+    expect(events[4].trace_id).not.toBe(events[0].trace_id);
+    expect(JSON.stringify(events)).not.toContain("PRIVATE-");
+    const allowed = new Set(["event", "trace_id", "operation", "stage", "phase", "elapsed_ms", "outcome", "error_kind"]);
+    expect(events.every(row => Object.keys(row).every(key => allowed.has(key)))).toBe(true);
+  });
+
+  it("logs only the fixed failure code of a typed read error", async () => {
+    const logs = vi.spyOn(console, "info").mockImplementation(() => {});
+    const failure = new ReadFailure("dependency_timeout", "database");
+    await expect(createReadTrace("memory_search").run("vector", async () => { throw failure; })).rejects.toBe(failure);
+    expect(JSON.parse(logs.mock.calls[1][0])).toMatchObject({ error_kind: "dependency_timeout", outcome: "error" });
+  });
+});
 
 describe("safe read diagnostics", () => {
   it.each([401, 403, 429, 503])("preserves status %i without provider response bodies", status => {

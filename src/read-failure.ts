@@ -1,5 +1,5 @@
 /** Safe diagnostics for read dependencies. Never retain upstream bodies, URLs or credentials. */
-export type ReadStage = "context" | "database" | "github_token" | "github_content" | "embeddings";
+export type ReadStage = "context" | "database" | "github_token" | "github_content" | "embeddings" | "reranking";
 export type ReadFailureCode =
   | "source_context_unavailable"
   | "github_not_connected"
@@ -40,6 +40,35 @@ export class ReadFailure extends Error {
       ...(this.retryAfterSeconds === undefined ? {} : { retry_after_seconds: this.retryAfterSeconds }),
     };
   }
+}
+
+type ReadOperation = "platform_search" | "personal_search" | "memory_search";
+type ReadTraceStage =
+  | "search" | "embedding" | "keyword" | "vector" | "rerank" | "parent_content" | "pool_close"
+  | "db_connect" | "db_begin" | "db_context" | "db_query" | "db_commit" | "db_rollback";
+
+export interface ReadTrace {
+  run<T>(stage: ReadTraceStage, operation: () => Promise<T>): Promise<T>;
+}
+
+/** Correlate dependency stages without accepting caller IDs, queries, paths, or payloads. */
+export function createReadTrace(operation: ReadOperation): ReadTrace {
+  const traceId = crypto.randomUUID();
+  return {
+    async run<T>(stage: ReadTraceStage, work: () => Promise<T>): Promise<T> {
+      const fields = { event: "read_stage", trace_id: traceId, operation, stage };
+      const started = performance.now();
+      console.info(JSON.stringify({ ...fields, phase: "start" }));
+      try {
+        const result = await work();
+        console.info(JSON.stringify({ ...fields, phase: "end", outcome: "success", elapsed_ms: Math.max(0, Math.round(performance.now() - started)) }));
+        return result;
+      } catch (error) {
+        console.info(JSON.stringify({ ...fields, phase: "end", outcome: "error", elapsed_ms: Math.max(0, Math.round(performance.now() - started)), error_kind: error instanceof ReadFailure ? error.code : "unclassified" }));
+        throw error;
+      }
+    },
+  };
 }
 
 function retryAfterSeconds(response: Response): number | undefined {

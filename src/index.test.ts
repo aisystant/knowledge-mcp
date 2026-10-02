@@ -5,6 +5,7 @@ import worker from "./index.js";
 import { PRIVATE_TOOL_NAMES } from "./layers/private.js";
 import { chunkLargeFile, contentHash } from "../scripts/ingest.js";
 import { neon } from "@neondatabase/serverless";
+import { withUserContext } from "./rls.js";
 
 vi.mock("@neondatabase/serverless", () => ({
   neon: vi.fn(),
@@ -980,6 +981,46 @@ describe("rerankWithLLM", () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it.each(["headers", "body"])("returns the original limited results after 5s when %s ignores abort", async stalledStage => {
+    vi.useFakeTimers();
+    const results = [makeResult({ id: 1, score: 0.9 }), makeResult({ id: 2, score: 0.6 })];
+    let signal: AbortSignal | undefined;
+    const never = new Promise<never>(() => {});
+    const response = new Response("");
+    vi.spyOn(response, "json").mockImplementation(() => never);
+    globalThis.fetch = vi.fn((_input, init) => {
+      signal = init?.signal as AbortSignal;
+      return stalledStage === "headers" ? never : Promise.resolve(response);
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let settled = false;
+    const pending = rerankWithLLM("synthetic-private-key", "synthetic-private-query", results, 1)
+      .then(result => { settled = true; return result; });
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled).toBe(true);
+    expect(await pending).toEqual(results.slice(0, 1));
+    expect(signal?.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(warn).toHaveBeenCalledWith(JSON.stringify({ event: "rerank_fallback", reason: "timeout" }));
+    const logged = JSON.stringify(warn.mock.calls);
+    expect(logged).not.toContain("synthetic-private");
+    expect(logged).not.toContain(results[0].content);
+  });
+
+  it("cleans the deadline on network failure and never logs upstream exception details", async () => {
+    vi.useFakeTimers();
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error("synthetic-private-network-detail"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const results = [makeResult({ id: 1, score: 0.9 }), makeResult({ id: 2, score: 0.6 })];
+    expect(await rerankWithLLM("synthetic-key", "query", results, 1)).toEqual(results.slice(0, 1));
+    expect(vi.getTimerCount()).toBe(0);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("synthetic-private-network-detail");
   });
 
   it("returns single result unchanged", async () => {
@@ -990,6 +1031,7 @@ describe("rerankWithLLM", () => {
   });
 
   it("reranks by hybrid score (vector 0.3 + LLM 0.7)", async () => {
+    vi.useFakeTimers();
     const results = [
       makeResult({ id: 1, score: 0.9 }), // high vector, low LLM
       makeResult({ id: 2, score: 0.5 }), // low vector, high LLM
@@ -1005,6 +1047,7 @@ describe("rerankWithLLM", () => {
     expect(out[1].id).toBe(1);
     expect(out[0].score).toBeCloseTo(0.815, 2);
     expect(out[1].score).toBeCloseTo(0.41, 2);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("respects limit parameter", async () => {
@@ -1116,6 +1159,52 @@ describe("rerankWithLLM", () => {
 
     const out = await rerankWithLLM("fake-key", "query", results, 5);
     expect(out[0].score).toBe(0.7); // original
+  });
+});
+
+describe("platform search stage diagnostics", () => {
+  const originalFetch = globalThis.fetch;
+  const env = { KNOWLEDGE_DATABASE_URL: "postgres://synthetic", OPENROUTER_API_KEY: "synthetic-private-key" } as Env;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it.each(["keyword", "vector"])("traces the %s path and forwards one trace to database calls without logging input", async path => {
+    const query = path === "keyword" ? "DP.PRIVATE.123" : "synthetic private natural language query";
+    const rows = [makeResult({ id: 1, score: 0.9, content: "synthetic-private-document", filename: "private-path.md" }), makeResult({ id: 2, score: 0.8 })];
+    let call = 0;
+    mockWithUserContextImpl = fn => fn(makeMockSql(call++ === 0 ? rows : []));
+    vi.mocked(withUserContext).mockClear();
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce(mockEmbeddingResponse(Array(1024).fill(0.01)))
+      .mockResolvedValueOnce(mockFetchResponse([{ index: 0, relevance_score: 0.9 }, { index: 1, relevance_score: 0.8 }]));
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+    const result = await searchDocuments(env, query, "private-source", undefined, 2, "synthetic-private-user");
+    expect(result).toHaveLength(2);
+    const records = info.mock.calls.map(([entry]) => JSON.parse(String(entry)))
+      .filter(entry => entry.event === "read_stage");
+    const starts = records.filter(entry => entry.phase === "start").map(entry => entry.stage);
+    expect(starts).toEqual(path === "keyword"
+      ? ["search", "keyword", "parent_content", "pool_close"]
+      : ["search", "vector", "embedding", "rerank", "parent_content", "pool_close"]);
+    for (const stage of starts) {
+      expect(records).toContainEqual(expect.objectContaining({ stage, phase: "end", outcome: "success", elapsed_ms: expect.any(Number) }));
+    }
+    expect(new Set(records.map(entry => entry.trace_id)).size).toBe(1);
+    expect(records.every(entry => entry.operation === "platform_search")).toBe(true);
+    const calls = vi.mocked(withUserContext).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls[0][4]).toEqual(expect.objectContaining({ run: expect.any(Function) }));
+    expect(calls[1][4]).toBe(calls[0][4]);
+    if (path === "keyword") expect(fetch).not.toHaveBeenCalled();
+    else expect(fetch).toHaveBeenCalledTimes(2);
+    const logged = JSON.stringify(info.mock.calls);
+    for (const secret of [query, env.OPENROUTER_API_KEY, rows[0].content, rows[0].filename, "private-source", "synthetic-private-user"]) {
+      expect(logged).not.toContain(secret);
+    }
   });
 });
 
@@ -1731,4 +1820,3 @@ describe("PRIVATE_TOOLS schema vs. PRIVATE_TOOL_NAMES dispatch gate (WP-7 Ф176)
     }
   });
 });
-
