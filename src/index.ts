@@ -1,3 +1,4 @@
+import { ReadFailure, withReadDeadline, readJson, createReadTrace, type ReadTrace } from "./read-failure.js";
 /**
  * Knowledge MCP Server v4.1 — L2 Platform — Hybrid Search + Parent Retrieval + LLM Reranking + Feedback Loop
  *
@@ -863,7 +864,8 @@ async function keywordSearch(
   sourceType?: string,
   limit: number = 5,
   userId?: string,
-  pool?: Pool
+  pool?: Pool,
+  trace?: ReadTrace
 ): Promise<SearchResult[]> {
   const src = source ?? null;
   const stype = sourceType ?? null;
@@ -914,7 +916,7 @@ async function keywordSearch(
              CASE WHEN source_uri ILIKE ${pattern} THEN 0 ELSE 1 END,
              length(content) DESC
     LIMIT ${limit}
-  `, pool);
+  `, pool, trace);
 
   return rows.map((r) => {
     const source = (r.source as string) || "";
@@ -938,9 +940,11 @@ async function vectorSearch(
   sourceType?: string,
   limit: number = 5,
   userId?: string,
-  pool?: Pool
+  pool?: Pool,
+  trace?: ReadTrace
 ): Promise<SearchResult[]> {
-  const embedding = await getEmbedding(env.OPENROUTER_API_KEY, query);
+  const embed = () => getEmbedding(env.OPENROUTER_API_KEY, query);
+  const embedding = await (trace ? trace.run("embedding", embed) : embed());
   const vec = `[${embedding.join(",")}]`;
   const src = source ?? null;
   const stype = sourceType ?? null;
@@ -961,7 +965,7 @@ async function vectorSearch(
       AND account_id IS NULL
     ORDER BY embedding <=> ${vec}::vector
     LIMIT ${limit}
-  `, pool);
+  `, pool, trace);
 
   return rows.map((r) => {
     const source = (r.source as string) || "";
@@ -1015,77 +1019,81 @@ Include ALL candidates. Score based on how well the document answers the query.`
 Candidates:
 ${candidates.map((c) => `[${c.index}] ${c.filename}\n${c.snippet}`).join("\n\n")}`;
 
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), RERANK_TIMEOUT_MS);
-
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: RERANK_MODEL,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        temperature: 0,
-        response_format: { type: "json_object" },
-      }),
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      // Fallback: return original order
-      return results.slice(0, limit);
-    }
-
-    const data = (await response.json()) as {
-      choices: { message: { content: string } }[];
-    };
-
-    const content = data.choices[0]?.message?.content;
-    if (!content) return results.slice(0, limit);
-
-    // Parse LLM scores — handle both array and {scores: [...]} formats
-    const parsed = JSON.parse(content);
-    const scores: RerankScore[] = Array.isArray(parsed)
-      ? parsed
-      : Array.isArray(parsed.scores)
-        ? parsed.scores
-        : [];
-
-    if (scores.length === 0) return results.slice(0, limit);
-
-    // Build score map
-    const llmScoreMap = new Map<number, number>();
-    for (const s of scores) {
-      if (typeof s.index === "number" && typeof s.relevance_score === "number") {
-        llmScoreMap.set(s.index, Math.max(0, Math.min(1, s.relevance_score)));
-      }
-    }
-
-    // Compute hybrid score and reorder
-    const reranked = results.map((r, i) => {
-      const llmScore = llmScoreMap.get(i) ?? 0.5; // default 0.5 if missing
-      const hybridScore = r.score * RERANK_VECTOR_WEIGHT + llmScore * RERANK_LLM_WEIGHT;
-      return { ...r, score: hybridScore };
-    });
-
-    reranked.sort((a, b) => b.score - a.score);
-    return reranked.slice(0, limit);
-  } catch {
-    // Timeout or parse error — fallback to original order
+  const fallback = (reason: "timeout" | "request_failed" | "invalid_response"): SearchResult[] => {
+    console.warn(JSON.stringify({ event: "rerank_fallback", reason }));
     return results.slice(0, limit);
+  };
+
+  try {
+    return await withReadDeadline("reranking", async signal => {
+      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: RERANK_MODEL,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          temperature: 0,
+          response_format: { type: "json_object" },
+        }),
+        signal,
+      });
+
+      if (!response.ok) {
+        // Fallback: return original order
+        return fallback("request_failed");
+      }
+
+      const data = (await readJson(response, "reranking")) as {
+        choices: { message: { content: string } }[];
+      };
+
+      const content = data.choices[0]?.message?.content;
+      if (!content) return fallback("invalid_response");
+
+      // Parse LLM scores — handle both array and {scores: [...]} formats
+      const parsed = JSON.parse(content);
+      const scores: RerankScore[] = Array.isArray(parsed)
+        ? parsed
+        : Array.isArray(parsed.scores)
+          ? parsed.scores
+          : [];
+
+      if (scores.length === 0) return fallback("invalid_response");
+
+      // Build score map
+      const llmScoreMap = new Map<number, number>();
+      for (const s of scores) {
+        if (typeof s.index === "number" && typeof s.relevance_score === "number") {
+          llmScoreMap.set(s.index, Math.max(0, Math.min(1, s.relevance_score)));
+        }
+      }
+
+      // Compute hybrid score and reorder
+      const reranked = results.map((r, i) => {
+        const llmScore = llmScoreMap.get(i) ?? 0.5; // default 0.5 if missing
+        const hybridScore = r.score * RERANK_VECTOR_WEIGHT + llmScore * RERANK_LLM_WEIGHT;
+        return { ...r, score: hybridScore };
+      });
+
+      reranked.sort((a, b) => b.score - a.score);
+      return reranked.slice(0, limit);
+    }, RERANK_TIMEOUT_MS);
+  } catch (error) {
+    const reason = error instanceof ReadFailure && error.code === "dependency_timeout" ? "timeout"
+      : error instanceof ReadFailure && error.code === "dependency_invalid_response" ? "invalid_response"
+      : "request_failed";
+    return fallback(reason);
   }
 }
 
 /** Enrich search results with parent document content when available */
-export async function enrichWithParentContent(env: Env, results: SearchResult[], userId?: string, pool?: Pool): Promise<SearchResult[]> {
+export async function enrichWithParentContent(env: Env, results: SearchResult[], userId?: string, pool?: Pool, trace?: ReadTrace): Promise<SearchResult[]> {
   if (results.length === 0) return results;
 
   // Batch-fetch parent info for all results that are chunks (have parent_id)
@@ -1111,7 +1119,7 @@ export async function enrichWithParentContent(env: Env, results: SearchResult[],
       )
       AND p.account_id IS NULL
       AND c.account_id IS NULL
-  `, pool);
+  `, pool, trace);
 
   const parentMap = new Map<string, { parent_filename: string; parent_content: string }>();
   for (const row of parentRows) {
@@ -1139,89 +1147,95 @@ export async function searchDocuments(
   limit: number = 5,
   userId?: string
 ): Promise<SearchResult[]> {
-  limit = normalizeSearchResultLimit(limit);
-  // One pool for this call's whole DB round-trip chain (up to 4 sequential queries below),
-  // never reused past it — see rls.ts createRequestPool() for why (issue #231).
-  const pool = createRequestPool(activeDsn(env));
+  const trace = createReadTrace("platform_search");
+  return trace.run("search", async () => {
+    limit = normalizeSearchResultLimit(limit);
+    // One pool for this call's whole DB round-trip chain (up to 4 sequential queries below),
+    // never reused past it — see rls.ts createRequestPool() for why (issue #231).
+    const pool = createRequestPool(activeDsn(env));
+    const keyword = () => trace.run("keyword", () => keywordSearch(env, query, source, sourceType, limit, userId, pool, trace));
+    const enrich = (results: SearchResult[]) => trace.run("parent_content", () => enrichWithParentContent(env, results, userId, pool, trace));
+    const rerank = (results: SearchResult[]) => trace.run("rerank", () => rerankWithLLM(env.OPENROUTER_API_KEY, query, results, limit));
 
-  try {
-    const queryType = detectQueryType(query);
-
-    if (queryType === "keyword") {
-      // Keyword-first: skip embedding generation (~200ms saved), no reranking needed
-      const kwResults = await keywordSearch(env, query, source, sourceType, limit, userId, pool);
-      if (kwResults.length > 0) return await enrichWithParentContent(env, kwResults, userId, pool);
-      // Fallback to vector if keyword found nothing
-    }
-
-    // Vector path: fetch extra candidates for LLM reranking
-    const fetchLimit = Math.max(limit, RERANK_CANDIDATES);
-    let vectorResults: SearchResult[];
     try {
-      vectorResults = await vectorSearch(env, query, source, sourceType, fetchLimit, userId, pool);
-    } catch (error) {
-      if (!(error instanceof EmbeddingUnavailableError)) throw error;
+      const queryType = detectQueryType(query);
 
-      console.warn(JSON.stringify({
-        event: "knowledge_search_embedding_fallback",
-        reason: error.reason,
-        // Correlation keys: they match the "embedding_http_error" record of the last attempt.
-        status: error.status,
-        request_id: error.requestId,
-        embedding_attempts: 2,
-        fallback: "keyword",
-        source_filter_present: source !== undefined,
-        source_type_filter_present: sourceType !== undefined,
-      }));
+      if (queryType === "keyword") {
+        // Keyword-first: skip embedding generation (~200ms saved), no reranking needed
+        const kwResults = await keyword();
+        if (kwResults.length > 0) return await enrich(kwResults);
+        // Fallback to vector if keyword found nothing
+      }
 
-      const fallbackResults = await keywordSearch(env, query, source, sourceType, limit, userId, pool);
-      return await enrichWithParentContent(env, fallbackResults, userId, pool);
-    }
+      // Vector path: fetch extra candidates for LLM reranking
+      const fetchLimit = Math.max(limit, RERANK_CANDIDATES);
+      let vectorResults: SearchResult[];
+      try {
+        vectorResults = await trace.run("vector", () => vectorSearch(env, query, source, sourceType, fetchLimit, userId, pool, trace));
+      } catch (error) {
+        if (!(error instanceof EmbeddingUnavailableError)) throw error;
 
-    // Keyword fallback when the vector path cannot stand on its own: the top hit is below
-    // the confidence threshold, OR the ANN query legitimately returned nothing (chunks
-    // without an embedding, or a narrow source/source_type filter). Previously only the
-    // low-confidence case fell back to keyword search — a legitimately empty vector result
-    // skipped it entirely and returned `[]` with no fallback at all. A keyword-typed query
-    // already ran keywordSearch above and found nothing, so it's not repeated here.
-    const vectorEmpty = vectorResults.length === 0;
-    const vectorLowConfidence = !vectorEmpty && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD;
-    if (queryType !== "keyword" && (vectorEmpty || vectorLowConfidence)) {
-      const kwFallback = await keywordSearch(env, query, source, sourceType, limit, userId, pool);
-      if (vectorEmpty) {
-        // Same privacy contract as knowledge_search_embedding_fallback: no query text, no key.
         console.warn(JSON.stringify({
-          event: "knowledge_search_vector_empty",
+          event: "knowledge_search_embedding_fallback",
+          reason: error.reason,
+          // Correlation keys: they match the "embedding_http_error" record of the last attempt.
+          status: error.status,
+          request_id: error.requestId,
+          embedding_attempts: 2,
           fallback: "keyword",
-          keyword_result_count: kwFallback.length,
           source_filter_present: source !== undefined,
           source_type_filter_present: sourceType !== undefined,
         }));
-      }
-      if (kwFallback.length > 0) {
-        // Merge: deduplicate by filename, keep highest score
-        const seen = new Map<string, SearchResult>();
-        for (const r of [...kwFallback, ...vectorResults]) {
-          const existing = seen.get(r.filename);
-          if (!existing || r.score > existing.score) {
-            seen.set(r.filename, r);
-          }
-        }
-        const merged = [...seen.values()].sort((a, b) => b.score - a.score);
-        // Rerank merged results
-        const reranked = await rerankWithLLM(env.OPENROUTER_API_KEY, query, merged, limit);
-        return await enrichWithParentContent(env, reranked, userId, pool);
-      }
-    }
 
-    // LLM rerank vector results → return top-K
-    const reranked = await rerankWithLLM(env.OPENROUTER_API_KEY, query, vectorResults, limit);
-    return await enrichWithParentContent(env, reranked, userId, pool);
-  } finally {
-    await pool.end().catch((err) => {
-      console.error("[search] pool.end() failed (contained):", err);
-    });
-  }
+        const fallbackResults = await keyword();
+        return await enrich(fallbackResults);
+      }
+
+      // Keyword fallback when the vector path cannot stand on its own: the top hit is below
+      // the confidence threshold, OR the ANN query legitimately returned nothing (chunks
+      // without an embedding, or a narrow source/source_type filter). Previously only the
+      // low-confidence case fell back to keyword search — a legitimately empty vector result
+      // skipped it entirely and returned `[]` with no fallback at all. A keyword-typed query
+      // already ran keywordSearch above and found nothing, so it's not repeated here.
+      const vectorEmpty = vectorResults.length === 0;
+      const vectorLowConfidence = !vectorEmpty && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD;
+      if (queryType !== "keyword" && (vectorEmpty || vectorLowConfidence)) {
+        const kwFallback = await keyword();
+        if (vectorEmpty) {
+          // Same privacy contract as knowledge_search_embedding_fallback: no query text, no key.
+          console.warn(JSON.stringify({
+            event: "knowledge_search_vector_empty",
+            fallback: "keyword",
+            keyword_result_count: kwFallback.length,
+            source_filter_present: source !== undefined,
+            source_type_filter_present: sourceType !== undefined,
+          }));
+        }
+        if (kwFallback.length > 0) {
+          // Merge: deduplicate by filename, keep highest score
+          const seen = new Map<string, SearchResult>();
+          for (const r of [...kwFallback, ...vectorResults]) {
+            const existing = seen.get(r.filename);
+            if (!existing || r.score > existing.score) {
+              seen.set(r.filename, r);
+            }
+          }
+          const merged = [...seen.values()].sort((a, b) => b.score - a.score);
+          // Rerank merged results
+          const reranked = await rerank(merged);
+          return await enrich(reranked);
+        }
+      }
+
+      // LLM rerank vector results → return top-K
+      const reranked = await rerank(vectorResults);
+      return await enrich(reranked);
+    } finally {
+      await trace.run("pool_close", () => pool.end()).catch(() => {
+        console.warn(JSON.stringify({ event: "search_pool_close_failed", reason: "dependency_unavailable" }));
+      });
+    }
+  });
 }
 
 async function getDocument(
@@ -1270,21 +1284,16 @@ async function getDocumentStructure(
   const doc = await getDocument(env, filename, source, userId);
   if (!doc) return null;
 
-  const headings: DocumentHeading[] = [];
-  for (const line of doc.content.split("\n")) {
-    const match = line.match(/^(#{1,6})\s+(.+)$/);
-    if (match) {
-      headings.push({
-        level: match[1].length,
-        title: match[2].trim(),
-      });
-    }
-  }
+  return { filename: doc.filename, headings: documentHeadings(doc.content) };
+}
 
-  return {
-    filename: doc.filename,
-    headings,
-  };
+function documentHeadings(content: string): DocumentHeading[] {
+  const headings: DocumentHeading[] = [];
+  for (const line of content.split("\n")) {
+    const match = line.match(/^(#{1,6})\s+(.+)$/);
+    if (match) headings.push({ level: match[1].length, title: match[2].trim() });
+  }
+  return headings;
 }
 
 // WP-7 Ф117: extractTitle/PathEntry/buildPathTree moved to ./path-tree.ts so layers/personal.ts
@@ -3397,7 +3406,14 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
               args.source as string | undefined,
               (args.limit as number) || 5
             );
-            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] } };
+            const content: { type: "text"; text: string }[] = [{ type: "text", text: JSON.stringify(results, null, 2) }];
+            if (results.degradation) {
+              content.push({ type: "text", text: JSON.stringify({
+                warning: "Смысловой поиск недоступен; выполнен только поиск по тексту. Пустой результат не доказывает отсутствие документа.",
+                diagnostic: results.degradation,
+              }) });
+            }
+            return { jsonrpc: "2.0", id, result: { content, ...(results.degradation && results.length === 0 ? { isError: true } : {}) } };
           }
 
           if (toolName === "get_document") {
@@ -3453,7 +3469,10 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             if (!doc) {
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Document not found" }], isError: true } };
             }
-            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: doc.content }] } };
+            const text = args.format === "headings"
+              ? JSON.stringify({ filename: doc.filename, headings: documentHeadings(doc.content) }, null, 2)
+              : doc.content;
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text }] } };
           }
 
           if (toolName === "list_documents") {
@@ -3936,6 +3955,12 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
         return { jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } };
     }
   } catch (err) {
+    if (err instanceof ReadFailure) {
+      console.warn(JSON.stringify({ event: "read_dependency_failed", ...err.toJSON() }));
+      return { jsonrpc: "2.0", id, result: {
+        content: [{ type: "text", text: JSON.stringify(err.toJSON()) }], isError: true,
+      } };
+    }
     return {
       jsonrpc: "2.0",
       id,

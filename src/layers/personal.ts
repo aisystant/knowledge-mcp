@@ -1,3 +1,4 @@
+import { ReadFailure, createReadTrace, fetchReadResponse, readHttpFailure, readJson, withReadDeadline, type ReadTrace } from "../read-failure.js";
 // Personal-corpus data layer for the private MCP mode (WP-410 срез-2b).
 // Ported from personal-knowledge-mcp/src/index.ts, then hardened in this private-mode layer:
 // resolveUserContext, GitHub App JWT signing, writeToGitHub, getInstallationToken.
@@ -283,13 +284,13 @@ export async function resolveUserContext(
       const schema = getKnowledgeSchema(env);
       const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
       const includeReindexing = options.includeReindexing === true;
-      const rows = await sql`
+      const rows = await withReadDeadline("context", async () => sql`
         SELECT source, github_owner, github_repo, path_prefix, source_type
         FROM ${sql.unsafe(userSourcesTable)}
         WHERE user_id = ${userId} AND active = true
           AND (index_state = 'ready' OR ${includeReindexing} = true)
         ORDER BY source
-      `;
+      `, 5_000);
       if (rows.length > 0) {
         const sources = rows.map(r => ({
           source: r.source as string,
@@ -305,12 +306,14 @@ export async function resolveUserContext(
         };
       }
     } catch (err) {
-      console.error(`resolveUserContext: DB error for user ${userId}, falling back to defaults:`, err instanceof Error ? err.message : err);
+      const failure = err instanceof ReadFailure ? err : new ReadFailure("source_context_unavailable", "context");
+      console.error(JSON.stringify({ event: "source_context_failed", ...failure.toJSON() }));
+      throw failure;
     }
   }
 
   // No sources found — return empty context (never leak other users' data)
-  console.warn(`resolveUserContext: no sources for user ${userId ?? "(anonymous)"} — returning empty context`);
+  console.info(JSON.stringify({ event: "source_context_empty" }));
   return { userId, sources: [], sourceNames: [] };
 }
 
@@ -399,6 +402,7 @@ export async function getInstallationToken(
   env: PersonalEnv,
   userId: string | null,
   repository: string,
+  request: typeof fetch = fetch,
 ): Promise<string | null> {
   if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY) return null;
   if (!userId) return null;
@@ -423,7 +427,7 @@ export async function getInstallationToken(
   const jwt = await createGitHubAppJWT(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY);
 
   // Token is narrowed to one repository even when the App was installed for all repos.
-  const tokenResp = await fetch(`https://api.github.com/app/installations/${installationId}/access_tokens`, {
+  const tokenResp = await request(`https://api.github.com/app/installations/${installationId}/access_tokens`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${jwt}`,
@@ -439,7 +443,10 @@ export async function getInstallationToken(
 
   if (!tokenResp.ok) return null;
 
-  const tokenData = (await tokenResp.json()) as { token: string };
+  const tokenData = await readJson(tokenResp, "github_token") as { token?: unknown } | null;
+  if (!tokenData || typeof tokenData.token !== "string" || !tokenData.token) {
+    throw new ReadFailure("dependency_invalid_response", "github_token");
+  }
   return tokenData.token;
 }
 
@@ -1116,9 +1123,10 @@ export async function deleteFromGitHub(
   path: string,
   message: string,
   dependencies: Partial<GitHubApiDependencies> = {},
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; warning?: string }> {
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return { success: false, error: `Unknown source: ${source}` };
+  if (!ctx.userId) return { success: false, error: "Invalid user context: missing userId" };
 
   let normalizedPath: string;
   let fullPath: string;
@@ -1132,6 +1140,29 @@ export async function deleteFromGitHub(
 
   const owner = userSource.githubOwner;
   const repo = userSource.githubRepo;
+  const sql = personalDb(env);
+  const schema = getKnowledgeSchema(env);
+  const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
+  let snapshot: { id: number; generation: number };
+  try {
+    const rows = await sql`
+      SELECT id, index_generation FROM ${sql.unsafe(userSourcesTable)}
+      WHERE user_id = ${ctx.userId} AND source = ${source}
+        AND github_owner = ${owner} AND github_repo = ${repo}
+        AND path_prefix = ${userSource.pathPrefix} AND active = true
+      LIMIT 1
+    `;
+    const id = Number(rows[0]?.id);
+    const generation = Number(rows[0]?.index_generation);
+    if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(generation) || generation <= 0) {
+      return { success: false, error: "Источник изменился или недоступен. Обновите подключённые источники перед удалением файла." };
+    }
+    snapshot = { id, generation };
+  } catch {
+    console.warn(JSON.stringify({ event: "personal_delete_snapshot_unavailable" }));
+    return { success: false, error: "Не удалось подтвердить подключённый источник. Файл в GitHub не удалён; повторите позже." };
+  }
+
   const getToken = dependencies.getInstallationToken ?? getInstallationToken;
   const githubFetch = dependencies.fetch ?? globalThis.fetch;
   const token = await getToken(env, ctx.userId, repo);
@@ -1158,13 +1189,31 @@ export async function deleteFromGitHub(
     return { success: false, error: `GitHub API error ${delResp.status}: ${err}` };
   }
 
-  if (!ctx.userId) {
-    return { success: false, error: "Invalid user context: missing userId" };
-  }
-  const sql = personalDb(env);
-  const schema = getKnowledgeSchema(env);
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
-  await buildDeleteDocumentQuery(sql, documentsTable, source, ctx.userId, normalizedPath);
+  const statusTable = KNOWLEDGE_TABLES.file_index_status(schema);
+  try {
+    // Match the source-row lock used by rebind/purge/indexing. The row id also fences
+    // purge + reconnect, where a new source can restart at the same generation.
+    await sql.transaction([
+      sql`
+        SELECT 1 / (
+          SELECT COUNT(*) FROM (
+            SELECT id FROM ${sql.unsafe(userSourcesTable)}
+            WHERE user_id = ${ctx.userId} AND source = ${source}
+              AND id = ${snapshot.id} AND index_generation = ${snapshot.generation}
+              AND github_owner = ${owner} AND github_repo = ${repo}
+              AND path_prefix = ${userSource.pathPrefix} AND active = true
+            FOR UPDATE
+          ) AS current_source
+        )::int AS fence
+      `,
+      buildDeleteDocumentQuery(sql, documentsTable, source, ctx.userId, normalizedPath),
+      buildDeleteIndexStatusQuery(sql, statusTable, source, ctx.userId, normalizedPath),
+    ]);
+  } catch {
+    console.warn(JSON.stringify({ event: "personal_delete_index_cleanup_deferred" }));
+    return { success: true, warning: "Файл удалён из GitHub, но очистка поискового индекса отложена: источник изменился или индекс временно недоступен." };
+  }
 
   return { success: true };
 }
@@ -1180,6 +1229,13 @@ const VECTOR_CONFIDENCE_THRESHOLD = 0.6;
 const OPENAI_MAX_ATTEMPTS = 4;
 const OPENAI_BASE_DELAY_MS = 500;
 const OPENAI_MAX_DELAY_MS = 10_000;
+const PERSONAL_SEARCH_BUDGET_MS = 20_000;
+
+function remainingSearchBudget(deadlineAt: number, stage: "database" | "embeddings"): number {
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) throw new ReadFailure("dependency_timeout", stage);
+  return remaining;
+}
 
 export type PersonalSearchResult = {
   filename: string;
@@ -1204,34 +1260,45 @@ function personalGithubUrl(ctx: UserContext, source: string, filename: string): 
 }
 
 // Exported for reuse by ./reindex.ts (WP-410 Деплой-2 группа Б) — same embedding call.
-export async function personalGetEmbedding(apiKey: string, text: string): Promise<number[]> {
-  let lastErr: unknown = null;
-  for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt++) {
-    const response = await fetch("https://openrouter.ai/api/v1/embeddings", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ input: [text], model: EMBEDDING_MODEL, dimensions: 1024 }),
-    });
-
-    if (response.ok) {
-      const data = (await response.json()) as { data: { embedding: number[] }[] };
-      return data.data[0].embedding;
+export async function personalGetEmbedding(apiKey: string, text: string, deadlineAt: number = Date.now() + 8_000): Promise<number[]> {
+  const embeddingDeadlineAt = Math.min(deadlineAt, Date.now() + 8_000);
+  const timeoutMs = remainingSearchBudget(embeddingDeadlineAt, "embeddings");
+  return withReadDeadline("embeddings", async signal => {
+    for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt++) {
+      remainingSearchBudget(embeddingDeadlineAt, "embeddings");
+      signal.throwIfAborted();
+      let response: Response;
+      try {
+        response = await fetch("https://openrouter.ai/api/v1/embeddings", {
+          method: "POST", signal,
+          headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ input: [text], model: EMBEDDING_MODEL, dimensions: 1024 }),
+        });
+      } catch {
+        throw new ReadFailure(signal.aborted ? "dependency_timeout" : "dependency_unavailable", "embeddings");
+      }
+      if (response.ok) {
+        const data = await readJson(response, "embeddings") as { data?: { embedding?: unknown }[] };
+        const embedding = data?.data?.[0]?.embedding;
+        if (!Array.isArray(embedding) || embedding.length !== 1024 || !embedding.every(n => typeof n === "number" && Number.isFinite(n))) {
+          throw new ReadFailure("dependency_invalid_response", "embeddings");
+        }
+        return embedding as number[];
+      }
+      const error = readHttpFailure(response, "embeddings");
+      if (response.status < 500 && response.status !== 429 || attempt === OPENAI_MAX_ATTEMPTS) throw error;
+      const delay = Math.max(error.retryAfterSeconds === undefined ? 0 : error.retryAfterSeconds * 1000,
+        Math.min(OPENAI_BASE_DELAY_MS * Math.pow(2, attempt - 1), OPENAI_MAX_DELAY_MS));
+      // Do not schedule an out-of-budget retry; the caller can honor Retry-After later.
+      if (delay >= remainingSearchBudget(embeddingDeadlineAt, "embeddings")) throw error;
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { signal.removeEventListener("abort", aborted); resolve(); }, delay);
+        const aborted = () => { clearTimeout(timer); reject(new ReadFailure("dependency_timeout", "embeddings")); };
+        signal.addEventListener("abort", aborted, { once: true });
+      });
     }
-
-    const errText = await response.text();
-    const isRetryable = response.status >= 500 || response.status === 429;
-    if (!isRetryable || attempt === OPENAI_MAX_ATTEMPTS) {
-      throw new Error(`OpenRouter embeddings error: ${response.status} ${errText}`);
-    }
-
-    const retryAfterHeader = response.headers.get("retry-after");
-    const retryAfterMs = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : 0;
-    const backoffMs = OPENAI_BASE_DELAY_MS * Math.pow(2, attempt - 1);
-    const delay = Math.min(Math.max(retryAfterMs, backoffMs), OPENAI_MAX_DELAY_MS);
-    lastErr = new Error(`OpenRouter embeddings error: ${response.status} ${errText.slice(0, 200)}`);
-    await new Promise((r) => setTimeout(r, delay));
-  }
-  throw lastErr instanceof Error ? lastErr : new Error("OpenRouter embeddings retry exhausted");
+    throw new ReadFailure("dependency_unavailable", "embeddings");
+  }, timeoutMs);
 }
 
 type PersonalQueryType = "keyword" | "vector";
@@ -1247,7 +1314,8 @@ async function personalKeywordSearch(
   ctx: UserContext,
   query: string,
   source: string | undefined,
-  limit: number
+  limit: number,
+  deadlineAt: number,
 ): Promise<PersonalSearchResult[]> {
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
@@ -1262,7 +1330,7 @@ async function personalKeywordSearch(
   const sectionRest = entityMatch ? query.replace(entityMatch[0], "").replace(/[§#]/g, "").trim() : null;
   const sectionPattern = sectionRest ? `%${sectionRest}%` : null;
 
-  const rows = await sql`
+  const rows = await withReadDeadline("database", async () => sql`
     SELECT filename, content, source, source_type,
            CASE
              WHEN filename ILIKE ${pattern} THEN 1.0
@@ -1287,7 +1355,7 @@ async function personalKeywordSearch(
              CASE WHEN filename ILIKE ${pattern} THEN 0 ELSE 1 END,
              length(content) DESC
     LIMIT ${limit}
-  `;
+  `, remainingSearchBudget(deadlineAt, "database"));
 
   return rows.map((r) => ({
     filename: r.filename as string,
@@ -1304,9 +1372,11 @@ async function personalVectorSearch(
   ctx: UserContext,
   query: string,
   source: string | undefined,
-  limit: number
+  limit: number,
+  deadlineAt: number,
+  trace: ReadTrace,
 ): Promise<PersonalSearchResult[]> {
-  const embedding = await personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query);
+  const embedding = await trace.run("embedding", () => personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query, deadlineAt));
   const vec = `[${embedding.join(",")}]`;
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
@@ -1314,7 +1384,7 @@ async function personalVectorSearch(
   const src = source ?? null;
   const sourceNames = ctx.sourceNames;
 
-  const rows = await sql`
+  const rows = await trace.run("db_query", () => withReadDeadline("database", async () => sql`
     SELECT filename, content, source, source_type,
            1 - (embedding <=> ${vec}::vector) AS score
     FROM ${sql.unsafe(documentsTable)}
@@ -1323,7 +1393,7 @@ async function personalVectorSearch(
       AND (${src}::text IS NULL OR source = ${src})
     ORDER BY embedding <=> ${vec}::vector
     LIMIT ${limit}
-  `;
+  `, remainingSearchBudget(deadlineAt, "database")));
 
   return rows.map((r) => ({
     filename: r.filename as string,
@@ -1342,29 +1412,42 @@ export async function personalSearchDocuments(
   query: string,
   source: string | undefined,
   limit: number = 5
-): Promise<PersonalSearchResult[]> {
-  const queryType = detectPersonalQueryType(query);
+): Promise<PersonalSearchResult[] & { degradation?: ReturnType<ReadFailure["toJSON"]> }> {
+  const deadlineAt = Date.now() + PERSONAL_SEARCH_BUDGET_MS;
+  const trace = createReadTrace("personal_search");
+  const keyword = () => trace.run("keyword", () => personalKeywordSearch(env, ctx, query, source, limit, deadlineAt));
+  return trace.run("search", async () => {
+    const queryType = detectPersonalQueryType(query);
 
-  if (queryType === "keyword") {
-    const kwResults = await personalKeywordSearch(env, ctx, query, source, limit);
-    if (kwResults.length > 0) return kwResults;
-  }
-
-  const vectorResults = await personalVectorSearch(env, ctx, query, source, limit);
-
-  if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
-    const kwFallback = await personalKeywordSearch(env, ctx, query, source, limit);
-    if (kwFallback.length > 0) {
-      const seen = new Map<string, PersonalSearchResult>();
-      for (const r of [...kwFallback, ...vectorResults]) {
-        const existing = seen.get(r.filename);
-        if (!existing || r.score > existing.score) seen.set(r.filename, r);
-      }
-      return [...seen.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+    if (queryType === "keyword") {
+      const kwResults = await keyword();
+      if (kwResults.length > 0) return kwResults;
     }
-  }
 
-  return vectorResults;
+    let vectorResults: PersonalSearchResult[];
+    try {
+      vectorResults = await trace.run("vector", () => personalVectorSearch(env, ctx, query, source, limit, deadlineAt, trace));
+    } catch (error) {
+      if (!(error instanceof ReadFailure) || error.stage !== "embeddings") throw error;
+      console.warn(JSON.stringify({ event: "personal_search_keyword_fallback", ...error.toJSON() }));
+      const fallback = await keyword();
+      return Object.assign(fallback, { degradation: error.toJSON() });
+    }
+
+    if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
+      const kwFallback = await keyword();
+      if (kwFallback.length > 0) {
+        const seen = new Map<string, PersonalSearchResult>();
+        for (const r of [...kwFallback, ...vectorResults]) {
+          const existing = seen.get(r.filename);
+          if (!existing || r.score > existing.score) seen.set(r.filename, r);
+        }
+        return [...seen.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+      }
+    }
+
+    return vectorResults;
+  });
 }
 
 /** Private-mode `memory_search`: recency-weighted personal search. No public equivalent. */
@@ -1375,50 +1458,50 @@ export async function personalMemorySearch(
   recencyDays: number | undefined,
   limit: number = 5
 ): Promise<PersonalMemorySearchResult[]> {
-  const embedding = await personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query);
-  const vec = `[${embedding.join(",")}]`;
-  const sql = personalDb(env);
-  const schema = getKnowledgeSchema(env);
-  const documentsTable = KNOWLEDGE_TABLES.documents(schema);
-  const sourceNames = ctx.sourceNames;
-  const cutoff = recencyDays ? new Date(Date.now() - recencyDays * 24 * 60 * 60 * 1000).toISOString() : null;
+  const deadlineAt = Date.now() + PERSONAL_SEARCH_BUDGET_MS;
+  const trace = createReadTrace("memory_search");
+  return trace.run("search", async () => {
+    const embedding = await trace.run("embedding", () => personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query, deadlineAt));
+    const vec = `[${embedding.join(",")}]`;
+    const sql = personalDb(env);
+    const schema = getKnowledgeSchema(env);
+    const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+    const sourceNames = ctx.sourceNames;
+    const cutoff = recencyDays ? new Date(Date.now() - recencyDays * 24 * 60 * 60 * 1000).toISOString() : null;
 
-  const rows = await sql`
-    SELECT filename, content, source, source_type, updated_at,
-           1 - (embedding <=> ${vec}::vector) AS base_score
-    FROM ${sql.unsafe(documentsTable)}
-    WHERE user_id = ${ctx.userId}
-      AND source = ANY(${sourceNames})
-      AND (${cutoff}::timestamptz IS NULL OR updated_at >= ${cutoff}::timestamptz)
-    ORDER BY embedding <=> ${vec}::vector
-    LIMIT ${limit * 3}
-  `;
+    const rows = await trace.run("vector", () => withReadDeadline("database", async () => sql`
+      SELECT filename, content, source, source_type, updated_at,
+             1 - (embedding <=> ${vec}::vector) AS base_score
+      FROM ${sql.unsafe(documentsTable)}
+      WHERE user_id = ${ctx.userId}
+        AND source = ANY(${sourceNames})
+        AND (${cutoff}::timestamptz IS NULL OR updated_at >= ${cutoff}::timestamptz)
+      ORDER BY embedding <=> ${vec}::vector
+      LIMIT ${limit * 3}
+    `, remainingSearchBudget(deadlineAt, "database")));
 
-  const now = Date.now();
-  return rows
-    .map((r) => {
-      const ageDays = (now - new Date(r.updated_at as string).getTime()) / (1000 * 60 * 60 * 24);
-      const decayFactor = ageDays <= 14 ? 1.0 : ageDays <= 30 ? 0.7 : 0.4;
-      return {
-        filename: r.filename as string,
-        content: r.content as string,
-        source: (r.source as string) || "",
-        source_type: (r.source_type as string) || "",
-        score: (r.base_score as number) * decayFactor,
-        github_url: personalGithubUrl(ctx, (r.source as string) || "", r.filename as string),
-        updated_at: r.updated_at as string,
-        age_days: Math.round(ageDays),
-      };
-    })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+    const now = Date.now();
+    return rows
+      .map((r) => {
+        const ageDays = (now - new Date(r.updated_at as string).getTime()) / (1000 * 60 * 60 * 24);
+        const decayFactor = ageDays <= 14 ? 1.0 : ageDays <= 30 ? 0.7 : 0.4;
+        return {
+          filename: r.filename as string,
+          content: r.content as string,
+          source: (r.source as string) || "",
+          source_type: (r.source_type as string) || "",
+          score: (r.base_score as number) * decayFactor,
+          github_url: personalGithubUrl(ctx, (r.source as string) || "", r.filename as string),
+          updated_at: r.updated_at as string,
+          age_days: Math.round(ageDays),
+        };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
+  });
 }
 
-/** Private-mode `get_document`: personal corpus only.
- * Reads the new chunk_ordinal format first (aggregating every chunk of the
- * document in order); falls back to the legacy LIMIT-1 read only while a
- * document hasn't been backfilled yet, so behavior never regresses during
- * the transition (WP-7 Ф94). */
+/** Read one scoped snapshot: all v2 chunks, or the first legacy fragment while backfill is pending. */
 export async function personalGetDocument(
   env: PersonalEnv,
   ctx: UserContext,
@@ -1442,29 +1525,36 @@ export async function personalGetDocument(
   const sourceNames = ctx.sourceNames;
   const chunkPrefix = documentChunkPrefix(baseName);
 
-  // Ambiguity check runs across BOTH protocol versions together, before any
-  // data query — checking only v2 (or only legacy) rows would silently miss
-  // the migration-window case where source A is backfilled to v2 and source B
-  // still holds a v1 copy of the same filename (WP-7 Ф94, cold-context review).
-  if (src === null) {
-    const distinctSources = await sql`
-      SELECT DISTINCT source FROM ${sql.unsafe(documentsTable)}
+  const rows = await withReadDeadline("database", async () => sql`
+    WITH candidates AS (
+      SELECT filename, content, source, source_type, protocol_version, chunk_ordinal,
+        ROW_NUMBER() OVER (
+          PARTITION BY source
+          ORDER BY
+            CASE WHEN protocol_version = 2 AND filename = ${baseName} THEN 0 ELSE 1 END,
+            CASE WHEN protocol_version = 2 AND filename = ${baseName} THEN chunk_ordinal END,
+            CASE WHEN filename = ${normalizedFilename} THEN 0 ELSE 1 END,
+            filename
+        ) AS representation_rank
+      FROM ${sql.unsafe(documentsTable)}
       WHERE (filename = ${baseName} OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
-        AND user_id = ${ctx.userId} AND source = ANY(${sourceNames})
-    `;
-    if (distinctSources.length > 1) throw new AmbiguousSourceError(distinctSources.map(r => r.source as string));
+        AND user_id = ${ctx.userId}
+        AND source = ANY(${sourceNames})
+        AND (${src}::text IS NULL OR source = ${src})
+    )
+    SELECT filename, content, source, source_type, protocol_version, chunk_ordinal
+    FROM candidates
+    WHERE (protocol_version = 2 AND filename = ${baseName}) OR representation_rank = 1
+    ORDER BY source, representation_rank
+  `, 5_000);
+  // Only v2 base rows are reconstructed; null/old protocols retain their first fragment.
+  // Keep one legacy row per source so ambiguity is detected without transferring every fragment.
+  // Both ambiguity and representation selection use this single database snapshot.
+  if (src === null) {
+    const sources = [...new Set(rows.map(row => row.source as string))];
+    if (sources.length > 1) throw new AmbiguousSourceError(sources);
   }
-
-  const v2Rows = await sql`
-    SELECT filename, content, source, source_type, chunk_ordinal
-    FROM ${sql.unsafe(documentsTable)}
-    WHERE filename = ${baseName}
-      AND protocol_version = 2
-      AND user_id = ${ctx.userId}
-      AND source = ANY(${sourceNames})
-      AND (${src}::text IS NULL OR source = ${src})
-    ORDER BY chunk_ordinal
-  `;
+  const v2Rows = rows.filter(row => row.protocol_version === 2 && row.filename === baseName);
 
   if (v2Rows.length > 0) {
     const r0 = v2Rows[0];
@@ -1476,20 +1566,6 @@ export async function personalGetDocument(
       github_url: personalGithubUrl(ctx, (r0.source as string) || "", r0.filename as string),
     };
   }
-
-  const rows = await sql`
-    SELECT filename, content, source, source_type
-    FROM ${sql.unsafe(documentsTable)}
-    WHERE (filename = ${normalizedFilename}
-           OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
-      AND user_id = ${ctx.userId}
-      AND source = ANY(${sourceNames})
-      AND (${src}::text IS NULL OR source = ${src})
-    ORDER BY
-      CASE WHEN filename = ${normalizedFilename} THEN 0 ELSE 1 END,
-      filename
-    LIMIT 1
-  `;
 
   if (!rows.length) return null;
   const r = rows[0];
@@ -1568,43 +1644,33 @@ export async function personalGetDocumentLive(
 
   const owner = userSource.githubOwner;
   const repo = userSource.githubRepo;
-  const token = await getInstallationToken(env, ctx.userId, repo);
-  if (!token) return null;
-
-  // WP-7 Ф176: ref is a git ref (commit sha, branch, tag) resolved by GitHub
-  // itself — reading a prior version this way needs no history bookkeeping
-  // of our own, only the sha the caller already has (from a previous
-  // include_sha read, or from a version_mismatch/sha_required rejection's
-  // current_sha, or from `history`).
-  // ref !== undefined, not a truthy check — an explicit empty string must still
-  // reach GitHub as an invalid ref (surfacing as null below), not be silently
-  // treated as "no ref, read the current version" (cold-review finding).
-  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}${ref !== undefined ? `?ref=${encodeURIComponent(ref)}` : ""}`;
-
-  // External response parsing (json, atob, UTF-8 decode) can throw; the
-  // dispatch layer expects null, not an exception.
   try {
-    const response = await fetch(apiUrl, {
-      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+    return await withReadDeadline("github_content", async signal => {
+      const token = await getInstallationToken(env, ctx.userId, repo,
+        (input, init) => fetchReadResponse(input, init ?? {}, "github_token", signal));
+      if (!token) throw new ReadFailure("github_not_connected", "github_token");
+      const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}${ref !== undefined ? `?ref=${encodeURIComponent(ref)}` : ""}`;
+      const response = await fetchReadResponse(apiUrl, {
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+      }, "github_content", signal);
+      const body = await readJson(response, "github_content") as { sha?: unknown; content?: unknown; encoding?: unknown };
+      if (!body || typeof body.sha !== "string" || !GIT_BLOB_SHA.test(body.sha)
+          || typeof body.content !== "string" || body.encoding !== "base64") {
+        throw new ReadFailure("dependency_invalid_response", "github_content");
+      }
+      let content: string;
+      try {
+        content = decodeURIComponent(escape(atob(body.content.replace(/\n/g, ""))));
+      } catch {
+        throw new ReadFailure("dependency_invalid_response", "github_content");
+      }
+      return { filename, content, source, source_type: userSource.sourceType,
+        github_url: personalGithubUrl(ctx, source, filename), sha: body.sha };
     });
-    if (!response.ok) return null;
-
-    const body = (await response.json()) as { sha?: unknown; content?: unknown; encoding?: unknown };
-    // Same sha shape check as the write path — a malformed sha handed out
-    // here would be rejected by write(expected_sha) later anyway, better to
-    // fail the read (peer-review round 2, 30.08).
-    if (typeof body.sha !== "string" || !/^[0-9a-f]{40}$|^[0-9a-f]{64}$/i.test(body.sha) || typeof body.content !== "string" || body.encoding !== "base64") return null;
-
-    return {
-      filename,
-      content: decodeURIComponent(escape(atob(body.content.replace(/\n/g, "")))),
-      source,
-      source_type: userSource.sourceType,
-      github_url: personalGithubUrl(ctx, source, filename),
-      sha: body.sha,
-    };
-  } catch {
-    return null;
+  } catch (error) {
+    // GitHub also hides inaccessible private resources behind 404. Do not assert absence.
+    if (error instanceof ReadFailure && error.stage === "github_content" && error.status === 404) return null;
+    throw error;
   }
 }
 
@@ -1715,7 +1781,7 @@ export async function personalListSources(
   const sourceNames = ctx.sourceNames;
   const docsTable = KNOWLEDGE_TABLES.documents(getKnowledgeSchema(env));
 
-  const rows = await sql`
+  const rows = await withReadDeadline("database", async () => sql`
     SELECT source, source_type, COUNT(DISTINCT filename)::int AS doc_count
     FROM ${sql.unsafe(docsTable)}
     WHERE user_id = ${ctx.userId}
@@ -1723,7 +1789,7 @@ export async function personalListSources(
       AND filename NOT LIKE '%::%'
     GROUP BY source, source_type
     ORDER BY source_type, source
-  `;
+  `, 5_000);
 
   return rows.map((r) => ({
     source: (r.source as string) || "",
@@ -1753,7 +1819,7 @@ export async function personalListDocuments(
   // WP-7 Ф122: GROUP BY + SUM(octet_length), not DISTINCT — a v2 document is stored as one
   // row per chunk_ordinal, all sharing the same filename (see personalGetDocument); a plain
   // per-row length would report only one chunk's size instead of the whole file's.
-  const rows = await sql`
+  const rows = await withReadDeadline("database", async () => sql`
     SELECT filename, source, source_type, SUM(octet_length(content))::bigint AS size_bytes
     FROM ${sql.unsafe(docsTable)}
     WHERE user_id = ${ctx.userId}
@@ -1764,7 +1830,7 @@ export async function personalListDocuments(
     GROUP BY filename, source, source_type
     ORDER BY source, filename
     LIMIT ${limit}
-  `;
+  `, 5_000);
 
   return rows.map((r) => {
     const docSource = (r.source as string) || "";
@@ -1805,7 +1871,7 @@ export async function personalListPath(
   // per document. string_agg in chunk_ordinal order reassembles the full content (same pattern
   // personalGetDocument already uses via v2Rows.map(...).join("")), fixing the duplicate-listing
   // bug and letting extractTitle/size see the whole document, not one chunk.
-  const rows = await sql`
+  const rows = await withReadDeadline("database", async () => sql`
     SELECT filename, source,
       string_agg(content, '' ORDER BY chunk_ordinal) AS full_content
     FROM ${sql.unsafe(docsTable)}
@@ -1817,7 +1883,7 @@ export async function personalListPath(
     GROUP BY filename, source
     ORDER BY source, filename
     LIMIT ${limit}
-  `;
+  `, 5_000);
 
   const docs = rows.map((r) => {
     const content = (r.full_content as string) || "";
@@ -1996,7 +2062,7 @@ export async function connectSource(
 
   const readCurrentRow = async () => {
     const rows = await sql`
-      SELECT active, github_repository_id, index_state FROM ${sql.unsafe(userSourcesTable)}
+      SELECT id, index_generation, active, github_repository_id, index_state FROM ${sql.unsafe(userSourcesTable)}
       WHERE user_id = ${userId} AND source = ${source}
       LIMIT 1
     `;
@@ -2065,25 +2131,29 @@ export async function connectSource(
     }
 
     if (rebindReason) {
-      // One transaction: (purge,) bind the identity, bump the generation (atomically in the
+      // One transaction: lock/bind the identity, bump the generation, then purge (atomically in the
       // DB, never read-modify-write), and create the reindex job carrying that generation.
       // A crash between any two of these can't leave a purged source without a job, and the
       // consumer fences every document write on the generation (see reindex.ts).
-      const purge = rebindReason === "stuck_index_recovery" ? [] : [
+      const purge = () => rebindReason === "stuck_index_recovery" ? [] : [
         sql`DELETE FROM ${sql.unsafe(documentsTable)} WHERE user_id = ${userId} AND source = ${source}`,
         sql`DELETE FROM ${sql.unsafe(statusTable)} WHERE user_id = ${userId} AND source = ${source}`,
       ];
       const results = await sql.transaction([
-        ...purge,
         sql`
-          UPDATE ${sql.unsafe(userSourcesTable)}
-          SET github_repository_id = ${repositoryId}::bigint,
-              github_owner = ${githubUsername}, github_repo = ${source},
-              active = true, index_state = 'reindexing',
-              index_generation = index_generation + 1
-          WHERE user_id = ${userId} AND source = ${source}
-          RETURNING index_generation
+          WITH rebound AS (
+            UPDATE ${sql.unsafe(userSourcesTable)}
+            SET github_repository_id = ${repositoryId}::bigint,
+                github_owner = ${githubUsername}, github_repo = ${source},
+                active = true, index_state = 'reindexing',
+                index_generation = index_generation + 1
+            WHERE user_id = ${userId} AND source = ${source}
+              AND id = ${current.id} AND index_generation = ${current.index_generation}
+            RETURNING index_generation
+          )
+          SELECT 1 / COUNT(*)::int AS source_fence FROM rebound
         `,
+        ...purge(),
         sql`
           INSERT INTO ${sql.unsafe(reindexJobsTable)} (user_id, source, status, generation)
           SELECT ${userId}, ${source}, 'pending', index_generation
@@ -2245,10 +2315,11 @@ export async function purgeSource(
   const schema = getKnowledgeSchema(env);
   const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+  const statusTable = KNOWLEDGE_TABLES.file_index_status(schema);
   const reindexJobsTable = KNOWLEDGE_TABLES.reindex_jobs(schema);
 
   const sourceRows = await sql`
-    SELECT source FROM ${sql.unsafe(userSourcesTable)}
+    SELECT id, source FROM ${sql.unsafe(userSourcesTable)}
     WHERE user_id = ${userId} AND source = ${source}
     LIMIT 1
   `;
@@ -2257,7 +2328,18 @@ export async function purgeSource(
       error: `Source '${source}' не найден. Проверь list_sources.` };
   }
 
-  const [docResult, jobResult] = await Promise.all([
+  // Same lock order as the indexer/rebind: source, documents, status, jobs.
+  // Holding the source row until commit prevents an old queue job from repopulating a purge.
+  const [, docResult, , jobResult] = await sql.transaction([
+    sql`
+      SELECT 1 / (
+        SELECT COUNT(*) FROM (
+          SELECT id FROM ${sql.unsafe(userSourcesTable)}
+          WHERE user_id = ${userId} AND source = ${source} AND id = ${sourceRows[0].id}
+          FOR UPDATE
+        ) AS current_source
+      )::int AS source_fence
+    `,
     sql`
       WITH deleted AS (
         DELETE FROM ${sql.unsafe(documentsTable)}
@@ -2266,6 +2348,7 @@ export async function purgeSource(
       )
       SELECT COUNT(*)::int AS cnt FROM deleted
     `,
+    sql`DELETE FROM ${sql.unsafe(statusTable)} WHERE user_id = ${userId} AND source = ${source}`,
     sql`
       WITH deleted AS (
         DELETE FROM ${sql.unsafe(reindexJobsTable)}
@@ -2274,12 +2357,8 @@ export async function purgeSource(
       )
       SELECT COUNT(*)::int AS cnt FROM deleted
     `,
+    sql`DELETE FROM ${sql.unsafe(userSourcesTable)} WHERE user_id = ${userId} AND source = ${source}`,
   ]);
-
-  await sql`
-    DELETE FROM ${sql.unsafe(userSourcesTable)}
-    WHERE user_id = ${userId} AND source = ${source}
-  `;
 
   return {
     source,

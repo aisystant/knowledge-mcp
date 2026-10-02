@@ -40,6 +40,7 @@
  */
 
 import { neonConfig, Pool } from "@neondatabase/serverless";
+import type { ReadTrace } from "./read-failure.js";
 
 // Cloudflare Workers: использовать нативный WebSocket (доступен через nodejs_compat)
 // Без этого Pool не может открыть WebSocket-соединение для транзакций
@@ -97,20 +98,25 @@ export async function withUserContext<T>(
   connectionString: string,
   userId: string | null | undefined,
   fn: (sql: SqlClient) => Promise<T>,
-  sharedPool?: Pool
+  sharedPool?: Pool,
+  trace?: ReadTrace,
 ): Promise<T> {
+  const run = <R>(stage: Parameters<ReadTrace["run"]>[0], operation: () => Promise<R>): Promise<R> =>
+    trace ? trace.run(stage, operation) : operation();
   const pool = sharedPool ?? createRequestPool(connectionString);
-  const client = await pool.connect();
+  const client = await run("db_connect", () => pool.connect());
 
   try {
-    await client.query("BEGIN");
+    await run("db_begin", () => client.query("BEGIN"));
 
     if (userId) {
       // set_config с is_local=true — эквивалент SET LOCAL, но принимает параметр
       // SET LOCAL не поддерживает $1 параметры в протоколе PostgreSQL
-      for (const gucName of RLS_ACCOUNT_CONTEXT_GUCS) {
-        await client.query(`SELECT set_config('${gucName}', $1, true)`, [userId]);
-      }
+      await run("db_context", async () => {
+        for (const gucName of RLS_ACCOUNT_CONTEXT_GUCS) {
+          await client.query(`SELECT set_config('${gucName}', $1, true)`, [userId]);
+        }
+      });
     }
 
     // Обёртка для совместимости с кодом использующим тегированный шаблон.
@@ -138,7 +144,7 @@ export async function withUserContext<T>(
           }
         }
       });
-      return client.query(query, params).then((r) => r.rows);
+      return run("db_query", () => client.query(query, params).then((r) => r.rows));
     }) as SqlClient;
 
     // Compatibility with neon()'s sql.unsafe() — used throughout index.ts
@@ -148,10 +154,10 @@ export async function withUserContext<T>(
 
     const result = await fn(sql);
 
-    await client.query("COMMIT");
+    await run("db_commit", () => client.query("COMMIT"));
     return result;
   } catch (err) {
-    await client.query("ROLLBACK");
+    await run("db_rollback", () => client.query("ROLLBACK"));
     throw err;
   } finally {
     client.release();

@@ -5,11 +5,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createHash, generateKeyPairSync } from "node:crypto";
 
-let queryQueue: unknown[][] = [];
+let queryQueue: Array<unknown[] | Error | Promise<unknown[]>> = [];
 let sqlCalls: unknown[][] = [];
 
-function nextSqlResult(): unknown[] {
-  return queryQueue.shift() ?? [];
+function nextSqlResult(): unknown[] | Promise<unknown[]> {
+  const next = queryQueue.shift();
+  if (next instanceof Error) throw next;
+  return next ?? [];
 }
 
 function makeMockSql() {
@@ -56,6 +58,9 @@ import {
   personalListDocuments,
   personalListPath,
   personalGetDocument,
+  personalSearchDocuments,
+  personalMemorySearch,
+  personalGetEmbedding,
   personalGetDocumentLive,
   personalGetDocumentWithSha,
   personalGetDocumentHistory,
@@ -123,6 +128,7 @@ function queuedFetch(items: Response[]) {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -548,16 +554,14 @@ describe("personalListPath", () => {
 
 describe("personalGetDocument", () => {
   it("returns null when no matching document exists", async () => {
-    queryQueue.push([]); // ambiguity pre-check (source omitted → runs first)
     queryQueue.push([]); // v2 query
-    queryQueue.push([]); // legacy fallback
     const doc = await personalGetDocument(ENV, ctx(), "missing.md");
     expect(doc).toBeNull();
   });
 
   it("returns the document content and a resolved github_url for a known source", async () => {
     // source given explicitly — skips the ambiguity pre-check (WP-7 Ф94)
-    queryQueue.push([{ filename: "notes/idea.md", content: "hello", source: "DS-my-strategy", source_type: "ds", chunk_ordinal: 1 }]); // v2 query
+    queryQueue.push([{ filename: "notes/idea.md", content: "hello", source: "DS-my-strategy", source_type: "ds", protocol_version: 2, chunk_ordinal: 1 }]); // v2 query
     const doc = await personalGetDocument(ENV, ctx(), "notes/idea.md", "DS-my-strategy");
     expect(doc?.content).toBe("hello");
     expect(doc?.github_url).toContain("github.com/TserenTserenov/DS-my-strategy");
@@ -566,9 +570,7 @@ describe("personalGetDocument", () => {
   it.each(["vault", "vault/"])("uses literal chunk matching and an encoded HEAD URL with prefix %s", async pathPrefix => {
     const rawFilename = "notes/./cafe\u0301_%#? file.md";
     const normalizedFilename = "notes/cafe\u0301_%#? file.md";
-    // Merged Ф94 query order with source omitted: ambiguity pre-check → v2 → legacy.
-    queryQueue.push([{ source: "DS-my-strategy" }]);
-    queryQueue.push([]); // v2 — not backfilled in this fixture
+    // One snapshot reads either representation and checks ambiguity.
     queryQueue.push([{ filename: normalizedFilename, content: "hello", source: "DS-my-strategy", source_type: "ds" }]);
     const sourceContext = ctx({
       sources: [{ ...ctx().sources[0], pathPrefix }],
@@ -588,16 +590,15 @@ describe("personalGetDocument", () => {
 
   it("joins multiple v2 chunks in the order returned, not just the first (WP-7 Ф94 regression)", async () => {
     queryQueue.push([
-      { filename: "docs/big.md", content: "part one. ", source: "DS-my-strategy", source_type: "ds", chunk_ordinal: 1 },
-      { filename: "docs/big.md", content: "part two. ", source: "DS-my-strategy", source_type: "ds", chunk_ordinal: 2 },
-      { filename: "docs/big.md", content: "part three.", source: "DS-my-strategy", source_type: "ds", chunk_ordinal: 3 },
+      { filename: "docs/big.md", content: "part one. ", source: "DS-my-strategy", source_type: "ds", protocol_version: 2, chunk_ordinal: 1 },
+      { filename: "docs/big.md", content: "part two. ", source: "DS-my-strategy", source_type: "ds", protocol_version: 2, chunk_ordinal: 2 },
+      { filename: "docs/big.md", content: "part three.", source: "DS-my-strategy", source_type: "ds", protocol_version: 2, chunk_ordinal: 3 },
     ]); // v2 query — source given, no ambiguity pre-check
     const doc = await personalGetDocument(ENV, ctx(), "docs/big.md", "DS-my-strategy");
     expect(doc?.content).toBe("part one. part two. part three.");
   });
 
   it("falls back to the legacy read when no v2 rows exist yet (WP-7 Ф94 regression)", async () => {
-    queryQueue.push([]); // v2 query — empty, not yet backfilled
     queryQueue.push([{ filename: "docs/old.md::intro", content: "legacy content", source: "DS-my-strategy", source_type: "ds" }]); // legacy fallback
     const doc = await personalGetDocument(ENV, ctx(), "docs/old.md", "DS-my-strategy");
     expect(doc?.content).toBe("legacy content");
@@ -612,6 +613,93 @@ describe("personalGetDocument", () => {
 });
 
 describe("deleteFromGitHub", () => {
+  it.each([[], new Error("private-database-detail")])("refuses remote deletion without a verified source snapshot (%s)", async (snapshot) => {
+    queryQueue.push(snapshot);
+    const { request, dependencies } = githubDependencies([{ ok: true, json: async () => ({ sha: "old" }) }, { ok: true }]);
+    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", dependencies);
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result)).not.toContain("private-database-detail");
+    expect(dependencies.getInstallationToken).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("refuses a missing caller before making a GitHub request", async () => {
+    const { request, dependencies } = githubDependencies([{ ok: true, json: async () => ({ sha: "old" }) }, { ok: true }]);
+    const result = await deleteFromGitHub(ENV, ctx({ userId: "" }), "DS-my-strategy", "notes/idea.md", "delete", dependencies);
+    expect(result.success).toBe(false);
+    expect(request).not.toHaveBeenCalled();
+    expect(sqlCalls).toHaveLength(0);
+  });
+
+  it("keeps remote deletion successful and reports a deferred cleanup when the transaction fails", async () => {
+    queryQueue.push([{ id: 17, index_generation: 3 }], new Error("private-cleanup-detail"));
+    const { request, dependencies } = githubDependencies([{ ok: true, json: async () => ({ sha: "old" }) }, { ok: true }]);
+    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", dependencies);
+    expect(result.success).toBe(true);
+    expect(result.warning).toMatch(/очистка.*индекса.*отложена/i);
+    expect(JSON.stringify(result)).not.toContain("private-cleanup-detail");
+    expect(request.mock.calls[1][1]).toEqual(expect.objectContaining({ method: "DELETE" }));
+    expect(sqlCalls.filter(([template]) => String(template).includes("DELETE FROM"))).toHaveLength(0);
+    const fence = sqlCalls[1] as [TemplateStringsArray, ...unknown[]];
+    expect(fence[0].join(" ")).toContain("FOR UPDATE");
+    expect(fence.slice(1)).toEqual(expect.arrayContaining([17, 3, ctx().userId, "DS-my-strategy"]));
+  });
+
+  it.each([
+    { change: "rebind", replacement: { id: 17, index_generation: 4 } },
+    { change: "purge/reconnect with the same generation", replacement: { id: 18, index_generation: 3 } },
+  ])("preserves the replacement index after $change during the GitHub request", async ({ replacement }) => {
+    let current = { id: 17, index_generation: 3 };
+    let documents = ["original-document"];
+    let statuses = ["original-status"];
+    let transactionStarted = false;
+    // Model Neon lazy queries: mutations execute only when the transaction awaits them,
+    // and the source fence must reject before either index table can be changed.
+    const sql = Object.assign((strings: TemplateStringsArray, ...values: unknown[]) => ({
+      then: (resolve: (rows: unknown[]) => unknown, reject: (error: unknown) => unknown) => Promise.resolve().then(() => {
+        const query = strings.join("?");
+        if (query.includes("FOR UPDATE")) {
+          if (values[3] !== current.id || values[4] !== current.index_generation) throw new Error("division by zero");
+          return [{ fence: 1 }];
+        }
+        if (query.includes("DELETE FROM")) {
+          if (values[0] === "knowledge.documents") documents = [];
+          if (values[0] === "knowledge.file_index_status") statuses = [];
+          return [];
+        }
+        return [{ ...current }];
+      }).then(resolve, reject),
+    }), {
+      unsafe: (value: string) => value,
+      transaction: async (queries: PromiseLike<unknown[]>[]) => {
+        transactionStarted = true;
+        const results = [];
+        for (const query of queries) results.push(await query);
+        return results;
+      },
+    });
+    const { neon } = await import("@neondatabase/serverless");
+    vi.mocked(neon).mockReturnValueOnce(sql as never);
+    const request = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      expect(transactionStarted).toBe(false); // no row lock spans the network call
+      if (init?.method === "DELETE") {
+        current = replacement;
+        documents = ["replacement-document"];
+        statuses = ["replacement-status"];
+        return responseJson({});
+      }
+      return responseJson({ sha: "existing-file" });
+    });
+    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", {
+      getInstallationToken: vi.fn().mockResolvedValue("test-token"), fetch: request as never,
+    });
+    expect(result.success).toBe(true);
+    expect(result.warning).toMatch(/отложена/);
+    expect(transactionStarted).toBe(true);
+    expect(documents).toEqual(["replacement-document"]);
+    expect(statuses).toEqual(["replacement-status"]);
+  });
+
   it("rejects an unknown source without touching the network", async () => {
     const result = await deleteFromGitHub(ENV, ctx(), "not-a-real-source", "notes/idea.md", "delete");
     expect(result.success).toBe(false);
@@ -624,7 +712,7 @@ describe("deleteFromGitHub", () => {
       { ok: true, status: 200, json: async () => ({ sha }) },
       { ok: true, status: 200 },
     ]);
-    queryQueue.push([]); // indexed document cleanup
+    queryQueue.push([{ id: 17, index_generation: 3 }], [], [], []); // snapshot, fence, documents, file status
     const path = "notes/./cafe\u0301_%#? file.md";
     const sourceContext = ctx({ sources: [{ ...ctx().sources[0], pathPrefix }] });
 
@@ -636,12 +724,20 @@ describe("deleteFromGitHub", () => {
     expect(request.mock.calls[0][0]).toBe(expectedUrl);
     expect(request.mock.calls[1][0]).toBe(expectedUrl);
     expect(request.mock.calls[1][1]).toEqual(expect.objectContaining({ method: "DELETE" }));
-    const [template, ...values] = sqlCalls.at(-1) as [TemplateStringsArray, ...unknown[]];
+    const snapshot = sqlCalls[0] as [TemplateStringsArray, ...unknown[]];
+    expect(snapshot[0].join(" ")).toMatch(/user_id = .*source = .*github_owner = .*github_repo = .*path_prefix = /s);
+    expect(snapshot.slice(1)).toEqual(["knowledge.user_sources", sourceContext.userId, "DS-my-strategy", "TserenTserenov", "DS-my-strategy", pathPrefix]);
+    const fence = sqlCalls[1] as [TemplateStringsArray, ...unknown[]];
+    expect(fence[0].join(" ")).toMatch(/id = .*index_generation = .*FOR UPDATE/s);
+    expect(fence.slice(1)).toEqual(expect.arrayContaining([17, 3]));
+    const [template, ...values] = sqlCalls[2] as [TemplateStringsArray, ...unknown[]];
     expect(template.join(" ")).not.toContain(" LIKE ");
     const normalizedPath = normalizeScopePath(path);
     expect(normalizedPath).toBe(resolveSourcePath(pathPrefix, path).relativePath);
     expect(values).toContain(normalizedPath);
     expect(values).toContain(`${normalizedPath}::`);
+    expect(sqlCalls[3].slice(1)).toEqual(["knowledge.file_index_status", sourceContext.userId, "DS-my-strategy", normalizedPath]);
+    expect(result.warning).toBeUndefined();
   });
 });
 
@@ -1424,7 +1520,7 @@ describe("getInstallationToken call contract (WP-7 2026-08-31 pagination fix)", 
     const request = vi.fn()
       .mockResolvedValueOnce(responseJson({ sha: "a".repeat(40) })) // GET existing
       .mockResolvedValueOnce(responseJson({})); // DELETE
-    queryQueue.push([]); // post-delete document-index cleanup query
+    queryQueue.push([{ id: 17, index_generation: 3 }], [], [], []); // snapshot and fenced cleanup
     const result = await deleteFromGitHub(
       ENV, ctx(), "DS-my-strategy", "notes/idea.md", "msg",
       { getInstallationToken, fetch: request as unknown as typeof globalThis.fetch },
@@ -1460,10 +1556,10 @@ describe("personalGetDocumentLive (WP-7 Ф96)", () => {
     expect(doc).toBeNull();
   });
 
-  it("returns null when the response is missing content/encoding", async () => {
+  it("reports a malformed GitHub response rather than an absent file", async () => {
     queuedFetch([...installationTokenResponses(), responseJson({ sha: "e".repeat(40) })]);
-    const doc = await personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy");
-    expect(doc).toBeNull();
+    await expect(personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy"))
+      .rejects.toMatchObject({ code: "dependency_invalid_response", stage: "github_content" });
   });
 
   it("adds ref as a query parameter to read a prior version (WP-7 Ф176)", async () => {
@@ -1619,7 +1715,7 @@ describe("connectSource", () => {
 
   it("skips scope provisioning (not fails the connect) when INDICATORS_DATABASE_URL is absent", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: false, github_repository_id: REPO_ID, index_state: "ready" }]); // same identity, inactive → reactivate
+    queryQueue.push([{ id: 17, index_generation: 1, active: false, github_repository_id: REPO_ID, index_state: "ready" }]); // same identity, inactive → reactivate
     queryQueue.push([]); // UPDATE user_sources
 
     const result = await connectSource(ENV, "user-1", "DS-my-strategy", githubIdentity(Number(REPO_ID)).dependencies);
@@ -1650,10 +1746,10 @@ describe("connectSource", () => {
 
   it("rebinds when the stored fingerprint differs: purge + bump + pending job in one transaction", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: true, github_repository_id: "111", index_state: "ready" }]); // stored identity ≠ live
+    queryQueue.push([{ id: 17, index_generation: 1, active: true, github_repository_id: "111", index_state: "ready" }]); // stored identity ≠ live
+    queryQueue.push([{ index_generation: 2 }]); // UPDATE ... RETURNING index_generation
     queryQueue.push([]); // DELETE documents
     queryQueue.push([]); // DELETE file_index_status
-    queryQueue.push([{ index_generation: 2 }]); // UPDATE ... RETURNING index_generation
     queryQueue.push([{ id: "job-rebind", generation: "2" }]); // INSERT reindex_jobs ... RETURNING
 
     const result = await connectSource(ENV, "user-1", "DS-my-strategy", githubIdentity(Number(REPO_ID)).dependencies);
@@ -1665,13 +1761,16 @@ describe("connectSource", () => {
     expect(result.reindex_triggered).toBe(false); // index.ts starts the pre-created job
     expect(result.message).toContain("недоступен для чтения");
     expect(sqlTextContaining("DELETE FROM")).toBeDefined();
+    const statements = sqlCalls.map(([template]) => (template as TemplateStringsArray).join(" "));
+    expect(statements.findIndex(text => text.includes("index_generation = index_generation + 1")))
+      .toBeLessThan(statements.findIndex(text => text.includes("DELETE FROM")));
     expect(sqlTextContaining("index_generation = index_generation + 1")).toContain("index_state = 'reindexing'");
     expect(sqlTextContaining("(user_id, source, status, generation)")).toContain("SELECT");
   });
 
   it("compares the BIGINT identity as a string — a driver string equals the live numeric id", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: true, github_repository_id: REPO_ID, index_state: "ready" }]); // driver returns BIGINT as string
+    queryQueue.push([{ id: 17, index_generation: 1, active: true, github_repository_id: REPO_ID, index_state: "ready" }]); // driver returns BIGINT as string
     queryQueue.push([]); // UPDATE (COALESCE no-op)
 
     const result = await connectSource(ENV, "user-1", "DS-my-strategy", githubIdentity(Number(REPO_ID)).dependencies);
@@ -1682,11 +1781,11 @@ describe("connectSource", () => {
 
   it("legacy row without fingerprint but WITH documents is not trusted: fail-closed rebind", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: true, github_repository_id: null, index_state: "ready" }]);
+    queryQueue.push([{ id: 17, index_generation: 1, active: true, github_repository_id: null, index_state: "ready" }]);
     queryQueue.push([{ cnt: 17 }]); // documents exist under the unverified binding
+    queryQueue.push([{ index_generation: 5 }]);
     queryQueue.push([]); // DELETE documents
     queryQueue.push([]); // DELETE file_index_status
-    queryQueue.push([{ index_generation: 5 }]);
     queryQueue.push([{ id: "job-legacy", generation: 5 }]);
 
     const result = await connectSource(ENV, "user-1", "DS-my-strategy", githubIdentity(Number(REPO_ID)).dependencies);
@@ -1699,7 +1798,7 @@ describe("connectSource", () => {
 
   it("legacy row without fingerprint and without documents just gets bound (no purge)", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: false, github_repository_id: null, index_state: "ready" }]);
+    queryQueue.push([{ id: 17, index_generation: 1, active: false, github_repository_id: null, index_state: "ready" }]);
     queryQueue.push([{ cnt: 0 }]); // no documents
     queryQueue.push([]); // UPDATE ... COALESCE(github_repository_id, ...)
 
@@ -1725,7 +1824,7 @@ describe("connectSource — review fixes (WP-560 Ф3, cold review 02.09)", () =>
 
   it("same repository but index stuck in 'reindexing' → recovery job with a new generation, no purge", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: true, github_repository_id: REPO_ID, index_state: "reindexing" }]);
+    queryQueue.push([{ id: 17, index_generation: 1, active: true, github_repository_id: REPO_ID, index_state: "reindexing" }]);
     queryQueue.push([]); // findLiveReindexJob → nothing alive
     queryQueue.push([{ index_generation: 9 }]); // UPDATE ... RETURNING (no DELETEs before it)
     queryQueue.push([{ id: "job-recover", generation: 9 }]); // INSERT reindex_jobs
@@ -1743,7 +1842,7 @@ describe("connectSource — review fixes (WP-560 Ф3, cold review 02.09)", () =>
 
   it("same repository, index 'failed' → same recovery path", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: true, github_repository_id: REPO_ID, index_state: "failed" }]);
+    queryQueue.push([{ id: 17, index_generation: 1, active: true, github_repository_id: REPO_ID, index_state: "failed" }]);
     queryQueue.push([]); // findLiveReindexJob → nothing alive
     queryQueue.push([{ index_generation: 3 }]);
     queryQueue.push([{ id: "job-recover-2", generation: 3 }]);
@@ -1754,7 +1853,7 @@ describe("connectSource — review fixes (WP-560 Ф3, cold review 02.09)", () =>
 
   it("reconnect DURING a live reindex does not restart it: no generation bump, points at the running job", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: true, github_repository_id: REPO_ID, index_state: "reindexing" }]);
+    queryQueue.push([{ id: 17, index_generation: 1, active: true, github_repository_id: REPO_ID, index_state: "reindexing" }]);
     queryQueue.push([{ id: "job-live" }]); // findLiveReindexJob → running with fresh heartbeat
     queryQueue.push([]); // UPDATE ... COALESCE (plain reconnect)
 
@@ -1778,10 +1877,10 @@ describe("connectSource — review fixes (WP-560 Ф3, cold review 02.09)", () =>
     queryQueue.push([INSTALL_ROW]);
     queryQueue.push([]); // currentRows — none yet
     queryQueue.push([]); // INSERT ... DO NOTHING RETURNING → conflict, nothing inserted
-    queryQueue.push([{ active: true, github_repository_id: "111", index_state: "ready" }]); // winner bound another repo id
+    queryQueue.push([{ id: 17, index_generation: 1, active: true, github_repository_id: "111", index_state: "ready" }]); // winner bound another repo id
+    queryQueue.push([{ index_generation: 2 }]);
     queryQueue.push([]); // DELETE documents
     queryQueue.push([]); // DELETE status
-    queryQueue.push([{ index_generation: 2 }]);
     queryQueue.push([{ id: "job-race", generation: 2 }]);
 
     const result = await connectSource(ENV, "user-1", "DS-my-strategy", deps(Number(REPO_ID)));
@@ -1848,14 +1947,21 @@ describe("purgeSource", () => {
   });
 
   it("deletes documents, reindex_jobs, and the user_sources row (irreversible)", async () => {
-    queryQueue.push([{ source: "DS-my-strategy" }]); // sourceRows — found
+    queryQueue.push([{ id: 17, source: "DS-my-strategy" }]); // sourceRows — found
+    queryQueue.push([{ source: "DS-my-strategy" }]); // lock source until transaction commit
     queryQueue.push([{ cnt: 7 }]); // documents DELETE...RETURNING count
+    queryQueue.push([]); // DELETE file_index_status
     queryQueue.push([{ cnt: 2 }]); // reindex_jobs DELETE...RETURNING count
     queryQueue.push([]); // final DELETE user_sources
     const result = await purgeSource(ENV, "user-1", "DS-my-strategy");
     expect(result.status).toBe("purged");
     expect(result.documents_deleted).toBe(7);
     expect(result.jobs_deleted).toBe(2);
+    const statements = sqlCalls.map(([template]) => (template as TemplateStringsArray).join(" "));
+    expect(statements.findIndex(text => text.includes("FOR UPDATE")))
+      .toBeLessThan(statements.findIndex(text => text.includes("DELETE FROM")));
+    expect(sqlCalls.some(([template, ...values]) => (template as TemplateStringsArray).join(" ").includes("DELETE FROM")
+      && values.some(value => String(value).includes("file_index_status")))).toBe(true);
   });
 });
 
@@ -1903,9 +2009,7 @@ describe("personalGetDocumentWithSha (WP-7 Ф96 rework — live-first)", () => {
   });
 
   it("returns source_required on an index miss with several sources", async () => {
-    queryQueue.push([]); // ambiguity pre-check
     queryQueue.push([]); // v2 query
-    queryQueue.push([]); // legacy fallback
     queuedFetch([]);
     const twoSources = ctx({ sourceNames: ["DS-my-strategy", "DS-other"] });
     const result = await personalGetDocumentWithSha(ENV_WITH_APP, twoSources, "notes/unknown.md");
@@ -1996,13 +2100,13 @@ describe("writeToGitHub — sha case and length edge cases (WP-7 Ф96 round-2)",
 });
 
 describe("personalGetDocumentLive — sha shape validation (WP-7 Ф96 round-2)", () => {
-  it("returns null when GitHub hands back a malformed sha", async () => {
+  it("reports a malformed GitHub sha without treating it as a missing file", async () => {
     queuedFetch([
       ...installationTokenResponses(),
       responseJson({ sha: "not-a-real-sha", content: btoa("x"), encoding: "base64" }),
     ]);
-    const doc = await personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy");
-    expect(doc).toBeNull();
+    await expect(personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy"))
+      .rejects.toMatchObject({ code: "dependency_invalid_response", stage: "github_content" });
   });
 });
 
@@ -2056,5 +2160,236 @@ describe("writeToGitHub — enforced expected_sha on an existing path (WP-7 Ф99
     const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "update", "update", {}, CUR);
     expect(result.success).toBe(true);
     expect(result.reason).toBeUndefined();
+  });
+});
+
+
+describe("read failures remain distinguishable from missing documents", () => {
+  it("does not turn a source-context database failure into no connected sources", async () => {
+    queryQueue.push(new Error("synthetic database connection refused"));
+    await expect(resolveUserContext(ENV, "test-user")).rejects.toMatchObject({
+      code: "source_context_unavailable", stage: "context",
+    });
+    expect(sqlCalls).toHaveLength(1);
+  });
+
+  it.each([
+    ["document", () => personalGetDocument(ENV, ctx(), "note.md", "DS-my-strategy")],
+    ["sources", () => personalListSources(ENV, ctx())],
+    ["documents", () => personalListDocuments(ENV, ctx())],
+    ["paths", () => personalListPath(ENV, ctx())],
+  ] as const)("bounds a stalled %s query without declaring absence", async (_name, read) => {
+    vi.useFakeTimers();
+    queryQueue.push(new Promise(() => {}));
+    const assertion = expect(read()).rejects.toMatchObject({ code: "dependency_timeout", stage: "database" });
+    await vi.advanceTimersByTimeAsync(5_001);
+    await assertion;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps a keyword fallback database failure distinct from an empty search", async () => {
+    queuedFetch([responseJson({}, 403)]);
+    queryQueue.push(new Error("PRIVATE-DATABASE-DETAIL"));
+    await expect(personalSearchDocuments(ENV, ctx(), "finding my notes", undefined, 5))
+      .rejects.toMatchObject({ code: "dependency_unavailable", stage: "database" });
+  });
+
+  it.each([null, {}, { token: "" }])("identifies malformed installation-token responses at their own stage: %j", async body => {
+    queryQueue.push([{ installation_id: 42 }]);
+    queuedFetch([responseJson(body)]);
+    await expect(personalGetDocumentLive(ENV_WITH_APP, ctx(), "note.md", "DS-my-strategy"))
+      .rejects.toMatchObject({ code: "dependency_invalid_response", stage: "github_token" });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry embeddings before a long Retry-After", async () => {
+    queuedFetch([new Response("", { status: 429, headers: { "retry-after": "90" } })]);
+    await expect(personalGetEmbedding("synthetic", "query"))
+      .rejects.toMatchObject({ code: "dependency_rate_limited", retryAfterSeconds: 90 });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a malformed embedding before sending it to the vector database", async () => {
+    queuedFetch([responseJson({ data: [{ embedding: [1, 2] }] })]);
+    await expect(personalGetEmbedding("synthetic", "query"))
+      .rejects.toMatchObject({ code: "dependency_invalid_response", stage: "embeddings" });
+    expect(sqlCalls).toHaveLength(0);
+  });
+
+  it.each([403, 429, 503])("preserves GitHub Contents HTTP %i as an actionable failure", async status => {
+    queuedFetch([...installationTokenResponses(), responseJson({ message: "private upstream body" }, status)]);
+    await expect(personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy"))
+      .rejects.toMatchObject({ stage: "github_content", status });
+  });
+
+  it("preserves a GitHub installation-token refusal rather than claiming the file is absent", async () => {
+    queryQueue.push([{ installation_id: 42 }]);
+    queuedFetch([responseJson({ message: "private upstream body" }, 403)]);
+    await expect(personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy"))
+      .rejects.toMatchObject({ stage: "github_token", status: 403 });
+  });
+
+  it("falls back to scoped keyword search when embeddings refuse access, and marks degradation", async () => {
+    queuedFetch([responseJson({ error: "private upstream body" }, 403)]);
+    queryQueue.push([{ filename: "notes/idea.md", content: "keyword result", source: "DS-my-strategy", source_type: "ds", score: 0.8 }]);
+    const result = await personalSearchDocuments(ENV, ctx(), "finding my notes", "DS-my-strategy", 5);
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toBe("keyword result");
+    expect(result).toHaveProperty("degradation.status", 403);
+    const [template, ...values] = sqlCalls[0] as [TemplateStringsArray, ...unknown[]];
+    expect(template.join(" ")).toContain("user_id =");
+    expect(values).toContain(ctx().userId);
+    expect(values).toContainEqual(ctx().sourceNames);
+    expect(values).toContain("DS-my-strategy");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not expose provider response text in an embeddings failure", async () => {
+    queuedFetch([responseJson({ error: "PRIVATE-SENTINEL" }, 403)]);
+    let failure: unknown;
+    try { await personalGetEmbedding("synthetic-key", "synthetic query"); } catch (error) { failure = error; }
+    expect(failure).toMatchObject({ stage: "embeddings", status: 403 });
+    expect(String(failure)).not.toContain("PRIVATE-SENTINEL");
+  });
+});
+
+describe("private search shares one overall deadline", () => {
+  const hit = { filename: "notes/found.md", content: "found", source: "DS-my-strategy", source_type: "ds", score: 0.9 };
+  const embeddingResponse = () => responseJson({ data: [{ embedding: Array(1024).fill(0.1) }] });
+  const capture = <T>(pending: Promise<T>) => pending.then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
+
+  it("allows a healthy nine-second unscoped keyword query", async () => {
+    vi.useFakeTimers();
+    queryQueue.push(new Promise(resolve => setTimeout(() => resolve([hit]), 9_000)));
+    const outcome = capture(personalSearchDocuments(ENV, ctx(), "DP.ROLE.039", undefined));
+    await vi.advanceTimersByTimeAsync(9_001);
+    expect(await outcome).toMatchObject({ value: [expect.objectContaining({ filename: hit.filename })], error: undefined });
+    expect(sqlCalls).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("gives a low-confidence keyword fallback only the remainder after embedding and vector search", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(resolve => setTimeout(() => resolve(embeddingResponse()), 7_000))));
+    let finishVector!: (rows: unknown[]) => void;
+    queryQueue.push(new Promise(resolve => { finishVector = resolve; }), new Promise(() => {}));
+    const outcome = capture(personalSearchDocuments(ENV, ctx(), "finding my notes", undefined));
+    await vi.advanceTimersByTimeAsync(15_000);
+    finishVector([{ ...hit, score: 0.1 }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sqlCalls).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(5_001);
+    expect(await outcome).toMatchObject({ error: { code: "dependency_timeout", stage: "database" } });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("bounds a stalled embedding plus stalled keyword database by twenty seconds total", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+    queryQueue.push(new Promise(() => {}));
+    let settled = false;
+    const outcome = capture(personalSearchDocuments(ENV, ctx(), "finding my notes", undefined)).then(result => { settled = true; return result; });
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(sqlCalls).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(11_999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await outcome).toMatchObject({ error: { code: "dependency_timeout", stage: "database" } });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(sqlCalls).toHaveLength(1); // the fallback started at 8s; no new read starts at 20s
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not retry a rate-limited embedding when Retry-After exceeds the remaining budget", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(resolve => setTimeout(() => resolve(
+      new Response("", { status: 429, headers: { "Retry-After": "3" } }),
+    ), 1_000))));
+    const outcome = capture(personalGetEmbedding("synthetic-key", "finding my notes", Date.now() + 3_000));
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await outcome).toMatchObject({ error: { code: "dependency_rate_limited", stage: "embeddings", retryAfterSeconds: 3 } });
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(sqlCalls).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("caps embeddings by the remaining three seconds after a slow empty keyword search", async () => {
+    vi.useFakeTimers();
+    queryQueue.push(new Promise(resolve => setTimeout(() => resolve([]), 17_000)));
+    const embedding = vi.fn((_url: unknown, _init?: RequestInit) => new Promise<Response>(() => {}));
+    vi.stubGlobal("fetch", embedding);
+    const outcome = capture(personalSearchDocuments(ENV, ctx(), "DP.ROLE.039", undefined));
+    await vi.advanceTimersByTimeAsync(17_000);
+    expect(embedding).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(await outcome).toMatchObject({ error: { code: "dependency_timeout" } });
+    expect(embedding.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    expect(sqlCalls).toHaveLength(1); // expired budget must not start another SQL query
+  });
+
+  it("starts no next dependency when the initial keyword read exhausts the whole budget", async () => {
+    vi.useFakeTimers();
+    queryQueue.push(new Promise(resolve => setTimeout(() => resolve([]), 20_000)));
+    const embedding = vi.fn();
+    vi.stubGlobal("fetch", embedding);
+    const outcome = capture(personalSearchDocuments(ENV, ctx(), "DP.ROLE.039", undefined));
+    await vi.advanceTimersByTimeAsync(20_001);
+    expect(await outcome).toMatchObject({ error: { code: "dependency_timeout" } });
+    expect(sqlCalls).toHaveLength(1);
+    expect(embedding).not.toHaveBeenCalled();
+  });
+
+  it.each(["success", "timeout"])("applies the same shared budget to memory search (%s)", async (mode) => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(resolve => setTimeout(() => resolve(embeddingResponse()), 7_000))));
+    let finishQuery!: (rows: unknown[]) => void;
+    queryQueue.push(new Promise(resolve => { finishQuery = resolve; }));
+    const outcome = capture(personalMemorySearch(ENV, ctx(), "finding my notes", undefined));
+    await vi.advanceTimersByTimeAsync(16_000); // embedding 7s, database 9s
+    if (mode === "success") {
+      finishQuery([{ ...hit, base_score: 0.9, updated_at: new Date().toISOString() }]);
+      expect(await outcome).toMatchObject({ value: [expect.objectContaining({ filename: hit.filename })], error: undefined });
+    } else {
+      await vi.advanceTimersByTimeAsync(4_001);
+      expect(await outcome).toMatchObject({ error: { code: "dependency_timeout", stage: "database" } });
+    }
+    expect(sqlCalls).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+
+it("reads all v2 chunks and legacy fallback in one document snapshot", async () => {
+  queryQueue.push([
+    { filename: "note.md", content: "one ", source: "DS-my-strategy", source_type: "ds", protocol_version: 2, chunk_ordinal: 1 },
+    { filename: "note.md", content: "two", source: "DS-my-strategy", source_type: "ds", protocol_version: 2, chunk_ordinal: 2 },
+    { filename: "note.md::old", content: "stale fragment", source: "DS-my-strategy", source_type: "ds", protocol_version: 1, chunk_ordinal: null },
+  ]);
+  const doc = await personalGetDocument(ENV, ctx(), "note.md", "DS-my-strategy");
+  expect(doc?.content).toBe("one two");
+  expect(sqlCalls).toHaveLength(1);
+  const statement = (sqlCalls[0][0] as TemplateStringsArray).join(" ");
+  expect(statement).toContain("PARTITION BY source");
+  expect(statement).toContain("OR representation_rank = 1");
+});
+
+describe("private search stage diagnostics", () => {
+  it("marks a stalled keyword read and returns a typed timeout without logging private inputs", async () => {
+    vi.useFakeTimers();
+    const logs = vi.spyOn(console, "info").mockImplementation(() => {});
+    queryQueue.push(new Promise(() => {}));
+    const pending = personalSearchDocuments(ENV, ctx(), "DP.ROLE.039 PRIVATE-QUERY", undefined);
+    const assertion = expect(pending).rejects.toMatchObject({ code: "dependency_timeout", stage: "database" });
+    expect(logs.mock.calls.map(([line]) => JSON.parse(line).stage)).toEqual(["search", "keyword"]);
+    await vi.advanceTimersByTimeAsync(20_000);
+    await assertion;
+    const events = logs.mock.calls.map(([line]) => JSON.parse(line));
+    expect(events.filter(row => row.phase === "end").map(row => [row.stage, row.outcome])).toEqual([["keyword", "error"], ["search", "error"]]);
+    expect(new Set(events.map(row => row.trace_id)).size).toBe(1);
+    expect(JSON.stringify(events)).not.toContain("PRIVATE-QUERY");
+    expect(JSON.stringify(events)).not.toContain(ctx().userId);
+    expect(sqlCalls).toHaveLength(1);
+    logs.mockRestore();
   });
 });

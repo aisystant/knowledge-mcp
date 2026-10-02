@@ -9,7 +9,7 @@
 // unknown-source early-return path is covered there) — this is an accepted gap, closed by the
 // live Ory-JWT smoke required after every WP-410 cut-over group, not by unit tests.
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 let queryQueue: (unknown[] | Error)[] = [];
 let sqlCalls: unknown[][] = [];
@@ -72,6 +72,8 @@ beforeEach(() => {
   vi.mocked(getInstallationToken).mockClear();
 });
 
+afterEach(() => vi.unstubAllGlobals());
+
 const ENV: ReindexEnv = {
   DATABASE_URL: "postgres://fake",
   OPENROUTER_API_KEY: "fake-key",
@@ -83,6 +85,13 @@ const USER_ID = "11111111-1111-1111-1111-111111111111";
 
 function sourceRow(pathPrefix: string = "") {
   return { source: "DS-my-strategy", github_owner: "TserenTserenov", github_repo: "DS-my-strategy", path_prefix: pathPrefix, source_type: "ds" };
+}
+
+function emptyRepositoryFetch() {
+  return vi.fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ default_branch: "main" }) })
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ commit: { sha: "a".repeat(40) } }) })
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ tree: [], truncated: false }) });
 }
 
 function latestSqlCallContaining(fragment: string): unknown[] {
@@ -190,7 +199,9 @@ describe("personalReindexFiles", () => {
 
   it("errors on a source the user hasn't connected", async () => {
     queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([{ index_generation: 3 }]); // generation pre-check
     const result = await personalReindexFiles(ENV, {
+      job_id: "job-test", generation: 3,
       source: "not-connected", files: [{ path: "a.md", action: "modified" }], user_id: USER_ID,
     });
     expect(result.errors[0]).toContain("Unknown source: not-connected");
@@ -198,9 +209,11 @@ describe("personalReindexFiles", () => {
 
   it("skips non-markdown files without reading GitHub", async () => {
     queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([{ index_generation: 3 }]); // generation pre-check
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn();
     const result = await personalReindexFiles(ENV, {
+      job_id: "job-test", generation: 3,
       source: "DS-my-strategy", files: [{ path: "image.png", action: "modified" }], user_id: USER_ID,
     });
     expect(result.skipped).toBe(1);
@@ -211,10 +224,12 @@ describe("personalReindexFiles", () => {
 
   it.each(["a\\b.md", "\\a.md"])("rejects invalid path %s before GitHub fetch", async path => {
     queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([{ index_generation: 3 }]); // generation pre-check
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn();
 
     const result = await personalReindexFiles(ENV, {
+      job_id: "job-test", generation: 3,
       source: "DS-my-strategy", files: [{ path, action: "modified" }], user_id: USER_ID,
     });
 
@@ -225,12 +240,15 @@ describe("personalReindexFiles", () => {
 
   it("deletes on action=removed without reading GitHub", async () => {
     queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([{ index_generation: 3 }]); // generation pre-check
+    queryQueue.push([{ fence: 1 }], [{ job_fence: 1 }]); // publishing guards
     queryQueue.push([]); // DELETE documents result (ignored)
     queryQueue.push([]); // DELETE file_index_status result (ignored) — WP-7 Ф97.2
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn();
     const path = "gone%_file.md";
     const result = await personalReindexFiles(ENV, {
+      job_id: "job-test", generation: 3,
       source: "DS-my-strategy", files: [{ path, action: "removed" }], user_id: USER_ID,
     });
     expect(result.deleted).toBe(1);
@@ -252,12 +270,14 @@ describe("personalReindexFiles", () => {
     const hash = await contentHash("unchanged content");
     const path = "docs/cafe\u0301_%#? file.md";
     queryQueue.push([sourceRow(pathPrefix)]); // resolveUserContext
+    queryQueue.push([{ index_generation: 3 }]); // generation pre-check
     queryQueue.push([{ hash, protocol_version: 2 }]); // hash check — matches, already backfilled (merged Ф94 skip needs v2)
 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn().mockResolvedValueOnce({ ok: true, text: async () => "unchanged content" }); // file content
 
     const result = await personalReindexFiles(ENV, {
+      job_id: "job-test", generation: 3,
       source: "DS-my-strategy", files: [{ path, action: "modified" }], user_id: USER_ID,
     });
     expect(result.skipped).toBe(1);
@@ -272,10 +292,12 @@ describe("personalReindexFiles", () => {
 
   it("rejects an invalid configured prefix before token acquisition or fetch", async () => {
     queryQueue.push([sourceRow("../outside")]); // resolveUserContext
+    queryQueue.push([{ index_generation: 3 }]); // generation pre-check
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn();
 
     const result = await personalReindexFiles(ENV, {
+      job_id: "job-test", generation: 3,
       source: "DS-my-strategy",
       files: [{ path: "note.md", action: "modified" }],
       user_id: USER_ID,
@@ -290,14 +312,16 @@ describe("personalReindexFiles", () => {
   it("does NOT skip an unchanged file still on legacy protocol_version — backfills it (WP-7 Ф94 regression)", async () => {
     const hash = await contentHash("unchanged legacy content");
     queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([{ index_generation: 3 }]); // generation pre-check
     queryQueue.push([{ hash, protocol_version: 1 }]); // hash matches, but still legacy
 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn()
       .mockResolvedValueOnce({ ok: true, text: async () => "unchanged legacy content" })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [{ embedding: [0.1, 0.2, 0.3] }] }) }); // embedding
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [{ embedding: Array(1024).fill(0.1) }] }) }); // embedding
 
     const result = await personalReindexFiles(ENV, {
+      job_id: "job-test", generation: 3,
       source: "DS-my-strategy", files: [{ path: "note.md", action: "modified" }], user_id: USER_ID,
     });
     expect(result.skipped).toBe(0);
@@ -308,7 +332,9 @@ describe("personalReindexFiles", () => {
   it("processes a changed file: reads GitHub, embeds, and inserts", async () => {
     const path = "note%_file.md";
     queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([{ index_generation: 3 }]); // generation pre-check
     queryQueue.push([{ hash: "0000000000000000" }]); // hash check — different, proceed
+    queryQueue.push([{ fence: 1 }], [{ job_fence: 1 }]); // publishing guards
     queryQueue.push([]); // DELETE old chunks
     queryQueue.push([]); // INSERT result (ignored)
     queryQueue.push([]); // UPSERT file_index_status success (ignored) — WP-7 Ф97.2
@@ -316,9 +342,10 @@ describe("personalReindexFiles", () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn()
       .mockResolvedValueOnce({ ok: true, text: async () => "new content" })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [{ embedding: [0.1, 0.2, 0.3] }] }) }); // embedding
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [{ embedding: Array(1024).fill(0.1) }] }) }); // embedding
 
     const result = await personalReindexFiles(ENV, {
+      job_id: "job-test", generation: 3,
       source: "DS-my-strategy", files: [{ path, action: "modified" }], user_id: USER_ID,
     });
     expect(result.processed).toBe(1);
@@ -444,7 +471,8 @@ describe("startReindexJob", () => {
 
     const result = await startReindexJob(env, USER_ID, "DS-my-strategy");
 
-    expect(result.message).toContain("No files");
+    expect(result.status).toBe("failed");
+    expect(result.message).toContain("default branch");
     expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     expect(sendBatch).not.toHaveBeenCalled();
     globalThis.fetch = originalFetch;
@@ -467,11 +495,69 @@ describe("startReindexJob", () => {
 
     const result = await startReindexJob(env, USER_ID, "DS-my-strategy");
 
-    expect(result.message).toContain("No files");
+    expect(result.status).toBe("failed");
+    expect(result.message).toContain("prefix");
     expect(getInstallationToken).not.toHaveBeenCalled();
     expect(globalThis.fetch).not.toHaveBeenCalled();
     expect(sendBatch).not.toHaveBeenCalled();
     globalThis.fetch = originalFetch;
+  });
+});
+
+describe("reindex enumeration failures", () => {
+  const repository = { default_branch: "main" };
+  const branch = { commit: { sha: "a".repeat(40) } };
+  const entry = { path: "note.md", type: "blob", mode: "100644", sha: "b".repeat(40) };
+
+  it.each([
+    { name: "repository 503", responses: [503] },
+    { name: "branch 403", responses: [repository, 403] },
+    { name: "missing branch commit", responses: [repository, {}] },
+    { name: "tree 429", responses: [repository, branch, 429] },
+    { name: "missing tree", responses: [repository, branch, {}] },
+    { name: "malformed tree", responses: [repository, branch, { tree: {} }] },
+    { name: "truncated tree", responses: [repository, branch, { tree: [entry], truncated: true }] },
+  ])("fails $name without publishing an empty or partial successful index", async ({ responses }) => {
+    queryQueue.push([], [{ id: "job-enumeration", generation: 3 }], [sourceRow()]);
+    const fetchMock = vi.fn();
+    for (const response of responses) {
+      fetchMock.mockResolvedValueOnce(typeof response === "number"
+        ? { ok: false, status: response }
+        : { ok: true, json: async () => response });
+    }
+    vi.stubGlobal("fetch", fetchMock);
+    const sendBatch = vi.fn();
+    const result = await startReindexJob({ ...ENV, REINDEX_QUEUE: { sendBatch } as unknown as Queue<ReindexBatchMessage> }, USER_ID, "DS-my-strategy");
+
+    expect(result.status).toBe("failed");
+    expect(sendBatch).not.toHaveBeenCalled();
+    expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("status = 'succeeded'"))).toBe(false);
+    const sourceState = latestSqlCallContaining("index_state = 'reindexing' AND index_generation =");
+    expect(sourceState[2]).toBe("failed");
+    expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("DELETE FROM"))).toBe(false);
+  });
+
+  it("fails when no installation token is available", async () => {
+    queryQueue.push([], [{ id: "job-token", generation: 3 }], [sourceRow()]);
+    vi.mocked(getInstallationToken).mockResolvedValueOnce(null);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const sendBatch = vi.fn();
+    const result = await startReindexJob({ ...ENV, REINDEX_QUEUE: { sendBatch } as unknown as Queue<ReindexBatchMessage> }, USER_ID, "DS-my-strategy");
+    expect(result.status).toBe("failed");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(sendBatch).not.toHaveBeenCalled();
+  });
+
+  it("still accepts a successfully enumerated empty repository", async () => {
+    queryQueue.push([], [{ id: "job-empty", generation: 3 }], [sourceRow()]);
+    vi.stubGlobal("fetch", emptyRepositoryFetch());
+    const sendBatch = vi.fn();
+    const result = await startReindexJob({ ...ENV, REINDEX_QUEUE: { sendBatch } as unknown as Queue<ReindexBatchMessage> }, USER_ID, "DS-my-strategy");
+    expect(result.message).toContain("No files");
+    expect(sendBatch).not.toHaveBeenCalled();
+    expect(latestSqlCallContaining("status = 'succeeded'")).toBeDefined();
+    expect(latestSqlCallContaining("index_state = 'reindexing' AND index_generation =")[2]).toBe("ready");
   });
 });
 
@@ -480,6 +566,7 @@ describe("generation fencing (WP-560 Ф3)", () => {
     queryQueue.push([sourceRow()]); // resolveUserContext (includeReindexing)
     queryQueue.push([{ index_generation: "4" }]); // current generation ≠ job's 3
     const result = await personalReindexFiles(ENV, {
+      job_id: "job-test",
       source: "DS-my-strategy", user_id: USER_ID, generation: 3,
       files: [{ path: "gone.md", action: "removed" }],
     });
@@ -492,9 +579,11 @@ describe("generation fencing (WP-560 Ф3)", () => {
     queryQueue.push([sourceRow()]); // resolveUserContext
     queryQueue.push([{ index_generation: 3 }]); // pre-check passes
     queryQueue.push([{ fence: 1 }]); // fence statement
+    queryQueue.push([{ job_fence: 1 }]); // job identity
     queryQueue.push([]); // DELETE documents
     queryQueue.push([]); // DELETE status
     const result = await personalReindexFiles(ENV, {
+      job_id: "job-test",
       source: "DS-my-strategy", user_id: USER_ID, generation: 3,
       files: [{ path: "gone.md", action: "removed" }],
     });
@@ -502,6 +591,7 @@ describe("generation fencing (WP-560 Ф3)", () => {
     expect(result.deleted).toBe(1);
     const fence = latestSqlCallContaining("AS fence") as unknown[];
     expect((fence[0] as TemplateStringsArray).join(" ")).toContain("index_generation =");
+    expect((fence[0] as TemplateStringsArray).join(" ")).toContain("FOR UPDATE");
     expect(fence[4]).toBe(3); // params: [table, userId, source, generation]
   });
 
@@ -510,6 +600,7 @@ describe("generation fencing (WP-560 Ф3)", () => {
     queryQueue.push([{ index_generation: 3 }]); // pre-check passes (race: bump happens right after)
     queryQueue.push(new Error("division by zero")); // fence raises inside the transaction
     const result = await personalReindexFiles(ENV, {
+      job_id: "job-test",
       source: "DS-my-strategy", user_id: USER_ID, generation: 3,
       files: [{ path: "gone.md", action: "removed" }, { path: "other.md", action: "removed" }],
     });
@@ -518,16 +609,19 @@ describe("generation fencing (WP-560 Ф3)", () => {
     expect(result.deleted).toBe(0);
   });
 
-  it("legacy job without generation is unfenced (no pre-check, no fence statement)", async () => {
-    queryQueue.push([sourceRow()]); // resolveUserContext
-    queryQueue.push([]); // DELETE documents
-    queryQueue.push([]); // DELETE status
+  it.each([
+    { generation: null, job_id: "job-test" },
+    { generation: 3, job_id: undefined },
+  ])("rejects incomplete processing identity before any SQL: %j", async identity => {
     const result = await personalReindexFiles(ENV, {
-      source: "DS-my-strategy", user_id: USER_ID, generation: null,
+      ...identity,
+      source: "DS-my-strategy", user_id: USER_ID,
       files: [{ path: "gone.md", action: "removed" }],
     });
-    expect(result.deleted).toBe(1);
-    expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("AS fence"))).toBe(false);
+    expect(result.deleted).toBe(0);
+    expect(result.stale).toBe(true);
+    expect(result.errors[0]).toContain("Missing job identity or generation");
+    expect(sqlCalls).toHaveLength(0);
   });
 
   it("handleQueue cancels and acks a superseded job instead of retrying it", async () => {
@@ -548,6 +642,7 @@ describe("generation fencing (WP-560 Ф3)", () => {
     queryQueue.push([sourceRow()]); // resolveUserContext
     queryQueue.push([{ index_generation: 3 }]); // pre-check
     queryQueue.push([{ fence: 1 }]); // fence
+    queryQueue.push([{ job_fence: 1 }]); // queue identity, fresh statement after the lock
     queryQueue.push([]); // DELETE documents
     queryQueue.push([]); // DELETE status
     queryQueue.push([{ completed_batches: 1, expected_batches: 1 }]); // UPDATE ... RETURNING
@@ -559,6 +654,12 @@ describe("generation fencing (WP-560 Ф3)", () => {
     const ready = latestSqlCallContaining("index_state = 'reindexing' AND index_generation =") as unknown[];
     expect(ready[2]).toBe("ready"); // params: [table, state, userId, source, generation]
     expect(ready[5]).toBe(3);
+    expect(ready).toContain("job-3");
+    expect((ready[0] as TemplateStringsArray).join(" ")).toContain("AND EXISTS");
+    const stateLock = sqlCalls.find(([t]) => (t as TemplateStringsArray).join(" ").includes("SELECT source FROM")
+      && (t as TemplateStringsArray).join(" ").includes("FOR UPDATE"));
+    expect(stateLock).toBeDefined();
+    expect(sqlCalls.indexOf(stateLock!)).toBeLessThan(sqlCalls.indexOf(ready));
   });
 
   it("startReindexJob with a pre-created rebind job skips cooldown and reads the job's generation", async () => {
@@ -568,7 +669,7 @@ describe("generation fencing (WP-560 Ф3)", () => {
     queryQueue.push([]); // UPDATE succeeded
     queryQueue.push([]); // user_sources index_state='ready' (fenced)
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({}) });
+    globalThis.fetch = emptyRepositoryFetch();
     const env = { ...ENV, REINDEX_QUEUE: { sendBatch: vi.fn() } as unknown as Queue<ReindexBatchMessage> };
 
     const result = await startReindexJob(env, USER_ID, "DS-my-strategy", { jobId: "job-rebind" });
@@ -617,6 +718,7 @@ describe("generation fencing (WP-560 Ф3)", () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn().mockResolvedValueOnce({ ok: false, status: 500, json: async () => ({}) }); // readFromGitHub fails
     const result = await personalReindexFiles(ENV, {
+      job_id: "job-test",
       source: "DS-my-strategy", user_id: USER_ID, generation: 3,
       files: [{ path: "broken.md", action: "modified" }],
     });
@@ -650,12 +752,13 @@ describe("generation fencing (WP-560 Ф3)", () => {
     queryQueue.push([]); // UPDATE succeeded
     queryQueue.push([]); // ready (fenced, generation 7)
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({}) });
+    globalThis.fetch = emptyRepositoryFetch();
     const env = { ...ENV, REINDEX_QUEUE: { sendBatch: vi.fn() } as unknown as Queue<ReindexBatchMessage> };
     await startReindexJob(env, USER_ID, "DS-my-strategy");
     const insert = latestSqlCallContaining("(user_id, source, status, generation)") as unknown[];
     expect((insert[0] as TemplateStringsArray).join(" ")).toContain("SELECT");
     expect((insert[0] as TemplateStringsArray).join(" ")).toContain("index_generation");
+    expect((insert[0] as TemplateStringsArray).join(" ")).toContain("FOR UPDATE");
     globalThis.fetch = originalFetch;
   });
 });
@@ -703,6 +806,52 @@ describe("handleQueue", () => {
     return { messages, queue: "reindex", ackAll: vi.fn(), retryAll: vi.fn() } as unknown as MessageBatch<ReindexBatchMessage>;
   }
 
+  it.each(["full", "incremental"] as const)("finishes a %s job with a failed file as failed without discarding old chunks or retrying 403", async kind => {
+    const errors = ["Cannot read note.md from GitHub"];
+    queryQueue.push(
+      [{ status: "running", generation: 3, kind, completed_batch_indexes: [] }],
+      [sourceRow()], [{ index_generation: 3 }], [{ fence: 1 }], [{ job_fence: 1 }], [],
+      [{ completed_batches: 1, expected_batches: 1, errors }], [], [],
+    );
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 403 });
+    vi.stubGlobal("fetch", fetchMock);
+    const msg = makeMessage({ kind });
+    await handleQueue(makeBatch([msg]), ENV);
+
+    expect(msg.ack).toHaveBeenCalledOnce();
+    expect(msg.retry).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const completion = latestSqlCallContaining("finished_at = NOW()");
+    expect(completion).toContain("failed");
+    expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("DELETE FROM"))).toBe(false);
+    expect(latestSqlCallContaining("completed_batch_indexes = array_append")).toContain(JSON.stringify(errors));
+    const sourceUpdates = sqlCalls.filter(([t]) => (t as TemplateStringsArray).join(" ").includes("index_state = 'reindexing' AND index_generation ="));
+    if (kind === "full") expect(sourceUpdates[0][2]).toBe("failed");
+    else expect(sourceUpdates).toHaveLength(0);
+  });
+
+  it("does not forget an earlier batch's failure when the final file is successfully retained", async () => {
+    const content = "already indexed content";
+    const hash = await contentHash(content);
+    queryQueue.push(
+      [{ status: "running", generation: 3, kind: "full", completed_batch_indexes: [0] }],
+      [sourceRow()], [{ index_generation: 3 }], [{ hash, protocol_version: 2 }],
+      [{ fence: 1 }], [{ job_fence: 1 }], [],
+      [{ completed_batches: 2, expected_batches: 2, errors: ["earlier.md: embedding failed (403)"] }], [], [],
+    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, text: async () => content }));
+    const msg = makeMessage({ kind: "full", batch_index: 1 });
+    await handleQueue(makeBatch([msg]), ENV);
+
+    expect(msg.ack).toHaveBeenCalledOnce();
+    expect(msg.retry).not.toHaveBeenCalled();
+    expect(latestSqlCallContaining("finished_at = NOW()")).toContain("failed");
+    expect(latestSqlCallContaining("index_state = 'reindexing' AND index_generation =")[2]).toBe("failed");
+    expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("DELETE FROM"))).toBe(false);
+    // The final batch itself succeeded; job completion must use accumulated errors.
+    expect(latestSqlCallContaining("completed_batch_indexes = array_append")).toContain("[]");
+  });
+
   it("acks and skips a message whose job no longer exists", async () => {
     queryQueue.push([]); // SELECT status → not found
     const msg = makeMessage();
@@ -718,9 +867,46 @@ describe("handleQueue", () => {
     expect(msg.ack).toHaveBeenCalledOnce();
   });
 
+  it("cancels a legacy job without generation and asks for a new reindex without reading files", async () => {
+    queryQueue.push([{ status: "running", generation: null }], []);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const msg = makeMessage();
+    await handleQueue(makeBatch([msg]), ENV);
+    expect(msg.ack).toHaveBeenCalledOnce();
+    expect(msg.retry).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(getInstallationToken).not.toHaveBeenCalled();
+    const cancellation = latestSqlCallContaining("status = 'cancelled'");
+    expect((cancellation[0] as TemplateStringsArray).join(" ")).toContain("missing_generation: start a new reindex");
+    expect(sqlCalls).toHaveLength(2);
+  });
+
+  it("cancels an old job whose identity was purged even if the source generation was reused", async () => {
+    queryQueue.push(
+      [{ status: "running", generation: 1, kind: "full", completed_batch_indexes: [] }],
+      [sourceRow()], [{ index_generation: 1 }], [{ fence: 1 }], new Error("division by zero"),
+      [], [], [],
+    );
+    const msg = makeMessage({ kind: "full", files: [{ path: "old.md", action: "removed" }] });
+    await handleQueue(makeBatch([msg]), ENV);
+    expect(msg.ack).toHaveBeenCalledOnce();
+    expect(msg.retry).not.toHaveBeenCalled();
+    const fence = latestSqlCallContaining("AS fence");
+    const identity = latestSqlCallContaining("AS job_fence");
+    expect(sqlCalls.indexOf(identity)).toBeGreaterThan(sqlCalls.indexOf(fence));
+    expect(identity).toContain("job-1");
+    expect(identity).toContain(USER_ID);
+    expect(identity).toContain("DS-my-strategy");
+    expect((identity[0] as TemplateStringsArray).join(" ")).toContain("status = 'running'");
+    expect(latestSqlCallContaining("status = 'cancelled'")).toBeDefined();
+    expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("completed_batches = completed_batches + 1"))).toBe(false);
+  });
+
   it("retries a message when its own job-update query fails", async () => {
-    queryQueue.push([{ status: "running" }]); // SELECT status
+    queryQueue.push([{ status: "running", generation: 3 }]); // SELECT status
     queryQueue.push([sourceRow()]); // resolveUserContext inside personalReindexFiles
+    queryQueue.push([{ index_generation: 3 }]); // generation pre-check
     queryQueue.push(new Error("connection reset")); // UPDATE ... RETURNING throws
 
     const msg = makeMessage({ files: [] }); // empty batch — personalReindexFiles no-ops, no further DB/fetch calls
@@ -750,7 +936,11 @@ describe("handleQueue", () => {
     // makeMessage/jobRows both omitting `kind`) must NOT, even on a real last-batch completion.
     queryQueue.push([{ status: "running", generation: 3, kind: "incremental", completed_batch_indexes: [] }]); // SELECT status
     queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([{ index_generation: 3 }]); // generation pre-check
+    queryQueue.push([{ fence: 1 }]); // source lock
+    queryQueue.push([{ job_fence: 1 }]); // job identity
     queryQueue.push([]); // DELETE (removed action)
+    queryQueue.push([]); // DELETE file status
     queryQueue.push([{ completed_batches: 2, expected_batches: 2 }]); // UPDATE ... RETURNING
     queryQueue.push([]); // final UPDATE status='succeeded' (no RETURNING consumed)
 
@@ -816,6 +1006,7 @@ describe("startIncrementalReindexJob (WP-545 Ф13)", () => {
     expect(sentBatch[0].body).toMatchObject({ job_id: "job-inc-2", kind: "incremental", batch_index: 0 });
 
     const insertCall = latestSqlCallContaining("kind") as unknown[];
+    expect((insertCall[0] as TemplateStringsArray).join(" ")).toContain("FOR UPDATE");
     expect((insertCall[0] as TemplateStringsArray).join(" ")).toContain("INSERT INTO");
   });
 
