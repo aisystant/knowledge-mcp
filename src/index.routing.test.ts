@@ -1,3 +1,4 @@
+import { ReadFailure } from "./read-failure.js";
 // Integration-level routing test for the dual-mode dispatcher (WP-410 срез-2b).
 //
 // Reviewer finding (peer-session 2026-07-01-27, cold-review): the invariant "private mode
@@ -117,7 +118,7 @@ vi.mock("./layers/private.js", async (importOriginal) => {
 });
 
 const { handleMcpRequest, default: worker } = await import("./index.js");
-const { personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalListSources, personalListDocuments, personalListPath, writeToGitHub } = await import("./layers/personal.js");
+const { resolveUserContext, personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalListSources, personalListDocuments, personalListPath, writeToGitHub } = await import("./layers/personal.js");
 
 const ENV = {
   KNOWLEDGE_DATABASE_URL: "postgres://fake-public",
@@ -544,4 +545,34 @@ describe("/reindex-full and /provision-bridge-scopes (WP-545 Ф5, ported from pe
     const body = await res.json() as { reason: string };
     expect(body.reason).toBe("missing_source");
   });
+});
+
+
+describe("private read contract", () => {
+  it("honors headings without returning the document body", async () => {
+    vi.mocked(personalGetDocument).mockResolvedValueOnce({
+      filename: "note.md", content: "# First\nPRIVATE BODY\n## Second", source: "DS-my-strategy", source_type: "ds", github_url: null,
+    });
+    const result = await callTool("get_document", { filename: "note.md", source: "DS-my-strategy", format: "headings" }, "private") as { result: {content: [{text: string}]} };
+    expect(JSON.parse(result.result.content[0].text)).toEqual({ filename: "note.md", headings: [{level:1,title:"First"},{level:2,title:"Second"}] });
+    expect(result.result.content[0].text).not.toContain("PRIVATE BODY");
+  });
+});
+
+
+it("returns an explicit tool failure when the source context cannot be loaded", async () => {
+  vi.mocked(resolveUserContext).mockRejectedValueOnce(new ReadFailure("source_context_unavailable", "context"));
+  const result = await callTool("get_document", { filename: "note.md" }, "private") as { result: {isError: boolean; content: [{text:string}]} };
+  expect(result.result.isError).toBe(true);
+  expect(JSON.parse(result.result.content[0].text).error).toBe("source_context_unavailable");
+  expect(personalGetDocument).not.toHaveBeenCalled();
+});
+
+it.each([true, false])("preserves the semantic-search degradation notice (empty=%s)", async empty => {
+  const rows = empty ? [] : [{ filename:"note.md", content:"keyword match", source:"DS-my-strategy",source_type:"ds",score:1,github_url:null }];
+  vi.mocked(personalSearchDocuments).mockResolvedValueOnce(Object.assign(rows, {degradation:new ReadFailure("dependency_access_denied","embeddings",403).toJSON()}));
+  const result = await callTool("search", { query:"find my notes" }, "private") as { result: {isError?: boolean;content:{text:string}[]} };
+  expect(JSON.parse(result.result.content[0].text)).toEqual([...rows]);
+  expect(result.result.content[1].text).toContain("Смысловой поиск недоступен");
+  expect(result.result.isError === true).toBe(empty);
 });

@@ -1,3 +1,4 @@
+import { ReadFailure } from "./read-failure.js";
 /**
  * Knowledge MCP Server v4.1 — L2 Platform — Hybrid Search + Parent Retrieval + LLM Reranking + Feedback Loop
  *
@@ -1270,21 +1271,16 @@ async function getDocumentStructure(
   const doc = await getDocument(env, filename, source, userId);
   if (!doc) return null;
 
-  const headings: DocumentHeading[] = [];
-  for (const line of doc.content.split("\n")) {
-    const match = line.match(/^(#{1,6})\s+(.+)$/);
-    if (match) {
-      headings.push({
-        level: match[1].length,
-        title: match[2].trim(),
-      });
-    }
-  }
+  return { filename: doc.filename, headings: documentHeadings(doc.content) };
+}
 
-  return {
-    filename: doc.filename,
-    headings,
-  };
+function documentHeadings(content: string): DocumentHeading[] {
+  const headings: DocumentHeading[] = [];
+  for (const line of content.split("\n")) {
+    const match = line.match(/^(#{1,6})\s+(.+)$/);
+    if (match) headings.push({ level: match[1].length, title: match[2].trim() });
+  }
+  return headings;
 }
 
 // WP-7 Ф117: extractTitle/PathEntry/buildPathTree moved to ./path-tree.ts so layers/personal.ts
@@ -3397,7 +3393,14 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
               args.source as string | undefined,
               (args.limit as number) || 5
             );
-            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] } };
+            const content: { type: "text"; text: string }[] = [{ type: "text", text: JSON.stringify(results, null, 2) }];
+            if (results.degradation) {
+              content.push({ type: "text", text: JSON.stringify({
+                warning: "Смысловой поиск недоступен; выполнен только поиск по тексту. Пустой результат не доказывает отсутствие документа.",
+                diagnostic: results.degradation,
+              }) });
+            }
+            return { jsonrpc: "2.0", id, result: { content, ...(results.degradation && results.length === 0 ? { isError: true } : {}) } };
           }
 
           if (toolName === "get_document") {
@@ -3453,7 +3456,10 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             if (!doc) {
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Document not found" }], isError: true } };
             }
-            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: doc.content }] } };
+            const text = args.format === "headings"
+              ? JSON.stringify({ filename: doc.filename, headings: documentHeadings(doc.content) }, null, 2)
+              : doc.content;
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text }] } };
           }
 
           if (toolName === "list_documents") {
@@ -3936,6 +3942,12 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
         return { jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } };
     }
   } catch (err) {
+    if (err instanceof ReadFailure) {
+      console.warn(JSON.stringify({ event: "read_dependency_failed", ...err.toJSON() }));
+      return { jsonrpc: "2.0", id, result: {
+        content: [{ type: "text", text: JSON.stringify(err.toJSON()) }], isError: true,
+      } };
+    }
     return {
       jsonrpc: "2.0",
       id,

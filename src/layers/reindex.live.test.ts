@@ -51,6 +51,7 @@ const DB_URL = process.env.LIVE_NEON_DATABASE_URL;
 describe.skipIf(!RUN_LIVE || !DB_URL)("personalReindexFiles — live Neon idempotency (opt-in)", () => {
   const TEST_SOURCE = `test-live-f972-${randomUUID().slice(0, 8)}`;
   const TEST_USER_ID = "test-live-f972-user";
+  const TEST_JOB_ID = randomUUID();
   const TEST_PATH = "live-test-file.md";
   const TEST_CONTENT = "Live idempotency test content — WP-7 Ф97.2 remainder.";
   const FAKE_EMBEDDING = Array(1024).fill(0.01);
@@ -72,6 +73,7 @@ describe.skipIf(!RUN_LIVE || !DB_URL)("personalReindexFiles — live Neon idempo
   let documentsTable: string;
   let statusTable: string;
   let userSourcesTable: string;
+  let reindexJobsTable: string;
 
   beforeAll(async () => {
     sql = personalDb(ENV);
@@ -79,11 +81,16 @@ describe.skipIf(!RUN_LIVE || !DB_URL)("personalReindexFiles — live Neon idempo
     documentsTable = KNOWLEDGE_TABLES.documents(schema);
     statusTable = KNOWLEDGE_TABLES.file_index_status(schema);
     userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
+    reindexJobsTable = KNOWLEDGE_TABLES.reindex_jobs(schema);
 
     await sql`
       INSERT INTO ${sql.unsafe(userSourcesTable)}
-        (user_id, source, github_owner, github_repo, path_prefix, source_type)
-      VALUES (${TEST_USER_ID}, ${TEST_SOURCE}, 'test-owner', 'test-repo', '', 'ds')
+        (user_id, source, github_owner, github_repo, path_prefix, source_type, index_generation)
+      VALUES (${TEST_USER_ID}, ${TEST_SOURCE}, 'test-owner', 'test-repo', '', 'ds', 1)
+    `;
+    await sql`
+      INSERT INTO ${sql.unsafe(reindexJobsTable)} (id, user_id, source, generation, status)
+      VALUES (${TEST_JOB_ID}::uuid, ${TEST_USER_ID}, ${TEST_SOURCE}, 1, 'running')
     `;
   });
 
@@ -95,7 +102,7 @@ describe.skipIf(!RUN_LIVE || !DB_URL)("personalReindexFiles — live Neon idempo
     // statement and left an orphaned user_sources row behind (found live,
     // cleaned up manually). Each DELETE now runs independently so a failure
     // in one never skips the others.
-    for (const table of [statusTable, documentsTable, userSourcesTable]) {
+    for (const table of [statusTable, documentsTable, reindexJobsTable, userSourcesTable]) {
       try {
         // Scoped by user_id AND source (not source alone) — defense in depth
         // matching file_index_status's own PK shape, even though TEST_SOURCE's
@@ -137,6 +144,7 @@ describe.skipIf(!RUN_LIVE || !DB_URL)("personalReindexFiles — live Neon idempo
       mockFetchOnce();
       const first = await personalReindexFiles(ENV, {
         source: TEST_SOURCE, files: [{ path: TEST_PATH, action: "modified" }], user_id: TEST_USER_ID,
+        generation: 1, job_id: TEST_JOB_ID,
       });
       expect(first.processed).toBe(1);
       expect(first.errors).toEqual([]);
@@ -160,6 +168,7 @@ describe.skipIf(!RUN_LIVE || !DB_URL)("personalReindexFiles — live Neon idempo
       mockFetchOnce();
       const retry = await personalReindexFiles(ENV, {
         source: TEST_SOURCE, files: [{ path: TEST_PATH, action: "modified" }], user_id: TEST_USER_ID,
+        generation: 1, job_id: TEST_JOB_ID,
       });
       // Hash-match skip path (existing logic) — not reprocessed, but status
       // upsert still fires (WP-7 Ф97.2 round-1 consensus: skip must confirm
