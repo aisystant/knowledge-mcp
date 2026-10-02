@@ -1229,6 +1229,13 @@ const VECTOR_CONFIDENCE_THRESHOLD = 0.6;
 const OPENAI_MAX_ATTEMPTS = 4;
 const OPENAI_BASE_DELAY_MS = 500;
 const OPENAI_MAX_DELAY_MS = 10_000;
+const PERSONAL_SEARCH_BUDGET_MS = 20_000;
+
+function remainingSearchBudget(deadlineAt: number, stage: "database" | "embeddings"): number {
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) throw new ReadFailure("dependency_timeout", stage);
+  return remaining;
+}
 
 export type PersonalSearchResult = {
   filename: string;
@@ -1253,9 +1260,12 @@ function personalGithubUrl(ctx: UserContext, source: string, filename: string): 
 }
 
 // Exported for reuse by ./reindex.ts (WP-410 Деплой-2 группа Б) — same embedding call.
-export async function personalGetEmbedding(apiKey: string, text: string): Promise<number[]> {
+export async function personalGetEmbedding(apiKey: string, text: string, deadlineAt: number = Date.now() + 8_000): Promise<number[]> {
+  const embeddingDeadlineAt = Math.min(deadlineAt, Date.now() + 8_000);
+  const timeoutMs = remainingSearchBudget(embeddingDeadlineAt, "embeddings");
   return withReadDeadline("embeddings", async signal => {
     for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt++) {
+      remainingSearchBudget(embeddingDeadlineAt, "embeddings");
       signal.throwIfAborted();
       let response: Response;
       try {
@@ -1280,7 +1290,7 @@ export async function personalGetEmbedding(apiKey: string, text: string): Promis
       const delay = Math.max(error.retryAfterSeconds === undefined ? 0 : error.retryAfterSeconds * 1000,
         Math.min(OPENAI_BASE_DELAY_MS * Math.pow(2, attempt - 1), OPENAI_MAX_DELAY_MS));
       // Do not schedule an out-of-budget retry; the caller can honor Retry-After later.
-      if (delay >= 8_000) throw error;
+      if (delay >= remainingSearchBudget(embeddingDeadlineAt, "embeddings")) throw error;
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => { signal.removeEventListener("abort", aborted); resolve(); }, delay);
         const aborted = () => { clearTimeout(timer); reject(new ReadFailure("dependency_timeout", "embeddings")); };
@@ -1288,7 +1298,7 @@ export async function personalGetEmbedding(apiKey: string, text: string): Promis
       });
     }
     throw new ReadFailure("dependency_unavailable", "embeddings");
-  }, 8_000);
+  }, timeoutMs);
 }
 
 type PersonalQueryType = "keyword" | "vector";
@@ -1304,7 +1314,8 @@ async function personalKeywordSearch(
   ctx: UserContext,
   query: string,
   source: string | undefined,
-  limit: number
+  limit: number,
+  deadlineAt: number,
 ): Promise<PersonalSearchResult[]> {
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
@@ -1344,7 +1355,7 @@ async function personalKeywordSearch(
              CASE WHEN filename ILIKE ${pattern} THEN 0 ELSE 1 END,
              length(content) DESC
     LIMIT ${limit}
-  `, 5_000);
+  `, remainingSearchBudget(deadlineAt, "database"));
 
   return rows.map((r) => ({
     filename: r.filename as string,
@@ -1361,9 +1372,10 @@ async function personalVectorSearch(
   ctx: UserContext,
   query: string,
   source: string | undefined,
-  limit: number
+  limit: number,
+  deadlineAt: number,
 ): Promise<PersonalSearchResult[]> {
-  const embedding = await personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query);
+  const embedding = await personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query, deadlineAt);
   const vec = `[${embedding.join(",")}]`;
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
@@ -1380,7 +1392,7 @@ async function personalVectorSearch(
       AND (${src}::text IS NULL OR source = ${src})
     ORDER BY embedding <=> ${vec}::vector
     LIMIT ${limit}
-  `, 5_000);
+  `, remainingSearchBudget(deadlineAt, "database"));
 
   return rows.map((r) => ({
     filename: r.filename as string,
@@ -1400,25 +1412,26 @@ export async function personalSearchDocuments(
   source: string | undefined,
   limit: number = 5
 ): Promise<PersonalSearchResult[] & { degradation?: ReturnType<ReadFailure["toJSON"]> }> {
+  const deadlineAt = Date.now() + PERSONAL_SEARCH_BUDGET_MS;
   const queryType = detectPersonalQueryType(query);
 
   if (queryType === "keyword") {
-    const kwResults = await personalKeywordSearch(env, ctx, query, source, limit);
+    const kwResults = await personalKeywordSearch(env, ctx, query, source, limit, deadlineAt);
     if (kwResults.length > 0) return kwResults;
   }
 
   let vectorResults: PersonalSearchResult[];
   try {
-    vectorResults = await personalVectorSearch(env, ctx, query, source, limit);
+    vectorResults = await personalVectorSearch(env, ctx, query, source, limit, deadlineAt);
   } catch (error) {
     if (!(error instanceof ReadFailure) || error.stage !== "embeddings") throw error;
     console.warn(JSON.stringify({ event: "personal_search_keyword_fallback", ...error.toJSON() }));
-    const fallback = await personalKeywordSearch(env, ctx, query, source, limit);
+    const fallback = await personalKeywordSearch(env, ctx, query, source, limit, deadlineAt);
     return Object.assign(fallback, { degradation: error.toJSON() });
   }
 
   if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
-    const kwFallback = await personalKeywordSearch(env, ctx, query, source, limit);
+    const kwFallback = await personalKeywordSearch(env, ctx, query, source, limit, deadlineAt);
     if (kwFallback.length > 0) {
       const seen = new Map<string, PersonalSearchResult>();
       for (const r of [...kwFallback, ...vectorResults]) {
@@ -1440,7 +1453,8 @@ export async function personalMemorySearch(
   recencyDays: number | undefined,
   limit: number = 5
 ): Promise<PersonalMemorySearchResult[]> {
-  const embedding = await personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query);
+  const deadlineAt = Date.now() + PERSONAL_SEARCH_BUDGET_MS;
+  const embedding = await personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query, deadlineAt);
   const vec = `[${embedding.join(",")}]`;
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
@@ -1457,7 +1471,7 @@ export async function personalMemorySearch(
       AND (${cutoff}::timestamptz IS NULL OR updated_at >= ${cutoff}::timestamptz)
     ORDER BY embedding <=> ${vec}::vector
     LIMIT ${limit * 3}
-  `, 5_000);
+  `, remainingSearchBudget(deadlineAt, "database"));
 
   const now = Date.now();
   return rows

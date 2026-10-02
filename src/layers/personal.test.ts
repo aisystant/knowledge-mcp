@@ -59,6 +59,7 @@ import {
   personalListPath,
   personalGetDocument,
   personalSearchDocuments,
+  personalMemorySearch,
   personalGetEmbedding,
   personalGetDocumentLive,
   personalGetDocumentWithSha,
@@ -2249,6 +2250,112 @@ describe("read failures remain distinguishable from missing documents", () => {
     try { await personalGetEmbedding("synthetic-key", "synthetic query"); } catch (error) { failure = error; }
     expect(failure).toMatchObject({ stage: "embeddings", status: 403 });
     expect(String(failure)).not.toContain("PRIVATE-SENTINEL");
+  });
+});
+
+describe("private search shares one overall deadline", () => {
+  const hit = { filename: "notes/found.md", content: "found", source: "DS-my-strategy", source_type: "ds", score: 0.9 };
+  const embeddingResponse = () => responseJson({ data: [{ embedding: Array(1024).fill(0.1) }] });
+  const capture = <T>(pending: Promise<T>) => pending.then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
+
+  it("allows a healthy nine-second unscoped keyword query", async () => {
+    vi.useFakeTimers();
+    queryQueue.push(new Promise(resolve => setTimeout(() => resolve([hit]), 9_000)));
+    const outcome = capture(personalSearchDocuments(ENV, ctx(), "DP.ROLE.039", undefined));
+    await vi.advanceTimersByTimeAsync(9_001);
+    expect(await outcome).toMatchObject({ value: [expect.objectContaining({ filename: hit.filename })], error: undefined });
+    expect(sqlCalls).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("gives a low-confidence keyword fallback only the remainder after embedding and vector search", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(resolve => setTimeout(() => resolve(embeddingResponse()), 7_000))));
+    let finishVector!: (rows: unknown[]) => void;
+    queryQueue.push(new Promise(resolve => { finishVector = resolve; }), new Promise(() => {}));
+    const outcome = capture(personalSearchDocuments(ENV, ctx(), "finding my notes", undefined));
+    await vi.advanceTimersByTimeAsync(15_000);
+    finishVector([{ ...hit, score: 0.1 }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sqlCalls).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(5_001);
+    expect(await outcome).toMatchObject({ error: { code: "dependency_timeout", stage: "database" } });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("bounds a stalled embedding plus stalled keyword database by twenty seconds total", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+    queryQueue.push(new Promise(() => {}));
+    let settled = false;
+    const outcome = capture(personalSearchDocuments(ENV, ctx(), "finding my notes", undefined)).then(result => { settled = true; return result; });
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(sqlCalls).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(11_999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await outcome).toMatchObject({ error: { code: "dependency_timeout", stage: "database" } });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(sqlCalls).toHaveLength(1); // the fallback started at 8s; no new read starts at 20s
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not retry a rate-limited embedding when Retry-After exceeds the remaining budget", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(resolve => setTimeout(() => resolve(
+      new Response("", { status: 429, headers: { "Retry-After": "3" } }),
+    ), 1_000))));
+    const outcome = capture(personalGetEmbedding("synthetic-key", "finding my notes", Date.now() + 3_000));
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await outcome).toMatchObject({ error: { code: "dependency_rate_limited", stage: "embeddings", retryAfterSeconds: 3 } });
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(sqlCalls).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("caps embeddings by the remaining three seconds after a slow empty keyword search", async () => {
+    vi.useFakeTimers();
+    queryQueue.push(new Promise(resolve => setTimeout(() => resolve([]), 17_000)));
+    const embedding = vi.fn((_url: unknown, _init?: RequestInit) => new Promise<Response>(() => {}));
+    vi.stubGlobal("fetch", embedding);
+    const outcome = capture(personalSearchDocuments(ENV, ctx(), "DP.ROLE.039", undefined));
+    await vi.advanceTimersByTimeAsync(17_000);
+    expect(embedding).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(await outcome).toMatchObject({ error: { code: "dependency_timeout" } });
+    expect(embedding.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    expect(sqlCalls).toHaveLength(1); // expired budget must not start another SQL query
+  });
+
+  it("starts no next dependency when the initial keyword read exhausts the whole budget", async () => {
+    vi.useFakeTimers();
+    queryQueue.push(new Promise(resolve => setTimeout(() => resolve([]), 20_000)));
+    const embedding = vi.fn();
+    vi.stubGlobal("fetch", embedding);
+    const outcome = capture(personalSearchDocuments(ENV, ctx(), "DP.ROLE.039", undefined));
+    await vi.advanceTimersByTimeAsync(20_001);
+    expect(await outcome).toMatchObject({ error: { code: "dependency_timeout" } });
+    expect(sqlCalls).toHaveLength(1);
+    expect(embedding).not.toHaveBeenCalled();
+  });
+
+  it.each(["success", "timeout"])("applies the same shared budget to memory search (%s)", async (mode) => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(resolve => setTimeout(() => resolve(embeddingResponse()), 7_000))));
+    let finishQuery!: (rows: unknown[]) => void;
+    queryQueue.push(new Promise(resolve => { finishQuery = resolve; }));
+    const outcome = capture(personalMemorySearch(ENV, ctx(), "finding my notes", undefined));
+    await vi.advanceTimersByTimeAsync(16_000); // embedding 7s, database 9s
+    if (mode === "success") {
+      finishQuery([{ ...hit, base_score: 0.9, updated_at: new Date().toISOString() }]);
+      expect(await outcome).toMatchObject({ value: [expect.objectContaining({ filename: hit.filename })], error: undefined });
+    } else {
+      await vi.advanceTimersByTimeAsync(4_001);
+      expect(await outcome).toMatchObject({ error: { code: "dependency_timeout", stage: "database" } });
+    }
+    expect(sqlCalls).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 
