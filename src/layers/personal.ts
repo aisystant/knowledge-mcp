@@ -1,4 +1,5 @@
 import { ReadFailure, createReadTrace, fetchReadResponse, readHttpFailure, readJson, withReadDeadline, type ReadTrace } from "../read-failure.js";
+import { normalizeSearchResultLimit } from "../search-limits.js";
 // Personal-corpus data layer for the private MCP mode (WP-410 срез-2b).
 // Ported from personal-knowledge-mcp/src/index.ts, then hardened in this private-mode layer:
 // resolveUserContext, GitHub App JWT signing, writeToGitHub, getInstallationToken.
@@ -1413,6 +1414,7 @@ export async function personalSearchDocuments(
   source: string | undefined,
   limit: number = 5
 ): Promise<PersonalSearchResult[] & { degradation?: ReturnType<ReadFailure["toJSON"]> }> {
+  limit = normalizeSearchResultLimit(limit);
   const deadlineAt = Date.now() + PERSONAL_SEARCH_BUDGET_MS;
   const trace = createReadTrace("personal_search");
   const keyword = () => trace.run("keyword", () => personalKeywordSearch(env, ctx, query, source, limit, deadlineAt));

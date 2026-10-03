@@ -2253,6 +2253,38 @@ describe("read failures remain distinguishable from missing documents", () => {
   });
 });
 
+describe("private search normalizes SQL limits across every route", () => {
+  const hit = { filename: "notes/found.md", content: "found", source: "DS-my-strategy", source_type: "ds", score: 0.9 };
+  const cases: [unknown, number][] = [
+    [undefined, 5], [null, 5], ["20", 5], [NaN, 5], [Infinity, 5],
+    [-3, 1], [0, 1], [2.9, 2], [20, 20], [100_000, 20],
+  ];
+
+  for (const route of ["keyword", "vector", "embedding fallback", "low-confidence fallback", "empty keyword fallback"]) {
+    it.each(cases)(route + " sends a bounded SQL limit for %j", async (input, expected) => {
+      const isKeyword = route === "keyword" || route === "empty keyword fallback";
+      if (route !== "keyword") queuedFetch([route === "embedding fallback"
+        ? responseJson({}, 403)
+        : responseJson({ data: [{ embedding: Array(1024).fill(0.1) }] })]);
+      if (route === "empty keyword fallback") queryQueue.push([]);
+      if (route === "low-confidence fallback") queryQueue.push([{ ...hit, score: 0.1 }]);
+      queryQueue.push([hit]);
+
+      const result = await personalSearchDocuments(ENV, ctx(), isKeyword ? "DP.ROLE.039" : "finding my notes",
+        "DS-my-strategy", input as number);
+      expect(result[0]).toMatchObject({ filename: hit.filename, content: hit.content, score: hit.score });
+      expect(sqlCalls).toHaveLength(route === "low-confidence fallback" || route === "empty keyword fallback" ? 2 : 1);
+      for (const [template, ...values] of sqlCalls as [TemplateStringsArray, ...unknown[]][]) {
+        expect(template.join(" ")).toContain("LIMIT ");
+        expect(values.at(-1)).toBe(expected);
+        expect(values).toContain(ctx().userId);
+        expect(values).toContainEqual(ctx().sourceNames);
+        expect(values).toContain("DS-my-strategy");
+      }
+    });
+  }
+});
+
 describe("private search shares one overall deadline", () => {
   const hit = { filename: "notes/found.md", content: "found", source: "DS-my-strategy", source_type: "ds", score: 0.9 };
   const embeddingResponse = () => responseJson({ data: [{ embedding: Array(1024).fill(0.1) }] });
