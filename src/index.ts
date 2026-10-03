@@ -2956,6 +2956,25 @@ export const PRIVATE_TOOLS = [
   },
 ];
 
+// Private search uses a different implementation from the public search tool.
+// Keep accepted argument shapes unchanged; these descriptions do not add bounds.
+function privateToolDefinition(tool: (typeof TOOLS)[number]) {
+  if (tool.name !== "search") return tool;
+  return {
+    ...tool,
+    description: "Search connected personal sources by keyword or semantic similarity. Direct results contain indexed text without an excerpt budget; a gateway may shorten it. Use get_document to read a selected document.",
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: {
+        ...tool.inputSchema.properties,
+        source: { ...tool.inputSchema.properties.source, description: "Filter by a connected personal source" },
+        source_type: { ...tool.inputSchema.properties.source_type, description: "Ignored in private mode; use source to select a personal source" },
+        limit: { ...tool.inputSchema.properties.limit, description: "Requested result count (default: 5). The private handler does not enforce the declared maximum." },
+      },
+    },
+  };
+}
+
 // --- MCP handler ---
 
 // WP-7 Ф187: the learner id of learner_progress / analyze_verbalization keys row-level
@@ -3033,7 +3052,7 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
           id,
           result: {
             tools: mode === "private"
-              ? [...TOOLS.filter(tool => !PUBLIC_ONLY_TOOL_NAMES.has(tool.name)), ...PRIVATE_TOOLS]
+              ? [...TOOLS.filter(tool => !PUBLIC_ONLY_TOOL_NAMES.has(tool.name)).map(privateToolDefinition), ...PRIVATE_TOOLS]
               : TOOLS,
           },
         };

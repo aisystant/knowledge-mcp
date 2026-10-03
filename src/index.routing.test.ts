@@ -117,7 +117,7 @@ vi.mock("./layers/private.js", async (importOriginal) => {
   return { ...actual, JwtScopeGuard: FakeJwtScopeGuard };
 });
 
-const { handleMcpRequest, default: worker } = await import("./index.js");
+const { handleMcpRequest, TOOLS, default: worker } = await import("./index.js");
 const { resolveUserContext, personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalListSources, personalListDocuments, personalListPath, writeToGitHub } = await import("./layers/personal.js");
 
 const ENV = {
@@ -143,6 +143,37 @@ beforeEach(() => {
 });
 
 describe("dual-mode routing: private mode reaches the personal layer, never the public layer", () => {
+  it("advertises the private search implementation without changing the public catalog or accepted schema", async () => {
+    const publicBefore = structuredClone(TOOLS);
+    const request = { jsonrpc: "2.0", id: 1, method: "tools/list" } as const;
+    const privateResponse = await handleMcpRequest(request, ENV, undefined, "private");
+    const privateTools = (privateResponse.result as { tools: typeof TOOLS }).tools;
+    const privateSearch = privateTools.find(tool => tool.name === "search")!;
+    const publicSearch = TOOLS.find(tool => tool.name === "search")!;
+    expect(privateSearch.description).toContain("connected personal sources");
+    expect(privateSearch.description).toContain("indexed text without an excerpt budget");
+    expect(privateSearch.description).not.toMatch(/reranking|Pack entities|parent metadata/);
+    expect(privateSearch.inputSchema.properties.source_type?.description).toContain("Ignored in private mode");
+    expect(privateSearch.inputSchema.properties.limit?.description).toContain("Requested result count");
+    expect(privateSearch.inputSchema.properties.limit?.description).toContain("does not enforce");
+    expect(privateSearch.inputSchema.properties.limit).toMatchObject({ minimum: 1, maximum: 20 });
+
+    const withoutDescriptions = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(withoutDescriptions);
+      if (value && typeof value === "object") {
+        return Object.fromEntries(Object.entries(value)
+          .filter(([key]) => key !== "description")
+          .map(([key, entry]) => [key, withoutDescriptions(entry)]));
+      }
+      return value;
+    };
+    expect(withoutDescriptions(privateSearch.inputSchema)).toEqual(withoutDescriptions(publicSearch.inputSchema));
+    expect(privateSearch.annotations).toEqual(publicSearch.annotations);
+    const publicResponse = await handleMcpRequest(request, ENV, undefined, "public");
+    expect(publicResponse.result).toEqual({ tools: publicBefore });
+    expect(TOOLS).toEqual(publicBefore);
+  });
+
   it("search: private mode returns the personal-layer sentinel, not the public corpus", async () => {
     const res = await callTool("search", { query: "test" }, "private");
     const text = (res as { result: { content: [{ text: string }] } }).result.content[0].text;
