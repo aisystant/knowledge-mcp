@@ -1,4 +1,7 @@
 import { ReadFailure, withReadDeadline, readJson, createReadTrace, type ReadTrace } from "./read-failure.js";
+import { normalizeSearchResultLimit, SEARCH_RESULT_LIMIT_MAX } from "./search-limits.js";
+import { buildPrivateDocumentResponse, buildPrivateSearchResponse, enforcePrivateReadBudget, privateReadError, privateReadIdError, validateDocumentPageRequest } from "./personal-response-bounds.js";
+export { normalizeSearchResultLimit } from "./search-limits.js";
 /**
  * Knowledge MCP Server v4.1 — L2 Platform — Hybrid Search + Parent Retrieval + LLM Reranking + Feedback Loop
  *
@@ -133,7 +136,7 @@ interface McpRequest {
 
 interface McpResponse {
   jsonrpc: "2.0";
-  id: string | number;
+  id: string | number | null;
   result?: unknown;
   error?: { code: number; message: string };
 }
@@ -536,14 +539,7 @@ export type SearchResult = {
 
 const SEARCH_RESPONSE_EXCERPT_CHARACTERS = 2_000;
 const SEARCH_RESPONSE_TRUNCATION_MARKER = "\n\n...[truncated; use get_document for the full document]";
-const SEARCH_RESULT_LIMIT_MAX = 20;
 export const SEARCH_TOOL_RESPONSE_BUDGET_BYTES = 32_000;
-
-export function normalizeSearchResultLimit(limit: number): number {
-  return Number.isFinite(limit)
-    ? Math.min(Math.max(Math.trunc(limit), 1), SEARCH_RESULT_LIMIT_MAX)
-    : 5;
-}
 
 function searchResponseExcerpt(
   value: string | undefined,
@@ -2956,20 +2952,30 @@ export const PRIVATE_TOOLS = [
   },
 ];
 
-// Private search uses a different implementation from the public search tool.
-// Keep accepted argument shapes unchanged; these descriptions do not add bounds.
+// Private read contracts differ; never mutate the shared public definitions.
 function privateToolDefinition(tool: (typeof TOOLS)[number]) {
+  if (tool.name === "get_document") return {
+    ...tool,
+    description: "Read a personal document (32000 UTF-8 response bytes). Small legacy responses keep their shape; oversized reads require cursor:'start', then next_cursor. complete covers the selected representation; indexed legacy data may be a fragment. Use include_sha:true for the exact live file and collect all pages before editing. Headings are never partial.",
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: {
+        ...tool.inputSchema.properties,
+        cursor: { type: "string", maxLength: 512, description: "Private full reads only: 'start' opts into JSON pages; copy next_cursor with the same filename/source/include_sha/ref. On document_changed, discard pages and restart. Each page rechecks access. Not combinable with headings." },
+      },
+    },
+  };
   if (tool.name !== "search") return tool;
   return {
     ...tool,
-    description: "Search connected personal sources by keyword or semantic similarity. Direct results contain indexed text without an excerpt budget; a gateway may shorten it. Use get_document to read a selected document.",
+    description: "Search personal sources by keyword or semantic similarity (max 20 hits, 32000 UTF-8 response bytes). Content excerpts are marked when shortened; all selected hits are retained or an explicit size error is returned. Use get_document, with cursor:'start' for large documents. source_type is ignored.",
     inputSchema: {
       ...tool.inputSchema,
       properties: {
         ...tool.inputSchema.properties,
         source: { ...tool.inputSchema.properties.source, description: "Filter by a connected personal source" },
         source_type: { ...tool.inputSchema.properties.source_type, description: "Ignored in private mode; use source to select a personal source" },
-        limit: { ...tool.inputSchema.properties.limit, description: "Requested result count (default: 5). The private handler does not enforce the declared maximum." },
+        limit: { ...tool.inputSchema.properties.limit, description: "Maximum results: finite numbers are truncated and clamped to 1..20; other values use 5 (default)." },
       },
     },
   };
@@ -3031,6 +3037,17 @@ export function gateLearnerCall(env: Env, tool: string, caller: LearnerCaller, a
 }
 
 export async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public", rawRequest?: Request, jwtSubject?: string): Promise<McpResponse> {
+  const boundedRead = mode === "private" && request.method === "tools/call"
+    && (request.params?.name === "search" || request.params?.name === "get_document");
+  if (boundedRead) {
+    const idError = privateReadIdError(request.id);
+    if (idError) return idError;
+  }
+  const response = await handleMcpRequestImpl(request, env, userId, mode, rawRequest, jwtSubject);
+  return boundedRead ? enforcePrivateReadBudget(response) : response;
+}
+
+async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: string | undefined, mode: McpMode, rawRequest?: Request, jwtSubject?: string): Promise<McpResponse> {
   const { id, method, params } = request;
 
   try {
@@ -3399,19 +3416,14 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
               ctx,
               args.query as string,
               args.source as string | undefined,
-              (args.limit as number) || 5
+              normalizeSearchResultLimit(args.limit)
             );
-            const content: { type: "text"; text: string }[] = [{ type: "text", text: JSON.stringify(results, null, 2) }];
-            if (results.degradation) {
-              content.push({ type: "text", text: JSON.stringify({
-                warning: "Смысловой поиск недоступен; выполнен только поиск по тексту. Пустой результат не доказывает отсутствие документа.",
-                diagnostic: results.degradation,
-              }) });
-            }
-            return { jsonrpc: "2.0", id, result: { content, ...(results.degradation && results.length === 0 ? { isError: true } : {}) } };
+            return buildPrivateSearchResponse(id, results, results.degradation);
           }
 
           if (toolName === "get_document") {
+            const pageError = validateDocumentPageRequest(args);
+            if (pageError) return privateReadError(id, pageError.code, pageError.message);
             const filename = args.filename as string;
             const ref = args.ref as string | undefined;
 
@@ -3449,7 +3461,7 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
               if (liveResult.kind === "source_required") {
                 return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ error: "source_required", message: "Документа нет в индексе — для живого чтения с GitHub передай source явно.", sources: liveResult.sources }) }], isError: true } };
               }
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ filename: liveResult.filename, source: liveResult.source, sha: liveResult.sha, ...(ref ? { ref } : {}), content: liveResult.content }, null, 2) }] } };
+              return await buildPrivateDocumentResponse(id, liveResult, { userId: principal.userId, live: true, ref, cursor: args.cursor });
             }
 
             let doc;
@@ -3464,10 +3476,10 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             if (!doc) {
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Document not found" }], isError: true } };
             }
-            const text = args.format === "headings"
-              ? JSON.stringify({ filename: doc.filename, headings: documentHeadings(doc.content) }, null, 2)
-              : doc.content;
-            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text }] } };
+            return await buildPrivateDocumentResponse(id, doc, {
+              userId: principal.userId, live: false, cursor: args.cursor,
+              ...(args.format === "headings" ? { headings: documentHeadings(doc.content) } : {}),
+            });
           }
 
           if (toolName === "list_documents") {

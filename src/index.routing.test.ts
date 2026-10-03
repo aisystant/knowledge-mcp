@@ -57,6 +57,9 @@ vi.mock("./rls.js", () => ({
 }));
 
 vi.mock("./layers/personal.js", () => ({
+  AmbiguousSourceError: class extends Error {
+    constructor(public readonly sources: string[]) { super("Ambiguous source"); }
+  },
   resolveUserContext: vi.fn().mockResolvedValue({
     userId: "user-private-1",
     sources: [{ source: "DS-my-strategy", githubOwner: "TserenTserenov", githubRepo: "DS-my-strategy", pathPrefix: "", sourceType: "ds" }],
@@ -118,7 +121,7 @@ vi.mock("./layers/private.js", async (importOriginal) => {
 });
 
 const { handleMcpRequest, TOOLS, default: worker } = await import("./index.js");
-const { resolveUserContext, personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalListSources, personalListDocuments, personalListPath, writeToGitHub } = await import("./layers/personal.js");
+const { AmbiguousSourceError, resolveUserContext, personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalListSources, personalListDocuments, personalListPath, writeToGitHub } = await import("./layers/personal.js");
 
 const ENV = {
   KNOWLEDGE_DATABASE_URL: "postgres://fake-public",
@@ -150,12 +153,12 @@ describe("dual-mode routing: private mode reaches the personal layer, never the 
     const privateTools = (privateResponse.result as { tools: typeof TOOLS }).tools;
     const privateSearch = privateTools.find(tool => tool.name === "search")!;
     const publicSearch = TOOLS.find(tool => tool.name === "search")!;
-    expect(privateSearch.description).toContain("connected personal sources");
-    expect(privateSearch.description).toContain("indexed text without an excerpt budget");
+    expect(privateSearch.description).toContain("personal sources");
+    expect(privateSearch.description).toContain("32000 UTF-8 response bytes");
     expect(privateSearch.description).not.toMatch(/reranking|Pack entities|parent metadata/);
     expect(privateSearch.inputSchema.properties.source_type?.description).toContain("Ignored in private mode");
-    expect(privateSearch.inputSchema.properties.limit?.description).toContain("Requested result count");
-    expect(privateSearch.inputSchema.properties.limit?.description).toContain("does not enforce");
+    expect(privateSearch.inputSchema.properties.limit?.description).toContain("clamped to 1..20");
+    expect(privateSearch.inputSchema.properties.limit?.description).toContain("other values use 5");
     expect(privateSearch.inputSchema.properties.limit).toMatchObject({ minimum: 1, maximum: 20 });
 
     const withoutDescriptions = (value: unknown): unknown => {
@@ -580,6 +583,147 @@ describe("/reindex-full and /provision-bridge-scopes (WP-545 Ф5, ported from pe
 
 
 describe("private read contract", () => {
+  const syntheticDoc = { filename: "notes/bounds.md", source: "DS-my-strategy", source_type: "ds",
+    github_url: null, content: '😀Яe\u0301\r\n"\\'.repeat(8_000) };
+  const toolResult = (response: Awaited<ReturnType<typeof callTool>>) =>
+    response.result as { content: { text: string }[]; isError?: boolean };
+  const parsed = (response: Awaited<ReturnType<typeof callTool>>) => JSON.parse(toolResult(response).content[0].text);
+  const bounded = (response: unknown) => expect(Buffer.byteLength(JSON.stringify(response), "utf8")).toBeLessThanOrEqual(32_000);
+
+  it("advertises cursor only on the private document definition without mutating the public catalog", async () => {
+    const before = JSON.stringify(TOOLS);
+    const response = await handleMcpRequest({ jsonrpc: "2.0", id: 1, method: "tools/list" }, ENV, undefined, "private");
+    const tools = (response.result as { tools: { name: string; inputSchema: { properties: Record<string, unknown> } }[] }).tools;
+    expect(tools.find(tool => tool.name === "get_document")?.inputSchema.properties.cursor).toMatchObject({ type: "string", maxLength: 512 });
+    expect(TOOLS.find(tool => tool.name === "get_document")?.inputSchema.properties).not.toHaveProperty("cursor");
+    expect(JSON.stringify(TOOLS)).toBe(before);
+  });
+
+  it.each([[undefined, 5], [null, 5], ["200", 5], [Infinity, 5], [-1, 1], [0, 1], [2.8, 2], [200, 20]])(
+    "normalizes dispatch limit %j before invoking the private data layer", async (limit, expected) => {
+      const response = await callTool("search", { query: "notes", limit }, "private");
+      expect(personalSearchDocuments).toHaveBeenCalledWith(ENV, expect.objectContaining({ userId: "user-private-1" }),
+        "notes", undefined, expected);
+      expect(parsed(response)[0].filename).toBe("PRIVATE_SENTINEL.md");
+    });
+
+  it("returns every selected search hit and degradation within the final serialized budget", async () => {
+    const hits = Array.from({ length: 20 }, (_, i) => ({ ...syntheticDoc, filename: `note-${i}.md`, score: 1 - i / 100 }));
+    const diagnostic = new ReadFailure("dependency_access_denied", "embeddings", 403).toJSON();
+    vi.mocked(personalSearchDocuments).mockResolvedValueOnce(Object.assign(hits, { degradation: diagnostic }));
+    const response = await callTool("search", { query: "notes", limit: 20 }, "private");
+    bounded(response);
+    expect(parsed(response).map((hit: { filename: string }) => hit.filename)).toEqual(hits.map(hit => hit.filename));
+    expect(parsed(response).every((hit: { content_truncated: boolean }) => hit.content_truncated)).toBe(true);
+    expect(JSON.parse(toolResult(response).content[1].text).diagnostic).toEqual(diagnostic);
+  });
+
+  it.each([false, true])("refuses oversized legacy documents before partial success (live=%s)", async live => {
+    if (live) vi.mocked(personalGetDocumentWithSha).mockResolvedValueOnce({ ...syntheticDoc, kind: "document", sha: "a".repeat(40) });
+    else vi.mocked(personalGetDocument).mockResolvedValueOnce(syntheticDoc);
+    const response = await callTool("get_document", { filename: syntheticDoc.filename, include_sha: live }, "private");
+    bounded(response);
+    expect(toolResult(response).isError).toBe(true);
+    expect(parsed(response).error).toBe("response_too_large");
+  });
+
+  it("reauthenticates each page, resolves omitted source consistently and returns the exact indexed representation", async () => {
+    const authenticate = vi.spyOn(FakeJwtScopeGuard.prototype, "authenticate");
+    let cursor: string | null = "start";
+    let combined = "";
+    let calls = 0;
+    try {
+      do {
+        vi.mocked(personalGetDocument).mockResolvedValueOnce(syntheticDoc);
+        const response = await callTool("get_document", { filename: syntheticDoc.filename, cursor,
+          ...(calls ? { source: syntheticDoc.source, format: "full" } : {}) }, "private");
+        bounded(response);
+        expect(toolResult(response).isError).toBeUndefined();
+        const page = parsed(response);
+        expect(page).toMatchObject({ content_scope: "indexed_representation", read_mode: "indexed" });
+        combined += page.content;
+        cursor = page.next_cursor;
+        expect(++calls).toBeLessThan(50);
+      } while (cursor);
+      expect(combined).toBe(syntheticDoc.content);
+      expect(calls).toBeGreaterThan(1);
+      expect(authenticate).toHaveBeenCalledTimes(calls);
+      expect(resolveUserContext).toHaveBeenCalledTimes(calls);
+      expect(personalGetDocument).toHaveBeenCalledTimes(calls);
+      for (const [, context] of vi.mocked(personalGetDocument).mock.calls) expect(context.userId).toBe("user-private-1");
+    } finally { authenticate.mockRestore(); }
+  });
+
+  it("selects a live file from current arguments and refuses a cursor after a different user authenticates", async () => {
+    const liveDoc = { ...syntheticDoc, kind: "document" as const, sha: "a".repeat(40) };
+    vi.mocked(personalGetDocumentWithSha).mockResolvedValueOnce(liveDoc);
+    const first = await callTool("get_document", { filename: syntheticDoc.filename, source: syntheticDoc.source,
+      include_sha: true, ref: "pinned-ref", cursor: "start" }, "private");
+    const cursor = parsed(first).next_cursor;
+    expect(parsed(first)).toMatchObject({ read_mode: "live", content_scope: "full_file", ref: "pinned-ref", sha: liveDoc.sha });
+    const authenticate = vi.spyOn(FakeJwtScopeGuard.prototype, "authenticate").mockResolvedValueOnce({ userId: "user-private-2" });
+    vi.mocked(resolveUserContext).mockResolvedValueOnce({ userId: "user-private-2", sources: [], sourceNames: [] });
+    vi.mocked(personalGetDocumentWithSha).mockResolvedValueOnce(liveDoc);
+    try {
+      const next = await callTool("get_document", { filename: syntheticDoc.filename, source: syntheticDoc.source,
+        include_sha: true, ref: "pinned-ref", cursor }, "private");
+      expect(resolveUserContext).toHaveBeenLastCalledWith(ENV, "user-private-2");
+      expect(personalGetDocumentWithSha).toHaveBeenLastCalledWith(ENV, expect.objectContaining({ userId: "user-private-2" }),
+        syntheticDoc.filename, syntheticDoc.source, "pinned-ref");
+      expect(parsed(next).error).toBe("invalid_cursor");
+      expect(toolResult(next).isError).toBe(true);
+      bounded(next);
+    } finally { authenticate.mockRestore(); }
+  });
+
+  it.each([{ cursor: "bad" }, { cursor: "start", format: "headings" }, { cursor: "start", ref: "" }])(
+    "rejects invalid paging arguments before reading document content: %j", async args => {
+      const response = await callTool("get_document", { filename: syntheticDoc.filename, ...args }, "private");
+      expect(toolResult(response).isError).toBe(true);
+      expect(personalGetDocument).not.toHaveBeenCalled();
+      expect(personalGetDocumentWithSha).not.toHaveBeenCalled();
+      bounded(response);
+    });
+
+  it("does not call authentication or storage for an id too large to echo safely", async () => {
+    const authenticate = vi.spyOn(FakeJwtScopeGuard.prototype, "authenticate");
+    try {
+      const response = await handleMcpRequest({ jsonrpc: "2.0", id: "名".repeat(40_000), method: "tools/call",
+        params: { name: "get_document", arguments: { filename: syntheticDoc.filename } } }, ENV, undefined, "private",
+      new Request("https://x/mcp"));
+      expect(response).toMatchObject({ id: null, error: { code: -32600 } });
+      expect(authenticate).not.toHaveBeenCalled();
+      expect(resolveUserContext).not.toHaveBeenCalled();
+      expect(personalGetDocument).not.toHaveBeenCalled();
+      bounded(response);
+    } finally { authenticate.mockRestore(); }
+  });
+
+  it.each(["ambiguous index", "ambiguous live", "source required", "ref hint", "dependency"] as const)(
+    "bounds a large pre-pagination failure: %s", async scenario => {
+      const long = "synthetic-".repeat(8_000);
+      let args: Record<string, unknown> = { filename: syntheticDoc.filename, cursor: "start" };
+      if (scenario === "ambiguous index") vi.mocked(personalGetDocument).mockRejectedValueOnce(new AmbiguousSourceError([long]));
+      if (scenario === "ambiguous live") {
+        args.include_sha = true;
+        vi.mocked(personalGetDocumentWithSha).mockRejectedValueOnce(new AmbiguousSourceError([long]));
+      }
+      if (scenario === "source required") {
+        args.include_sha = true;
+        vi.mocked(personalGetDocumentWithSha).mockResolvedValueOnce({ kind: "source_required", sources: [long] });
+      }
+      if (scenario === "ref hint") {
+        args.ref = long;
+        vi.mocked(personalGetDocumentWithSha).mockResolvedValueOnce(null);
+      }
+      if (scenario === "dependency") vi.mocked(personalGetDocument).mockRejectedValueOnce(new ReadFailure("dependency_unavailable", "database"));
+      const response = await callTool("get_document", args, "private");
+      bounded(response);
+      expect(toolResult(response).isError).toBe(true);
+      expect(JSON.stringify(response)).not.toContain(long);
+      expect(parsed(response).error).toBe(scenario === "dependency" ? "dependency_unavailable" : "response_too_large");
+    });
+
   it("honors headings without returning the document body", async () => {
     vi.mocked(personalGetDocument).mockResolvedValueOnce({
       filename: "note.md", content: "# First\nPRIVATE BODY\n## Second", source: "DS-my-strategy", source_type: "ds", github_url: null,
