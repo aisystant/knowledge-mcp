@@ -147,6 +147,32 @@ describe("JwtScopeGuard.authorize", () => {
       })
     ).resolves.toBeUndefined();
   });
+
+  it("denies required scope checks when the scope database is unconfigured", async () => {
+    const guard = new JwtScopeGuard("https://auth.example.com/hydra");
+    await expect(guard.authorize(principal, {
+      toolName: "personal_write",
+      args: { source: "DS-mine", path: "notes/a.md" },
+      indicatorsDatabaseUrl: undefined,
+      scopeGuardMode: "off",
+      policy: "required",
+    })).rejects.toMatchObject({
+      denyResponse: { data: { reason: "indicators_db_unavailable" } },
+    });
+  });
+
+  it("denies required scope checks when the scope database fails", async () => {
+    const guard = new JwtScopeGuard("https://auth.example.com/hydra");
+    await expect(guard.authorize(principal, {
+      toolName: "personal_write",
+      args: { source: "DS-mine", path: "notes/a.md" },
+      indicatorsDatabaseUrl: "not-a-real-dsn",
+      scopeGuardMode: "off",
+      policy: "required",
+    })).rejects.toMatchObject({
+      denyResponse: { data: { reason: "indicators_db_unavailable" } },
+    });
+  });
 });
 
 describe("ScopeDeniedError", () => {

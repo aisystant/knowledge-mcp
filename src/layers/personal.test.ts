@@ -613,10 +613,26 @@ describe("personalGetDocument", () => {
 });
 
 describe("deleteFromGitHub", () => {
+  const confirmedSha = "a".repeat(40);
+  it("requires a confirmed file version before any database or GitHub request", async () => {
+    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", "");
+    expect(result).toMatchObject({ success: false, reason: "invalid_expected_sha" });
+    expect(sqlCalls).toHaveLength(0);
+  });
+
+  it("refuses deletion when the file changed after confirmation", async () => {
+    queryQueue.push([{ id: 17, index_generation: 3 }]);
+    const { request, dependencies } = githubDependencies([{ ok: true, json: async () => ({ sha: confirmedSha }) }]);
+    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", "b".repeat(40), dependencies);
+    expect(result).toMatchObject({ success: false, reason: "version_mismatch" });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(sqlCalls).toHaveLength(1); // source snapshot only; no index mutation
+  });
+
   it.each([[], new Error("private-database-detail")])("refuses remote deletion without a verified source snapshot (%s)", async (snapshot) => {
     queryQueue.push(snapshot);
     const { request, dependencies } = githubDependencies([{ ok: true, json: async () => ({ sha: "old" }) }, { ok: true }]);
-    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", dependencies);
+    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", confirmedSha, dependencies);
     expect(result.success).toBe(false);
     expect(JSON.stringify(result)).not.toContain("private-database-detail");
     expect(dependencies.getInstallationToken).not.toHaveBeenCalled();
@@ -625,7 +641,7 @@ describe("deleteFromGitHub", () => {
 
   it("refuses a missing caller before making a GitHub request", async () => {
     const { request, dependencies } = githubDependencies([{ ok: true, json: async () => ({ sha: "old" }) }, { ok: true }]);
-    const result = await deleteFromGitHub(ENV, ctx({ userId: "" }), "DS-my-strategy", "notes/idea.md", "delete", dependencies);
+    const result = await deleteFromGitHub(ENV, ctx({ userId: "" }), "DS-my-strategy", "notes/idea.md", "delete", confirmedSha, dependencies);
     expect(result.success).toBe(false);
     expect(request).not.toHaveBeenCalled();
     expect(sqlCalls).toHaveLength(0);
@@ -633,8 +649,8 @@ describe("deleteFromGitHub", () => {
 
   it("keeps remote deletion successful and reports a deferred cleanup when the transaction fails", async () => {
     queryQueue.push([{ id: 17, index_generation: 3 }], new Error("private-cleanup-detail"));
-    const { request, dependencies } = githubDependencies([{ ok: true, json: async () => ({ sha: "old" }) }, { ok: true }]);
-    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", dependencies);
+    const { request, dependencies } = githubDependencies([{ ok: true, json: async () => ({ sha: confirmedSha }) }, { ok: true }]);
+    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", confirmedSha, dependencies);
     expect(result.success).toBe(true);
     expect(result.warning).toMatch(/очистка.*индекса.*отложена/i);
     expect(JSON.stringify(result)).not.toContain("private-cleanup-detail");
@@ -688,9 +704,9 @@ describe("deleteFromGitHub", () => {
         statuses = ["replacement-status"];
         return responseJson({});
       }
-      return responseJson({ sha: "existing-file" });
+      return responseJson({ sha: confirmedSha });
     });
-    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", {
+    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", confirmedSha, {
       getInstallationToken: vi.fn().mockResolvedValue("test-token"), fetch: request as never,
     });
     expect(result.success).toBe(true);
@@ -701,7 +717,7 @@ describe("deleteFromGitHub", () => {
   });
 
   it("rejects an unknown source without touching the network", async () => {
-    const result = await deleteFromGitHub(ENV, ctx(), "not-a-real-source", "notes/idea.md", "delete");
+    const result = await deleteFromGitHub(ENV, ctx(), "not-a-real-source", "notes/idea.md", "delete", confirmedSha);
     expect(result.success).toBe(false);
     expect(result.error).toContain("Unknown source");
   });
@@ -716,7 +732,7 @@ describe("deleteFromGitHub", () => {
     const path = "notes/./cafe\u0301_%#? file.md";
     const sourceContext = ctx({ sources: [{ ...ctx().sources[0], pathPrefix }] });
 
-    const result = await deleteFromGitHub(ENV, sourceContext, "DS-my-strategy", path, "delete", dependencies);
+    const result = await deleteFromGitHub(ENV, sourceContext, "DS-my-strategy", path, "delete", sha, dependencies);
 
     expect(result.success).toBe(true);
     const expectedUrl = "https://api.github.com/repos/TserenTserenov/DS-my-strategy/contents/" +
@@ -1523,6 +1539,7 @@ describe("getInstallationToken call contract (WP-7 2026-08-31 pagination fix)", 
     queryQueue.push([{ id: 17, index_generation: 3 }], [], [], []); // snapshot and fenced cleanup
     const result = await deleteFromGitHub(
       ENV, ctx(), "DS-my-strategy", "notes/idea.md", "msg",
+      "a".repeat(40),
       { getInstallationToken, fetch: request as unknown as typeof globalThis.fetch },
     );
     expect(result.success).toBe(true);
