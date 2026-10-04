@@ -163,6 +163,43 @@ describe("dual-mode routing: private mode reaches the personal layer, never the 
     expect(deleteTool?.inputSchema.required).toContain("expected_sha");
   });
 
+  it("guides a client with the old delete schema to a SHA-bound retry without deleting", async () => {
+    const response = await callTool("delete", { source: "DS-my-strategy", path: "notes/a.md" }, "private");
+    const result = response.result as { isError?: boolean; content: [{ text: string }] };
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      success: false,
+      reason: "expected_sha_required",
+    });
+    expect(result.content[0].text).toContain("IWE-DELETE-SHA:");
+    expect(deleteFromGitHub).not.toHaveBeenCalled();
+  });
+
+  it("accepts a confirmed SHA through the old schema's message field", async () => {
+    const sha = "a".repeat(40);
+    vi.mocked(deleteFromGitHub).mockResolvedValueOnce({ success: true });
+    const response = await callTool("delete", {
+      source: "DS-my-strategy",
+      path: "notes/a.md",
+      message: `IWE-DELETE-SHA:${sha}`,
+    }, "private");
+    expect((response.result as { isError?: boolean }).isError).toBeUndefined();
+    expect(deleteFromGitHub).toHaveBeenCalledWith(
+      expect.anything(), expect.anything(), "DS-my-strategy", "notes/a.md",
+      "Delete via Aisystant MCP", sha,
+    );
+  });
+
+  it("refuses a malformed legacy SHA marker before calling the delete layer", async () => {
+    const response = await callTool("delete", {
+      source: "DS-my-strategy",
+      path: "notes/a.md",
+      message: "IWE-DELETE-SHA:short",
+    }, "private");
+    expect((response.result as { isError?: boolean }).isError).toBe(true);
+    expect(deleteFromGitHub).not.toHaveBeenCalled();
+  });
+
   it("advertises the private search implementation without changing the public catalog or accepted schema", async () => {
     const publicBefore = structuredClone(TOOLS);
     const request = { jsonrpc: "2.0", id: 1, method: "tools/list" } as const;

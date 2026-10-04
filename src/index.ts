@@ -3240,12 +3240,38 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
           if (toolName === "delete") {
             const source = args.source as string;
             const path = args.path as string;
-            const expectedSha = args.expected_sha as string;
-            const message = (args.message as string) || "Delete via Aisystant MCP";
+            const suppliedSha = args.expected_sha;
+            const suppliedMessage = typeof args.message === "string" ? args.message : undefined;
+            // Clients that connected before expected_sha became required still expose
+            // source/path/message only. Carry the already-read blob SHA in their existing
+            // message field; never write this transport marker into the Git commit.
+            const legacyPrefix = "IWE-DELETE-SHA:";
+            const legacySha = suppliedMessage?.startsWith(legacyPrefix)
+              ? suppliedMessage.slice(legacyPrefix.length)
+              : undefined;
 
             if (!ctx.sourceNames.includes(source)) {
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
             }
+
+            if (suppliedSha === undefined && !/^[0-9a-fA-F]{40}$/.test(legacySha ?? "")) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({
+                success: false,
+                reason: "expected_sha_required",
+                error: "Файл не удалён: нужен SHA версии, которую подтвердил человек.",
+                next_action: "Прочитай точный файл через personal_get_document(source, filename, include_sha=true), назови человеку источник и путь и получи явное подтверждение удаления. Если в схеме personal_delete нет expected_sha, повтори вызов с теми же source/path и message='IWE-DELETE-SHA:<sha из чтения>' (ровно 40 hex-символов). Переподключение не требуется.",
+              }) }], isError: true } };
+            }
+            if (suppliedSha !== undefined && legacySha !== undefined) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({
+                success: false,
+                reason: "conflicting_sha_arguments",
+                error: "Передай SHA только одним способом: expected_sha или совместимый маркер в message.",
+              }) }], isError: true } };
+            }
+
+            const expectedSha = (suppliedSha ?? legacySha) as string;
+            const message = legacySha !== undefined ? "Delete via Aisystant MCP" : suppliedMessage || "Delete via Aisystant MCP";
 
             const deleteResult = await deleteFromGitHub(env, ctx, source, path, message, expectedSha);
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(deleteResult, null, 2) }], ...(deleteResult.success ? {} : { isError: true }) } };
