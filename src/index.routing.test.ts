@@ -121,7 +121,7 @@ vi.mock("./layers/private.js", async (importOriginal) => {
 });
 
 const { handleMcpRequest, TOOLS, default: worker } = await import("./index.js");
-const { AmbiguousSourceError, resolveUserContext, personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalListSources, personalListDocuments, personalListPath, writeToGitHub } = await import("./layers/personal.js");
+const { AmbiguousSourceError, resolveUserContext, personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalListSources, personalListDocuments, personalListPath, writeToGitHub, deleteFromGitHub } = await import("./layers/personal.js");
 
 const ENV = {
   KNOWLEDGE_DATABASE_URL: "postgres://fake-public",
@@ -146,6 +146,23 @@ beforeEach(() => {
 });
 
 describe("dual-mode routing: private mode reaches the personal layer, never the public layer", () => {
+  it("requires a confirmed SHA and a strict scope check before personal deletion", async () => {
+    const sha = "a".repeat(40);
+    const authorize = vi.spyOn(FakeJwtScopeGuard.prototype, "authorize");
+    vi.mocked(deleteFromGitHub).mockResolvedValueOnce({ success: true });
+    const response = await callTool("delete", { source: "DS-my-strategy", path: "notes/a.md", expected_sha: sha }, "private");
+    expect(authorize).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      policy: "required",
+      toolName: "personal_write",
+      args: expect.objectContaining({ source: "DS-my-strategy", path: "notes/a.md" }),
+    }));
+    expect(deleteFromGitHub).toHaveBeenCalledWith(expect.anything(), expect.anything(), "DS-my-strategy", "notes/a.md", expect.any(String), sha);
+    expect((response.result as { isError?: boolean }).isError).toBeUndefined();
+    const listed = await handleMcpRequest({ jsonrpc: "2.0", id: 2, method: "tools/list" } as never, ENV, undefined, "private");
+    const deleteTool = (listed.result as { tools: Array<{ name: string; inputSchema: { required: string[] } }> }).tools.find(tool => tool.name === "delete");
+    expect(deleteTool?.inputSchema.required).toContain("expected_sha");
+  });
+
   it("advertises the private search implementation without changing the public catalog or accepted schema", async () => {
     const publicBefore = structuredClone(TOOLS);
     const request = { jsonrpc: "2.0", id: 1, method: "tools/list" } as const;

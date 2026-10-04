@@ -2845,15 +2845,16 @@ export const PRIVATE_TOOLS = [
   },
   {
     name: "delete",
-    description: "Delete a file from a personal knowledge repo via GitHub.",
+    description: "Удаляет файл из личного репозитория и поиска. Сначала прочитай точный файл через personal_get_document(source, filename, include_sha=true), назови человеку источник и путь, получи явное подтверждение удаления и передай прочитанный sha как expected_sha. Если файл изменился, повтори чтение и подтверждение.",
     inputSchema: {
       type: "object",
       properties: {
         source: { type: "string", description: "Target repo (source name)" },
         path: { type: "string", description: "File path relative to repo root" },
+        expected_sha: { type: "string", pattern: "^[0-9a-fA-F]{40}$", description: "SHA подтверждённой версии из personal_get_document(include_sha=true)" },
         message: { type: "string", description: "Commit message (default: 'Delete via Aisystant MCP')" },
       },
-      required: ["source", "path"],
+      required: ["source", "path", "expected_sha"],
     },
   },
   {
@@ -3174,6 +3175,7 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
                 activeSources: ctx.sourceNames,
                 indicatorsDatabaseUrl: env.INDICATORS_DATABASE_URL,
                 scopeGuardMode: env.SCOPE_GUARD_MODE,
+                policy: toolName === "delete" ? "required" : "configured",
                 requiresPath: !PATH_NOT_REQUIRED_TOOLS.has(toolName),
               });
             } catch (err) {
@@ -3238,14 +3240,15 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
           if (toolName === "delete") {
             const source = args.source as string;
             const path = args.path as string;
+            const expectedSha = args.expected_sha as string;
             const message = (args.message as string) || "Delete via Aisystant MCP";
 
             if (!ctx.sourceNames.includes(source)) {
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
             }
 
-            const deleteResult = await deleteFromGitHub(env, ctx, source, path, message);
-            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(deleteResult, null, 2) }] } };
+            const deleteResult = await deleteFromGitHub(env, ctx, source, path, message, expectedSha);
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(deleteResult, null, 2) }], ...(deleteResult.success ? {} : { isError: true }) } };
           }
 
           if (toolName === "new_post") {

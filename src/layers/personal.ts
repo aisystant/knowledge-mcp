@@ -1123,8 +1123,12 @@ export async function deleteFromGitHub(
   source: string,
   path: string,
   message: string,
+  expectedSha: string,
   dependencies: Partial<GitHubApiDependencies> = {},
-): Promise<{ success: boolean; error?: string; warning?: string }> {
+): Promise<{ success: boolean; error?: string; warning?: string; reason?: string }> {
+  if (!/^[0-9a-fA-F]{40}$/.test(expectedSha)) {
+    return { success: false, reason: "invalid_expected_sha", error: "Перед удалением прочитай файл через personal_get_document с include_sha=true и передай его sha в expected_sha." };
+  }
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return { success: false, error: `Unknown source: ${source}` };
   if (!ctx.userId) return { success: false, error: "Invalid user context: missing userId" };
@@ -1178,6 +1182,9 @@ export async function deleteFromGitHub(
     return { success: false, error: `File not found: ${path} in ${source}` };
   }
   const existing = (await getResp.json()) as { sha: string };
+  if (existing.sha.toLowerCase() !== expectedSha.toLowerCase()) {
+    return { success: false, reason: "version_mismatch", error: "Файл изменился после чтения. Прочитай актуальную версию и подтверди удаление заново." };
+  }
 
   const delResp = await githubFetch(apiUrl, {
     method: "DELETE",
