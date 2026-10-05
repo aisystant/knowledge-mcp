@@ -3052,7 +3052,7 @@ export const PRIVATE_TOOLS = [
 function privateToolDefinition(tool: (typeof TOOLS)[number]) {
   if (tool.name === "get_document") return {
     ...tool,
-    description: "Read a personal document (32000 UTF-8 response bytes). Small legacy responses keep their shape; oversized reads require cursor:'start', then next_cursor. complete covers the selected representation; indexed legacy data may be a fragment. Use include_sha:true for the exact live file and collect all pages before editing. Headings are never partial. For just the end or one heading of a large file, use tail_lines or section instead of paging through cursor from the start (WP-7 Ф204) — pick exactly one of cursor, tail_lines, section.",
+    description: "Read a personal document (32000 UTF-8 response bytes). Small legacy responses keep their shape; oversized reads require cursor:'start', then next_cursor. complete covers the selected representation; indexed legacy data may be a fragment. Use include_sha:true for the exact live file and collect all pages before editing. Headings are never partial. For just the end or one heading of a large file, use tail_lines or section instead of paging through cursor from the start (WP-7 Ф204) — pick exactly one of cursor, tail_lines, section. Reading right after your OWN write without include_sha can return the pre-write content: search indexing happens asynchronously after the push, and a plain read (no include_sha, no ref) serves from that index, not live GitHub — tail_lines and section are no exception, they page the same stale copy if include_sha is omitted. Always pass include_sha:true (or ref) to see what you just wrote.",
     inputSchema: {
       ...tool.inputSchema,
       properties: {
