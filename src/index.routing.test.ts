@@ -783,8 +783,167 @@ describe("private read contract", () => {
       filename: "note.md", content: "# First\nPRIVATE BODY\n## Second", source: "DS-my-strategy", source_type: "ds", github_url: null,
     });
     const result = await callTool("get_document", { filename: "note.md", source: "DS-my-strategy", format: "headings" }, "private") as { result: {content: [{text: string}]} };
-    expect(JSON.parse(result.result.content[0].text)).toEqual({ filename: "note.md", headings: [{level:1,title:"First"},{level:2,title:"Second"}] });
+    // line/offset are additive (WP-7 Ф204, section selector) — existing level/title consumers are unaffected.
+    expect(JSON.parse(result.result.content[0].text)).toEqual({ filename: "note.md", headings: [
+      { level: 1, title: "First", line: 1, offset: 0 },
+      { level: 2, title: "Second", line: 3, offset: 21 },
+    ] });
     expect(result.result.content[0].text).not.toContain("PRIVATE BODY");
+  });
+
+  // WP-7 Ф204: end-to-end wiring for the three selectors added this session — the unit-level
+  // byte-budget mechanics are covered in personal-response-bounds.test.ts; here we check that
+  // index.ts resolves `section` against the real document and reports the right MCP error shape.
+  describe("tail_lines and section (WP-7 Ф204)", () => {
+    const withSections = { filename: "list.md", source: "DS-my-strategy", source_type: "ds", github_url: null,
+      content: "# Intro\nnot kept\n## Tasks\n- a\n- b\n## Diary\nkept out" };
+
+    it("returns the section body bounded to its heading, excluding siblings", async () => {
+      vi.mocked(personalGetDocument).mockResolvedValueOnce(withSections);
+      const response = await callTool("get_document", { filename: withSections.filename, section: "Tasks" }, "private");
+      bounded(response);
+      expect(toolResult(response).isError).toBeUndefined();
+      expect(parsed(response).content).toBe("## Tasks\n- a\n- b\n");
+    });
+
+    it("reports section_not_found with the outline instead of guessing", async () => {
+      vi.mocked(personalGetDocument).mockResolvedValueOnce(withSections);
+      const response = await callTool("get_document", { filename: withSections.filename, section: "Nope" }, "private");
+      expect(toolResult(response).isError).toBe(true);
+      expect(parsed(response)).toMatchObject({ error: "section_not_found" });
+      expect(parsed(response).headings.map((h: { title: string }) => h.title)).toEqual(["Intro", "Tasks", "Diary"]);
+    });
+
+    it("reports section_ambiguous with line numbers instead of picking one", async () => {
+      vi.mocked(personalGetDocument).mockResolvedValueOnce({ ...withSections, content: "## Same\na\n## Same\nb" });
+      const response = await callTool("get_document", { filename: withSections.filename, section: "Same" }, "private");
+      expect(toolResult(response).isError).toBe(true);
+      expect(parsed(response)).toMatchObject({ error: "section_ambiguous", matches: [{ level: 2, line: 1 }, { level: 2, line: 3 }] });
+    });
+
+    it("does not treat a heading-shaped line inside a fenced code block or frontmatter as a section", async () => {
+      const withNoise = { ...withSections, content: "---\n# not a heading\n---\n```\n## Tasks\n```\n## Tasks\nreal body" };
+      vi.mocked(personalGetDocument).mockResolvedValueOnce(withNoise);
+      const response = await callTool("get_document", { filename: withNoise.filename, section: "Tasks" }, "private");
+      expect(toolResult(response).isError).toBeUndefined();
+      expect(parsed(response).content).toBe("## Tasks\nreal body");
+    });
+
+    // Kimi + Codex cold review, round 8: a naive toggle-on-any-fence-line parser misreads a
+    // fenced block that contains a DIFFERENT fence character, or a shorter one of the SAME
+    // character, as already closed — CommonMark only closes on the same character, length >= opener.
+    it("does not close an outer fence on a shorter or differently-charactered nested fence", async () => {
+      const nested = { ...withSections, content: "````markdown\n```python\n## not real\n```\n~~~\n## also not real\n~~~\n````\n## Tasks\nreal body" };
+      vi.mocked(personalGetDocument).mockResolvedValueOnce(nested);
+      const response = await callTool("get_document", { filename: nested.filename, section: "Tasks" }, "private");
+      expect(toolResult(response).isError).toBeUndefined();
+      expect(parsed(response).content).toBe("## Tasks\nreal body");
+    });
+
+    it("does not treat a 4-space-indented fence marker as a real fence (CommonMark indented code)", async () => {
+      // Four leading spaces make this an indented code block, not a fence — so the heading-shaped
+      // line right after it is NOT inside a fence and IS a real section.
+      const indented = { ...withSections, content: "para\n    ```\n## Tasks\nreal body" };
+      vi.mocked(personalGetDocument).mockResolvedValueOnce(indented);
+      const response = await callTool("get_document", { filename: indented.filename, section: "Tasks" }, "private");
+      expect(toolResult(response).isError).toBeUndefined();
+      expect(parsed(response).content).toBe("## Tasks\nreal body");
+    });
+
+    it("finds headings in a file that starts with '---' but never closes it (thematic break, not frontmatter)", async () => {
+      const noClose = { ...withSections, content: "---\nintro text, no closing dashes anywhere\n## Tasks\nreal body" };
+      vi.mocked(personalGetDocument).mockResolvedValueOnce(noClose);
+      const response = await callTool("get_document", { filename: noClose.filename, section: "Tasks" }, "private");
+      expect(toolResult(response).isError).toBeUndefined();
+      expect(parsed(response).content).toBe("## Tasks\nreal body");
+    });
+
+    it("finds the section that runs to the end of the file when no later heading exists", async () => {
+      const last = { ...withSections, content: "# Intro\n## Tasks\n- a\n- b" };
+      vi.mocked(personalGetDocument).mockResolvedValueOnce(last);
+      const response = await callTool("get_document", { filename: last.filename, section: "Tasks" }, "private");
+      expect(toolResult(response).isError).toBeUndefined();
+      expect(parsed(response).content).toBe("## Tasks\n- a\n- b");
+    });
+
+    // Kimi cold review, round 9: documentHeadings' heading/fence/frontmatter regexes all operate
+    // per-line; JS `.`/`$` do not cross a trailing \r, so a CRLF file (Windows-authored notes, a
+    // realistic case for personal files) previously matched NO headings at all, not just corrupted
+    // titles as first suspected — confirmed empirically before fixing, not by inspection alone.
+    it("finds sections and exact offsets in a CRLF file the same as in an LF one", async () => {
+      const crlf = { ...withSections, content: "# Intro\r\nnot kept\r\n## Tasks\r\n- a\r\n- b\r\n## Diary\r\nkept out" };
+      vi.mocked(personalGetDocument).mockResolvedValueOnce(crlf);
+      const response = await callTool("get_document", { filename: crlf.filename, section: "Tasks" }, "private");
+      expect(toolResult(response).isError).toBeUndefined();
+      expect(parsed(response).content).toBe("## Tasks\r\n- a\r\n- b\r\n");
+    });
+
+    it("strips an ATX heading's optional closing run of # characters from the title", async () => {
+      const closed = { ...withSections, content: "## Tasks ##\nbody" };
+      vi.mocked(personalGetDocument).mockResolvedValueOnce(closed);
+      const response = await callTool("get_document", { filename: closed.filename, section: "Tasks" }, "private");
+      expect(toolResult(response).isError).toBeUndefined();
+      expect(parsed(response).content).toBe("## Tasks ##\nbody");
+    });
+
+    it("recognizes a heading indented up to 3 spaces, same CommonMark tolerance as fences (Kimi, round 10)", async () => {
+      const indentedHeading = { ...withSections, content: "para\n   ## Tasks\nbody" };
+      vi.mocked(personalGetDocument).mockResolvedValueOnce(indentedHeading);
+      const response = await callTool("get_document", { filename: indentedHeading.filename, section: "Tasks" }, "private");
+      expect(toolResult(response).isError).toBeUndefined();
+      expect(parsed(response).content).toBe("   ## Tasks\nbody");
+    });
+
+    it("rejects a whitespace-only section title instead of silently matching nothing useful", async () => {
+      const response = await callTool("get_document", { filename: withSections.filename, section: "   " }, "private");
+      expect(toolResult(response).isError).toBe(true);
+      expect(parsed(response).error).toBe("invalid_arguments");
+    });
+
+    it("paginates a section through the real handler via next_cursor, bounded to the section", async () => {
+      const big = { ...withSections, content: "# Intro\nbefore\n## Tasks\n" + "x".repeat(60_000) + "\n## Diary\nafter" };
+      vi.mocked(personalGetDocument).mockResolvedValue(big);
+      let cursor: string | null = null;
+      let combined = "";
+      let pages = 0;
+      do {
+        const response = await callTool("get_document", cursor
+          ? { filename: big.filename, cursor }
+          : { filename: big.filename, section: "Tasks" }, "private");
+        bounded(response);
+        const page = parsed(response);
+        combined += page.content;
+        cursor = page.next_cursor;
+        expect(++pages).toBeLessThan(20);
+      } while (cursor);
+      const sectionText = big.content.slice(big.content.indexOf("## Tasks"), big.content.indexOf("## Diary"));
+      expect(combined).toBe(sectionText);
+      expect(combined).not.toContain("after");
+      expect(pages).toBeGreaterThan(1);
+    });
+
+    it("works through a live read (include_sha) the same way as indexed", async () => {
+      vi.mocked(personalGetDocumentWithSha).mockResolvedValueOnce({ ...withSections, kind: "document", sha: "a".repeat(40) });
+      const response = await callTool("get_document", { filename: withSections.filename, section: "Tasks", include_sha: true }, "private");
+      expect(toolResult(response).isError).toBeUndefined();
+      expect(parsed(response)).toMatchObject({ content: "## Tasks\n- a\n- b\n", sha: "a".repeat(40) });
+    });
+
+    it("returns the last requested lines through the real handler, live and indexed", async () => {
+      vi.mocked(personalGetDocument).mockResolvedValueOnce({ ...withSections, content: "a\nb\nc" });
+      const indexedResponse = await callTool("get_document", { filename: withSections.filename, tail_lines: 2 }, "private");
+      expect(parsed(indexedResponse)).toMatchObject({ content: "b\nc", lines_returned: 2 });
+
+      vi.mocked(personalGetDocumentWithSha).mockResolvedValueOnce({ ...withSections, kind: "document", content: "a\nb\nc", sha: "a".repeat(40) });
+      const liveResponse = await callTool("get_document", { filename: withSections.filename, tail_lines: 2, include_sha: true }, "private");
+      expect(parsed(liveResponse)).toMatchObject({ content: "b\nc", lines_returned: 2, sha: "a".repeat(40) });
+    });
+
+    it("rejects tail_lines and section together with the same selector-exclusivity error as cursor", async () => {
+      const response = await callTool("get_document", { filename: withSections.filename, tail_lines: 2, section: "Tasks" }, "private");
+      expect(toolResult(response).isError).toBe(true);
+      expect(parsed(response).error).toBe("invalid_arguments");
+    });
   });
 });
 
