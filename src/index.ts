@@ -1245,6 +1245,8 @@ async function getDocument(
 interface DocumentHeading {
   level: number;
   title: string;
+  line: number;
+  offset: number;
 }
 
 async function getDocumentStructure(
@@ -1259,13 +1261,99 @@ async function getDocumentStructure(
   return { filename: doc.filename, headings: documentHeadings(doc.content) };
 }
 
+// CommonMark allows a fence to be indented up to 3 spaces; 4+ is an indented code block, not a
+// fence (Codex cold review, round 8). Anchored at line start, not `trimStart()`, for that reason.
+// The opener may be followed by anything (an info string like "python" or "js linenums"); only
+// the closer is required to contain nothing but the fence character itself.
+const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})/;
+const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})\s*$/;
+
+/** `line`/`offset` are additive (WP-7 Ф204): existing consumers reading only
+ * {level, title} are unaffected. A heading inside a fenced code block or the
+ * leading YAML frontmatter is not a real section boundary and is skipped —
+ * otherwise `## comment syntax` in a snippet would shadow the real section.
+ * Fences remember their own opening marker and length (Kimi cold review,
+ * round 8): a plain toggle on any ```/~~~ line misreads a fenced block that
+ * itself contains a shorter nested fence (a ```markdown block showcasing a
+ * ```python snippet), or one fenced with the other character, as closed one
+ * line early. CommonMark's own rule — a fence closes only on a line of the
+ * SAME character repeated at least as many times as the opener, with
+ * nothing else on it — avoids both. */
 function documentHeadings(content: string): DocumentHeading[] {
   const headings: DocumentHeading[] = [];
-  for (const line of content.split("\n")) {
-    const match = line.match(/^(#{1,6})\s+(.+)$/);
-    if (match) headings.push({ level: match[1].length, title: match[2].trim() });
+  const lines = content.split("\n");
+  // CRLF files keep a trailing \r on every split element (only "\n" is the delimiter). JS regex
+  // `.` and `$` do not cross it, so every pattern below silently matched nothing at all on a
+  // CRLF file before this strip (Kimi cold review, round 9 — found empirically, not by inspection:
+  // the heading regex returned null outright on a line ending in \r, not a corrupted title as
+  // first suspected). `offset` still accumulates the UNSTRIPPED `line.length`, so byte positions
+  // into the original `content` stay exact.
+  const stripCR = (line: string) => line.endsWith("\r") ? line.slice(0, -1) : line;
+  // A leading "---" with no closing "---" anywhere after it is not frontmatter at all — just a
+  // thematic break (Kimi + Codex cold review, round 8) — so it must not swallow every heading
+  // in the file. `lines.length > 1` because a bare "---" on the only line of a file is already
+  // handled correctly either way (nothing follows it to lose).
+  const inFrontmatterAtAll = stripCR(lines[0]) === "---" && lines.length > 1 && lines.slice(1).some(l => stripCR(l) === "---");
+  let inFrontmatter = inFrontmatterAtAll;
+  let fence: { char: string; length: number } | null = null;
+  let offset = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const line = stripCR(raw);
+    if (inFrontmatter) {
+      if (i > 0 && line === "---") inFrontmatter = false;
+    } else if (fence) {
+      const close = line.match(FENCE_CLOSE);
+      if (close && close[1][0] === fence.char && close[1].length >= fence.length) fence = null;
+    } else {
+      const opens = line.match(FENCE_OPEN);
+      if (opens) {
+        fence = { char: opens[1][0], length: opens[1].length };
+      } else {
+        // Up to 3 leading spaces, same CommonMark tolerance already applied to fences above
+        // (Kimi cold review, round 10).
+        const heading = line.match(/^ {0,3}(#{1,6})\s+(.+)$/);
+        // CommonMark ATX headings allow an optional closing run of # chars ("## Foo ##") that is
+        // not part of the title (Kimi cold review, round 9) — stripped before trimming.
+        if (heading) headings.push({ level: heading[1].length, title: heading[2].replace(/\s+#+\s*$/, "").trim(), line: i + 1, offset });
+      }
+    }
+    offset += raw.length + 1; // the \r (if any) is part of the original document's bytes
   }
   return headings;
+}
+
+type SectionLookup =
+  | { ok: true; start: number; end: number }
+  | { ok: false; reason: "section_not_found"; headings: DocumentHeading[] }
+  | { ok: false; reason: "section_ambiguous"; matches: { level: number; line: number }[] };
+
+/** A section runs from its heading to the next heading of the same or higher
+ * importance (lower or equal `level`) — the standard outline convention — or
+ * to the end of the document (WP-7 Ф204, `get_document(section: "...")`). */
+function resolveSection(content: string, title: string): SectionLookup {
+  const headings = documentHeadings(content);
+  const matches = headings.filter(h => h.title === title);
+  if (matches.length === 0) return { ok: false, reason: "section_not_found", headings };
+  if (matches.length > 1) {
+    return { ok: false, reason: "section_ambiguous", matches: matches.map(h => ({ level: h.level, line: h.line })) };
+  }
+  const match = matches[0];
+  const next = headings.find(h => h.offset > match.offset && h.level <= match.level);
+  return { ok: true, start: match.offset, end: next ? next.offset : content.length };
+}
+
+/** Shared by the live and indexed `get_document` paths below, which otherwise repeat the same
+ * not-found/ambiguous JSON error shape for a `section` argument (WP-7 Ф204). */
+function sectionWindowOrError(id: string | number, content: string, title: string):
+  { bound: { start: number; end: number }; errorResult?: undefined }
+  | { bound?: undefined; errorResult: { jsonrpc: "2.0"; id: string | number; result: { content: { type: "text"; text: string }[]; isError: true } } } {
+  const lookup = resolveSection(content, title);
+  if (lookup.ok) return { bound: { start: lookup.start, end: lookup.end } };
+  const payload = lookup.reason === "section_not_found"
+    ? { error: lookup.reason, message: "Заголовок не найден — вот оглавление файла.", headings: lookup.headings }
+    : { error: lookup.reason, message: "Заголовок встречается несколько раз — уточни какой (см. matches).", matches: lookup.matches };
+  return { errorResult: { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(payload) }], isError: true } } };
 }
 
 // WP-7 Ф117: extractTitle/PathEntry/buildPathTree moved to ./path-tree.ts so layers/personal.ts
@@ -2957,12 +3045,14 @@ export const PRIVATE_TOOLS = [
 function privateToolDefinition(tool: (typeof TOOLS)[number]) {
   if (tool.name === "get_document") return {
     ...tool,
-    description: "Read a personal document (32000 UTF-8 response bytes). Small legacy responses keep their shape; oversized reads require cursor:'start', then next_cursor. complete covers the selected representation; indexed legacy data may be a fragment. Use include_sha:true for the exact live file and collect all pages before editing. Headings are never partial.",
+    description: "Read a personal document (32000 UTF-8 response bytes). Small legacy responses keep their shape; oversized reads require cursor:'start', then next_cursor. complete covers the selected representation; indexed legacy data may be a fragment. Use include_sha:true for the exact live file and collect all pages before editing. Headings are never partial. For just the end or one heading of a large file, use tail_lines or section instead of paging through cursor from the start (WP-7 Ф204) — pick exactly one of cursor, tail_lines, section.",
     inputSchema: {
       ...tool.inputSchema,
       properties: {
         ...tool.inputSchema.properties,
-        cursor: { type: "string", maxLength: 512, description: "Private full reads only: 'start' opts into JSON pages; copy next_cursor with the same filename/source/include_sha/ref. On document_changed, discard pages and restart. Each page rechecks access. Not combinable with headings." },
+        cursor: { type: "string", maxLength: 512, description: "Private full reads only: 'start' opts into JSON pages; copy next_cursor with the same filename/source/include_sha/ref. On document_changed, discard pages and restart. Each page rechecks access. Not combinable with headings, tail_lines or section." },
+        tail_lines: { type: "integer", minimum: 1, description: "Private full reads only: the last N whole lines of the document, cheaper than paging from the start when you only need the end (e.g. before appending). If the budget cannot fit N lines, returns as many as fit with truncated:true; if even one line cannot fit, returns its tail with partial_line:true rather than nothing. Not combinable with cursor or section." },
+        section: { type: "string", description: "Private full reads only: the content under one heading (its title, exact match — copy it from format:'headings' rather than retyping, leading/trailing whitespace is not trimmed), up to the next heading of the same or higher level or the end of the document. Headings inside fenced code blocks or YAML frontmatter do not count. No match returns the document's heading outline (error section_not_found); more than one match returns their line numbers (error section_ambiguous) — call get_document(format:'headings') or disambiguate and retry. A section larger than the budget pages the same way as cursor, via next_cursor. Not combinable with cursor or tail_lines." },
       },
     },
   };
@@ -3455,6 +3545,8 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
             if (pageError) return privateReadError(id, pageError.code, pageError.message);
             const filename = args.filename as string;
             const ref = args.ref as string | undefined;
+            const tailLines = args.tail_lines as number | undefined;
+            const sectionTitle = args.section as string | undefined;
 
             // GitHub's Contents API treats an empty ref value as "no ref" and returns the
             // default-branch (current) version — not an error. Passing that empty ref through
@@ -3490,7 +3582,17 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
               if (liveResult.kind === "source_required") {
                 return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ error: "source_required", message: "Документа нет в индексе — для живого чтения с GitHub передай source явно.", sources: liveResult.sources }) }], isError: true } };
               }
-              return await buildPrivateDocumentResponse(id, liveResult, { userId: principal.userId, live: true, ref, cursor: args.cursor });
+              let liveSection;
+              if (sectionTitle !== undefined) {
+                const resolved = sectionWindowOrError(id, liveResult.content, sectionTitle);
+                if (resolved.errorResult) return resolved.errorResult;
+                liveSection = resolved.bound;
+              }
+              return await buildPrivateDocumentResponse(id, liveResult, {
+                userId: principal.userId, live: true, ref, cursor: args.cursor,
+                ...(tailLines !== undefined ? { tailLines } : {}),
+                ...(liveSection ? { section: liveSection } : {}),
+              });
             }
 
             let doc;
@@ -3505,9 +3607,17 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
             if (!doc) {
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Document not found" }], isError: true } };
             }
+            let indexedSection;
+            if (sectionTitle !== undefined) {
+              const resolved = sectionWindowOrError(id, doc.content, sectionTitle);
+              if (resolved.errorResult) return resolved.errorResult;
+              indexedSection = resolved.bound;
+            }
             return await buildPrivateDocumentResponse(id, doc, {
               userId: principal.userId, live: false, cursor: args.cursor,
               ...(args.format === "headings" ? { headings: documentHeadings(doc.content) } : {}),
+              ...(tailLines !== undefined ? { tailLines } : {}),
+              ...(indexedSection ? { section: indexedSection } : {}),
             });
           }
 

@@ -7,7 +7,7 @@ const CURSOR_MAX_LENGTH = 512;
 type RequestId = string | number;
 type ResponseEnvelope = { jsonrpc: "2.0"; id: RequestId | null; result?: unknown; error?: { code: number; message: string } };
 type Problem = { code: string; message: string };
-type DocumentCursor = { offset: number; binding: string; revision: string };
+type DocumentCursor = { offset: number; binding: string; revision: string; end?: number };
 
 export function privateResponseBytes(response: ResponseEnvelope): number {
   return new TextEncoder().encode(JSON.stringify(response)).length;
@@ -85,11 +85,16 @@ function decodeCursor(value: unknown): DocumentCursor | null {
     throw new Error("Invalid document cursor");
   }
   const parsed = JSON.parse(atob(value.slice(CURSOR_PREFIX.length).replace(/-/g, "+").replace(/_/g, "/")));
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
-    || Object.keys(parsed).sort().join(",") !== "binding,offset,revision"
-    || !Number.isSafeInteger(parsed.offset) || parsed.offset < 0
+  const keys = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? Object.keys(parsed).sort().join(",") : "";
+  // "end" is optional: absent means "to the end of the whole document" (plain forward paging,
+  // unchanged shape of every cursor issued before the section selector existed, WP-7 Ф204).
+  if (keys !== "binding,offset,revision" && keys !== "binding,end,offset,revision") {
+    throw new Error("Invalid document cursor");
+  }
+  if (!Number.isSafeInteger(parsed.offset) || parsed.offset < 0
     || typeof parsed.binding !== "string" || typeof parsed.revision !== "string"
-    || !/^[a-f0-9]{64}$/.test(parsed.binding) || !/^[a-f0-9]{64}$/.test(parsed.revision)) {
+    || !/^[a-f0-9]{64}$/.test(parsed.binding) || !/^[a-f0-9]{64}$/.test(parsed.revision)
+    || (parsed.end !== undefined && (!Number.isSafeInteger(parsed.end) || parsed.end < parsed.offset))) {
     throw new Error("Invalid document cursor");
   }
   return parsed as DocumentCursor;
@@ -100,15 +105,27 @@ function encodeCursor(cursor: DocumentCursor): string {
 }
 
 export function validateDocumentPageRequest(args: Record<string, unknown>): Problem | null {
-  if (args.cursor === undefined) return null;
+  const selectors = ["cursor", "tail_lines", "section"].filter(key => args[key] !== undefined);
+  if (selectors.length > 1) {
+    return { code: "invalid_arguments", message: `Only one of cursor, tail_lines, section may be given at once (got ${selectors.join(", ")}).` };
+  }
+  if (selectors.length === 0) return null;
   if (args.format !== undefined && args.format !== "full") {
     return { code: "invalid_arguments", message: "Document pages require format:'full'; headings are returned only as a complete outline." };
   }
   if (args.ref !== undefined && (typeof args.ref !== "string" || args.ref.length === 0)) {
     return { code: "invalid_arguments", message: "ref must be a non-empty git ref" };
   }
-  try { decodeCursor(args.cursor); } catch {
-    return { code: "invalid_cursor", message: "Invalid document cursor; start again with cursor:'start'." };
+  if (args.cursor !== undefined) {
+    try { decodeCursor(args.cursor); } catch {
+      return { code: "invalid_cursor", message: "Invalid document cursor; start again with cursor:'start'." };
+    }
+  }
+  if (args.tail_lines !== undefined && (!Number.isSafeInteger(args.tail_lines) || (args.tail_lines as number) <= 0)) {
+    return { code: "invalid_arguments", message: "tail_lines must be a positive integer." };
+  }
+  if (args.section !== undefined && (typeof args.section !== "string" || args.section.trim().length === 0)) {
+    return { code: "invalid_arguments", message: "section must be a non-empty heading title." };
   }
   return null;
 }
@@ -121,7 +138,24 @@ async function digest(value: unknown): Promise<string> {
 }
 
 type PersonalDocument = { filename: string; source: string; content: string; sha?: string };
-type DocumentRead = { userId: string; live: boolean; ref?: string; cursor?: unknown; headings?: unknown[] };
+type SectionBound = { start: number; end: number };
+type DocumentRead = {
+  userId: string; live: boolean; ref?: string; cursor?: unknown; headings?: unknown[];
+  tailLines?: number; section?: SectionBound;
+};
+
+/** Shared document metadata envelope — identical for every read shape (plain, paged, tail). */
+function documentEnvelope(doc: PersonalDocument, read: DocumentRead, readMode: "live" | "indexed") {
+  return {
+    filename: doc.filename, source: doc.source,
+    ...(read.live ? { sha: doc.sha, ...(read.ref !== undefined ? { ref: read.ref } : {}) } : {}),
+    read_mode: readMode,
+    content_scope: read.live ? "full_file" : "indexed_representation",
+    instruction: read.live
+      ? "Collect all pages before editing; sha belongs to the complete file."
+      : "complete covers this indexed representation, which may be a legacy fragment; use include_sha:true for the exact file.",
+  };
+}
 
 async function pagedDocumentResponse(id: RequestId, doc: PersonalDocument, read: DocumentRead): Promise<ResponseEnvelope> {
   let cursor: DocumentCursor | null;
@@ -139,29 +173,30 @@ async function pagedDocumentResponse(id: RequestId, doc: PersonalDocument, read:
   if (cursor && cursor.revision !== revision) {
     return privateReadError(id, "document_changed", "Document representation changed between pages; discard collected pages and start again.");
   }
-  const start = cursor?.offset ?? 0;
-  if (start > doc.content.length || (cursor && start === doc.content.length)
+  // A section cursor carries its own upper bound (WP-7 Ф204); a plain forward cursor has none
+  // and reads to the end of the whole document, same as before this selector existed.
+  const boundEnd = cursor?.end ?? read.section?.end ?? doc.content.length;
+  const start = cursor?.offset ?? read.section?.start ?? 0;
+  if (start > boundEnd || boundEnd > doc.content.length || (cursor && start === boundEnd)
     || !isTextBoundary(doc.content, start)) {
     return privateReadError(id, "invalid_cursor", "Cursor offset is outside the document or splits a Unicode character.");
   }
+  // Hoisted out of render(): both are O(document size) and render() runs once per bisection step.
+  const totalLines = countLines(doc.content);
+  const totalBytes = new TextEncoder().encode(doc.content).length;
   const render = (end: number): ResponseEnvelope => textResponse(id, JSON.stringify({
-    filename: doc.filename, source: doc.source,
-    ...(read.live ? { sha: doc.sha, ...(read.ref !== undefined ? { ref: read.ref } : {}) } : {}),
+    ...documentEnvelope(doc, read, readMode),
     content: doc.content.slice(start, end),
-    read_mode: readMode,
-    content_scope: read.live ? "full_file" : "indexed_representation",
-    instruction: read.live
-      ? "Collect all pages before editing; sha belongs to the complete file."
-      : "complete covers this indexed representation, which may be a legacy fragment; use include_sha:true for the exact file.",
+    total_lines: totalLines, total_bytes: totalBytes,
     revision: `v1:${revision}`,
-    complete: end === doc.content.length,
-    next_cursor: end === doc.content.length ? null : encodeCursor({ offset: end, binding, revision }),
+    complete: end === boundEnd,
+    next_cursor: end === boundEnd ? null : encodeCursor({ offset: end, binding, revision, ...(boundEnd !== doc.content.length ? { end: boundEnd } : {}) }),
   }, null, 2));
 
-  const remainder = render(doc.content.length);
+  const remainder = render(boundEnd);
   if (privateResponseBytes(remainder) <= PRIVATE_READ_RESPONSE_BUDGET_BYTES) return remainder;
   let low = start + 1;
-  let high = doc.content.length - 1;
+  let high = boundEnd - 1;
   let best: ResponseEnvelope | null = null;
   while (low <= high) {
     const middle = Math.floor((low + high) / 2);
@@ -177,10 +212,102 @@ async function pagedDocumentResponse(id: RequestId, doc: PersonalDocument, read:
   return best ?? privateReadError(id, "response_too_large", "Document metadata leaves no room for a non-empty page within 32000 UTF-8 bytes.");
 }
 
+/** Lines in the CommonMark sense: a trailing newline terminates the last line rather than
+ * starting an empty one, matching how editors and `wc -l` count a well-formed text file. */
+function countLines(content: string): number {
+  if (content.length === 0) return 0;
+  const body = content.endsWith("\n") ? content.slice(0, -1) : content;
+  return body.split("\n").length;
+}
+
+/** Character offset where the last `n` lines of `content` begin, and how many whole lines
+ * that actually is (capped by the lines the document has). Slicing the ORIGINAL string from
+ * this offset — never splitting and rejoining — preserves `\r\n` exactly as written. */
+function tailLinesStart(content: string, n: number): { start: number; lines: number } {
+  if (n <= 0) return { start: content.length, lines: 0 };
+  let pos = content.endsWith("\n") ? content.length - 1 : content.length;
+  let lines = 0;
+  while (lines < n) {
+    const newline = content.lastIndexOf("\n", pos - 1);
+    if (newline === -1) return { start: 0, lines: lines + 1 };
+    pos = newline;
+    lines++;
+  }
+  return { start: pos + 1, lines };
+}
+
+async function tailLinesDocumentResponse(id: RequestId, doc: PersonalDocument, read: DocumentRead): Promise<ResponseEnvelope> {
+  const readMode = read.live ? "live" : "indexed";
+  const revision = await digest([doc.content, doc.sha ?? null]);
+  const totalLines = countLines(doc.content);
+  const totalBytes = new TextEncoder().encode(doc.content).length;
+  const requested = read.tailLines!;
+
+  const render = (start: number, linesReturned: number, partialLine: boolean): ResponseEnvelope => textResponse(id, JSON.stringify({
+    ...documentEnvelope(doc, read, readMode),
+    content: doc.content.slice(start),
+    lines_returned: linesReturned, total_lines: totalLines, total_bytes: totalBytes,
+    truncated: linesReturned < Math.min(requested, totalLines) || partialLine,
+    partial_line: partialLine,
+    revision: `v1:${revision}`,
+  }, null, 2));
+
+  // Binary search over "how many whole trailing lines" fit the byte budget — monotonic because
+  // fewer lines never slice a larger suffix of the same document (WP-7 Ф204, Codex cold review).
+  const ideal = tailLinesStart(doc.content, Math.min(requested, totalLines));
+  let bestLines = 0;
+  let bestStart = doc.content.length;
+  let low = 0, high = ideal.lines;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const { start, lines } = tailLinesStart(doc.content, middle);
+    const response = render(start, lines, false);
+    if (privateResponseBytes(response) <= PRIVATE_READ_RESPONSE_BUDGET_BYTES) {
+      bestLines = lines; bestStart = start;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  if (bestLines > 0 || doc.content.length === 0) return render(bestStart, bestLines, false);
+
+  // Not even one whole line fits the budget — hand back the tail of that single line instead
+  // of an empty, useless page (Codex cold review, High: a silent 0-line response is worse than
+  // a partial one here, since the caller asked specifically for the end of the document).
+  // Unlike the bisection above, growing `start` here SHRINKS the response (end is pinned at
+  // content.length) — the fitting direction is reversed, so moving the found boundary must be
+  // too: on a fit we narrow `high` to look for an even smaller (more content) start.
+  const oneLine = tailLinesStart(doc.content, 1);
+  low = oneLine.start + 1; high = doc.content.length;
+  let bestPartialStart = doc.content.length;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const start = boundaryAtOrBefore(doc.content, middle);
+    if (privateResponseBytes(render(start, 1, true)) <= PRIVATE_READ_RESPONSE_BUDGET_BYTES) {
+      bestPartialStart = start; high = middle - 1;
+    } else {
+      low = middle + 1;
+    }
+  }
+  return bestPartialStart < doc.content.length
+    ? render(bestPartialStart, 1, true)
+    : privateReadError(id, "response_too_large", "Document metadata leaves no room for a non-empty page within 32000 UTF-8 bytes.");
+}
+
 export async function buildPrivateDocumentResponse(id: RequestId, doc: PersonalDocument, read: DocumentRead): Promise<ResponseEnvelope> {
-  if (read.cursor !== undefined) {
-    if (read.headings !== undefined) return privateReadError(id, "invalid_arguments", "Document pages require format:'full'.");
-    return pagedDocumentResponse(id, doc, read);
+  const paged = read.cursor !== undefined || read.tailLines !== undefined || read.section !== undefined;
+  if (paged && read.headings !== undefined) {
+    return privateReadError(id, "invalid_arguments", "Document pages require format:'full'.");
+  }
+  if (read.tailLines !== undefined) return tailLinesDocumentResponse(id, doc, read);
+  if (read.cursor !== undefined || read.section !== undefined) {
+    // A `section` read's first page carries no cursor of its own (Kimi cold review, round 8):
+    // normalize it to the same explicit "start" a plain forward read uses here, at the one call
+    // site that needs it, rather than teaching decodeCursor a second meaning for `undefined`.
+    // `=== undefined`, not `??`: an explicit `null`/other garbage cursor must still fail as
+    // invalid below, not get silently replaced by "start" (cold review, round 8 — `??` would
+    // have papered over exactly the malformed-cursor cases the tests below exist to catch).
+    return pagedDocumentResponse(id, doc, { ...read, cursor: read.cursor === undefined ? "start" : read.cursor });
   }
   const text = read.live
     ? JSON.stringify({ filename: doc.filename, source: doc.source, sha: doc.sha, ...(read.ref ? { ref: read.ref } : {}), content: doc.content }, null, 2)
