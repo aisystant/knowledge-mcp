@@ -97,6 +97,7 @@ vi.mock("./layers/personal.js", () => ({
   connectSource: vi.fn(),
   writeToGitHub: vi.fn(),
   appendToGitHub: vi.fn(),
+  strReplaceInGitHub: vi.fn(),
   deleteFromGitHub: vi.fn(),
   // Real personalDb() is just neon(env.DATABASE_URL) — delegate to the same mockNeon
   // so overriding `neon` (e.g. vi.mocked(neon).mockImplementationOnce(...) in a test)
@@ -122,7 +123,7 @@ vi.mock("./layers/private.js", async (importOriginal) => {
 });
 
 const { handleMcpRequest, TOOLS, default: worker } = await import("./index.js");
-const { AmbiguousSourceError, resolveUserContext, personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalListSources, personalListDocuments, personalListPath, writeToGitHub, appendToGitHub, deleteFromGitHub } = await import("./layers/personal.js");
+const { AmbiguousSourceError, resolveUserContext, personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalListSources, personalListDocuments, personalListPath, writeToGitHub, appendToGitHub, strReplaceInGitHub, deleteFromGitHub } = await import("./layers/personal.js");
 
 const ENV = {
   KNOWLEDGE_DATABASE_URL: "postgres://fake-public",
@@ -381,6 +382,16 @@ describe("dual-mode routing: private mode reaches the personal layer, never the 
       expect(appendToGitHub).not.toHaveBeenCalled();
     });
 
+    // Codex cold review, round 15, High: content left the schema's `required` list when
+    // str_replace was added (it must be absent for that mode) — this pins that mode:'replace'
+    // still refuses a missing content instead of silently forwarding `undefined` to GitHub.
+    it("still requires content for mode:'replace' (regression: content left the schema's required list)", async () => {
+      const res = await callTool("write", { source: "DS-my-strategy", path: "docs/note.md" }, "private") as
+        { result: { content: [{ text: string }]; isError?: boolean } };
+      expect(res.result.isError).toBe(true);
+      expect(writeToGitHub).not.toHaveBeenCalled();
+    });
+
     it("rejects an empty or oversized operation_id before calling the personal layer", async () => {
       for (const operation_id of ["", "x".repeat(129)]) {
         const res = await callTool("write", {
@@ -421,6 +432,87 @@ describe("dual-mode routing: private mode reaches the personal layer, never the 
       }, "private") as { result: { content: [{ text: string }] } };
 
       expect(JSON.parse(res.result.content[0].text)).toMatchObject({ success: true, retried: 2, idempotent_replay: true });
+    });
+  });
+
+  describe("write: mode 'str_replace' (WP-7 Ф204)", () => {
+    const expectedSha = "a".repeat(40);
+
+    it("requires expected_sha before calling the personal layer at all", async () => {
+      const res = await callTool("write", { source: "DS-my-strategy", path: "docs/note.md", mode: "str_replace", old_string: "a", new_string: "b" }, "private") as
+        { result: { content: [{ text: string }]; isError?: boolean } };
+      expect(res.result.isError).toBe(true);
+      expect(strReplaceInGitHub).not.toHaveBeenCalled();
+    });
+
+    it("requires a non-empty old_string", async () => {
+      const res = await callTool("write", { source: "DS-my-strategy", path: "docs/note.md", mode: "str_replace", old_string: "", new_string: "b", expected_sha: expectedSha }, "private") as
+        { result: { content: [{ text: string }]; isError?: boolean } };
+      expect(res.result.isError).toBe(true);
+      expect(strReplaceInGitHub).not.toHaveBeenCalled();
+    });
+
+    it("requires new_string to be present (even if empty)", async () => {
+      const res = await callTool("write", { source: "DS-my-strategy", path: "docs/note.md", mode: "str_replace", old_string: "a", expected_sha: expectedSha }, "private") as
+        { result: { content: [{ text: string }]; isError?: boolean } };
+      expect(res.result.isError).toBe(true);
+      expect(strReplaceInGitHub).not.toHaveBeenCalled();
+    });
+
+    it("rejects a non-boolean dry_run", async () => {
+      const res = await callTool("write", {
+        source: "DS-my-strategy", path: "docs/note.md", mode: "str_replace", old_string: "a", new_string: "b", expected_sha: expectedSha, dry_run: "yes",
+      }, "private") as { result: { content: [{ text: string }]; isError?: boolean } };
+      expect(res.result.isError).toBe(true);
+      expect(strReplaceInGitHub).not.toHaveBeenCalled();
+    });
+
+    it("forwards old_string, new_string, expected_sha, on_conflict, operation_id and dry_run to strReplaceInGitHub, not writeToGitHub or appendToGitHub", async () => {
+      vi.mocked(strReplaceInGitHub).mockResolvedValueOnce({ success: true, sha: "b".repeat(40), retried: 0 });
+
+      await callTool("write", {
+        source: "DS-my-strategy", path: "docs/note.md", mode: "str_replace",
+        old_string: "old", new_string: "new", expected_sha: expectedSha, on_conflict: "retry", operation_id: "op-1", dry_run: true,
+      }, "private");
+
+      expect(writeToGitHub).not.toHaveBeenCalled();
+      expect(appendToGitHub).not.toHaveBeenCalled();
+      expect(strReplaceInGitHub).toHaveBeenCalledTimes(1);
+      expect(strReplaceInGitHub).toHaveBeenCalledWith(
+        ENV,
+        expect.objectContaining({ userId: "user-private-1" }),
+        "DS-my-strategy",
+        "docs/note.md",
+        "old",
+        "new",
+        "Update via Aisystant MCP",
+        expectedSha,
+        { onConflict: "retry", operationId: "op-1", dryRun: true },
+      );
+    });
+
+    it("returns strReplaceInGitHub's result shape verbatim, including fragment_ambiguous and matching_lines", async () => {
+      vi.mocked(strReplaceInGitHub).mockResolvedValueOnce({ success: false, reason: "fragment_ambiguous", matching_lines: [3, 9], error: "ambiguous" });
+
+      const res = await callTool("write", {
+        source: "DS-my-strategy", path: "docs/note.md", mode: "str_replace", old_string: "old", new_string: "new", expected_sha: expectedSha,
+      }, "private") as { result: { content: [{ text: string }] } };
+
+      expect(JSON.parse(res.result.content[0].text)).toMatchObject({ success: false, reason: "fragment_ambiguous", matching_lines: [3, 9] });
+    });
+
+    it("ignores a stray content argument for mode:'str_replace' instead of letting it affect the call", async () => {
+      vi.mocked(strReplaceInGitHub).mockResolvedValueOnce({ success: true, sha: "b".repeat(40) });
+
+      await callTool("write", {
+        source: "DS-my-strategy", path: "docs/note.md", mode: "str_replace",
+        content: "this should be ignored", old_string: "old", new_string: "new", expected_sha: expectedSha,
+      }, "private");
+
+      expect(strReplaceInGitHub).toHaveBeenCalledWith(
+        ENV, expect.objectContaining({ userId: "user-private-1" }), "DS-my-strategy", "docs/note.md",
+        "old", "new", "Update via Aisystant MCP", expectedSha, { onConflict: undefined, operationId: undefined, dryRun: false },
+      );
     });
   });
 

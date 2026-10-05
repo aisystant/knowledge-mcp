@@ -69,6 +69,7 @@ import {
   INDEXING_ASYNC_NOTICE,
   joinAppendedContent,
   appendToGitHub,
+  strReplaceInGitHub,
   type UserContext,
   type PersonalEnv,
 } from "./personal.js";
@@ -1710,6 +1711,225 @@ describe("appendToGitHub (WP-7 Ф204)", () => {
     expect(result.success).toBe(false);
     expect(result.reason).toBe("version_mismatch");
     expect(calls.filter(c => c.method === "PUT")).toHaveLength(1); // no second attempt
+  });
+});
+
+// WP-7 Ф204, step 3: the riskiest of the three — a replace can silently land on the wrong
+// text if the match isn't unique. Exact substring match only (no fuzzy/whitespace-normalized
+// matching, a documented simplification — see the function's own doc comment).
+describe("strReplaceInGitHub (WP-7 Ф204)", () => {
+  const OLD_SHA = "a".repeat(40);
+  const NEW_SHA = "b".repeat(40);
+  const liveContentResponse = (content: string, sha = OLD_SHA) =>
+    responseJson({ sha, content: btoa(unescape(encodeURIComponent(content))), encoding: "base64" });
+  const putResponse = (sha = NEW_SHA) => responseJson({ content: { sha, html_url: "https://github.com/x" } });
+
+  it("rejects an empty old_string before any network call", async () => {
+    const calls = queuedFetch([]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "", "x", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rejects old_string === new_string before any network call (nothing to replace)", async () => {
+    const calls = queuedFetch([]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "same", "same", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rejects a malformed expected_sha before any network call", async () => {
+    const calls = queuedFetch([]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old", "new", "replace", "not-a-sha");
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("invalid_expected_sha");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("replaces the one exact occurrence and writes the whole resulting file", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("line one\nold text\nline three"),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      putResponse(),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old text", "new text", "replace", OLD_SHA);
+    expect(result.success).toBe(true);
+    expect(result.sha).toBe(NEW_SHA);
+    expect(result.retried).toBe(0);
+    const put = calls.find(c => c.method === "PUT");
+    const body = JSON.parse(put!.body!) as { content: string };
+    expect(decodeURIComponent(escape(atob(body.content)))).toBe("line one\nnew text\nline three");
+  });
+
+  it("reports fragment_not_found instead of guessing, with no write attempted", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("line one\nline two"),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "not present", "x", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("fragment_not_found");
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("reports fragment_ambiguous with every match's line number, with no write attempted", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("dup\nline two\ndup\nline four\ndup"),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "dup", "x", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("fragment_ambiguous");
+    expect(result.matching_lines).toEqual([1, 3, 5]);
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("reports fragment_ambiguous for a self-overlapping old_string, not a false single match (Codex cold review, round 15, Critical)", async () => {
+    // "aba" occurs at offset 0 AND offset 2 of "ababa" — these overlap (share the middle "a"),
+    // but both are real matches. A non-overlapping scanner finds only the first and would have
+    // let this through as "exactly one occurrence", replacing an ambiguous fragment silently.
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("ababa"),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "aba", "X", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("fragment_ambiguous");
+    expect(result.matching_lines).toEqual([1, 1]); // both matches fall on the same (only) line — expected, not a bug
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("still finds the single match correctly when old_string has no self-overlap potential", async () => {
+    // Guards the fix above from overcorrecting: "aa" inside "xaax" is one real match, not
+    // artificially inflated by the overlap-aware scan.
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("xaax"),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      putResponse(),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "aa", "Y", "replace", OLD_SHA);
+    expect(result.success).toBe(true);
+  });
+
+  it("refuses a file that does not exist — str_replace never creates one", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ message: "Not Found" }, 404),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/new.md", "old", "new", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("invalid_expected_sha");
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("refuses a stale expected_sha without attempting a write when on_conflict is 'fail' (default)", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("old text here", NEW_SHA),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old text", "new text", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("version_mismatch");
+    expect(result.current_sha).toBe(NEW_SHA);
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("dry_run reports the match without writing, and never retries", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("line one\nold text\nline three"),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old text", "new text", "replace", OLD_SHA, { dryRun: true, onConflict: "retry" });
+    expect(result).toMatchObject({ success: true, dry_run: true, matching_lines: [2] });
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("retries once after a race between its own GET and PUT, re-verifying uniqueness each time", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("old text here", OLD_SHA),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      responseJson({ message: "sha does not match" }, 409), // another writer landed between our GET and PUT
+      ...installationTokenResponses(),
+      liveContentResponse("old text here, now with more context", NEW_SHA), // their edit, but our match still unique
+      ...installationTokenResponses(),
+      responseJson({ sha: NEW_SHA }),
+      putResponse("c".repeat(40)),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old text", "new text", "replace", OLD_SHA, { onConflict: "retry" });
+    expect(result.success).toBe(true);
+    expect(result.retried).toBe(1);
+  });
+
+  it("stops retrying the moment the precondition breaks, instead of blindly reapplying the edit", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("old text here", OLD_SHA),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      responseJson({ message: "sha does not match" }, 409),
+      ...installationTokenResponses(),
+      // Someone else's edit duplicated the matched text — retrying blindly here would risk
+      // replacing the wrong copy; this must report fragment_ambiguous, not try a third GET.
+      liveContentResponse("old text here\nold text here", NEW_SHA),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old text here", "new text", "replace", OLD_SHA, { onConflict: "retry" });
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("fragment_ambiguous");
+  });
+
+  it("does not retry a race at the PUT step when on_conflict is 'fail' (default)", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("old text here", OLD_SHA),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      responseJson({ message: "sha does not match" }, 409),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old text", "new text", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("version_mismatch");
+    expect(calls.filter(c => c.method === "PUT")).toHaveLength(1);
+  });
+
+  it("replays a prior commit by operation_id instead of applying the replace again", async () => {
+    queryQueue.push([{ installation_id: 42 }]);
+    const calls = queuedFetch([
+      responseJson({ token: "installation-token" }),
+      responseJson([
+        { sha: "d".repeat(40), commit: { message: "replace entry [op:retry-789]", author: { date: null, name: null } } },
+      ]),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old", "new", "replace entry", OLD_SHA, { operationId: "retry-789" });
+    expect(result).toMatchObject({ success: true, sha: "d".repeat(40), idempotent_replay: true });
+    expect(calls).toHaveLength(2); // history only — no GET-content, no PUT
+  });
+
+  it("does not consult operation_id history for a dry_run", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("old text here"),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old text", "new text", "replace", OLD_SHA, { dryRun: true, operationId: "op-1" });
+    expect(result).toMatchObject({ success: true, dry_run: true });
+    expect(calls).toHaveLength(2); // installation token + content GET only, no history lookup
+  });
+
+  it("works on a live read the same way as indexed (there is no indexed path for this layer)", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("a\nold\nb"),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      putResponse(),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old", "new", "replace", OLD_SHA);
+    expect(result.success).toBe(true);
   });
 });
 

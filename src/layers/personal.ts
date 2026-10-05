@@ -103,10 +103,13 @@ export interface PersonalWriteResult {
   url?: string;
   indexing?: IndexingNotice;
   error?: string;
-  reason?: "post_scaffold_required" | "existence_check_unavailable" | "version_mismatch" | "invalid_expected_sha" | "sha_required" | "github_validation_error";
+  reason?: "post_scaffold_required" | "existence_check_unavailable" | "version_mismatch" | "invalid_expected_sha"
+    | "sha_required" | "github_validation_error" | "fragment_not_found" | "fragment_ambiguous";
   next_action?: string;
   evidence?: ManagedPostEvidence;
   current_sha?: string | null;
+  /** str_replace only: 1-indexed line numbers of every match, present on fragment_ambiguous. */
+  matching_lines?: number[];
 }
 
 function frontmatterDeclaresPost(content: string): boolean {
@@ -736,6 +739,133 @@ export async function appendToGitHub(
     }
     // version_mismatch on this attempt's own PUT, more attempts left: someone else wrote between
     // our GET and PUT. Loop — the next GET picks up whatever they left and appends onto it.
+  }
+  throw new Error("unreachable: the loop above always returns on attempt === maxAttempts");
+}
+
+/** 1-indexed line number of a character offset, for fragment_ambiguous's error — the caller
+ * needs to find each occurrence by eye, not by re-deriving offsets. */
+function lineNumberAt(content: string, offset: number): number {
+  let line = 1;
+  for (let i = 0; i < offset; i++) if (content.charCodeAt(i) === 10 /* \n */) line++;
+  return line;
+}
+
+/** Every start offset where `needle` occurs in `haystack`, INCLUDING overlapping matches, in
+ * order (Codex cold review, round 15 — Critical). Advancing `from` past the whole match
+ * (`at + needle.length`) undercounts a self-overlapping needle: "aba" occurs at both offset 0
+ * and offset 2 of "ababa", but a non-overlapping scan only ever finds the first and reports a
+ * false "exactly one occurrence" — the one case str_replace's uniqueness guarantee exists to
+ * catch. Advancing by 1 instead costs nothing here: `oldString` is bounded by one file's size,
+ * not run in a hot loop. */
+function findAllOccurrences(haystack: string, needle: string): number[] {
+  const offsets: number[] = [];
+  let from = 0;
+  while (true) {
+    const at = haystack.indexOf(needle, from);
+    if (at === -1) break;
+    offsets.push(at);
+    from = at + 1;
+  }
+  return offsets;
+}
+
+export interface PersonalStrReplaceResult extends PersonalWriteResult {
+  retried?: number;
+  idempotent_replay?: boolean;
+  dry_run?: boolean;
+}
+
+/**
+ * Replace one exact occurrence of `oldString` with `newString` without the caller ever
+ * resending the rest of the file (WP-7 Ф204, step 3 — the riskiest of the three: unlike
+ * append, a replace can silently land on the wrong text if the match isn't unique).
+ *
+ * Exact substring match only in this first version — no fuzzy or whitespace-normalized
+ * matching (deferred, same reasoning as dropping the redundant `cursor:'end'` selector in
+ * step 1: a known, documented simplification, not an oversight). `oldString` must occur in
+ * the current file EXACTLY ONCE: zero occurrences is `fragment_not_found`, two or more is
+ * `fragment_ambiguous` with every match's line number — never a guess at which one was meant.
+ *
+ * `onConflict:'retry'` is deliberately STRICTER than append's: a replace's precondition —
+ * "oldString still occurs exactly once" — is re-checked on every attempt against the content
+ * actually just read, and retrying stops the moment it stops holding (someone else's edit
+ * touched the matched region, or duplicated/removed it) rather than ploughing ahead the way
+ * append safely can. A race that leaves the precondition intact (an edit elsewhere in the
+ * file) is the only case a retry actually resolves.
+ *
+ * `dryRun` runs every check and returns what WOULD happen (the matched line, under
+ * `matching_lines`) without writing — never retries, since there is nothing to retry.
+ */
+export async function strReplaceInGitHub(
+  env: PersonalEnv,
+  ctx: UserContext,
+  source: string,
+  path: string,
+  oldString: string,
+  newString: string,
+  message: string,
+  expectedSha: string,
+  options: { onConflict?: "fail" | "retry"; operationId?: string; dryRun?: boolean; dependencies?: Partial<GitHubApiDependencies> } = {},
+): Promise<PersonalStrReplaceResult> {
+  if (oldString.length === 0) {
+    return { success: false, error: "old_string не может быть пустым." };
+  }
+  if (oldString === newString) {
+    return { success: false, error: "old_string и new_string совпадают — нечего заменять." };
+  }
+  if (!GIT_BLOB_SHA.test(expectedSha)) {
+    return { success: false, reason: "invalid_expected_sha", error: "expected_sha должен быть 40-символьным hex sha из get_document(include_sha: true); str_replace не создаёт новые файлы." };
+  }
+  if (options.operationId !== undefined && (options.operationId.length === 0 || options.operationId.length > 128)) {
+    return { success: false, error: "operation_id должен быть непустой строкой до 128 символов." };
+  }
+
+  if (options.operationId !== undefined && !options.dryRun) {
+    const history = await personalGetDocumentHistory(env, ctx, source, path, 10);
+    if (history.success) {
+      const tag = APPEND_OPERATION_TAG(options.operationId);
+      const replay = history.entries.find(entry => entry.message.includes(tag));
+      if (replay) return { success: true, sha: replay.sha, idempotent_replay: true, indexing: INDEXING_ASYNC_NOTICE };
+    }
+    // Same best-effort reasoning as appendToGitHub: a lookup failure only risks a missed
+    // replay, not an unsafe write, so it must not block the write itself.
+  }
+
+  const onConflict = options.onConflict ?? "fail";
+  const taggedMessage = options.operationId ? `${message} ${APPEND_OPERATION_TAG(options.operationId)}` : message;
+  const maxAttempts = onConflict === "retry" && !options.dryRun ? APPEND_MAX_ATTEMPTS : 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const live = await personalGetDocumentLive(env, ctx, path, source);
+    if (!live) return { success: false, reason: "invalid_expected_sha", error: "Файл не найден — str_replace работает только с уже существующим файлом." };
+
+    if (live.sha.toLowerCase() !== expectedSha.toLowerCase() && attempt === 1 && onConflict === "fail") {
+      return { success: false, reason: "version_mismatch", current_sha: live.sha, error: "Файл изменился с момента чтения — перечитай personal_get_document(include_sha: true) и повтори запись." };
+    }
+
+    const matches = findAllOccurrences(live.content, oldString);
+    if (matches.length === 0) {
+      return { success: false, reason: "fragment_not_found", error: "old_string не найден в текущем содержимом файла — перечитай файл, текст мог измениться." };
+    }
+    if (matches.length > 1) {
+      return { success: false, reason: "fragment_ambiguous", matching_lines: matches.map(offset => lineNumberAt(live.content, offset)), error: `old_string встречается ${matches.length} раз(а) — добавь контекст, чтобы указать ровно одно вхождение.` };
+    }
+
+    const matchStart = matches[0];
+    const matchLine = lineNumberAt(live.content, matchStart);
+    if (options.dryRun) {
+      return { success: true, dry_run: true, matching_lines: [matchLine], sha: live.sha };
+    }
+
+    const newContent = live.content.slice(0, matchStart) + newString + live.content.slice(matchStart + oldString.length);
+    const result = await writeToGitHub(env, ctx, source, path, newContent, taggedMessage, options.dependencies, live.sha);
+    if (result.success || result.reason !== "version_mismatch" || attempt === maxAttempts) {
+      return { ...result, retried: attempt - 1 };
+    }
+    // The precondition (exactly one match) is re-verified at the top of the next iteration
+    // against whatever the next GET actually returns — a race that broke it fails there with
+    // fragment_not_found/fragment_ambiguous, not a blind reapplication of this attempt's edit.
   }
   throw new Error("unreachable: the loop above always returns on attempt === maxAttempts");
 }

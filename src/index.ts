@@ -42,6 +42,7 @@ import {
   personalGetDocumentWithSha,
   personalGetDocumentHistory,
   appendToGitHub,
+  strReplaceInGitHub,
   AmbiguousSourceError,
   personalListSources,
   personalListDocuments,
@@ -2854,19 +2855,22 @@ export const WITHDRAWN_TOOL_MESSAGES: ReadonlyMap<string, string> = new Map([
 export const PRIVATE_TOOLS = [
   {
     name: "write",
-    description: "Write a file to a personal knowledge repo via GitHub. Existing files and new ordinary/service Markdown are supported; search indexing is triggered asynchronously by the push and is NOT confirmed in the result (indexing.status: async) — this is expected and needs no follow-up call. When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, the write is refused with reason: sha_required rather than overwriting an unknown current version (WP-7 Ф99). A new publication-like file (frontmatter type: post or a channel filename) under TserenTserenov/DS-Knowledge-Index-Tseren docs/ is server-blocked: create its canonical draft with new_post(scaffold), then edit the returned existing paths with expected_sha. Local shell clients may use scripts/new-post.py with a validated shared reservation. To add to the end of an existing file without resending its content, use mode:'append' (WP-7 Ф204) instead of reading the whole file and rewriting it with content appended yourself.",
+    description: "Write a file to a personal knowledge repo via GitHub. Existing files and new ordinary/service Markdown are supported; search indexing is triggered asynchronously by the push and is NOT confirmed in the result (indexing.status: async) — this is expected and needs no follow-up call. When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, the write is refused with reason: sha_required rather than overwriting an unknown current version (WP-7 Ф99). A new publication-like file (frontmatter type: post or a channel filename) under TserenTserenov/DS-Knowledge-Index-Tseren docs/ is server-blocked: create its canonical draft with new_post(scaffold), then edit the returned existing paths with expected_sha. Local shell clients may use scripts/new-post.py with a validated shared reservation. To edit an EXISTING file without resending the rest of it, use mode:'append' (add to the end) or mode:'str_replace' (change one exact piece) instead of reading the whole file and rewriting it yourself (WP-7 Ф204).",
     inputSchema: {
       type: "object",
       properties: {
         source: { type: "string", description: "Target repo (source name)" },
         path: { type: "string", description: "File path relative to repo root (e.g. 'notes/my-note.md')" },
-        content: { type: "string", description: "mode:'replace' (default): the file's full content. mode:'append': just the fragment to add at the end — never resend the rest of the file." },
-        mode: { type: "string", enum: ["replace", "append"], description: "'replace' (default): content is the whole file, as today. 'append' (WP-7 Ф204): content is a fragment added after the current end of an EXISTING file (expected_sha required, file must already exist); the server reads the current file, joins it with exactly one line break at the seam matching the file's own line-ending style, and writes the result in one commit — you never read or resend the rest of the file. Not for creating new files or editing the middle of one." },
-        on_conflict: { type: "string", enum: ["fail", "retry"], description: "mode:'append' only. 'fail' (default): a concurrent edit since expected_sha was read is reported as version_mismatch, nothing is written — re-read and retry yourself. 'retry': the server re-reads the current file and appends the same fragment onto it instead, up to 3 times — safe specifically because appending never overwrites someone else's edit, both survive. Ignored for mode:'replace'." },
-        operation_id: { type: "string", minLength: 1, maxLength: 128, description: "mode:'append' only. An id you generate once per logical append and send on every retry of that SAME call (e.g. after a dropped response). If a prior call with this id already committed, you get that same result back (idempotent_replay: true) instead of the fragment being appended a second time. Best-effort (checked against the last 10 commits on the path): a retry sent before the earlier call's commit becomes visible, or after 10+ other commits landed on the same path meanwhile, can still duplicate the fragment — do not rely on this alone for a file multiple agents write to concurrently. Reuse across different appends defeats this — generate a new one each time you decide to append something new." },
-        expected_sha: { type: "string", pattern: "^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$", description: "sha from get_document(include_sha: true). Required whenever the path already exists — omitting it there is refused with reason: sha_required (not a silent overwrite); required unconditionally for mode:'append'. If the file changed since you read it, the write is refused with reason: version_mismatch instead (mode:'append' with on_conflict:'retry' resolves this itself instead of refusing). Omit only when creating a brand-new file with mode:'replace' (never pass an empty string)." },
+        content: { type: "string", description: "Required for mode:'replace' (default): the file's full content. Required for mode:'append': just the fragment to add at the end — never resend the rest of the file. Must be omitted for mode:'str_replace', which uses old_string/new_string instead." },
+        mode: { type: "string", enum: ["replace", "append", "str_replace"], description: "'replace' (default): content is the whole file, as today. 'append' (WP-7 Ф204): content is a fragment added after the current end of an EXISTING file. 'str_replace' (WP-7 Ф204): old_string/new_string replace one exact piece of an EXISTING file. append/str_replace both require expected_sha and an already-existing file; the server reads the current file and writes the result in one commit — you never read or resend the rest of it. Not for creating new files." },
+        old_string: { type: "string", minLength: 1, description: "mode:'str_replace' only. The exact text to replace — must occur in the current file's content EXACTLY ONCE (byte-for-byte, including whitespace and line endings). Zero matches: error fragment_not_found. Two or more: error fragment_ambiguous with every match's line number — add surrounding lines to old_string until it is unique, do not guess which one was meant." },
+        new_string: { type: "string", description: "mode:'str_replace' only. Replaces the single old_string match verbatim — no line-break or whitespace normalization is applied to either string." },
+        dry_run: { type: "boolean", description: "mode:'str_replace' only. true: run every check (expected_sha, uniqueness) and report the result (matching_lines) WITHOUT writing anything — use to confirm old_string is unique before committing to the real call. Never retries even with on_conflict:'retry' (default false)." },
+        on_conflict: { type: "string", enum: ["fail", "retry"], description: "mode:'append'/'str_replace' only. 'fail' (default): a concurrent edit since expected_sha was read is reported as version_mismatch, nothing is written — re-read and retry yourself. 'retry': the server re-reads the current file and tries again, up to 3 times. For append this is always safe (appending never overwrites someone else's edit, both survive). For str_replace it is safe only when old_string is STILL the sole match in the freshly re-read content — if someone else's edit broke that, retry stops and reports fragment_not_found/fragment_ambiguous instead of guessing. Ignored for mode:'replace'." },
+        operation_id: { type: "string", minLength: 1, maxLength: 128, description: "mode:'append'/'str_replace' only (ignored by dry_run). An id you generate once per logical edit and send on every retry of that SAME call (e.g. after a dropped response). If a prior call with this id already committed, you get that same result back (idempotent_replay: true) instead of the edit being applied a second time. Best-effort (checked against the last 10 commits on the path): a retry sent before the earlier call's commit becomes visible, or after 10+ other commits landed on the same path meanwhile, can still duplicate the edit — do not rely on this alone for a file multiple agents write to concurrently. Reuse across different edits defeats this — generate a new one each time you decide to make a new edit." },
+        expected_sha: { type: "string", pattern: "^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$", description: "sha from get_document(include_sha: true). Required whenever the path already exists — omitting it there is refused with reason: sha_required (not a silent overwrite); required unconditionally for mode:'append'/'str_replace'. If the file changed since you read it, the write is refused with reason: version_mismatch instead (on_conflict:'retry' resolves this itself instead of refusing, where safe — see on_conflict). Omit only when creating a brand-new file with mode:'replace' (never pass an empty string)." },
       },
-      required: ["source", "path", "content"],
+      required: ["source", "path"],
     },
   },
   {
@@ -3282,7 +3286,6 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
           if (toolName === "write") {
             const source = args.source as string;
             const path = args.path as string;
-            const content = args.content as string;
             const message = (args.message as string) || "Update via Aisystant MCP";
 
             if (!ctx.sourceNames.includes(source)) {
@@ -3292,12 +3295,12 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
             const expectedSha = args.expected_sha as string | undefined;
             const mode = (args.mode as string | undefined) ?? "replace";
 
-            if (mode === "append") {
+            if (mode === "append" || mode === "str_replace") {
               // Mirrors the inline validation style already used in this handler (e.g. the
               // ref === "" check above) rather than relying on client-side schema enforcement,
               // which this server does not apply to tool arguments (WP-7 Ф204).
               if (expectedSha === undefined) {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "mode: 'append' требует expected_sha — прочитай personal_get_document(include_sha: true) и передай его sha." }], isError: true } };
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `mode: '${mode}' требует expected_sha — прочитай personal_get_document(include_sha: true) и передай его sha.` }], isError: true } };
               }
               const onConflictArg = args.on_conflict;
               if (onConflictArg !== undefined && onConflictArg !== "fail" && onConflictArg !== "retry") {
@@ -3307,17 +3310,40 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
               if (operationIdArg !== undefined && (typeof operationIdArg !== "string" || operationIdArg.length === 0 || operationIdArg.length > 128)) {
                 return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "operation_id должен быть непустой строкой до 128 символов." }], isError: true } };
               }
-              const appendResult = await appendToGitHub(env, ctx, source, path, content, message, expectedSha, {
-                onConflict: onConflictArg as "fail" | "retry" | undefined,
-                operationId: operationIdArg as string | undefined,
+              const sharedOptions = { onConflict: onConflictArg as "fail" | "retry" | undefined, operationId: operationIdArg as string | undefined };
+
+              if (mode === "append") {
+                if (typeof args.content !== "string") {
+                  return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "mode: 'append' требует content (строку с добавляемым фрагментом)." }], isError: true } };
+                }
+                const appendResult = await appendToGitHub(env, ctx, source, path, args.content, message, expectedSha, sharedOptions);
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(appendResult, null, 2) }] } };
+              }
+
+              // mode === "str_replace"
+              if (typeof args.old_string !== "string" || args.old_string.length === 0) {
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "mode: 'str_replace' требует непустой old_string." }], isError: true } };
+              }
+              if (typeof args.new_string !== "string") {
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "mode: 'str_replace' требует new_string (строка, может быть пустой)." }], isError: true } };
+              }
+              const dryRunArg = args.dry_run;
+              if (dryRunArg !== undefined && typeof dryRunArg !== "boolean") {
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "dry_run должен быть булевым значением." }], isError: true } };
+              }
+              const replaceResult = await strReplaceInGitHub(env, ctx, source, path, args.old_string, args.new_string, message, expectedSha, {
+                ...sharedOptions, dryRun: dryRunArg === true,
               });
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(appendResult, null, 2) }] } };
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(replaceResult, null, 2) }] } };
             }
             if (mode !== "replace") {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `mode должен быть 'replace' или 'append', получено: ${JSON.stringify(mode)}.` }], isError: true } };
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `mode должен быть 'replace', 'append' или 'str_replace', получено: ${JSON.stringify(mode)}.` }], isError: true } };
             }
 
-            const writeResult = await writeToGitHub(env, ctx, source, path, content, message, {}, expectedSha);
+            if (typeof args.content !== "string") {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "mode: 'replace' требует content (строку с полным содержимым файла)." }], isError: true } };
+            }
+            const writeResult = await writeToGitHub(env, ctx, source, path, args.content, message, {}, expectedSha);
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(writeResult, null, 2) }] } };
           }
 
