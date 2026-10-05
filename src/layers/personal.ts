@@ -617,6 +617,129 @@ export async function writeToGitHub(
   return { success: true, sha: result.content.sha, url: result.content.html_url, indexing: INDEXING_ASYNC_NOTICE };
 }
 
+const APPEND_MAX_ATTEMPTS = 3;
+const APPEND_OPERATION_TAG = (id: string) => `[op:${id}]`;
+
+/** Joins old content and a new fragment with exactly one line break at the seam, regardless
+ * of trailing/leading breaks on either side, and matches the file's own PREDOMINANT CRLF/LF
+ * style rather than imposing one (WP-7 Ф204, round 8/9 cold review — a mismatched seam reads
+ * as diff noise in the file's own editor, not just a cosmetic nit). A file that is empty, or
+ * made of nothing but line breaks, gets the fragment as-is: there is no real content to seam
+ * against (Codex cold review, round 12 — the earlier `.length === 0` check alone still left a
+ * stray leading break for an all-newline old file, e.g. "\n\n" + "x" producing "\nx"). The EOL
+ * choice counts both styles rather than treating one stray CRLF as the whole file's style.
+ * The "nothing but line breaks" check matches `\r`/`\n` only, not `trim()` (Codex cold review,
+ * round 13 — `trim()` also strips plain spaces/tabs, so a file containing exactly " " would
+ * have been silently replaced by the fragment, losing that space). */
+export function joinAppendedContent(oldContent: string, fragment: string): string {
+  if (/^[\r\n]*$/.test(oldContent)) return fragment;
+  const crlfCount = (oldContent.match(/\r\n/g) ?? []).length;
+  const lfOnlyCount = (oldContent.match(/(?<!\r)\n/g) ?? []).length;
+  const eol = crlfCount > lfOnlyCount ? "\r\n" : "\n";
+  const trimmedOld = oldContent.replace(/(\r\n|\n)+$/, "");
+  const trimmedFragment = fragment.replace(/^(\r\n|\n)+/, "");
+  return trimmedOld + eol + trimmedFragment;
+}
+
+export interface PersonalAppendResult extends PersonalWriteResult {
+  retried?: number;
+  idempotent_replay?: boolean;
+}
+
+/**
+ * Append a fragment to an existing file without the caller ever reading or resending the
+ * rest of it (WP-7 Ф204 — the resident complaint this phase exists for: "cost of an edit
+ * equals the size of the file"). The actual PUT still writes the whole resulting file in one
+ * GitHub API call — Contents API has no partial write — this function only moves the
+ * read-modify-write step from the calling agent onto the server.
+ *
+ * `onConflict: "retry"` treats append as safe to replay onto whatever the current content
+ * turns out to be (appending can't destructively overwrite a concurrent edit the way a full
+ * replace can — both edits survive, ordered by which PUT lands second) — up to
+ * APPEND_MAX_ATTEMPTS GitHub round trips. `onConflict: "fail"` (default) behaves like an
+ * ordinary write: a stale `expectedSha`, or a race discovered only when the PUT itself is
+ * rejected, is reported as `version_mismatch` and nothing is retried.
+ *
+ * `operationId`, if given, makes retried append calls idempotent: before doing any work, the
+ * file's recent commit history (same mechanism as the `history` tool) is checked for one
+ * already carrying this id, so a client that retried after a dropped response does not
+ * duplicate the fragment (Codex cold review, round 8, Critical — a plain retry loop here
+ * would silently double-write on exactly the failure mode it exists to recover from).
+ *
+ * NOTE (round 9, correction to the original АрхГейт record): this repository has no
+ * content-level secret scanner for personal writes — `writeToGitHub` never had one, and this
+ * function does not add one. The ArchGate accepted for Ф204 assumed such a guard existed and
+ * would cover the appended fragment; that assumption was wrong. append therefore leaves the
+ * existing secret-leak exposure exactly where plain `write` already left it — unchanged, not
+ * worsened, but also not mitigated. Flagged to the pilot, not silently corrected in the record.
+ */
+export async function appendToGitHub(
+  env: PersonalEnv,
+  ctx: UserContext,
+  source: string,
+  path: string,
+  fragment: string,
+  message: string,
+  expectedSha: string,
+  options: { onConflict?: "fail" | "retry"; operationId?: string; dependencies?: Partial<GitHubApiDependencies> } = {},
+): Promise<PersonalAppendResult> {
+  if (fragment.trim().length === 0) {
+    return { success: false, error: "content пуст — append требует непустой фрагмент." };
+  }
+  if (!GIT_BLOB_SHA.test(expectedSha)) {
+    return { success: false, reason: "invalid_expected_sha", error: "expected_sha должен быть 40-символьным hex sha из get_document(include_sha: true); append не создаёт новые файлы." };
+  }
+  // Defense in depth (Codex cold review, round 12): index.ts's handler already validates this
+  // shape before calling in, but appendToGitHub is itself an exported function another caller
+  // could reach directly without going through that handler.
+  if (options.operationId !== undefined && (options.operationId.length === 0 || options.operationId.length > 128)) {
+    return { success: false, error: "operation_id должен быть непустой строкой до 128 символов." };
+  }
+
+  if (options.operationId !== undefined) {
+    const history = await personalGetDocumentHistory(env, ctx, source, path, 10);
+    if (history.success) {
+      const tag = APPEND_OPERATION_TAG(options.operationId);
+      const replay = history.entries.find(entry => entry.message.includes(tag));
+      // A prior commit already carries this operation_id: this is a retried call whose
+      // earlier PUT succeeded but whose response the client never saw — hand back that
+      // result instead of appending the same fragment a second time.
+      if (replay) return { success: true, sha: replay.sha, idempotent_replay: true, indexing: INDEXING_ASYNC_NOTICE };
+    }
+    // A history-lookup failure is not fatal here: it would only ever suppress a legitimate
+    // idempotent replay (annoying, not unsafe), while blocking the write entirely over a
+    // transient API error would be a worse outcome for a feature meant to make retries safer.
+  }
+
+  const onConflict = options.onConflict ?? "fail";
+  const taggedMessage = options.operationId ? `${message} ${APPEND_OPERATION_TAG(options.operationId)}` : message;
+  const maxAttempts = onConflict === "retry" ? APPEND_MAX_ATTEMPTS : 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const live = await personalGetDocumentLive(env, ctx, path, source);
+    if (!live) return { success: false, reason: "invalid_expected_sha", error: "Файл не найден — append работает только с уже существующим файлом (для нового используй mode: replace без expected_sha)." };
+
+    if (live.sha.toLowerCase() !== expectedSha.toLowerCase() && attempt === 1 && onConflict === "fail") {
+      return { success: false, reason: "version_mismatch", current_sha: live.sha, error: "Файл изменился с момента чтения — перечитай personal_get_document(include_sha: true) и повтори запись." };
+    }
+
+    const newContent = joinAppendedContent(live.content, fragment);
+    const result = await writeToGitHub(env, ctx, source, path, newContent, taggedMessage, options.dependencies, live.sha);
+    // The last attempt returns whatever it got, version_mismatch included — there is no more
+    // retrying left to do, and the caller needs the real reason, not a generic internal error
+    // (a bare `attempt === maxAttempts` check here, not `onConflict !== "retry"`, is what makes
+    // this correct for BOTH modes: "fail" already has maxAttempts=1, so its one attempt always
+    // is the last one; round-9 self-review caught the single-mode version of this as dead code
+    // that would have masked the final version_mismatch after exhausting retries).
+    if (result.success || result.reason !== "version_mismatch" || attempt === maxAttempts) {
+      return { ...result, retried: attempt - 1 };
+    }
+    // version_mismatch on this attempt's own PUT, more attempts left: someone else wrote between
+    // our GET and PUT. Loop — the next GET picks up whatever they left and appends onto it.
+  }
+  throw new Error("unreachable: the loop above always returns on attempt === maxAttempts");
+}
+
 // --- Post-number allocator (WP-560 Ф12) ---
 // All reads belong to one immutable Git commit. A new commit has that exact parent;
 // advancing the branch with force:false rejects a competing sibling commit, even if

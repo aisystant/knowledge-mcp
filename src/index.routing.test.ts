@@ -96,6 +96,7 @@ vi.mock("./layers/personal.js", () => ({
   }),
   connectSource: vi.fn(),
   writeToGitHub: vi.fn(),
+  appendToGitHub: vi.fn(),
   deleteFromGitHub: vi.fn(),
   // Real personalDb() is just neon(env.DATABASE_URL) — delegate to the same mockNeon
   // so overriding `neon` (e.g. vi.mocked(neon).mockImplementationOnce(...) in a test)
@@ -121,7 +122,7 @@ vi.mock("./layers/private.js", async (importOriginal) => {
 });
 
 const { handleMcpRequest, TOOLS, default: worker } = await import("./index.js");
-const { AmbiguousSourceError, resolveUserContext, personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalListSources, personalListDocuments, personalListPath, writeToGitHub, deleteFromGitHub } = await import("./layers/personal.js");
+const { AmbiguousSourceError, resolveUserContext, personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalListSources, personalListDocuments, personalListPath, writeToGitHub, appendToGitHub, deleteFromGitHub } = await import("./layers/personal.js");
 
 const ENV = {
   KNOWLEDGE_DATABASE_URL: "postgres://fake-public",
@@ -348,6 +349,79 @@ describe("dual-mode routing: private mode reaches the personal layer, never the 
       {},
       expectedSha,
     );
+  });
+
+  // WP-7 Ф204: mode:'append' routes to the dedicated append path instead of writeToGitHub's
+  // full-replace one — reachability through the dispatcher, same class of gap as the history
+  // regression noted above (a correct appendToGitHub does not matter if nothing calls it).
+  describe("write: mode 'append' (WP-7 Ф204)", () => {
+    const expectedSha = "a".repeat(40);
+
+    it("requires expected_sha before calling the personal layer at all", async () => {
+      const res = await callTool("write", { source: "DS-my-strategy", path: "docs/note.md", content: "new line", mode: "append" }, "private") as
+        { result: { content: [{ text: string }]; isError?: boolean } };
+      expect(res.result.isError).toBe(true);
+      expect(appendToGitHub).not.toHaveBeenCalled();
+    });
+
+    it("rejects an unknown on_conflict value before calling the personal layer", async () => {
+      const res = await callTool("write", {
+        source: "DS-my-strategy", path: "docs/note.md", content: "new line", mode: "append",
+        expected_sha: expectedSha, on_conflict: "retry-forever",
+      }, "private") as { result: { content: [{ text: string }]; isError?: boolean } };
+      expect(res.result.isError).toBe(true);
+      expect(appendToGitHub).not.toHaveBeenCalled();
+    });
+
+    it("rejects an unknown mode value", async () => {
+      const res = await callTool("write", { source: "DS-my-strategy", path: "docs/note.md", content: "x", mode: "delete-everything" }, "private") as
+        { result: { content: [{ text: string }]; isError?: boolean } };
+      expect(res.result.isError).toBe(true);
+      expect(writeToGitHub).not.toHaveBeenCalled();
+      expect(appendToGitHub).not.toHaveBeenCalled();
+    });
+
+    it("rejects an empty or oversized operation_id before calling the personal layer", async () => {
+      for (const operation_id of ["", "x".repeat(129)]) {
+        const res = await callTool("write", {
+          source: "DS-my-strategy", path: "docs/note.md", content: "x", mode: "append", expected_sha: expectedSha, operation_id,
+        }, "private") as { result: { content: [{ text: string }]; isError?: boolean } };
+        expect(res.result.isError).toBe(true);
+      }
+      expect(appendToGitHub).not.toHaveBeenCalled();
+    });
+
+    it("forwards content, expected_sha, on_conflict and operation_id to appendToGitHub, not writeToGitHub", async () => {
+      vi.mocked(appendToGitHub).mockResolvedValueOnce({ success: true, sha: "b".repeat(40), retried: 0 });
+
+      await callTool("write", {
+        source: "DS-my-strategy", path: "docs/note.md", content: "new line", mode: "append",
+        expected_sha: expectedSha, on_conflict: "retry", operation_id: "op-1",
+      }, "private");
+
+      expect(writeToGitHub).not.toHaveBeenCalled();
+      expect(appendToGitHub).toHaveBeenCalledTimes(1);
+      expect(appendToGitHub).toHaveBeenCalledWith(
+        ENV,
+        expect.objectContaining({ userId: "user-private-1" }),
+        "DS-my-strategy",
+        "docs/note.md",
+        "new line",
+        "Update via Aisystant MCP",
+        expectedSha,
+        { onConflict: "retry", operationId: "op-1" },
+      );
+    });
+
+    it("returns appendToGitHub's result shape verbatim, including retried and idempotent_replay", async () => {
+      vi.mocked(appendToGitHub).mockResolvedValueOnce({ success: true, sha: "b".repeat(40), retried: 2, idempotent_replay: true });
+
+      const res = await callTool("write", {
+        source: "DS-my-strategy", path: "docs/note.md", content: "new line", mode: "append", expected_sha: expectedSha,
+      }, "private") as { result: { content: [{ text: string }] } };
+
+      expect(JSON.parse(res.result.content[0].text)).toMatchObject({ success: true, retried: 2, idempotent_replay: true });
+    });
   });
 
   // WP-7 Ф176 cold-review finding (26.09): "history" was schema-declared (tools/list

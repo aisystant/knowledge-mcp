@@ -67,6 +67,8 @@ import {
   disconnectSource,
   purgeSource,
   INDEXING_ASYNC_NOTICE,
+  joinAppendedContent,
+  appendToGitHub,
   type UserContext,
   type PersonalEnv,
 } from "./personal.js";
@@ -1496,6 +1498,218 @@ describe("writeToGitHub — optimistic concurrency (WP-7 Ф96, ported from perso
     const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "racing write", "update", {}, VALID_SHA);
     expect(result.success).toBe(false);
     expect(result.reason).toBe("version_mismatch");
+  });
+});
+
+// WP-7 Ф204: append moves the read-modify-write step onto the server. Each call exercises
+// personalGetDocumentLive (installation token + content GET) followed by writeToGitHub
+// (its own installation token + existence-check GET + PUT) — getInstallationToken is not
+// cached across the two, so every scenario below queues installationTokenResponses() twice.
+describe("appendToGitHub (WP-7 Ф204)", () => {
+  const OLD_SHA = "a".repeat(40);
+  const NEW_SHA = "b".repeat(40);
+  const liveContentResponse = (content: string, sha = OLD_SHA) =>
+    responseJson({ sha, content: btoa(unescape(encodeURIComponent(content))), encoding: "base64" });
+  const putResponse = (sha = NEW_SHA) => responseJson({ content: { sha, html_url: "https://github.com/x" } });
+
+  it("rejects an empty or whitespace-only fragment before any network call", async () => {
+    const calls = queuedFetch([]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "   ", "append", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rejects a malformed expected_sha before any network call", async () => {
+    const calls = queuedFetch([]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "new line", "append", "not-a-sha");
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("invalid_expected_sha");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("appends with exactly one line break at the seam and writes the whole resulting file", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("line one"),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }), // writeToGitHub's own existence check
+      putResponse(),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "line two", "append entry", OLD_SHA);
+    expect(result.success).toBe(true);
+    expect(result.sha).toBe(NEW_SHA);
+    expect(result.retried).toBe(0);
+    const put = calls.find(c => c.method === "PUT");
+    const body = JSON.parse(put!.body!) as { content: string };
+    expect(decodeURIComponent(escape(atob(body.content)))).toBe("line one\nline two");
+  });
+
+  it("does not double a trailing newline already present on the old content", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("line one\n\n\n"),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      putResponse(),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "\n\nline two", "append", OLD_SHA);
+    expect(joinAppendedContent("line one\n\n\n", "\n\nline two")).toBe("line one\nline two");
+    expect(result.success).toBe(true);
+  });
+
+  it("joins with the file's own CRLF style, not a hardcoded LF", () => {
+    expect(joinAppendedContent("line one\r\nline two\r\n", "line three")).toBe("line one\r\nline two\r\nline three");
+  });
+
+  it("appends as-is to an empty file (nothing to normalize a seam against)", () => {
+    expect(joinAppendedContent("", "first line")).toBe("first line");
+  });
+
+  it("appends as-is when the old content is nothing but line breaks (Codex cold review, round 12)", () => {
+    // Before the fix, "\n\n" + "x" produced "\nx" — a stray leading blank line with no real
+    // content before it to have a seam against.
+    expect(joinAppendedContent("\n\n", "x")).toBe("x");
+    expect(joinAppendedContent("\r\n\r\n", "x")).toBe("x");
+  });
+
+  it("picks the predominant EOL style, not CRLF for a single stray occurrence", () => {
+    expect(joinAppendedContent("a\nb\nc\r\nd\n", "e")).toBe("a\nb\nc\r\nd\ne");
+  });
+
+  it("preserves a plain space or tab as real old content, not treated as empty (Codex cold review, round 13)", () => {
+    // `trim()` would have called " " or "\t" empty and silently dropped it in favor of the
+    // fragment alone — the earlier version of this check used trim(), not a newline-only test.
+    expect(joinAppendedContent(" ", "x")).toBe(" \nx");
+    expect(joinAppendedContent("\t", "x")).toBe("\t\nx");
+  });
+
+  it("refuses a file that does not exist — append never creates one", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ message: "Not Found" }, 404),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/new.md", "first line", "append", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("invalid_expected_sha");
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("refuses a stale expected_sha without attempting a write when on_conflict is 'fail' (default)", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("someone else's newer content", NEW_SHA),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "my line", "append", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("version_mismatch");
+    expect(result.current_sha).toBe(NEW_SHA);
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("appends onto whatever is current when on_conflict is 'retry', even if expected_sha was already stale", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("someone else's newer content", NEW_SHA),
+      ...installationTokenResponses(),
+      responseJson({ sha: NEW_SHA }),
+      putResponse("c".repeat(40)),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "my line", "append", OLD_SHA, { onConflict: "retry" });
+    expect(result.success).toBe(true);
+    expect(result.retried).toBe(0);
+  });
+
+  it("retries once after a race between its own GET and PUT, then succeeds", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("line one", OLD_SHA),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      responseJson({ message: "sha does not match" }, 409), // another writer landed between our GET and PUT
+      ...installationTokenResponses(),
+      liveContentResponse("line one\nsomeone else's line", NEW_SHA), // re-read picks up their change
+      ...installationTokenResponses(),
+      responseJson({ sha: NEW_SHA }),
+      putResponse("c".repeat(40)),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "our line", "append", OLD_SHA, { onConflict: "retry" });
+    expect(result.success).toBe(true);
+    expect(result.retried).toBe(1);
+  });
+
+  it("gives up after 3 attempts and reports the last version_mismatch, not a generic error", async () => {
+    const oneRacedAttempt = () => [
+      ...installationTokenResponses(),
+      liveContentResponse("content", OLD_SHA),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      responseJson({ message: "sha does not match" }, 409),
+    ];
+    queuedFetch([...oneRacedAttempt(), ...oneRacedAttempt(), ...oneRacedAttempt()]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "our line", "append", OLD_SHA, { onConflict: "retry" });
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("version_mismatch");
+    expect(result.retried).toBe(2);
+  });
+
+  it("replays a prior commit by operation_id instead of appending the fragment again", async () => {
+    queryQueue.push([{ installation_id: 42 }]);
+    const calls = queuedFetch([
+      responseJson({ token: "installation-token" }), // personalGetDocumentHistory's own token
+      responseJson([
+        { sha: "d".repeat(40), commit: { message: `append entry [op:retry-123]`, author: { date: null, name: null } } },
+      ]),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "my line", "append entry", OLD_SHA, { operationId: "retry-123" });
+    expect(result).toMatchObject({ success: true, sha: "d".repeat(40), idempotent_replay: true });
+    expect(calls).toHaveLength(2); // history only — no GET-content, no PUT
+  });
+
+  it("tags the commit message with operation_id so a later retry can find it", async () => {
+    queryQueue.push([{ installation_id: 42 }]); // personalGetDocumentHistory
+    const calls = queuedFetch([
+      responseJson({ token: "installation-token" }),
+      responseJson([]), // no prior commit carries this operation_id yet
+      ...installationTokenResponses(),
+      liveContentResponse("line one"),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      putResponse(),
+    ]);
+    await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "line two", "append entry", OLD_SHA, { operationId: "fresh-456" });
+    const put = calls.find(c => c.method === "PUT");
+    const body = JSON.parse(put!.body!) as { message: string };
+    expect(body.message).toBe("append entry [op:fresh-456]");
+  });
+
+  it("still appends when the history lookup itself fails, rather than blocking the write", async () => {
+    queryQueue.push([{ installation_id: 42 }]); // personalGetDocumentHistory
+    queuedFetch([
+      responseJson({ token: "installation-token" }),
+      responseJson({ message: "rate limited" }, 403), // history lookup fails
+      ...installationTokenResponses(),
+      liveContentResponse("line one"),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      putResponse(),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "line two", "append", OLD_SHA, { operationId: "op-x" });
+    expect(result.success).toBe(true);
+    expect(result.idempotent_replay).toBeUndefined();
+  });
+
+  it("does not retry a race at the PUT step when on_conflict is 'fail' (default)", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("line one", OLD_SHA), // matches expected_sha — no stale-read refusal
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      responseJson({ message: "sha does not match" }, 409), // another writer landed between our GET and PUT
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "line two", "append", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("version_mismatch");
+    expect(calls.filter(c => c.method === "PUT")).toHaveLength(1); // no second attempt
   });
 });
 
