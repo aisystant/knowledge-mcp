@@ -52,6 +52,21 @@ function boundaryAtOrBefore(text: string, offset: number): number {
   return isTextBoundary(text, offset) ? offset : offset - 1;
 }
 
+/**
+ * WP-560: a degraded search that still invites more searching is how the
+ * 11.10 browser-chat agent loop stayed alive — dependency_access_denied
+ * (embeddings, retryable:false) kept coming back with "empty doesn't prove
+ * absence", and the model tried personal_list_documents, knowledge_search,
+ * guessed filenames, etc. instead of stopping. retryable:false means the
+ * caller cannot fix this by trying something else in the same turn; the
+ * warning now says so. retryable:true (rate limit, transient outage) keeps
+ * the original wording — retrying later is a legitimate next step there.
+ */
+function isTerminalDegradation(degradation: unknown): boolean {
+  return typeof degradation === "object" && degradation !== null
+    && "retryable" in degradation && (degradation as { retryable: unknown }).retryable === false;
+}
+
 export function buildPrivateSearchResponse<T extends { content: string }>(
   id: RequestId, results: T[], degradation?: unknown,
 ): ResponseEnvelope {
@@ -63,7 +78,9 @@ export function buildPrivateSearchResponse<T extends { content: string }>(
     });
     const content = [{ type: "text", text: JSON.stringify(hits, null, 2) }];
     if (degradation) content.push({ type: "text", text: JSON.stringify({
-      warning: "Смысловой поиск недоступен; выполнен только поиск по тексту. Пустой результат не доказывает отсутствие документа.",
+      warning: isTerminalDegradation(degradation)
+        ? "Смысловой поиск недоступен и попытка не восстановит доступ. Не ищи тот же факт другими инструментами в этом ходу — сообщи пользователю, что поиск недоступен, и этим результатом текстового поиска придётся ограничиться."
+        : "Смысловой поиск недоступен; выполнен только поиск по тексту. Пустой результат не доказывает отсутствие документа.",
       diagnostic: degradation,
     }) });
     return { jsonrpc: "2.0", id, result: { content, ...(degradation && results.length === 0 ? { isError: true } : {}) } };

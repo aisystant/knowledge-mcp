@@ -44,6 +44,21 @@ describe("private search response bounds", () => {
     expect(result(response).isError).toBeUndefined();
   });
 
+  it("tells the caller to stop searching when the degradation is non-retryable (WP-560)", () => {
+    const diagnostic = { error: "dependency_access_denied", stage: "embeddings", retryable: false, status: 403 };
+    const response = buildPrivateSearchResponse(1, [], diagnostic);
+    const warning = JSON.parse(result(response).content[1].text).warning as string;
+    expect(warning).toContain("Не ищи");
+    expect(warning).not.toContain("не доказывает отсутствие");
+  });
+
+  it("keeps the retry-friendly wording when the degradation is retryable", () => {
+    const diagnostic = { error: "dependency_rate_limited", stage: "embeddings", retryable: true };
+    const response = buildPrivateSearchResponse(1, [], diagnostic);
+    const warning = JSON.parse(result(response).content[1].text).warning as string;
+    expect(warning).toContain("не доказывает отсутствие");
+  });
+
   it("refuses oversized metadata explicitly instead of returning a partial or empty list", () => {
     const response = buildPrivateSearchResponse(1, [{ ...doc, filename: "名".repeat(40_000) }]);
     assertBounded(response);
