@@ -90,6 +90,10 @@ export interface Env {
   SCOPE_GUARD_MODE?: string;
   GITHUB_APP_ID?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
+  /** Disabled by default until the team-repository acceptance gate is complete. */
+  GITHUB_TEAM_REPOS_ENABLED?: string;
+  GITHUB_INTEGRATION_URL?: string;
+  GITHUB_BROKER_SHARED_SECRET?: string;
   /** WP-532 Ф9 follow-up (2026-10-01): optional token for api.github.com reads of the platform
    *  sources (tree listing, blobs). Read access to public repositories is enough. Without it the
    *  worker shares the anonymous 60/h quota of its egress address and the heartbeats starve. */

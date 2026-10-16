@@ -54,6 +54,7 @@ import {
   resolveUserContext,
   deleteFromGitHub,
   writeToGitHub,
+  getInstallationToken,
   personalListSources,
   personalListDocuments,
   personalListPath,
@@ -1952,6 +1953,16 @@ describe("INDEXING_ASYNC_NOTICE wording (WP-7 Ф144)", () => {
 // arguments, so a caller silently passing the wrong value (e.g. owner where userId belongs)
 // would pass every other test in this file. These two pin the contract directly.
 describe("getInstallationToken call contract (WP-7 2026-08-31 pagination fix)", () => {
+  it("rejects an organization installation on the legacy token path when team access is enabled", async () => {
+    queryQueue.push([{ installation_id: 42, github_user_id: 99, github_username: "MimEcoSys" }]);
+    const calls = queuedFetch([responseJson({ account: { id: 99, login: "MimEcoSys", type: "Organization" } })]);
+    const token = await getInstallationToken({ ...ENV_WITH_APP, GITHUB_TEAM_REPOS_ENABLED: "true" },
+      ctx().userId, "editorial-lpf");
+    expect(token).toBeNull();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain("/app/installations/42");
+  });
+
   it("writeToGitHub calls getInstallationToken with (env, userId, repo) — not owner", async () => {
     const getInstallationToken = vi.fn().mockResolvedValue("ghs_test_token");
     const request = vi.fn()
