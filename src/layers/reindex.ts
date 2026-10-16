@@ -27,6 +27,7 @@ import {
   type PersonalEnv,
   type UserContext,
 } from "./personal.js";
+import { repositoryToken } from "./team-github.js";
 import {
   githubBranchApiUrl,
   githubContentsApiUrl,
@@ -86,6 +87,7 @@ function generationFence(sql: ReturnType<typeof personalDb>, userSourcesTable: s
       SELECT COUNT(*) FROM (
         SELECT index_generation FROM ${sql.unsafe(userSourcesTable)}
         WHERE user_id = ${userId} AND source = ${source} AND index_generation = ${generation}
+          AND active = true
         FOR UPDATE
       ) AS locked_source
     )::int AS fence
@@ -115,7 +117,7 @@ async function setSourceIndexState(
     UPDATE ${sql.unsafe(userSourcesTable)}
     SET index_state = ${state}
     WHERE user_id = ${userId} AND source = ${source}
-      AND index_state = 'reindexing' AND index_generation = ${generation}
+      AND active = true AND index_state = 'reindexing' AND index_generation = ${generation}
       AND EXISTS (
         SELECT 1 FROM ${sql.unsafe(reindexJobsTable)}
         WHERE id = ${jobId}::uuid AND user_id = ${userId} AND source = ${source}
@@ -211,10 +213,13 @@ async function readFromGitHub(
   // source configuration must never reach the installation-token or Contents endpoints.
   const fullPath = resolveSourcePath(userSource.pathPrefix, path).fullPath;
 
-  const token = await getInstallationToken(env, ctx.userId, repo);
-  if (!token) return null;
+  const lease = await repositoryToken(env, ctx, source, "read", () => getInstallationToken(env, ctx.userId, repo));
+  if (!lease) return null;
+  const token = lease.token;
+  try {
 
   const resp = await fetch(githubContentsApiUrl(owner, repo, fullPath), {
+    redirect: "manual",
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github.raw+json",
@@ -224,6 +229,9 @@ async function readFromGitHub(
 
   if (!resp.ok) return null;
   return await resp.text();
+  } finally {
+    await lease.release();
+  }
 }
 
 /** Content hash for dedup — truncated to 16 chars, matches documents.hash VARCHAR(16). */
@@ -476,18 +484,26 @@ async function listMdFilesViaTrees(env: ReindexEnv, ctx: UserContext, source: st
     throw new Error("Cannot enumerate repository: invalid source path prefix");
   }
 
-  const token = await getInstallationToken(env, ctx.userId, userSource.githubRepo);
-  if (!token) throw new Error("Cannot enumerate repository: GitHub installation token unavailable");
+  const lease = await repositoryToken(env, ctx, source, "read", () => getInstallationToken(env, ctx.userId, userSource.githubRepo));
+  if (!lease) throw new Error("Cannot enumerate repository: GitHub user access unavailable");
+  const token = lease.token;
+  try {
 
   const repoResp = await fetch(`https://api.github.com/repos/${userSource.githubOwner}/${userSource.githubRepo}`, {
+    redirect: "manual",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
   });
   if (!repoResp.ok) throw new Error(`Cannot enumerate repository: GitHub metadata request failed (${repoResp.status})`);
-  const repoJson = (await repoResp.json()) as { default_branch?: string };
+  const repoJson = (await repoResp.json()) as { default_branch?: string | null; id?: number; empty?: boolean; size?: number };
+  if (lease.repositoryId !== undefined && repoJson.id !== lease.repositoryId) {
+    throw new Error("Cannot enumerate repository: identity changed");
+  }
   const branch = repoJson.default_branch;
+  if (lease.repositoryId !== undefined && !branch && (repoJson.size === 0 || repoJson.empty === true)) return [];
   if (typeof branch !== "string" || !branch) throw new Error("Cannot enumerate repository: missing default branch");
 
   const branchResp = await fetch(githubBranchApiUrl(userSource.githubOwner, userSource.githubRepo, branch), {
+    redirect: "manual",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
   });
   if (!branchResp.ok) throw new Error(`Cannot enumerate repository: GitHub branch request failed (${branchResp.status})`);
@@ -496,6 +512,7 @@ async function listMdFilesViaTrees(env: ReindexEnv, ctx: UserContext, source: st
   if (typeof commitSha !== "string" || !commitSha) throw new Error("Cannot enumerate repository: missing branch commit");
 
   const treeResp = await fetch(`https://api.github.com/repos/${userSource.githubOwner}/${userSource.githubRepo}/git/trees/${encodeURIComponent(commitSha)}?recursive=1`, {
+    redirect: "manual",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
   });
   if (!treeResp.ok) throw new Error(`Cannot enumerate repository: GitHub tree request failed (${treeResp.status})`);
@@ -506,6 +523,9 @@ async function listMdFilesViaTrees(env: ReindexEnv, ctx: UserContext, source: st
     throw new Error("Cannot enumerate repository: GitHub tree is truncated; complete indexing cannot be guaranteed");
   }
   return relativeMarkdownPathsFromTree(treeJson.tree, normalizedPrefix);
+  } finally {
+    await lease.release();
+  }
 }
 
 // --- Reindex jobs: producer + status (faithful port of index.ts:2495-2660) ---
@@ -770,6 +790,14 @@ export async function startIncrementalReindexJob(
   const schema = getKnowledgeSchema(env);
   const reindexJobsTable = KNOWLEDGE_TABLES.reindex_jobs(schema);
   const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
+
+  if (source.includes("/")) {
+    const context = await resolveUserContext(env, userId);
+    const lease = await repositoryToken(env, context, source, "read", async () => null);
+    if (!lease) return { status: "skipped", reason: "github_permission_removed",
+      message: "GitHub access to this team repository is no longer available" };
+    await lease.release();
+  }
 
   const indexable: { path: string; action: "modified" | "removed" }[] = [];
   const rejected: string[] = [];

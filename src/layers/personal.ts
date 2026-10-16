@@ -1,5 +1,6 @@
 import { ReadFailure, createReadTrace, fetchReadResponse, readHttpFailure, readJson, withReadDeadline, type ReadTrace } from "../read-failure.js";
 import { normalizeSearchResultLimit } from "../search-limits.js";
+import { activeTeamBinding, issueTeamToken, repositoryToken, teamMarkdownFiles, teamRepositoryName, teamReposEnabled } from "./team-github.js";
 // Personal-corpus data layer for the private MCP mode (WP-410 срез-2b).
 // Ported from personal-knowledge-mcp/src/index.ts, then hardened in this private-mode layer:
 // resolveUserContext, GitHub App JWT signing, writeToGitHub, getInstallationToken.
@@ -42,6 +43,9 @@ export interface PersonalEnv {
   DATABASE_URL?: string;
   GITHUB_APP_ID?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
+  GITHUB_TEAM_REPOS_ENABLED?: boolean | string;
+  GITHUB_INTEGRATION_URL?: string;
+  GITHUB_BROKER_SHARED_SECRET?: string;
   KNOWLEDGE_DB_SCHEMA?: string;
   OPENROUTER_API_KEY?: string;
   /** Neon `indicators` DB. Required for provisionBridgeScopes (connect_source) — same DSN as PrivateGuard's authorize(). */
@@ -296,13 +300,16 @@ export async function resolveUserContext(
         ORDER BY source
       `, 5_000);
       if (rows.length > 0) {
-        const sources = rows.map(r => ({
+        const candidates = rows.map(r => ({
           source: r.source as string,
           githubOwner: r.github_owner as string,
           githubRepo: r.github_repo as string,
           pathPrefix: (r.path_prefix as string) || "",
           sourceType: (r.source_type as string) || "ds",
         }));
+        const allowed = await Promise.all(candidates.map(async candidate =>
+          !candidate.source.includes("/") || !!await activeTeamBinding(env, userId, candidate.source)));
+        const sources = candidates.filter((_, index) => allowed[index]);
         return {
           userId,
           sources,
@@ -419,7 +426,7 @@ export async function getInstallationToken(
   // installation instead of whatever order Postgres happens to return
   // (peer-review finding, WP-7 2026-08-31).
   const rows = await sql`
-    SELECT installation_id
+    SELECT installation_id, github_user_id, github_username
     FROM ${sql.unsafe(installationsTable)}
     WHERE user_id = ${userId}
     ORDER BY updated_at DESC
@@ -430,9 +437,27 @@ export async function getInstallationToken(
 
   const jwt = await createGitHubAppJWT(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY);
 
+  if (teamReposEnabled(env)) {
+    const installation = await request(`https://api.github.com/app/installations/${installationId}`, {
+      redirect: "manual",
+      headers: { Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json",
+        "User-Agent": "aisystant-knowledge" },
+    });
+    if (!installation.ok) return null;
+    const body = await readJson(installation, "github_token") as {
+      account?: { id?: number; login?: string; type?: string };
+    } | null;
+    if (body?.account?.type !== "User"
+      || Number(body.account.id) !== Number(rows[0].github_user_id)
+      || body.account.login?.toLowerCase() !== String(rows[0].github_username).toLowerCase()) {
+      return null;
+    }
+  }
+
   // Token is narrowed to one repository even when the App was installed for all repos.
   const tokenResp = await request(`https://api.github.com/app/installations/${installationId}/access_tokens`, {
     method: "POST",
+    redirect: "manual",
     headers: {
       Authorization: `Bearer ${jwt}`,
       Accept: "application/vnd.github+json",
@@ -472,6 +497,7 @@ async function checkGitHubFileExistence(
   let response: Response;
   try {
     response = await githubFetch(apiUrl, {
+      redirect: "manual",
       headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
     });
   } catch {
@@ -540,8 +566,10 @@ export async function writeToGitHub(
   const repo = userSource.githubRepo;
   const getToken = dependencies.getInstallationToken ?? getInstallationToken;
   const githubFetch = dependencies.fetch ?? globalThis.fetch;
-  const token = await getToken(env, ctx.userId, repo);
-  if (!token) return { success: false, error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge` };
+  const lease = await repositoryToken(env, ctx, source, "write", () => getToken(env, ctx.userId, repo));
+  if (!lease) return { success: false, error: `Нет подтверждённого доступа к ${source}. Переподключите GitHub.` };
+  const token = lease.token;
+  try {
 
   const apiUrl = githubContentsApiUrl(owner, repo, fullPath);
   const existence = await checkGitHubFileExistence(githubFetch, apiUrl, token);
@@ -594,6 +622,7 @@ export async function writeToGitHub(
   // Create or update file
   const putResp = await githubFetch(apiUrl, {
     method: "PUT",
+    redirect: "manual",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge", "Content-Type": "application/json" },
     body: JSON.stringify({
       message,
@@ -618,6 +647,9 @@ export async function writeToGitHub(
 
   const result = (await putResp.json()) as { content: { sha: string; html_url: string } };
   return { success: true, sha: result.content.sha, url: result.content.html_url, indexing: INDEXING_ASYNC_NOTICE };
+  } finally {
+    await lease.release();
+  }
 }
 
 const APPEND_MAX_ATTEMPTS = 3;
@@ -893,7 +925,8 @@ const LEGACY_CLUB_NUMBER = /^(\d+)-1-club-/;
 type AllocatorFailureReason = "invalid_draft_id" | "invalid_artifact_type" | "unknown_source"
   | "no_installation" | "allocator_conflict_exhausted" | "github_error"
   | "invalid_allocator_state" | "post_number_ownership_conflict" | "allocator_budget_exceeded"
-  | "invalid_scaffold" | "invalid_post_convention" | "scaffold_conflict" | "path_authorization_required";
+  | "invalid_scaffold" | "invalid_post_convention" | "scaffold_conflict" | "path_authorization_required"
+  | "unsupported_team_operation";
 
 export interface AllocatorLogEntry {
   draft_id: string;
@@ -1277,6 +1310,9 @@ export async function createPersonalPost(
   }
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return { success: false, reason: "unknown_source", error: `Unknown source: ${source}` };
+  if (source.includes("/")) {
+    return { success: false, reason: "unsupported_team_operation", error: "Создание публикаций через общий репозиторий пока недоступно." };
+  }
   const canonicalDraftId = draftId.toLowerCase();
   const deadline = performance.now() + ALLOCATOR_DEADLINE_MS;
   const signal = AbortSignal.timeout(ALLOCATOR_DEADLINE_MS);
@@ -1423,12 +1459,15 @@ export async function deleteFromGitHub(
 
   const getToken = dependencies.getInstallationToken ?? getInstallationToken;
   const githubFetch = dependencies.fetch ?? globalThis.fetch;
-  const token = await getToken(env, ctx.userId, repo);
-  if (!token) return { success: false, error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge` };
+  const lease = await repositoryToken(env, ctx, source, "write", () => getToken(env, ctx.userId, repo));
+  if (!lease) return { success: false, error: `Нет подтверждённого доступа к ${source}. Переподключите GitHub.` };
+  const token = lease.token;
+  try {
 
   const apiUrl = githubContentsApiUrl(owner, repo, fullPath);
 
   const getResp = await githubFetch(apiUrl, {
+    redirect: "manual",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
   });
   if (!getResp.ok) {
@@ -1441,6 +1480,7 @@ export async function deleteFromGitHub(
 
   const delResp = await githubFetch(apiUrl, {
     method: "DELETE",
+    redirect: "manual",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge", "Content-Type": "application/json" },
     body: JSON.stringify({ message, sha: existing.sha }),
   });
@@ -1477,6 +1517,9 @@ export async function deleteFromGitHub(
   }
 
   return { success: true };
+  } finally {
+    await lease.release();
+  }
 }
 
 // --- Personal search / read (WP-410 срез-2b, dual-mode private branch) ---
@@ -1507,6 +1550,38 @@ export type PersonalSearchResult = {
   github_url: string | null;
 };
 export type PersonalMemorySearchResult = PersonalSearchResult & { updated_at: string; age_days: number };
+
+/** Indexed team bytes are released only after a fresh user-scoped GitHub read. */
+async function currentIndexedResults<T extends PersonalSearchResult>(
+  env: PersonalEnv, ctx: UserContext, results: T[],
+): Promise<T[]> {
+  const verified = new Map<string, Promise<boolean>>();
+  const checked = await Promise.all(results.map(async result => {
+    if (!result.source.includes("/")) return result;
+    const filename = result.filename.split("::")[0];
+    const key = `${result.source}\0${filename}`;
+    if (!verified.has(key)) verified.set(key, (async () => {
+      try {
+        const sql = personalDb(env);
+        const table = KNOWLEDGE_TABLES.documents(getKnowledgeSchema(env));
+        const rows = await sql`
+          SELECT content FROM ${sql.unsafe(table)}
+          WHERE user_id = ${ctx.userId} AND source = ${result.source}
+            AND filename = ${filename} AND protocol_version = 2
+          ORDER BY chunk_ordinal
+        `;
+        if (!rows.length) return false;
+        const indexed = rows.map(row => String(row.content)).join("");
+        const live = await personalGetDocumentLive(env, ctx, filename, result.source);
+        return !!live && indexed === live.content;
+      } catch {
+        return false;
+      }
+    })());
+    return result.content.length > 0 && await verified.get(key) ? result : null;
+  }));
+  return checked.filter(result => result !== null) as T[];
+}
 
 function personalGithubUrl(ctx: UserContext, source: string, filename: string): string | null {
   const userSource = ctx.sources.find(s => s.source === source);
@@ -1683,7 +1758,7 @@ export async function personalSearchDocuments(
 
     if (queryType === "keyword") {
       const kwResults = await keyword();
-      if (kwResults.length > 0) return kwResults;
+      if (kwResults.length > 0) return currentIndexedResults(env, ctx, kwResults);
     }
 
     let vectorResults: PersonalSearchResult[];
@@ -1693,7 +1768,7 @@ export async function personalSearchDocuments(
       if (!(error instanceof ReadFailure) || error.stage !== "embeddings") throw error;
       console.warn(JSON.stringify({ event: "personal_search_keyword_fallback", ...error.toJSON() }));
       const fallback = await keyword();
-      return Object.assign(fallback, { degradation: error.toJSON() });
+      return Object.assign(await currentIndexedResults(env, ctx, fallback), { degradation: error.toJSON() });
     }
 
     if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
@@ -1704,11 +1779,11 @@ export async function personalSearchDocuments(
           const existing = seen.get(r.filename);
           if (!existing || r.score > existing.score) seen.set(r.filename, r);
         }
-        return [...seen.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+        return currentIndexedResults(env, ctx, [...seen.values()].sort((a, b) => b.score - a.score).slice(0, limit));
       }
     }
 
-    return vectorResults;
+    return currentIndexedResults(env, ctx, vectorResults);
   });
 }
 
@@ -1720,6 +1795,7 @@ export async function personalMemorySearch(
   recencyDays: number | undefined,
   limit: number = 5
 ): Promise<PersonalMemorySearchResult[]> {
+  limit = normalizeSearchResultLimit(limit);
   const deadlineAt = Date.now() + PERSONAL_SEARCH_BUDGET_MS;
   const trace = createReadTrace("memory_search");
   return trace.run("search", async () => {
@@ -1743,7 +1819,7 @@ export async function personalMemorySearch(
     `, remainingSearchBudget(deadlineAt, "database")));
 
     const now = Date.now();
-    return rows
+    const results = rows
       .map((r) => {
         const ageDays = (now - new Date(r.updated_at as string).getTime()) / (1000 * 60 * 60 * 24);
         const decayFactor = ageDays <= 14 ? 1.0 : ageDays <= 30 ? 0.7 : 0.4;
@@ -1760,6 +1836,7 @@ export async function personalMemorySearch(
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
+    return currentIndexedResults(env, ctx, results);
   });
 }
 
@@ -1780,11 +1857,21 @@ export async function personalGetDocument(
   }
   const normalizedFilename = separatorIndex === -1 ? baseName : `${baseName}${filename.slice(separatorIndex)}`;
 
+  if (source?.includes("/")) {
+    return personalGetDocumentLive(env, ctx, baseName, source);
+  }
+  if (!source && ctx.sourceNames.length === 1 && ctx.sourceNames[0].includes("/")) {
+    return personalGetDocumentLive(env, ctx, baseName, ctx.sourceNames[0]);
+  }
+  if (!source && ctx.sourceNames.some(name => name.includes("/"))) {
+    throw new AmbiguousSourceError(ctx.sourceNames);
+  }
+
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
   const src = source ?? null;
-  const sourceNames = ctx.sourceNames;
+  const sourceNames = ctx.sourceNames.filter(name => !name.includes("/"));
   const chunkPrefix = documentChunkPrefix(baseName);
 
   const rows = await withReadDeadline("database", async () => sql`
@@ -1908,11 +1995,14 @@ export async function personalGetDocumentLive(
   const repo = userSource.githubRepo;
   try {
     return await withReadDeadline("github_content", async signal => {
-      const token = await getInstallationToken(env, ctx.userId, repo,
-        (input, init) => fetchReadResponse(input, init ?? {}, "github_token", signal));
-      if (!token) throw new ReadFailure("github_not_connected", "github_token");
+      const lease = await repositoryToken(env, ctx, source, "read", () => getInstallationToken(env, ctx.userId, repo,
+        (input, init) => fetchReadResponse(input, init ?? {}, "github_token", signal)));
+      if (!lease) throw new ReadFailure("github_not_connected", "github_token");
+      const token = lease.token;
+      try {
       const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}${ref !== undefined ? `?ref=${encodeURIComponent(ref)}` : ""}`;
       const response = await fetchReadResponse(apiUrl, {
+        redirect: "manual",
         headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
       }, "github_content", signal);
       const body = await readJson(response, "github_content") as { sha?: unknown; content?: unknown; encoding?: unknown };
@@ -1928,6 +2018,9 @@ export async function personalGetDocumentLive(
       }
       return { filename, content, source, source_type: userSource.sourceType,
         github_url: personalGithubUrl(ctx, source, filename), sha: body.sha };
+      } finally {
+        await lease.release();
+      }
     });
   } catch (error) {
     // GitHub also hides inaccessible private resources behind 404. Do not assert absence.
@@ -2000,8 +2093,10 @@ export async function personalGetDocumentHistory(
 
   const owner = userSource.githubOwner;
   const repo = userSource.githubRepo;
-  const token = await getInstallationToken(env, ctx.userId, repo);
-  if (!token) return { success: false, error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge` };
+  const lease = await repositoryToken(env, ctx, source, "read", () => getInstallationToken(env, ctx.userId, repo));
+  if (!lease) return { success: false, error: `Нет подтверждённого доступа к ${source}. Переподключите GitHub.` };
+  const token = lease.token;
+  try {
 
   // Same shape as normalizeSearchResultLimit (../index.ts) — `|| 10` here would
   // treat an explicit 0 (truncates to falsy 0) as "absent" and silently return
@@ -2012,6 +2107,7 @@ export async function personalGetDocumentHistory(
   let response: Response;
   try {
     response = await fetch(apiUrl, {
+      redirect: "manual",
       headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
     });
   } catch (err) {
@@ -2032,6 +2128,9 @@ export async function personalGetDocumentHistory(
       author: c.commit.author?.name ?? null,
     })),
   };
+  } finally {
+    await lease.release();
+  }
 }
 
 /** Private-mode `list_sources`: count the same distinct files as `list_documents`, not chunks. */
@@ -2040,7 +2139,7 @@ export async function personalListSources(
   ctx: UserContext
 ): Promise<{ source: string; source_type: string; doc_count: number }[]> {
   const sql = personalDb(env);
-  const sourceNames = ctx.sourceNames;
+  const sourceNames = ctx.sourceNames.filter(name => !name.includes("/"));
   const docsTable = KNOWLEDGE_TABLES.documents(getKnowledgeSchema(env));
 
   const rows = await withReadDeadline("database", async () => sql`
@@ -2053,11 +2152,16 @@ export async function personalListSources(
     ORDER BY source_type, source
   `, 5_000);
 
-  return rows.map((r) => ({
+  const personal = rows.map((r) => ({
     source: (r.source as string) || "",
     source_type: (r.source_type as string) || "",
     doc_count: r.doc_count as number,
   }));
+  const team = await Promise.all(ctx.sources.filter(s => s.source.includes("/")).map(async s => ({
+    source: s.source, source_type: s.sourceType,
+    doc_count: (await teamMarkdownFiles(env, ctx, s.source)).length,
+  })));
+  return [...personal, ...team];
 }
 
 /** Private-mode `list_documents`: personal corpus only. WP-7 Ф117 — before this, list_documents
@@ -2073,7 +2177,7 @@ export async function personalListDocuments(
   limit: number = 100
 ): Promise<{ filename: string; source: string; source_type: string; github_url: string | null; size_bytes: number }[]> {
   const sql = personalDb(env);
-  const sourceNames = ctx.sourceNames;
+  const sourceNames = ctx.sourceNames.filter(name => !name.includes("/"));
   const docsTable = KNOWLEDGE_TABLES.documents(getKnowledgeSchema(env));
   const src = source ?? null;
   const stype = sourceType ?? null;
@@ -2094,7 +2198,7 @@ export async function personalListDocuments(
     LIMIT ${limit}
   `, 5_000);
 
-  return rows.map((r) => {
+  const personal = rows.map((r) => {
     const docSource = (r.source as string) || "";
     const docFilename = r.filename as string;
     return {
@@ -2105,6 +2209,15 @@ export async function personalListDocuments(
       size_bytes: Number(r.size_bytes ?? 0),
     };
   });
+  const teamSources = ctx.sources.filter(s => s.source.includes("/")
+    && (!source || s.source === source) && (!sourceType || s.sourceType === sourceType));
+  const team = (await Promise.all(teamSources.map(async teamSource =>
+    (await teamMarkdownFiles(env, ctx, teamSource.source)).map(file => ({
+      filename: file.path, source: teamSource.source, source_type: teamSource.sourceType,
+      github_url: personalGithubUrl(ctx, teamSource.source, file.path), size_bytes: file.size,
+    }))))).flat();
+  return [...personal, ...team].sort((a, b) => a.source.localeCompare(b.source)
+    || a.filename.localeCompare(b.filename)).slice(0, limit);
 }
 
 /** Private-mode `list_path`: personal corpus only. Same tree-building contract as the platform
@@ -2118,7 +2231,7 @@ export async function personalListPath(
   depth: number = 1
 ): Promise<PathEntry[]> {
   const sql = personalDb(env);
-  const sourceNames = ctx.sourceNames;
+  const sourceNames = ctx.sourceNames.filter(name => !name.includes("/"));
   const docsTable = KNOWLEDGE_TABLES.documents(getKnowledgeSchema(env));
   const src = source ?? null;
   const prefix = pathPrefix ?? "";
@@ -2157,7 +2270,12 @@ export async function personalListPath(
     };
   });
 
-  return buildPathTree(docs, prefix, depth);
+  const teamSources = ctx.sources.filter(s => s.source.includes("/") && (!source || s.source === source));
+  const teamDocs = (await Promise.all(teamSources.map(async teamSource =>
+    (await teamMarkdownFiles(env, ctx, teamSource.source))
+      .filter(file => file.path.startsWith(prefix))
+      .map(file => ({ source: teamSource.source, path: file.path, title: null, size_bytes: file.size }))))).flat();
+  return buildPathTree([...docs, ...teamDocs].slice(0, limit), prefix, depth);
 }
 
 // --- connect_source (WP-410 срез-2b) ---
@@ -2193,6 +2311,124 @@ export interface ConnectSourceDependencies {
   fetch?: typeof globalThis.fetch;
 }
 
+async function provisionTeamSourceScope(env: PersonalEnv, userId: string, source: string): Promise<ConnectSourceResult["scope_provisioning"]> {
+  if (!env.INDICATORS_DATABASE_URL) return "skipped";
+  try {
+    await provisionBridgeScopes(neon(env.INDICATORS_DATABASE_URL), userId, source);
+    return "ok";
+  } catch {
+    return "failed";
+  }
+}
+
+async function connectTeamSource(env: PersonalEnv, userId: string, source: string): Promise<ConnectSourceResult> {
+  const name = teamRepositoryName(source);
+  if (!name || !teamReposEnabled(env)) {
+    return { source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
+      error: "Командный репозиторий недоступен." };
+  }
+  const binding = await activeTeamBinding(env, userId, source);
+  if (!binding) {
+    return { source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
+      error: "Репозиторий отсутствует среди доступных вам установок GitHub App. Повторите github_connect." };
+  }
+  const lease = await issueTeamToken(env, userId, binding, "read");
+  if (!lease) {
+    return { source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
+      error: "GitHub не подтвердил ваше право читать этот репозиторий." };
+  }
+  const stillNamed = lease.repository.toLowerCase() === source.toLowerCase();
+  const released = await lease.release();
+  if (!stillNamed || !released) {
+    return { source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
+      error: stillNamed ? "Не удалось завершить проверку токена GitHub. Повторите позже."
+        : "Репозиторий переименован. Повторите github_connect и выберите его новое имя." };
+  }
+
+  const sql = personalDb(env);
+  const schema = getKnowledgeSchema(env);
+  const userSources = KNOWLEDGE_TABLES.user_sources(schema);
+  const documents = KNOWLEDGE_TABLES.documents(schema);
+  const fileStatus = KNOWLEDGE_TABLES.file_index_status(schema);
+  const jobs = KNOWLEDGE_TABLES.reindex_jobs(schema);
+  const scopeProvisioning = await provisionTeamSourceScope(env, userId, source);
+  const [, connected] = await sql.transaction([
+    sql`SELECT set_config('app.user_id', ${userId}, true)`,
+    sql`SELECT github_repository_id, github_user_binding_id, active, index_state
+        FROM ${sql.unsafe(userSources)} WHERE user_id = ${userId} AND source = ${source}`,
+  ]);
+  const existing = connected[0];
+  if (existing && existing.active === true && existing.index_state === "ready"
+    && Number(existing.github_repository_id) === binding.repositoryId
+    && Number(existing.github_user_binding_id) === binding.repositoryId) {
+    return { source, status: "already_connected", scope_provisioning: scopeProvisioning,
+      reindex_triggered: false, message: scopeProvisioning === "failed"
+        ? "Репозиторий подключён для чтения; право записи через IWE пока не настроено."
+        : "Репозиторий уже подключён." };
+  }
+  if (existing && existing.active === true && existing.index_state === "reindexing"
+    && Number(existing.github_repository_id) === binding.repositoryId) {
+    const live = await sql`
+      SELECT id FROM ${sql.unsafe(jobs)} WHERE user_id = ${userId} AND source = ${source}
+        AND status IN ('pending', 'running') ORDER BY started_at DESC LIMIT 1
+    `;
+    if (live.length) return { source, status: "already_connected", scope_provisioning: scopeProvisioning,
+      reindex_triggered: false, reindex_job_id: String(live[0].id),
+      message: "Индекс репозитория уже строится." };
+  }
+  let jobId: string;
+  try {
+    const results = await sql.transaction([
+      sql`SELECT set_config('app.user_id', ${userId}, true)`,
+      sql`
+        INSERT INTO ${sql.unsafe(userSources)}
+          (user_id, source, github_owner, github_repo, source_type, active,
+           github_repository_id, github_user_binding_id, index_state)
+        VALUES (${userId}, ${source}, ${binding.owner}, ${binding.repository},
+                ${inferSourceType(binding.repository)}, true, ${binding.repositoryId},
+                ${binding.repositoryId}, 'reindexing')
+        ON CONFLICT (user_id, source) DO UPDATE SET
+          github_owner = EXCLUDED.github_owner, github_repo = EXCLUDED.github_repo,
+          github_repository_id = EXCLUDED.github_repository_id,
+          github_user_binding_id = EXCLUDED.github_user_binding_id,
+          active = true, index_state = 'reindexing',
+          index_generation = ${sql.unsafe(userSources)}.index_generation + 1
+        RETURNING index_generation
+      `,
+      sql`DELETE FROM ${sql.unsafe(documents)} WHERE user_id = ${userId} AND source = ${source}`,
+      sql`DELETE FROM ${sql.unsafe(fileStatus)} WHERE user_id = ${userId} AND source = ${source}`,
+      sql`UPDATE ${sql.unsafe(jobs)} SET status = 'cancelled'
+          WHERE user_id = ${userId} AND source = ${source} AND status IN ('pending', 'running')`,
+      sql`
+        INSERT INTO knowledge.github_team_reindex_subscriptions
+          (user_id, repository_id, installation_id, source, active)
+        VALUES (${userId}, ${binding.repositoryId}, ${binding.installationId}, ${source}, true)
+        ON CONFLICT (user_id, repository_id) DO UPDATE SET
+          installation_id = EXCLUDED.installation_id, source = EXCLUDED.source, active = true
+      `,
+      sql`
+        INSERT INTO ${sql.unsafe(jobs)} (user_id, source, status, generation)
+        SELECT ${userId}, ${source}, 'pending', index_generation
+        FROM ${sql.unsafe(userSources)} WHERE user_id = ${userId} AND source = ${source}
+        RETURNING id
+      `,
+    ]);
+    jobId = String(results[results.length - 1][0]?.id ?? "");
+    if (!jobId) throw new Error("No reindex job returned");
+  } catch {
+    return { source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
+      error: "Не удалось безопасно подготовить индекс. Подключение не завершено." };
+  }
+
+  return {
+    source, status: "rebound", scope_provisioning: scopeProvisioning,
+    reindex_triggered: false, reindex_job_id: jobId,
+    message: scopeProvisioning === "failed"
+      ? "Репозиторий подключён для чтения, но право записи через IWE не настроено. Повторите подключение после восстановления службы прав."
+      : "Репозиторий подключён. Поиск станет доступен после завершения индексации.",
+  };
+}
+
 /**
  * GitHub's immutable numeric repository id for owner/repo, as a decimal string. Never a JS
  * number on the comparison path: the column is BIGINT and the driver returns it as a string.
@@ -2219,6 +2455,7 @@ async function fetchGitHubRepositoryId(
   let response: Response;
   try {
     response = await githubFetch(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, {
+      redirect: "manual",
       headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
     });
   } catch {
@@ -2263,6 +2500,7 @@ export async function connectSource(
   source: string,
   dependencies: ConnectSourceDependencies = {},
 ): Promise<ConnectSourceResult> {
+  if (source.includes("/")) return connectTeamSource(env, userId, source);
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
   const githubInstallationsTable = KNOWLEDGE_TABLES.github_installations(schema);
@@ -2525,6 +2763,26 @@ export async function disconnectSource(
   const schema = getKnowledgeSchema(env);
   const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+  if (source.includes("/") && teamReposEnabled(env)) {
+    const statusTable = KNOWLEDGE_TABLES.file_index_status(schema);
+    const jobsTable = KNOWLEDGE_TABLES.reindex_jobs(schema);
+    const statements = await sql.transaction([
+      sql`SELECT active FROM ${sql.unsafe(userSourcesTable)} WHERE user_id = ${userId} AND source = ${source} FOR UPDATE`,
+      sql`SELECT COUNT(*)::int AS cnt FROM ${sql.unsafe(documentsTable)} WHERE user_id = ${userId} AND source = ${source}`,
+      sql`UPDATE ${sql.unsafe(userSourcesTable)} SET active = false, index_state = 'failed',
+            index_generation = index_generation + 1
+          WHERE user_id = ${userId} AND source = ${source} AND github_user_binding_id IS NOT NULL`,
+      sql`DELETE FROM ${sql.unsafe(documentsTable)} WHERE user_id = ${userId} AND source = ${source}`,
+      sql`DELETE FROM ${sql.unsafe(statusTable)} WHERE user_id = ${userId} AND source = ${source}`,
+      sql`UPDATE ${sql.unsafe(jobsTable)} SET status = 'cancelled' WHERE user_id = ${userId}
+            AND source = ${source} AND status IN ('pending', 'running')`,
+      sql`UPDATE knowledge.github_team_reindex_subscriptions SET active = false
+          WHERE user_id = ${userId} AND source = ${source}`,
+    ]);
+    const wasActive = statements[0][0]?.active === true;
+    return { source, status: wasActive ? "disconnected" : "already_disconnected",
+      documents_kept: 0 };
+  }
 
   const currentRows = await sql`
     SELECT active FROM ${sql.unsafe(userSourcesTable)}
@@ -2620,6 +2878,10 @@ export async function purgeSource(
       SELECT COUNT(*)::int AS cnt FROM deleted
     `,
     sql`DELETE FROM ${sql.unsafe(userSourcesTable)} WHERE user_id = ${userId} AND source = ${source}`,
+    ...(source.includes("/") && teamReposEnabled(env)
+      ? [sql`DELETE FROM knowledge.github_team_reindex_subscriptions
+               WHERE user_id = ${userId} AND source = ${source}`]
+      : []),
   ]);
 
   return {
