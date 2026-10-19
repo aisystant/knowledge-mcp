@@ -3,13 +3,15 @@
 // exercised against a mocked neon() tag function — no live Neon connection.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 
-let queryQueue: unknown[][] = [];
+let queryQueue: Array<unknown[] | Error | Promise<unknown[]>> = [];
 let sqlCalls: unknown[][] = [];
 
-function nextSqlResult(): unknown[] {
-  return queryQueue.shift() ?? [];
+function nextSqlResult(): unknown[] | Promise<unknown[]> {
+  const next = queryQueue.shift();
+  if (next instanceof Error) throw next;
+  return next ?? [];
 }
 
 function makeMockSql() {
@@ -40,29 +42,41 @@ import {
   getManagedKnowledgeIndexPostEvidence,
   githubBlobUrl,
   githubBranchApiUrl,
+  githubCommitsApiUrl,
   githubContentsApiUrl,
   normalizeRepositoryPath,
   POST_SCAFFOLD_NEXT_ACTION,
   resolveSourcePath,
   allocatePostNumber,
+  createPersonalPost,
   ALLOCATOR_LOG_PATH,
   connectSource,
   resolveUserContext,
   deleteFromGitHub,
   writeToGitHub,
+  getInstallationToken,
   personalListSources,
   personalListDocuments,
   personalListPath,
   personalGetDocument,
+  personalSearchDocuments,
+  personalMemorySearch,
+  personalGetEmbedding,
   personalGetDocumentLive,
   personalGetDocumentWithSha,
+  personalGetDocumentHistory,
   disconnectSource,
   purgeSource,
   INDEXING_ASYNC_NOTICE,
+  joinAppendedContent,
+  appendToGitHub,
+  strReplaceInGitHub,
   type UserContext,
   type PersonalEnv,
 } from "./personal.js";
 import { normalizePath as normalizeScopePath } from "../scope.js";
+import { POST_CONVENTION_PATH } from "../post-scaffold.js";
+import { POST_CONVENTION_FIXTURE } from "../post-scaffold.test-fixture.js";
 
 beforeEach(() => {
   queryQueue = [];
@@ -118,6 +132,7 @@ function queuedFetch(items: Response[]) {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -368,7 +383,7 @@ describe("Knowledge Index publication creation guard", () => {
     expect(request).toHaveBeenCalledTimes(2);
   });
 
-  it("allows personal_write to update a confirmed existing publication", async () => {
+  it("allows personal_write to update a confirmed existing publication when expected_sha matches (WP-7 Ф99)", async () => {
     const existingSha = "a".repeat(40);
     const { request, dependencies } = githubDependencies([
       { ok: true, status: 200, json: async () => ({ sha: existingSha }) },
@@ -384,6 +399,7 @@ describe("Knowledge Index publication creation guard", () => {
       postContent,
       "update post",
       dependencies,
+      existingSha,
     );
 
     expect(result.success).toBe(true);
@@ -462,6 +478,21 @@ describe("detectPersonalQueryType", () => {
 });
 
 describe("personalListSources", () => {
+  it("counts distinct discoverable filenames without weakening caller/source isolation", async () => {
+    queryQueue.push([{ source: "notes", source_type: "ds", doc_count: 2 }]);
+    const context = ctx({ sourceNames: ["notes"] });
+    expect(await personalListSources(ENV, context)).toEqual([{ source: "notes", source_type: "ds", doc_count: 2 }]);
+    const [strings, table, userId, sources] = sqlCalls[0];
+    const query = (strings as string[]).join("?").replace(/\s+/g, " ");
+    expect(query).toContain("COUNT(DISTINCT filename)::int AS doc_count");
+    expect(query).toContain("filename NOT LIKE '%::%'");
+    expect(query).toContain("WHERE user_id = ? AND source = ANY(?)");
+    expect(query).toContain("GROUP BY source, source_type");
+    expect(table).toBe("knowledge.documents");
+    expect(userId).toBe(context.userId);
+    expect(sources).toEqual(["notes"]);
+  });
+
   it("maps rows scoped to the caller's sourceNames", async () => {
     queryQueue.push([{ source: "DS-my-strategy", source_type: "ds", doc_count: 3 }]);
     const result = await personalListSources(ENV, ctx());
@@ -527,16 +558,14 @@ describe("personalListPath", () => {
 
 describe("personalGetDocument", () => {
   it("returns null when no matching document exists", async () => {
-    queryQueue.push([]); // ambiguity pre-check (source omitted → runs first)
     queryQueue.push([]); // v2 query
-    queryQueue.push([]); // legacy fallback
     const doc = await personalGetDocument(ENV, ctx(), "missing.md");
     expect(doc).toBeNull();
   });
 
   it("returns the document content and a resolved github_url for a known source", async () => {
     // source given explicitly — skips the ambiguity pre-check (WP-7 Ф94)
-    queryQueue.push([{ filename: "notes/idea.md", content: "hello", source: "DS-my-strategy", source_type: "ds", chunk_ordinal: 1 }]); // v2 query
+    queryQueue.push([{ filename: "notes/idea.md", content: "hello", source: "DS-my-strategy", source_type: "ds", protocol_version: 2, chunk_ordinal: 1 }]); // v2 query
     const doc = await personalGetDocument(ENV, ctx(), "notes/idea.md", "DS-my-strategy");
     expect(doc?.content).toBe("hello");
     expect(doc?.github_url).toContain("github.com/TserenTserenov/DS-my-strategy");
@@ -545,9 +574,7 @@ describe("personalGetDocument", () => {
   it.each(["vault", "vault/"])("uses literal chunk matching and an encoded HEAD URL with prefix %s", async pathPrefix => {
     const rawFilename = "notes/./cafe\u0301_%#? file.md";
     const normalizedFilename = "notes/cafe\u0301_%#? file.md";
-    // Merged Ф94 query order with source omitted: ambiguity pre-check → v2 → legacy.
-    queryQueue.push([{ source: "DS-my-strategy" }]);
-    queryQueue.push([]); // v2 — not backfilled in this fixture
+    // One snapshot reads either representation and checks ambiguity.
     queryQueue.push([{ filename: normalizedFilename, content: "hello", source: "DS-my-strategy", source_type: "ds" }]);
     const sourceContext = ctx({
       sources: [{ ...ctx().sources[0], pathPrefix }],
@@ -567,16 +594,15 @@ describe("personalGetDocument", () => {
 
   it("joins multiple v2 chunks in the order returned, not just the first (WP-7 Ф94 regression)", async () => {
     queryQueue.push([
-      { filename: "docs/big.md", content: "part one. ", source: "DS-my-strategy", source_type: "ds", chunk_ordinal: 1 },
-      { filename: "docs/big.md", content: "part two. ", source: "DS-my-strategy", source_type: "ds", chunk_ordinal: 2 },
-      { filename: "docs/big.md", content: "part three.", source: "DS-my-strategy", source_type: "ds", chunk_ordinal: 3 },
+      { filename: "docs/big.md", content: "part one. ", source: "DS-my-strategy", source_type: "ds", protocol_version: 2, chunk_ordinal: 1 },
+      { filename: "docs/big.md", content: "part two. ", source: "DS-my-strategy", source_type: "ds", protocol_version: 2, chunk_ordinal: 2 },
+      { filename: "docs/big.md", content: "part three.", source: "DS-my-strategy", source_type: "ds", protocol_version: 2, chunk_ordinal: 3 },
     ]); // v2 query — source given, no ambiguity pre-check
     const doc = await personalGetDocument(ENV, ctx(), "docs/big.md", "DS-my-strategy");
     expect(doc?.content).toBe("part one. part two. part three.");
   });
 
   it("falls back to the legacy read when no v2 rows exist yet (WP-7 Ф94 regression)", async () => {
-    queryQueue.push([]); // v2 query — empty, not yet backfilled
     queryQueue.push([{ filename: "docs/old.md::intro", content: "legacy content", source: "DS-my-strategy", source_type: "ds" }]); // legacy fallback
     const doc = await personalGetDocument(ENV, ctx(), "docs/old.md", "DS-my-strategy");
     expect(doc?.content).toBe("legacy content");
@@ -591,8 +617,111 @@ describe("personalGetDocument", () => {
 });
 
 describe("deleteFromGitHub", () => {
+  const confirmedSha = "a".repeat(40);
+  it("requires a confirmed file version before any database or GitHub request", async () => {
+    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", "");
+    expect(result).toMatchObject({ success: false, reason: "invalid_expected_sha" });
+    expect(sqlCalls).toHaveLength(0);
+  });
+
+  it("refuses deletion when the file changed after confirmation", async () => {
+    queryQueue.push([{ id: 17, index_generation: 3 }]);
+    const { request, dependencies } = githubDependencies([{ ok: true, json: async () => ({ sha: confirmedSha }) }]);
+    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", "b".repeat(40), dependencies);
+    expect(result).toMatchObject({ success: false, reason: "version_mismatch" });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(sqlCalls).toHaveLength(1); // source snapshot only; no index mutation
+  });
+
+  it.each([[], new Error("private-database-detail")])("refuses remote deletion without a verified source snapshot (%s)", async (snapshot) => {
+    queryQueue.push(snapshot);
+    const { request, dependencies } = githubDependencies([{ ok: true, json: async () => ({ sha: "old" }) }, { ok: true }]);
+    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", confirmedSha, dependencies);
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result)).not.toContain("private-database-detail");
+    expect(dependencies.getInstallationToken).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("refuses a missing caller before making a GitHub request", async () => {
+    const { request, dependencies } = githubDependencies([{ ok: true, json: async () => ({ sha: "old" }) }, { ok: true }]);
+    const result = await deleteFromGitHub(ENV, ctx({ userId: "" }), "DS-my-strategy", "notes/idea.md", "delete", confirmedSha, dependencies);
+    expect(result.success).toBe(false);
+    expect(request).not.toHaveBeenCalled();
+    expect(sqlCalls).toHaveLength(0);
+  });
+
+  it("keeps remote deletion successful and reports a deferred cleanup when the transaction fails", async () => {
+    queryQueue.push([{ id: 17, index_generation: 3 }], new Error("private-cleanup-detail"));
+    const { request, dependencies } = githubDependencies([{ ok: true, json: async () => ({ sha: confirmedSha }) }, { ok: true }]);
+    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", confirmedSha, dependencies);
+    expect(result.success).toBe(true);
+    expect(result.warning).toMatch(/очистка.*индекса.*отложена/i);
+    expect(JSON.stringify(result)).not.toContain("private-cleanup-detail");
+    expect(request.mock.calls[1][1]).toEqual(expect.objectContaining({ method: "DELETE" }));
+    expect(sqlCalls.filter(([template]) => String(template).includes("DELETE FROM"))).toHaveLength(0);
+    const fence = sqlCalls[1] as [TemplateStringsArray, ...unknown[]];
+    expect(fence[0].join(" ")).toContain("FOR UPDATE");
+    expect(fence.slice(1)).toEqual(expect.arrayContaining([17, 3, ctx().userId, "DS-my-strategy"]));
+  });
+
+  it.each([
+    { change: "rebind", replacement: { id: 17, index_generation: 4 } },
+    { change: "purge/reconnect with the same generation", replacement: { id: 18, index_generation: 3 } },
+  ])("preserves the replacement index after $change during the GitHub request", async ({ replacement }) => {
+    let current = { id: 17, index_generation: 3 };
+    let documents = ["original-document"];
+    let statuses = ["original-status"];
+    let transactionStarted = false;
+    // Model Neon lazy queries: mutations execute only when the transaction awaits them,
+    // and the source fence must reject before either index table can be changed.
+    const sql = Object.assign((strings: TemplateStringsArray, ...values: unknown[]) => ({
+      then: (resolve: (rows: unknown[]) => unknown, reject: (error: unknown) => unknown) => Promise.resolve().then(() => {
+        const query = strings.join("?");
+        if (query.includes("FOR UPDATE")) {
+          if (values[3] !== current.id || values[4] !== current.index_generation) throw new Error("division by zero");
+          return [{ fence: 1 }];
+        }
+        if (query.includes("DELETE FROM")) {
+          if (values[0] === "knowledge.documents") documents = [];
+          if (values[0] === "knowledge.file_index_status") statuses = [];
+          return [];
+        }
+        return [{ ...current }];
+      }).then(resolve, reject),
+    }), {
+      unsafe: (value: string) => value,
+      transaction: async (queries: PromiseLike<unknown[]>[]) => {
+        transactionStarted = true;
+        const results = [];
+        for (const query of queries) results.push(await query);
+        return results;
+      },
+    });
+    const { neon } = await import("@neondatabase/serverless");
+    vi.mocked(neon).mockReturnValueOnce(sql as never);
+    const request = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      expect(transactionStarted).toBe(false); // no row lock spans the network call
+      if (init?.method === "DELETE") {
+        current = replacement;
+        documents = ["replacement-document"];
+        statuses = ["replacement-status"];
+        return responseJson({});
+      }
+      return responseJson({ sha: confirmedSha });
+    });
+    const result = await deleteFromGitHub(ENV, ctx(), "DS-my-strategy", "notes/idea.md", "delete", confirmedSha, {
+      getInstallationToken: vi.fn().mockResolvedValue("test-token"), fetch: request as never,
+    });
+    expect(result.success).toBe(true);
+    expect(result.warning).toMatch(/отложена/);
+    expect(transactionStarted).toBe(true);
+    expect(documents).toEqual(["replacement-document"]);
+    expect(statuses).toEqual(["replacement-status"]);
+  });
+
   it("rejects an unknown source without touching the network", async () => {
-    const result = await deleteFromGitHub(ENV, ctx(), "not-a-real-source", "notes/idea.md", "delete");
+    const result = await deleteFromGitHub(ENV, ctx(), "not-a-real-source", "notes/idea.md", "delete", confirmedSha);
     expect(result.success).toBe(false);
     expect(result.error).toContain("Unknown source");
   });
@@ -603,11 +732,11 @@ describe("deleteFromGitHub", () => {
       { ok: true, status: 200, json: async () => ({ sha }) },
       { ok: true, status: 200 },
     ]);
-    queryQueue.push([]); // indexed document cleanup
+    queryQueue.push([{ id: 17, index_generation: 3 }], [], [], []); // snapshot, fence, documents, file status
     const path = "notes/./cafe\u0301_%#? file.md";
     const sourceContext = ctx({ sources: [{ ...ctx().sources[0], pathPrefix }] });
 
-    const result = await deleteFromGitHub(ENV, sourceContext, "DS-my-strategy", path, "delete", dependencies);
+    const result = await deleteFromGitHub(ENV, sourceContext, "DS-my-strategy", path, "delete", sha, dependencies);
 
     expect(result.success).toBe(true);
     const expectedUrl = "https://api.github.com/repos/TserenTserenov/DS-my-strategy/contents/" +
@@ -615,12 +744,20 @@ describe("deleteFromGitHub", () => {
     expect(request.mock.calls[0][0]).toBe(expectedUrl);
     expect(request.mock.calls[1][0]).toBe(expectedUrl);
     expect(request.mock.calls[1][1]).toEqual(expect.objectContaining({ method: "DELETE" }));
-    const [template, ...values] = sqlCalls.at(-1) as [TemplateStringsArray, ...unknown[]];
+    const snapshot = sqlCalls[0] as [TemplateStringsArray, ...unknown[]];
+    expect(snapshot[0].join(" ")).toMatch(/user_id = .*source = .*github_owner = .*github_repo = .*path_prefix = /s);
+    expect(snapshot.slice(1)).toEqual(["knowledge.user_sources", sourceContext.userId, "DS-my-strategy", "TserenTserenov", "DS-my-strategy", pathPrefix]);
+    const fence = sqlCalls[1] as [TemplateStringsArray, ...unknown[]];
+    expect(fence[0].join(" ")).toMatch(/id = .*index_generation = .*FOR UPDATE/s);
+    expect(fence.slice(1)).toEqual(expect.arrayContaining([17, 3]));
+    const [template, ...values] = sqlCalls[2] as [TemplateStringsArray, ...unknown[]];
     expect(template.join(" ")).not.toContain(" LIKE ");
     const normalizedPath = normalizeScopePath(path);
     expect(normalizedPath).toBe(resolveSourcePath(pathPrefix, path).relativePath);
     expect(values).toContain(normalizedPath);
     expect(values).toContain(`${normalizedPath}::`);
+    expect(sqlCalls[3].slice(1)).toEqual(["knowledge.file_index_status", sourceContext.userId, "DS-my-strategy", normalizedPath]);
+    expect(result.warning).toBeUndefined();
   });
 });
 
@@ -628,118 +765,691 @@ describe("allocatePostNumber (WP-560 Ф12)", () => {
   const DRAFT_ID = "01996b1a-0000-7000-8000-000000000001";
   const OTHER_DRAFT_ID = "01996b1a-0000-7000-8000-000000000002";
   const allocatorContext = ctx({ sources: [knowledgeIndexTarget], sourceNames: [knowledgeIndexTarget.source] });
+  const POST_PATH = "docs/2026/04-сентябрь/13-09-2026-09-25-post/13-09-1-club-2026-09-25.md";
+  const entry = (number: number, draftId = OTHER_DRAFT_ID) => ({
+    draft_id: draftId, artifact_type: "post", post_number: number, timestamp: "2026-09-24T18:50:00.000Z",
+  });
+  const log = (...entries: unknown[]) => entries.map(value => JSON.stringify(value)).join("\n") + "\n";
+  const post = (number: number, draftId?: string) =>
+    `---\ntype: post\npost_number: ${number}\n${draftId ? `draft_id: ${draftId}\n` : ""}---\nBody`;
 
-  function logResponse(entries: Array<{ draft_id: string; artifact_type: string; post_number: number }>, sha: string) {
-    const body = entries.map(e => JSON.stringify({ ...e, timestamp: "2026-09-11T00:00:00.000Z" })).join("\n") + (entries.length ? "\n" : "");
-    return responseJson({ content: btoa(unescape(encodeURIComponent(body))), sha });
+  // A small Git object store models observable branch updates. Objects are immutable;
+  // branch updates succeed only when the candidate's parent is still the current head.
+  class FakeGitHub {
+    private readonly blobs = new Map<string, string>();
+    private readonly trees = new Map<string, Record<string, string>>();
+    private readonly commits = new Map<string, { tree: string; parent: string | null }>();
+    head: string;
+    readonly calls: Array<{ method: string; path: string; body: any }> = [];
+    beforePatch?: () => void;
+    truncated = false;
+    mismatchedTree = false;
+    mismatchedCommit = false;
+    brokenBlob = false;
+    graphErrors = false;
+    patchBlob?: (blob: Record<string, unknown>) => Record<string, unknown> | null;
+    afterBlobBatch?: () => void;
+    reportedSize?: number;
+    patchStatus?: number;
+    loseNextPatchResponse = false;
+    readonly branch = "main";
+    readonly authorizePaths = vi.fn<(paths: string[]) => Promise<void>>().mockResolvedValue(undefined);
+
+    constructor(files: Record<string, string> = {}) {
+      this.head = this.commit(files, null);
+    }
+
+    private oid(value: string): string { return createHash("sha1").update(value).digest("hex"); }
+
+    private saveTree(files: Record<string, string>): string {
+      const refs = Object.fromEntries(Object.entries(files).map(([path, content]) => {
+        const sha = this.oid(`blob:${content}`);
+        this.blobs.set(sha, content);
+        return [path, sha];
+      }));
+      const sha = this.oid(`tree:${JSON.stringify(refs)}`);
+      this.trees.set(sha, refs);
+      return sha;
+    }
+
+    private commit(files: Record<string, string>, parent: string | null): string {
+      const tree = this.saveTree(files);
+      const sha = this.oid(`commit:${tree}:${parent}`);
+      this.commits.set(sha, { tree, parent });
+      return sha;
+    }
+
+    files(head = this.head): Record<string, string> {
+      const tree = this.commits.get(head)!.tree;
+      return Object.fromEntries(Object.entries(this.trees.get(tree)!).map(([path, sha]) => [path, this.blobs.get(sha)!]));
+    }
+
+    externalWrite(path: string, content: string): void {
+      this.head = this.commit({ ...this.files(), [path]: content }, this.head);
+    }
+
+    externalDelete(path: string): void {
+      const files = this.files();
+      delete files[path];
+      this.head = this.commit(files, this.head);
+    }
+
+    scaffold(input: unknown, draftId = DRAFT_ID) {
+      return createPersonalPost(ENV, allocatorContext, {
+        source: knowledgeIndexTarget.source, draftId, artifactType: "post", scaffold: input,
+      }, { getInstallationToken: vi.fn().mockResolvedValue("test-token"), fetch: this.request,
+        authorizePaths: this.authorizePaths });
+    }
+
+    entries(): Array<ReturnType<typeof entry>> {
+      return (this.files()[ALLOCATOR_LOG_PATH] ?? "").trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+    }
+
+    request = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url = new URL(String(input));
+      const path = url.pathname.replace(/^\/repos\/[^/]+\/[^/]+/, "");
+      const method = init?.method ?? "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      this.calls.push({ method, path, body });
+      if (path.startsWith("/contents/")) {
+        const filename = decodeURIComponent(path.slice("/contents/".length));
+        const tree = this.trees.get(this.commits.get(this.head)!.tree)!;
+        if (!tree[filename]) return responseJson({ message: "Not Found" }, 404);
+        if (method === "GET") return responseJson({ sha: tree[filename], encoding: "base64",
+          content: Buffer.from(this.files()[filename]).toString("base64") });
+        if (method === "PUT") {
+          if (body.sha !== tree[filename]) return responseJson({ message: "sha mismatch" }, 409);
+          this.externalWrite(filename, Buffer.from(body.content, "base64").toString("utf8"));
+          return responseJson({ content: { sha: this.trees.get(this.commits.get(this.head)!.tree)![filename], html_url: "https://example.test/file" } });
+        }
+      }
+      if (method === "GET" && path === "") return responseJson({ default_branch: this.branch });
+      if (method === "GET" && path === `/git/ref/heads/${this.branch}`) {
+        return responseJson({ object: { sha: this.head, type: "commit" } });
+      }
+      if (method === "GET" && path.startsWith("/git/commits/")) {
+        const sha = path.split("/").at(-1)!;
+        return responseJson({ sha: this.mismatchedCommit ? "0".repeat(40) : sha,
+          tree: { sha: this.commits.get(sha)!.tree } });
+      }
+      if (method === "GET" && path.startsWith("/git/trees/")) {
+        const tree = this.trees.get(path.split("/").at(-1)!)!;
+        return responseJson({ sha: this.mismatchedTree ? "0".repeat(40) : path.split("/").at(-1),
+          truncated: this.truncated,
+          tree: Object.entries(tree).map(([path, sha]) => ({ path, sha, type: "blob", mode: "100644",
+            size: this.reportedSize ?? Buffer.byteLength(this.blobs.get(sha)!) })) });
+      }
+      if (method === "POST" && path === "/graphql") {
+        if (this.brokenBlob) return responseJson({ message: "unavailable" }, 503);
+        expect(body.variables).toEqual({ owner: knowledgeIndexTarget.githubOwner, repo: knowledgeIndexTarget.githubRepo });
+        const repository: Record<string, unknown> = {};
+        for (const match of body.query.matchAll(/(b\d+): object\(oid: "([a-f0-9]+)"\)/g)) {
+          const [, alias, oid] = match;
+          const text = this.blobs.get(oid)!;
+          const blob = { oid, text, byteSize: Buffer.byteLength(text), isBinary: false, isTruncated: false };
+          repository[alias] = this.patchBlob ? this.patchBlob(blob) : blob;
+        }
+        this.afterBlobBatch?.();
+        return responseJson({ data: { repository }, ...(this.graphErrors ? { errors: [{ message: "partial error" }] } : {}) });
+      }
+      if (method === "POST" && path === "/git/trees") {
+        const base = this.trees.get(body.base_tree)!;
+        const files = Object.fromEntries(Object.entries(base).map(([path, sha]) => [path, this.blobs.get(sha)!]));
+        for (const file of body.tree) files[file.path] = file.content;
+        return responseJson({ sha: this.saveTree(files) }, 201);
+      }
+      if (method === "POST" && path === "/git/commits") {
+        const sha = this.oid(`commit:${body.tree}:${body.parents[0]}`);
+        this.commits.set(sha, { tree: body.tree, parent: body.parents[0] });
+        return responseJson({ sha }, 201);
+      }
+      if (method === "PATCH" && path === `/git/refs/heads/${this.branch}`) {
+        this.beforePatch?.();
+        if (this.patchStatus) return responseJson({ message: "protected branch" }, this.patchStatus);
+        if (body.force !== false) throw new Error("Force updates are forbidden");
+        if (this.commits.get(body.sha)?.parent !== this.head) return responseJson({ message: "Update is not a fast forward" }, 422);
+        this.head = body.sha;
+        if (this.loseNextPatchResponse) {
+          this.loseNextPatchResponse = false;
+          throw new Error("Connection lost after GitHub advanced the ref");
+        }
+        return responseJson({ object: { sha: this.head } });
+      }
+      throw new Error(`Unexpected GitHub request ${method} ${path}`);
+    });
+
+    allocate(draftId = DRAFT_ID) {
+      return allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, draftId, "post", {
+        getInstallationToken: vi.fn().mockResolvedValue("test-token"), fetch: this.request,
+      });
+    }
   }
 
-  it("rejects a non-UUID draft_id without touching the network", async () => {
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, "not-a-uuid", "post");
-    expect(result).toMatchObject({ success: false, reason: "invalid_draft_id" });
-  });
-
-  it("rejects an artifact_type outside the allowlist without touching the network", async () => {
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "pack");
-    expect(result).toMatchObject({ success: false, reason: "invalid_artifact_type" });
-  });
-
-  it("allocates #1 on an empty (404) log and writes one PUT to the log path", async () => {
-    const { request, dependencies } = githubDependencies([
-      { ok: false, status: 404 }, // GET log: doesn't exist yet
-      { ok: true, status: 200, json: async () => ({}) }, // PUT: create
-    ]);
-
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
-
-    expect(result).toMatchObject({ success: true, post_number: 1, draft_id: DRAFT_ID, reused: false });
-    expect(request).toHaveBeenCalledTimes(2);
-    const putCall = request.mock.calls[1];
-    expect(putCall[0]).toContain(encodeURIComponent(ALLOCATOR_LOG_PATH).replace(/%2F/g, "/"));
-    const putBody = JSON.parse(putCall[1].body as string);
-    expect(putBody.sha).toBeUndefined(); // creating — no sha to send
-    const writtenLine = JSON.parse(decodeURIComponent(escape(atob(putBody.content))).trim());
-    expect(writtenLine).toMatchObject({ draft_id: DRAFT_ID, artifact_type: "post", post_number: 1 });
-  });
-
-  it("allocates the next number after existing entries, preserving them in the PUT", async () => {
-    const sha = "d".repeat(40);
-    const { request, dependencies } = githubDependencies([
-      logResponse([{ draft_id: OTHER_DRAFT_ID, artifact_type: "post", post_number: 5 }], sha),
-      { ok: true, status: 200, json: async () => ({}) },
-    ]);
-
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
-
-    expect(result).toMatchObject({ success: true, post_number: 6, reused: false });
-    const putBody = JSON.parse(request.mock.calls[1][1].body as string);
-    expect(putBody.sha).toBe(sha);
-    const lines = decodeURIComponent(escape(atob(putBody.content))).trim().split("\n").map(l => JSON.parse(l));
-    expect(lines).toEqual([
-      expect.objectContaining({ draft_id: OTHER_DRAFT_ID, post_number: 5 }),
-      expect.objectContaining({ draft_id: DRAFT_ID, post_number: 6 }),
-    ]);
-  });
-
-  it("is idempotent: a repeated draft_id returns the same number without a PUT", async () => {
-    const { request, dependencies } = githubDependencies([
-      logResponse([{ draft_id: DRAFT_ID, artifact_type: "post", post_number: 3 }], "e".repeat(40)),
-    ]);
-
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
-
-    expect(result).toMatchObject({ success: true, post_number: 3, reused: true });
-    expect(request).toHaveBeenCalledTimes(1); // read only, no PUT
-  });
-
-  it("retries on a concurrent-write conflict (409) and succeeds on the re-read", async () => {
-    const firstSha = "f".repeat(40);
-    const secondSha = "1".repeat(40);
-    const { request, dependencies } = githubDependencies([
-      logResponse([], firstSha === "no-entries" ? firstSha : firstSha), // first read: empty
-      { ok: false, status: 409, text: async () => "conflict" }, // first PUT: lost the race
-      logResponse([{ draft_id: OTHER_DRAFT_ID, artifact_type: "post", post_number: 1 }], secondSha), // re-read: winner's entry now present
-      { ok: true, status: 200, json: async () => ({}) }, // second PUT: succeeds
-    ]);
-
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
-
-    expect(result).toMatchObject({ success: true, post_number: 2, reused: false });
-    expect(request).toHaveBeenCalledTimes(4);
-  });
-
-  it("fails closed after exhausting retries under sustained conflict", async () => {
-    const responses: Array<Partial<Response> & { ok: boolean }> = [];
-    for (let i = 0; i < 5; i++) {
-      responses.push(logResponse([], `${i}`.repeat(40)));
-      responses.push({ ok: false, status: 409, text: async () => "conflict" });
+  it("rejects invalid UUID/type and unknown source without network access", async () => {
+    const fetch = vi.fn();
+    for (const [source, draftId, type, reason] of [
+      [knowledgeIndexTarget.source, "invalid", "post", "invalid_draft_id"],
+      [knowledgeIndexTarget.source, DRAFT_ID, "pack", "invalid_artifact_type"],
+      ["unknown", DRAFT_ID, "post", "unknown_source"],
+    ]) {
+      expect(await allocatePostNumber(ENV, allocatorContext, source, draftId, type, { fetch }))
+        .toMatchObject({ success: false, reason });
     }
-    const { request, dependencies } = githubDependencies(responses);
-
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
-
-    expect(result).toMatchObject({ success: false, reason: "allocator_conflict_exhausted" });
-    expect(request).toHaveBeenCalledTimes(10);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("surfaces a non-conflict GitHub error without retrying", async () => {
-    const { request, dependencies } = githubDependencies([
-      logResponse([], "a".repeat(40)),
-      { ok: false, status: 500, text: async () => "internal error" },
+  it("reserves #1 in an empty repository through a non-forced Git ref update", async () => {
+    const git = new FakeGitHub({ "README.md": "keep me" });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 1, reused: false });
+    expect(git.files()["README.md"]).toBe("keep me");
+    expect(git.entries()).toEqual([expect.objectContaining({ draft_id: DRAFT_ID, post_number: 1 })]);
+    expect(git.calls.filter(call => call.method === "PATCH")).toEqual([
+      expect.objectContaining({ body: { sha: git.head, force: false } }),
     ]);
-
-    const result = await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", dependencies);
-
-    expect(result).toMatchObject({ success: false, reason: "github_error" });
-    expect(request).toHaveBeenCalledTimes(2);
   });
 
-  it("reports no_installation when the GitHub App has no installation for this repo", async () => {
-    const result = await allocatePostNumber(
-      ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post",
-      { getInstallationToken: vi.fn().mockResolvedValue(null), fetch: vi.fn() as unknown as typeof globalThis.fetch },
-    );
-    expect(result).toMatchObject({ success: false, reason: "no_installation" });
+  it("reserves #234 with live-shaped posts #233 and allocator seed #232", async () => {
+    const original = log(entry(1, "2ad290d7-d9de-4f9a-be0f-a4c9232ca9ee"), entry(232));
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: original, [POST_PATH]: post(233) });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 234 });
+    expect(git.files()[ALLOCATOR_LOG_PATH].startsWith(original)).toBe(true);
+    expect(git.entries().map(value => value.post_number)).toEqual([1, 232, 234]);
+    expect(git.files()[POST_PATH]).toBe(post(233));
+  });
+
+  it("bootstraps from legacy filename numbers and preserves unnumbered monthly posts", async () => {
+    const git = new FakeGitHub({ "docs/2026/old/233-1-club-2026-09-01.md": "Legacy body",
+      [POST_PATH]: "---\ntype: post\n---\nUnnumbered draft" });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 234 });
+  });
+
+  it("reads quoted historical numbers only inside frontmatter", async () => {
+    const git = new FakeGitHub({ [POST_PATH]: '---\npost_number: "233" # legacy\n---\npost_number: 999' });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 234 });
+  });
+
+  it.each(["null", "", "~"])("treats actual YAML null (%s) as an unnumbered monthly post", async value => {
+    const git = new FakeGitHub({ [POST_PATH]: `---\npost_number: ${value}\n---\nBody` });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 1 });
+  });
+
+  it("uses the legacy filename if its explicit global number is YAML null", async () => {
+    const git = new FakeGitHub({ "docs/old/233-1-club-2026-09-01.md": "---\npost_number: null\n---\nBody" });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 234 });
+  });
+
+  it.each(["post_number: 'null'", `post_number: null\ndraft_id: ${DRAFT_ID}`, `draft_id: ${DRAFT_ID}`])(
+    "rejects a string-null number or draft ownership without a global number: %s", async fields => {
+      const git = new FakeGitHub({ [POST_PATH]: `---\n${fields}\n---\nBody` });
+      expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+      expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+    },
+  );
+
+  it("respects a quoted YAML key instead of silently ignoring the number", async () => {
+    const git = new FakeGitHub({ [POST_PATH]: '---\n"post_number": 233\n---\nBody' });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 234 });
+  });
+
+  it.each([
+    "not json", "null", "[]", log({ ...entry(232), post_number: "232" }),
+    log({ ...entry(232), post_number: -1 }), log({ ...entry(232), post_number: 1.5 }),
+    log({ ...entry(232), post_number: Number.MAX_SAFE_INTEGER + 1 }),
+    log({ ...entry(232), artifact_type: "pack" }), log({ ...entry(232), draft_id: "invalid" }),
+    log({ ...entry(232), timestamp: "yesterday" }), log(entry(232), entry(233)),
+    log(entry(232), entry(232, DRAFT_ID)), log(entry(232), entry(233, OTHER_DRAFT_ID.toUpperCase())),
+  ])("rejects malformed/ambiguous log without publishing a Git ref: %s", async raw => {
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: raw });
+    const originalHead = git.head;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+    expect(git.head).toBe(originalHead);
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("rejects a truncated tree before reading or modifying content", async () => {
+    const git = new FakeGitHub({ [POST_PATH]: post(233) });
+    git.truncated = true;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it.each(["mismatchedTree", "mismatchedCommit"] as const)("rejects immutable object identity mismatch (%s)", async flag => {
+    const git = new FakeGitHub({ [POST_PATH]: post(233) });
+    git[flag] = true;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+    expect(git.calls.some(call => call.method !== "GET")).toBe(false);
+  });
+
+  it("rejects an unreadable historical blob before creating Git objects", async () => {
+    const git = new FakeGitHub({ [POST_PATH]: post(233) });
+    git.brokenBlob = true;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "github_error" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it.each(["post_number: oops", "post_number: 0", "post_number: 232\npost_number: 233", "post_number: 233\ndraft_id: invalid",
+    "post_number: 1e3", "post_number: |\n  233", "post_number: &num 233\n<<: {post_number: 234}",
+    "number: &num 233\npost_number: *num", '"post_number": 233\npost_number: 234',
+    "post_number: !custom 233"])(
+    "rejects malformed historical ownership: %s", async fields => {
+      const git = new FakeGitHub({ [POST_PATH]: `---\n${fields}\n---\nBody` });
+      expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+      expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+    },
+  );
+
+  it("reuses a reservation case-insensitively without a new Git commit", async () => {
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: log(entry(233, DRAFT_ID)) });
+    const head = git.head;
+    expect(await git.allocate(DRAFT_ID.toUpperCase())).toMatchObject({ success: true, post_number: 233, draft_id: DRAFT_ID, reused: true });
+    expect(git.head).toBe(head);
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("reuses an existing post only with matching draft ownership", async () => {
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: log(entry(233, DRAFT_ID)), [POST_PATH]: post(233, DRAFT_ID) });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 233, reused: true });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it.each([undefined, OTHER_DRAFT_ID])("refuses a historic number owned by another/unknown draft (%s)", async draftId => {
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: log(entry(233, DRAFT_ID)), [POST_PATH]: post(233, draftId) });
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "post_number_ownership_conflict" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("re-reads history after a competing post-only commit leaves the log unchanged", async () => {
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: log(entry(232)) });
+    git.beforePatch = () => { git.beforePatch = undefined; git.externalWrite(POST_PATH, post(233)); };
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 234 });
+    expect(git.entries().map(value => value.post_number)).toEqual([232, 234]);
+    expect(git.files()[POST_PATH]).toBe(post(233));
+    expect(git.calls.filter(call => call.method === "PATCH")).toHaveLength(2);
+  });
+
+  it("reuses a same-draft reservation that wins the ref race", async () => {
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: log(entry(232)) });
+    git.beforePatch = () => { git.beforePatch = undefined; git.externalWrite(ALLOCATOR_LOG_PATH, log(entry(232), entry(233, DRAFT_ID))); };
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 233, reused: true });
+    expect(git.entries()).toHaveLength(2);
+    expect(git.calls.filter(call => call.method === "PATCH")).toHaveLength(1);
+  });
+
+  it("gives concurrent distinct drafts distinct numbers and preserves both log entries", async () => {
+    const git = new FakeGitHub();
+    const results = await Promise.all([git.allocate(DRAFT_ID), git.allocate(OTHER_DRAFT_ID)]);
+    expect(results.every(result => result.success)).toBe(true);
+    expect(results.map(result => result.post_number).sort()).toEqual([1, 2]);
+    expect(new Set(git.entries().map(value => value.draft_id))).toEqual(new Set([DRAFT_ID, OTHER_DRAFT_ID]));
+  });
+
+  it("stops after five ref conflicts without publishing any reservation", async () => {
+    const git = new FakeGitHub();
+    let writes = 0;
+    git.beforePatch = () => git.externalWrite("README.md", `concurrent ${++writes}`);
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "allocator_conflict_exhausted" });
+    expect(git.entries()).toEqual([]);
+    expect(git.calls.filter(call => call.method === "PATCH")).toHaveLength(5);
+  });
+
+  it("does not retry a protected-branch refusal as a concurrency conflict", async () => {
+    const git = new FakeGitHub();
+    git.patchStatus = 422;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "github_error" });
+    expect(git.entries()).toEqual([]);
+    expect(git.calls.filter(call => call.method === "PATCH")).toHaveLength(1);
+  });
+
+  it.each([
+    ["missing alias", () => null],
+    ["truncated blob", (blob: Record<string, unknown>) => ({ ...blob, isTruncated: true })],
+    ["binary blob", (blob: Record<string, unknown>) => ({ ...blob, isBinary: true })],
+    ["wrong oid", (blob: Record<string, unknown>) => ({ ...blob, oid: "0".repeat(40) })],
+    ["wrong byte size", (blob: Record<string, unknown>) => ({ ...blob, byteSize: 0 })],
+    ["missing text", (blob: Record<string, unknown>) => ({ ...blob, text: null })],
+  ] as const)("rejects GraphQL %s without publishing any mutation", async (_label, patchBlob) => {
+    const git = new FakeGitHub({ [POST_PATH]: post(233) });
+    git.patchBlob = patchBlob;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("rejects GraphQL partial errors even if all requested blobs are present", async () => {
+    const git = new FakeGitHub({ [POST_PATH]: post(233) });
+    git.graphErrors = true;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("reads 217 historical posts in six bounded GraphQL batches", async () => {
+    const files = Object.fromEntries(Array.from({ length: 217 }, (_, index) =>
+      [`docs/2026/legacy/${index + 1}-1-club-2026-09-01.md`, post(index + 1)]));
+    const git = new FakeGitHub(files);
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 218 });
+    const batches = git.calls.filter(call => call.path === "/graphql");
+    expect(batches).toHaveLength(6);
+    expect(batches.every(call => [...call.body.query.matchAll(/object\(oid:/g)].length <= 40)).toBe(true);
+    expect(git.calls).toHaveLength(13);
+  });
+
+  it("rejects oversized historical content before requesting its text", async () => {
+    const git = new FakeGitHub({ [POST_PATH]: post(233) });
+    git.reportedSize = 1024 * 1024 + 1;
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "allocator_budget_exceeded" });
+    expect(git.calls.some(call => call.method !== "GET")).toBe(false);
+  });
+
+  it("does not start a Git mutation once the overall deadline expires", async () => {
+    const controller = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+    try {
+      const git = new FakeGitHub({ [POST_PATH]: post(233) });
+      git.afterBlobBatch = () => controller.abort();
+      expect(await git.allocate()).toMatchObject({ success: false, reason: "allocator_budget_exceeded" });
+      expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+      expect(git.request.mock.calls.every(([, init]) => init?.signal === controller.signal)).toBe(true);
+    } finally {
+      timeout.mockRestore();
+    }
+  });
+
+  it("does not write after wall time expires while the abort callback is still pending", async () => {
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    try {
+      const git = new FakeGitHub({ [POST_PATH]: post(233) });
+      git.afterBlobBatch = () => { clock.mockReturnValue(25_001); };
+      expect(await git.allocate()).toMatchObject({ success: false, reason: "allocator_budget_exceeded" });
+      expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+      expect(git.request.mock.calls.every(([, init]) => init?.signal?.aborted === false)).toBe(true);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("rejects duplicate JSON keys instead of silently taking the last number", async () => {
+    const raw = log(entry(233)).replace('"post_number":233', '"post_number":999,"post_number":233');
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: raw });
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it.each([undefined, 234])("does not reallocate a historical draft with missing/mismatched log entry (%s)", async number => {
+    const git = new FakeGitHub({ [POST_PATH]: post(233, DRAFT_ID),
+      ...(number === undefined ? {} : { [ALLOCATOR_LOG_PATH]: log(entry(number, DRAFT_ID)) }) });
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "post_number_ownership_conflict" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("returns on the deadline even if auth is pending and ignores its late result", async () => {
+    const controller = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+    let finishAuth!: (token: string) => void;
+    const auth = new Promise<string>(resolve => { finishAuth = resolve; });
+    const fetch = vi.fn();
+    try {
+      const allocation = allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", {
+        getInstallationToken: vi.fn().mockReturnValue(auth), fetch,
+      });
+      controller.abort();
+      expect(await allocation).toMatchObject({ success: false, reason: "allocator_budget_exceeded" });
+      finishAuth("late-test-token");
+      await auth;
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      timeout.mockRestore();
+    }
+  });
+
+  it("fails within its request cap rather than reaching a Worker subrequest limit", async () => {
+    const files = Object.fromEntries(Array.from({ length: 1600 }, (_, index) =>
+      [`docs/2026/legacy/${index + 1}-1-club-2026-09-01.md`, post(index + 1)]));
+    const git = new FakeGitHub(files);
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "allocator_budget_exceeded" });
+    expect(git.calls).toHaveLength(40);
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("refuses an overflowing counter", async () => {
+    const git = new FakeGitHub({ [ALLOCATOR_LOG_PATH]: log(entry(Number.MAX_SAFE_INTEGER)) });
+    expect(await git.allocate()).toMatchObject({ success: false, reason: "invalid_allocator_state" });
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  const scaffoldInput = { date: "2026-09-25", slug: "browser-draft", title: 'Заголовок с "кавычками"', channels: ["telegram", "club"] };
+  const scaffoldRepository = (files: Record<string, string> = {}) => new FakeGitHub({
+    [POST_CONVENTION_PATH]: JSON.stringify(POST_CONVENTION_FIXTURE), ...files,
+  });
+
+  it.each([
+    ["reservation", undefined],
+    ["browser scaffold", scaffoldInput],
+  ] as const)("creates a %s with receiver-sensitive Workers fetch", async (_name, scaffold) => {
+    const git = scaffoldRepository();
+    vi.stubGlobal("fetch", function (this: unknown, input: RequestInfo | URL, init?: RequestInit) {
+      if (this !== undefined && this !== null && this !== globalThis) {
+        throw new TypeError("Illegal invocation: function called with incorrect this reference");
+      }
+      return git.request(input, init);
+    });
+
+    const result = await createPersonalPost(ENV, allocatorContext, {
+      source: knowledgeIndexTarget.source, draftId: DRAFT_ID, artifactType: "post", scaffold,
+    }, { getInstallationToken: async () => "test-token", authorizePaths: git.authorizePaths });
+
+    expect(result).toMatchObject({ success: true, post_number: 1, reused: false });
+    expect(git.entries()).toEqual([expect.objectContaining({ draft_id: DRAFT_ID, post_number: 1 })]);
+    expect(git.calls.filter(call => call.method === "PATCH")).toHaveLength(1);
+    if (scaffold) {
+      expect(result.scaffold).toMatchObject({ status: "created", commit_sha: git.head });
+      expect(result.scaffold!.paths).toHaveLength(2);
+      for (const path of result.scaffold!.paths) {
+        expect(git.files()[path]).toContain('status: "draft"');
+      }
+    }
+  });
+
+  it("atomically creates the reservation and all draft channel files after authorizing every path", async () => {
+    const git = scaffoldRepository({ [POST_PATH]: post(233), [ALLOCATOR_LOG_PATH]: log(entry(232)) });
+    git.authorizePaths.mockImplementation(async paths => {
+      expect(paths).toHaveLength(3);
+      expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+    });
+    const result = await git.scaffold(scaffoldInput);
+    expect(result).toMatchObject({ success: true, post_number: 234, reused: false, scaffold: { status: "created", commit_sha: git.head } });
+    const paths = result.scaffold!.paths;
+    expect(paths).toEqual([
+      "docs/2026/04-сентябрь/14-09-2026-09-25-browser-draft/14-09-1-club-2026-09-25.md",
+      "docs/2026/04-сентябрь/14-09-2026-09-25-browser-draft/14-09-4-telegram-2026-09-25.md",
+    ]);
+    expect(git.authorizePaths).toHaveBeenCalledWith([ALLOCATOR_LOG_PATH, ...paths]);
+    expect(git.entries().map(value => value.post_number)).toEqual([232, 234]);
+    expect(paths.every(path => git.files()[path].includes('status: "draft"'))).toBe(true);
+    expect(git.files()[paths[1]]).toContain('source_post: "14-09-1-club-2026-09-25.md"');
+    expect(git.calls.filter(call => call.method === "PATCH")).toHaveLength(1);
+    expect(git.calls.find(call => call.method === "POST" && call.path === "/git/trees")!.body.tree).toHaveLength(3);
+  });
+
+  it("fills a browser scaffold through live SHA reads while the search index remains empty", async () => {
+    const git = scaffoldRepository();
+    const result = await git.scaffold(scaffoldInput);
+    const filename = result.scaffold!.paths[0];
+    expect(result.next_action).toContain("include_sha:true");
+    queryQueue.push([{ installation_id: 42 }]);
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).endsWith("/access_tokens") ? responseJson({ token: "fake-token" }) : git.request(input, init));
+    const live = await personalGetDocumentWithSha(ENV_WITH_APP, allocatorContext, filename, knowledgeIndexTarget.source);
+    expect(live?.kind).toBe("document");
+    if (live?.kind !== "document") throw new Error("Expected live GitHub document");
+    expect(sqlCalls).toHaveLength(1); // Installation metadata only; no knowledge.documents query.
+    expect((sqlCalls[0][0] as TemplateStringsArray).join(" ")).toContain("installation_id");
+    const edited = live.content + "\nГотовый текст автора.\n";
+    const saved = await writeToGitHub(ENV, allocatorContext, knowledgeIndexTarget.source, filename, edited, "fill draft", {
+      getInstallationToken: async () => "fake-token", fetch: git.request,
+    }, live.sha);
+    expect(saved.success).toBe(true);
+    expect(git.files()[filename]).toBe(edited);
+    expect(git.entries()).toHaveLength(1);
+  });
+
+  it.each([undefined, OTHER_DRAFT_ID])("refuses scaffold after a legacy writer occupies a reserved number (owner %s)", async owner => {
+    const git = scaffoldRepository({ [ALLOCATOR_LOG_PATH]: log(entry(232)) });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 233 });
+    const reservedLog = git.files()[ALLOCATOR_LOG_PATH];
+    git.externalWrite(POST_PATH, post(233, owner));
+    const before = git.files();
+    const callCount = git.calls.length;
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false, reason: "post_number_ownership_conflict" });
+    expect(git.files()).toEqual(before);
+    expect(git.files()[ALLOCATOR_LOG_PATH]).toBe(reservedLog);
+    expect(git.calls.slice(callCount).some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+    expect(git.authorizePaths).not.toHaveBeenCalled();
+  });
+
+  it("refuses scaffold on CAS retry after a legacy writer occupies its reserved number", async () => {
+    const git = scaffoldRepository({ [ALLOCATOR_LOG_PATH]: log(entry(232)) });
+    expect(await git.allocate()).toMatchObject({ success: true, post_number: 233 });
+    const reservedLog = git.files()[ALLOCATOR_LOG_PATH];
+    let afterLegacy!: Record<string, string>;
+    git.beforePatch = () => {
+      git.beforePatch = undefined;
+      git.externalWrite(POST_PATH, post(233));
+      afterLegacy = git.files();
+    };
+    const callCount = git.calls.length;
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false, reason: "post_number_ownership_conflict" });
+    const calls = git.calls.slice(callCount);
+    const rejectedPatch = calls.findIndex(call => call.method === "PATCH");
+    expect(rejectedPatch).toBeGreaterThan(0);
+    expect(calls.filter(call => call.path === "/git/ref/heads/main")).toHaveLength(2);
+    expect(calls.slice(rejectedPatch + 1).some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+    expect(git.files()).toEqual(afterLegacy);
+    expect(git.files()[ALLOCATOR_LOG_PATH]).toBe(reservedLog);
+    expect(Object.keys(git.files()).filter(path => path.includes("browser-draft"))).toEqual([]);
+  });
+
+  it("materializes a previous reservation without adding a second log entry", async () => {
+    const initialLog = log(entry(233, DRAFT_ID));
+    const git = scaffoldRepository({ [ALLOCATOR_LOG_PATH]: initialLog });
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: true, post_number: 233, reused: true, scaffold: { status: "created" } });
+    expect(git.files()[ALLOCATOR_LOG_PATH]).toBe(initialLog);
+    expect(git.entries()).toHaveLength(1);
+    expect(git.authorizePaths.mock.calls[0][0]).not.toContain(ALLOCATOR_LOG_PATH);
+  });
+
+  it("replays after a lost PATCH response without overwriting edited content or appending a reservation", async () => {
+    const git = scaffoldRepository();
+    git.loseNextPatchResponse = true;
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false, reason: "github_error" });
+    const paths = Object.keys(git.files()).filter(path => path.includes("browser-draft")).sort();
+    expect(paths).toHaveLength(2);
+    const club = paths.find(path => path.includes("-1-club-"))!;
+    const edited = git.files()[club].replace('status: "draft"', 'status: "ready"') + "\nАвторский текст.\n";
+    git.externalWrite(club, edited);
+    const mutations = git.calls.filter(call => call.path !== "/graphql" && call.method !== "GET").length;
+    const replay = await git.scaffold(scaffoldInput);
+    expect(replay).toMatchObject({ success: true, reused: true, scaffold: { status: "existing", paths } });
+    expect(git.files()[club]).toBe(edited);
+    expect(git.entries()).toHaveLength(1);
+    expect(git.calls.filter(call => call.path !== "/graphql" && call.method !== "GET")).toHaveLength(mutations);
+  });
+
+  it.each([
+    { title: "Другой заголовок" }, { slug: "different-draft" }, { date: "2026-09-26" },
+    { channels: ["club"] }, { audience: "advanced" }, { content_plan: "changed" }, { related_wp: 560 },
+  ])("rejects changed scaffold parameters on replay: %j", async changes => {
+    const git = scaffoldRepository();
+    await git.scaffold(scaffoldInput);
+    const head = git.head;
+    expect(await git.scaffold({ ...scaffoldInput, ...changes })).toMatchObject({ success: false, reason: "scaffold_conflict" });
+    expect(git.head).toBe(head);
+    expect(git.entries()).toHaveLength(1);
+  });
+
+  it.each([0, 1])("refuses to silently recreate a missing channel file on replay (index %s)", async index => {
+    const git = scaffoldRepository();
+    const first = await git.scaffold(scaffoldInput);
+    git.externalDelete(first.scaffold!.paths[index]);
+    const head = git.head;
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false, reason: "scaffold_conflict" });
+    expect(git.head).toBe(head);
+    expect(git.files()[first.scaffold!.paths[index]]).toBeUndefined();
+  });
+
+  it("leaves both log and files unpublished when the branch refuses the atomic update", async () => {
+    const git = scaffoldRepository();
+    const files = git.files();
+    git.patchStatus = 403;
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false, reason: "github_error" });
+    expect(git.files()).toEqual(files);
+  });
+
+  it("does not create any Git objects when path scope authorization denies a channel", async () => {
+    const git = scaffoldRepository();
+    git.authorizePaths.mockRejectedValue(new Error("scope denied: path_not_allowed"));
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false });
+    expect(git.authorizePaths).toHaveBeenCalledTimes(1);
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("requires a path authorization callback before accessing GitHub for a scaffold", async () => {
+    const fetch = vi.fn();
+    expect(await createPersonalPost(ENV, allocatorContext, {
+      source: knowledgeIndexTarget.source, draftId: DRAFT_ID, artifactType: "post", scaffold: scaffoldInput,
+    }, { fetch })).toMatchObject({ success: false, reason: "path_authorization_required" });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("fails without allocating when the shared convention is missing or unsupported", async () => {
+    const fixtures: Array<Record<string, string>> = [{}, { [POST_CONVENTION_PATH]: JSON.stringify({ ...POST_CONVENTION_FIXTURE, version: 2 }) }];
+    for (const files of fixtures) {
+      const git = new FakeGitHub(files);
+      expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false, reason: "invalid_post_convention" });
+      expect(git.entries()).toEqual([]);
+      expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+    }
+  });
+
+  it.each([
+    "{channel_number}-{channel}-{date}-{sequence}-{month}.md",
+    "{sequence}-{month}-0{channel_number}-{channel}-{date}.md",
+  ])("rejects a channel template that the version 1 allocator cannot discover (%s)", async channel_file => {
+    const changed = { ...POST_CONVENTION_FIXTURE, templates: { ...POST_CONVENTION_FIXTURE.templates, channel_file } };
+    const git = scaffoldRepository({ [POST_CONVENTION_PATH]: JSON.stringify(changed) });
+    expect(await git.scaffold(scaffoldInput)).toMatchObject({ success: false, reason: "invalid_post_convention" });
+    expect(git.entries()).toEqual([]);
+    expect(git.calls.some(call => call.path !== "/graphql" && call.method !== "GET")).toBe(false);
+  });
+
+  it("replans names and numbers when concurrent browser drafts race on the branch", async () => {
+    const git = scaffoldRepository();
+    const results = await Promise.all([
+      git.scaffold(scaffoldInput, DRAFT_ID),
+      git.scaffold({ ...scaffoldInput, slug: "second-draft" }, OTHER_DRAFT_ID),
+    ]);
+    expect(results.every(result => result.success)).toBe(true);
+    expect(results.map(result => result.post_number).sort()).toEqual([1, 2]);
+    const paths = results.flatMap(result => result.scaffold!.paths);
+    expect(new Set(paths).size).toBe(4);
+    expect(paths.every(path => !!git.files()[path])).toBe(true);
+    expect(git.entries()).toHaveLength(2);
+    expect(git.authorizePaths).toHaveBeenCalledTimes(3);
+  });
+
+  it("creates only one scaffold for concurrent requests with the same UUID", async () => {
+    const git = scaffoldRepository();
+    const [first, second] = await Promise.all([git.scaffold(scaffoldInput), git.scaffold(scaffoldInput)]);
+    expect(first.success && second.success).toBe(true);
+    expect(first.post_number).toBe(second.post_number);
+    expect(first.scaffold!.paths).toEqual(second.scaffold!.paths);
+    expect(git.entries()).toHaveLength(1);
+  });
+
+  it("reports no_installation without any repository request", async () => {
+    const fetch = vi.fn();
+    expect(await allocatePostNumber(ENV, allocatorContext, knowledgeIndexTarget.source, DRAFT_ID, "post", {
+      getInstallationToken: vi.fn().mockResolvedValue(null), fetch,
+    })).toMatchObject({ success: false, reason: "no_installation" });
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
 
@@ -769,15 +1479,16 @@ describe("writeToGitHub — optimistic concurrency (WP-7 Ф96, ported from perso
     expect(calls.some(c => c.method === "PUT")).toBe(false);
   });
 
-  it("keeps prior overwrite behavior when expectedSha is omitted", async () => {
+  it("refuses to overwrite an existing file when expectedSha is omitted (WP-7 Ф99)", async () => {
     const calls = queuedFetch([
       ...installationTokenResponses(),
-      responseJson({ sha: VALID_SHA }),
-      responseJson({ content: { sha: "b".repeat(40), html_url: "https://github.com/x" } }),
+      responseJson({ sha: VALID_SHA }), // existence check finds a current file
     ]);
     const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "updated", "update");
-    expect(result.success).toBe(true);
-    expect(calls.filter(c => c.method === "PUT")).toHaveLength(1);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("sha_required");
+    expect(result.current_sha).toBe(VALID_SHA);
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
   });
 
   it("normalizes a GitHub 409 on PUT to version_mismatch instead of a generic error", async () => {
@@ -789,6 +1500,437 @@ describe("writeToGitHub — optimistic concurrency (WP-7 Ф96, ported from perso
     const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "racing write", "update", {}, VALID_SHA);
     expect(result.success).toBe(false);
     expect(result.reason).toBe("version_mismatch");
+  });
+});
+
+// WP-7 Ф204: append moves the read-modify-write step onto the server. Each call exercises
+// personalGetDocumentLive (installation token + content GET) followed by writeToGitHub
+// (its own installation token + existence-check GET + PUT) — getInstallationToken is not
+// cached across the two, so every scenario below queues installationTokenResponses() twice.
+describe("appendToGitHub (WP-7 Ф204)", () => {
+  const OLD_SHA = "a".repeat(40);
+  const NEW_SHA = "b".repeat(40);
+  const liveContentResponse = (content: string, sha = OLD_SHA) =>
+    responseJson({ sha, content: btoa(unescape(encodeURIComponent(content))), encoding: "base64" });
+  const putResponse = (sha = NEW_SHA) => responseJson({ content: { sha, html_url: "https://github.com/x" } });
+
+  it("rejects an empty or whitespace-only fragment before any network call", async () => {
+    const calls = queuedFetch([]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "   ", "append", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rejects a malformed expected_sha before any network call", async () => {
+    const calls = queuedFetch([]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "new line", "append", "not-a-sha");
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("invalid_expected_sha");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("appends with exactly one line break at the seam and writes the whole resulting file", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("line one"),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }), // writeToGitHub's own existence check
+      putResponse(),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "line two", "append entry", OLD_SHA);
+    expect(result.success).toBe(true);
+    expect(result.sha).toBe(NEW_SHA);
+    expect(result.retried).toBe(0);
+    const put = calls.find(c => c.method === "PUT");
+    const body = JSON.parse(put!.body!) as { content: string };
+    expect(decodeURIComponent(escape(atob(body.content)))).toBe("line one\nline two");
+  });
+
+  it("does not double a trailing newline already present on the old content", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("line one\n\n\n"),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      putResponse(),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "\n\nline two", "append", OLD_SHA);
+    expect(joinAppendedContent("line one\n\n\n", "\n\nline two")).toBe("line one\nline two");
+    expect(result.success).toBe(true);
+  });
+
+  it("joins with the file's own CRLF style, not a hardcoded LF", () => {
+    expect(joinAppendedContent("line one\r\nline two\r\n", "line three")).toBe("line one\r\nline two\r\nline three");
+  });
+
+  it("appends as-is to an empty file (nothing to normalize a seam against)", () => {
+    expect(joinAppendedContent("", "first line")).toBe("first line");
+  });
+
+  it("appends as-is when the old content is nothing but line breaks (Codex cold review, round 12)", () => {
+    // Before the fix, "\n\n" + "x" produced "\nx" — a stray leading blank line with no real
+    // content before it to have a seam against.
+    expect(joinAppendedContent("\n\n", "x")).toBe("x");
+    expect(joinAppendedContent("\r\n\r\n", "x")).toBe("x");
+  });
+
+  it("picks the predominant EOL style, not CRLF for a single stray occurrence", () => {
+    expect(joinAppendedContent("a\nb\nc\r\nd\n", "e")).toBe("a\nb\nc\r\nd\ne");
+  });
+
+  it("preserves a plain space or tab as real old content, not treated as empty (Codex cold review, round 13)", () => {
+    // `trim()` would have called " " or "\t" empty and silently dropped it in favor of the
+    // fragment alone — the earlier version of this check used trim(), not a newline-only test.
+    expect(joinAppendedContent(" ", "x")).toBe(" \nx");
+    expect(joinAppendedContent("\t", "x")).toBe("\t\nx");
+  });
+
+  it("refuses a file that does not exist — append never creates one", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ message: "Not Found" }, 404),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/new.md", "first line", "append", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("invalid_expected_sha");
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("refuses a stale expected_sha without attempting a write when on_conflict is 'fail' (default)", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("someone else's newer content", NEW_SHA),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "my line", "append", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("version_mismatch");
+    expect(result.current_sha).toBe(NEW_SHA);
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("appends onto whatever is current when on_conflict is 'retry', even if expected_sha was already stale", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("someone else's newer content", NEW_SHA),
+      ...installationTokenResponses(),
+      responseJson({ sha: NEW_SHA }),
+      putResponse("c".repeat(40)),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "my line", "append", OLD_SHA, { onConflict: "retry" });
+    expect(result.success).toBe(true);
+    expect(result.retried).toBe(0);
+  });
+
+  it("retries once after a race between its own GET and PUT, then succeeds", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("line one", OLD_SHA),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      responseJson({ message: "sha does not match" }, 409), // another writer landed between our GET and PUT
+      ...installationTokenResponses(),
+      liveContentResponse("line one\nsomeone else's line", NEW_SHA), // re-read picks up their change
+      ...installationTokenResponses(),
+      responseJson({ sha: NEW_SHA }),
+      putResponse("c".repeat(40)),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "our line", "append", OLD_SHA, { onConflict: "retry" });
+    expect(result.success).toBe(true);
+    expect(result.retried).toBe(1);
+  });
+
+  it("gives up after 3 attempts and reports the last version_mismatch, not a generic error", async () => {
+    const oneRacedAttempt = () => [
+      ...installationTokenResponses(),
+      liveContentResponse("content", OLD_SHA),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      responseJson({ message: "sha does not match" }, 409),
+    ];
+    queuedFetch([...oneRacedAttempt(), ...oneRacedAttempt(), ...oneRacedAttempt()]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "our line", "append", OLD_SHA, { onConflict: "retry" });
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("version_mismatch");
+    expect(result.retried).toBe(2);
+  });
+
+  it("replays a prior commit by operation_id instead of appending the fragment again", async () => {
+    queryQueue.push([{ installation_id: 42 }]);
+    const calls = queuedFetch([
+      responseJson({ token: "installation-token" }), // personalGetDocumentHistory's own token
+      responseJson([
+        { sha: "d".repeat(40), commit: { message: `append entry [op:retry-123]`, author: { date: null, name: null } } },
+      ]),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "my line", "append entry", OLD_SHA, { operationId: "retry-123" });
+    expect(result).toMatchObject({ success: true, sha: "d".repeat(40), idempotent_replay: true });
+    expect(calls).toHaveLength(2); // history only — no GET-content, no PUT
+  });
+
+  it("tags the commit message with operation_id so a later retry can find it", async () => {
+    queryQueue.push([{ installation_id: 42 }]); // personalGetDocumentHistory
+    const calls = queuedFetch([
+      responseJson({ token: "installation-token" }),
+      responseJson([]), // no prior commit carries this operation_id yet
+      ...installationTokenResponses(),
+      liveContentResponse("line one"),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      putResponse(),
+    ]);
+    await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "line two", "append entry", OLD_SHA, { operationId: "fresh-456" });
+    const put = calls.find(c => c.method === "PUT");
+    const body = JSON.parse(put!.body!) as { message: string };
+    expect(body.message).toBe("append entry [op:fresh-456]");
+  });
+
+  it("still appends when the history lookup itself fails, rather than blocking the write", async () => {
+    queryQueue.push([{ installation_id: 42 }]); // personalGetDocumentHistory
+    queuedFetch([
+      responseJson({ token: "installation-token" }),
+      responseJson({ message: "rate limited" }, 403), // history lookup fails
+      ...installationTokenResponses(),
+      liveContentResponse("line one"),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      putResponse(),
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "line two", "append", OLD_SHA, { operationId: "op-x" });
+    expect(result.success).toBe(true);
+    expect(result.idempotent_replay).toBeUndefined();
+  });
+
+  it("does not retry a race at the PUT step when on_conflict is 'fail' (default)", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("line one", OLD_SHA), // matches expected_sha — no stale-read refusal
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      responseJson({ message: "sha does not match" }, 409), // another writer landed between our GET and PUT
+    ]);
+    const result = await appendToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "line two", "append", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("version_mismatch");
+    expect(calls.filter(c => c.method === "PUT")).toHaveLength(1); // no second attempt
+  });
+});
+
+// WP-7 Ф204, step 3: the riskiest of the three — a replace can silently land on the wrong
+// text if the match isn't unique. Exact substring match only (no fuzzy/whitespace-normalized
+// matching, a documented simplification — see the function's own doc comment).
+describe("strReplaceInGitHub (WP-7 Ф204)", () => {
+  const OLD_SHA = "a".repeat(40);
+  const NEW_SHA = "b".repeat(40);
+  const liveContentResponse = (content: string, sha = OLD_SHA) =>
+    responseJson({ sha, content: btoa(unescape(encodeURIComponent(content))), encoding: "base64" });
+  const putResponse = (sha = NEW_SHA) => responseJson({ content: { sha, html_url: "https://github.com/x" } });
+
+  it("rejects an empty old_string before any network call", async () => {
+    const calls = queuedFetch([]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "", "x", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rejects old_string === new_string before any network call (nothing to replace)", async () => {
+    const calls = queuedFetch([]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "same", "same", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rejects a malformed expected_sha before any network call", async () => {
+    const calls = queuedFetch([]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old", "new", "replace", "not-a-sha");
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("invalid_expected_sha");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("replaces the one exact occurrence and writes the whole resulting file", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("line one\nold text\nline three"),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      putResponse(),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old text", "new text", "replace", OLD_SHA);
+    expect(result.success).toBe(true);
+    expect(result.sha).toBe(NEW_SHA);
+    expect(result.retried).toBe(0);
+    const put = calls.find(c => c.method === "PUT");
+    const body = JSON.parse(put!.body!) as { content: string };
+    expect(decodeURIComponent(escape(atob(body.content)))).toBe("line one\nnew text\nline three");
+  });
+
+  it("reports fragment_not_found instead of guessing, with no write attempted", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("line one\nline two"),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "not present", "x", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("fragment_not_found");
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("reports fragment_ambiguous with every match's line number, with no write attempted", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("dup\nline two\ndup\nline four\ndup"),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "dup", "x", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("fragment_ambiguous");
+    expect(result.matching_lines).toEqual([1, 3, 5]);
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("reports fragment_ambiguous for a self-overlapping old_string, not a false single match (Codex cold review, round 15, Critical)", async () => {
+    // "aba" occurs at offset 0 AND offset 2 of "ababa" — these overlap (share the middle "a"),
+    // but both are real matches. A non-overlapping scanner finds only the first and would have
+    // let this through as "exactly one occurrence", replacing an ambiguous fragment silently.
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("ababa"),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "aba", "X", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("fragment_ambiguous");
+    expect(result.matching_lines).toEqual([1, 1]); // both matches fall on the same (only) line — expected, not a bug
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("still finds the single match correctly when old_string has no self-overlap potential", async () => {
+    // Guards the fix above from overcorrecting: "aa" inside "xaax" is one real match, not
+    // artificially inflated by the overlap-aware scan.
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("xaax"),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      putResponse(),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "aa", "Y", "replace", OLD_SHA);
+    expect(result.success).toBe(true);
+  });
+
+  it("refuses a file that does not exist — str_replace never creates one", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ message: "Not Found" }, 404),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/new.md", "old", "new", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("invalid_expected_sha");
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("refuses a stale expected_sha without attempting a write when on_conflict is 'fail' (default)", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("old text here", NEW_SHA),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old text", "new text", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("version_mismatch");
+    expect(result.current_sha).toBe(NEW_SHA);
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("dry_run reports the match without writing, and never retries", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("line one\nold text\nline three"),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old text", "new text", "replace", OLD_SHA, { dryRun: true, onConflict: "retry" });
+    expect(result).toMatchObject({ success: true, dry_run: true, matching_lines: [2] });
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
+  });
+
+  it("retries once after a race between its own GET and PUT, re-verifying uniqueness each time", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("old text here", OLD_SHA),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      responseJson({ message: "sha does not match" }, 409), // another writer landed between our GET and PUT
+      ...installationTokenResponses(),
+      liveContentResponse("old text here, now with more context", NEW_SHA), // their edit, but our match still unique
+      ...installationTokenResponses(),
+      responseJson({ sha: NEW_SHA }),
+      putResponse("c".repeat(40)),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old text", "new text", "replace", OLD_SHA, { onConflict: "retry" });
+    expect(result.success).toBe(true);
+    expect(result.retried).toBe(1);
+  });
+
+  it("stops retrying the moment the precondition breaks, instead of blindly reapplying the edit", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("old text here", OLD_SHA),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      responseJson({ message: "sha does not match" }, 409),
+      ...installationTokenResponses(),
+      // Someone else's edit duplicated the matched text — retrying blindly here would risk
+      // replacing the wrong copy; this must report fragment_ambiguous, not try a third GET.
+      liveContentResponse("old text here\nold text here", NEW_SHA),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old text here", "new text", "replace", OLD_SHA, { onConflict: "retry" });
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("fragment_ambiguous");
+  });
+
+  it("does not retry a race at the PUT step when on_conflict is 'fail' (default)", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("old text here", OLD_SHA),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      responseJson({ message: "sha does not match" }, 409),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old text", "new text", "replace", OLD_SHA);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("version_mismatch");
+    expect(calls.filter(c => c.method === "PUT")).toHaveLength(1);
+  });
+
+  it("replays a prior commit by operation_id instead of applying the replace again", async () => {
+    queryQueue.push([{ installation_id: 42 }]);
+    const calls = queuedFetch([
+      responseJson({ token: "installation-token" }),
+      responseJson([
+        { sha: "d".repeat(40), commit: { message: "replace entry [op:retry-789]", author: { date: null, name: null } } },
+      ]),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old", "new", "replace entry", OLD_SHA, { operationId: "retry-789" });
+    expect(result).toMatchObject({ success: true, sha: "d".repeat(40), idempotent_replay: true });
+    expect(calls).toHaveLength(2); // history only — no GET-content, no PUT
+  });
+
+  it("does not consult operation_id history for a dry_run", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("old text here"),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old text", "new text", "replace", OLD_SHA, { dryRun: true, operationId: "op-1" });
+    expect(result).toMatchObject({ success: true, dry_run: true });
+    expect(calls).toHaveLength(2); // installation token + content GET only, no history lookup
+  });
+
+  it("works on a live read the same way as indexed (there is no indexed path for this layer)", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      liveContentResponse("a\nold\nb"),
+      ...installationTokenResponses(),
+      responseJson({ sha: OLD_SHA }),
+      putResponse(),
+    ]);
+    const result = await strReplaceInGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "old", "new", "replace", OLD_SHA);
+    expect(result.success).toBe(true);
   });
 });
 
@@ -811,6 +1953,16 @@ describe("INDEXING_ASYNC_NOTICE wording (WP-7 Ф144)", () => {
 // arguments, so a caller silently passing the wrong value (e.g. owner where userId belongs)
 // would pass every other test in this file. These two pin the contract directly.
 describe("getInstallationToken call contract (WP-7 2026-08-31 pagination fix)", () => {
+  it("rejects an organization installation on the legacy token path when team access is enabled", async () => {
+    queryQueue.push([{ installation_id: 42, github_user_id: 99, github_username: "MimEcoSys" }]);
+    const calls = queuedFetch([responseJson({ account: { id: 99, login: "MimEcoSys", type: "Organization" } })]);
+    const token = await getInstallationToken({ ...ENV_WITH_APP, GITHUB_TEAM_REPOS_ENABLED: "true" },
+      ctx().userId, "editorial-lpf");
+    expect(token).toBeNull();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain("/app/installations/42");
+  });
+
   it("writeToGitHub calls getInstallationToken with (env, userId, repo) — not owner", async () => {
     const getInstallationToken = vi.fn().mockResolvedValue("ghs_test_token");
     const request = vi.fn()
@@ -829,9 +1981,10 @@ describe("getInstallationToken call contract (WP-7 2026-08-31 pagination fix)", 
     const request = vi.fn()
       .mockResolvedValueOnce(responseJson({ sha: "a".repeat(40) })) // GET existing
       .mockResolvedValueOnce(responseJson({})); // DELETE
-    queryQueue.push([]); // post-delete document-index cleanup query
+    queryQueue.push([{ id: 17, index_generation: 3 }], [], [], []); // snapshot and fenced cleanup
     const result = await deleteFromGitHub(
       ENV, ctx(), "DS-my-strategy", "notes/idea.md", "msg",
+      "a".repeat(40),
       { getInstallationToken, fetch: request as unknown as typeof globalThis.fetch },
     );
     expect(result.success).toBe(true);
@@ -865,10 +2018,81 @@ describe("personalGetDocumentLive (WP-7 Ф96)", () => {
     expect(doc).toBeNull();
   });
 
-  it("returns null when the response is missing content/encoding", async () => {
+  it("reports a malformed GitHub response rather than an absent file", async () => {
     queuedFetch([...installationTokenResponses(), responseJson({ sha: "e".repeat(40) })]);
-    const doc = await personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy");
-    expect(doc).toBeNull();
+    await expect(personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy"))
+      .rejects.toMatchObject({ code: "dependency_invalid_response", stage: "github_content" });
+  });
+
+  it("adds ref as a query parameter to read a prior version (WP-7 Ф176)", async () => {
+    const priorSha = "f".repeat(40);
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: priorSha, content: btoa("old body"), encoding: "base64" }),
+    ]);
+    const doc = await personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy", priorSha);
+    expect(doc?.sha).toBe(priorSha);
+    expect(calls.at(-1)?.url).toBe(
+      `https://api.github.com/repos/TserenTserenov/DS-my-strategy/contents/notes/idea.md?ref=${priorSha}`,
+    );
+  });
+
+  it("omits the ref query parameter when ref is not passed", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: "a".repeat(40), content: btoa("body"), encoding: "base64" }),
+    ]);
+    await personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy");
+    expect(calls.at(-1)?.url).toBe("https://api.github.com/repos/TserenTserenov/DS-my-strategy/contents/notes/idea.md");
+  });
+});
+
+describe("personalGetDocumentHistory (WP-7 Ф176)", () => {
+  it("lists commits for a path, most recent first, via GitHub's own history", async () => {
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson([
+        { sha: "b".repeat(40), commit: { message: "update\n\nlonger body", author: { date: "2026-09-26T07:04:00Z", name: "Marfa" } } },
+        { sha: "a".repeat(40), commit: { message: "create", author: { date: "2026-09-25T10:00:00Z", name: "Marfa" } } },
+      ]),
+    ]);
+    const result = await personalGetDocumentHistory(ENV_WITH_APP, ctx(), "DS-my-strategy", "current/WeekPlan.md");
+    expect(result).toEqual({
+      success: true,
+      entries: [
+        { sha: "b".repeat(40), message: "update", date: "2026-09-26T07:04:00Z", author: "Marfa" },
+        { sha: "a".repeat(40), message: "create", date: "2026-09-25T10:00:00Z", author: "Marfa" },
+      ],
+    });
+    expect(calls.at(-1)?.url).toBe(githubCommitsApiUrl("TserenTserenov", "DS-my-strategy", "current/WeekPlan.md", 10));
+  });
+
+  it("caps an over-large limit to 30", async () => {
+    const calls = queuedFetch([...installationTokenResponses(), responseJson([])]);
+    await personalGetDocumentHistory(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", 999);
+    expect(calls.at(-1)?.url).toContain("per_page=30");
+  });
+
+  // Cold-review finding: `Math.trunc(limit) || 10` treated an explicit 0 (or
+  // anything truncating to 0) as "absent" via JS falsy-coercion and silently
+  // returned the default 10 instead of the documented floor of 1.
+  it.each([0, -5, 0.4])("floors a non-positive or sub-1 limit (%s) to 1, not the default", async limit => {
+    const calls = queuedFetch([...installationTokenResponses(), responseJson([])]);
+    await personalGetDocumentHistory(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", limit);
+    expect(calls.at(-1)?.url).toContain("per_page=1");
+  });
+
+  it("returns an error for an unknown source without touching the network", async () => {
+    queuedFetch([]);
+    const result = await personalGetDocumentHistory(ENV_WITH_APP, ctx(), "not-a-real-source", "notes/idea.md");
+    expect(result).toEqual({ success: false, error: "Unknown source: not-a-real-source" });
+  });
+
+  it("surfaces a GitHub error instead of throwing", async () => {
+    queuedFetch([...installationTokenResponses(), responseJson({ message: "Not Found" }, 404)]);
+    const result = await personalGetDocumentHistory(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/missing.md");
+    expect(result.success).toBe(false);
+    expect((result as { error: string }).error).toContain("404");
   });
 });
 
@@ -953,7 +2177,7 @@ describe("connectSource", () => {
 
   it("skips scope provisioning (not fails the connect) when INDICATORS_DATABASE_URL is absent", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: false, github_repository_id: REPO_ID, index_state: "ready" }]); // same identity, inactive → reactivate
+    queryQueue.push([{ id: 17, index_generation: 1, active: false, github_repository_id: REPO_ID, index_state: "ready" }]); // same identity, inactive → reactivate
     queryQueue.push([]); // UPDATE user_sources
 
     const result = await connectSource(ENV, "user-1", "DS-my-strategy", githubIdentity(Number(REPO_ID)).dependencies);
@@ -984,10 +2208,10 @@ describe("connectSource", () => {
 
   it("rebinds when the stored fingerprint differs: purge + bump + pending job in one transaction", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: true, github_repository_id: "111", index_state: "ready" }]); // stored identity ≠ live
+    queryQueue.push([{ id: 17, index_generation: 1, active: true, github_repository_id: "111", index_state: "ready" }]); // stored identity ≠ live
+    queryQueue.push([{ index_generation: 2 }]); // UPDATE ... RETURNING index_generation
     queryQueue.push([]); // DELETE documents
     queryQueue.push([]); // DELETE file_index_status
-    queryQueue.push([{ index_generation: 2 }]); // UPDATE ... RETURNING index_generation
     queryQueue.push([{ id: "job-rebind", generation: "2" }]); // INSERT reindex_jobs ... RETURNING
 
     const result = await connectSource(ENV, "user-1", "DS-my-strategy", githubIdentity(Number(REPO_ID)).dependencies);
@@ -999,13 +2223,16 @@ describe("connectSource", () => {
     expect(result.reindex_triggered).toBe(false); // index.ts starts the pre-created job
     expect(result.message).toContain("недоступен для чтения");
     expect(sqlTextContaining("DELETE FROM")).toBeDefined();
+    const statements = sqlCalls.map(([template]) => (template as TemplateStringsArray).join(" "));
+    expect(statements.findIndex(text => text.includes("index_generation = index_generation + 1")))
+      .toBeLessThan(statements.findIndex(text => text.includes("DELETE FROM")));
     expect(sqlTextContaining("index_generation = index_generation + 1")).toContain("index_state = 'reindexing'");
     expect(sqlTextContaining("(user_id, source, status, generation)")).toContain("SELECT");
   });
 
   it("compares the BIGINT identity as a string — a driver string equals the live numeric id", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: true, github_repository_id: REPO_ID, index_state: "ready" }]); // driver returns BIGINT as string
+    queryQueue.push([{ id: 17, index_generation: 1, active: true, github_repository_id: REPO_ID, index_state: "ready" }]); // driver returns BIGINT as string
     queryQueue.push([]); // UPDATE (COALESCE no-op)
 
     const result = await connectSource(ENV, "user-1", "DS-my-strategy", githubIdentity(Number(REPO_ID)).dependencies);
@@ -1016,11 +2243,11 @@ describe("connectSource", () => {
 
   it("legacy row without fingerprint but WITH documents is not trusted: fail-closed rebind", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: true, github_repository_id: null, index_state: "ready" }]);
+    queryQueue.push([{ id: 17, index_generation: 1, active: true, github_repository_id: null, index_state: "ready" }]);
     queryQueue.push([{ cnt: 17 }]); // documents exist under the unverified binding
+    queryQueue.push([{ index_generation: 5 }]);
     queryQueue.push([]); // DELETE documents
     queryQueue.push([]); // DELETE file_index_status
-    queryQueue.push([{ index_generation: 5 }]);
     queryQueue.push([{ id: "job-legacy", generation: 5 }]);
 
     const result = await connectSource(ENV, "user-1", "DS-my-strategy", githubIdentity(Number(REPO_ID)).dependencies);
@@ -1033,7 +2260,7 @@ describe("connectSource", () => {
 
   it("legacy row without fingerprint and without documents just gets bound (no purge)", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: false, github_repository_id: null, index_state: "ready" }]);
+    queryQueue.push([{ id: 17, index_generation: 1, active: false, github_repository_id: null, index_state: "ready" }]);
     queryQueue.push([{ cnt: 0 }]); // no documents
     queryQueue.push([]); // UPDATE ... COALESCE(github_repository_id, ...)
 
@@ -1059,7 +2286,7 @@ describe("connectSource — review fixes (WP-560 Ф3, cold review 02.09)", () =>
 
   it("same repository but index stuck in 'reindexing' → recovery job with a new generation, no purge", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: true, github_repository_id: REPO_ID, index_state: "reindexing" }]);
+    queryQueue.push([{ id: 17, index_generation: 1, active: true, github_repository_id: REPO_ID, index_state: "reindexing" }]);
     queryQueue.push([]); // findLiveReindexJob → nothing alive
     queryQueue.push([{ index_generation: 9 }]); // UPDATE ... RETURNING (no DELETEs before it)
     queryQueue.push([{ id: "job-recover", generation: 9 }]); // INSERT reindex_jobs
@@ -1077,7 +2304,7 @@ describe("connectSource — review fixes (WP-560 Ф3, cold review 02.09)", () =>
 
   it("same repository, index 'failed' → same recovery path", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: true, github_repository_id: REPO_ID, index_state: "failed" }]);
+    queryQueue.push([{ id: 17, index_generation: 1, active: true, github_repository_id: REPO_ID, index_state: "failed" }]);
     queryQueue.push([]); // findLiveReindexJob → nothing alive
     queryQueue.push([{ index_generation: 3 }]);
     queryQueue.push([{ id: "job-recover-2", generation: 3 }]);
@@ -1088,7 +2315,7 @@ describe("connectSource — review fixes (WP-560 Ф3, cold review 02.09)", () =>
 
   it("reconnect DURING a live reindex does not restart it: no generation bump, points at the running job", async () => {
     queryQueue.push([INSTALL_ROW]);
-    queryQueue.push([{ active: true, github_repository_id: REPO_ID, index_state: "reindexing" }]);
+    queryQueue.push([{ id: 17, index_generation: 1, active: true, github_repository_id: REPO_ID, index_state: "reindexing" }]);
     queryQueue.push([{ id: "job-live" }]); // findLiveReindexJob → running with fresh heartbeat
     queryQueue.push([]); // UPDATE ... COALESCE (plain reconnect)
 
@@ -1112,10 +2339,10 @@ describe("connectSource — review fixes (WP-560 Ф3, cold review 02.09)", () =>
     queryQueue.push([INSTALL_ROW]);
     queryQueue.push([]); // currentRows — none yet
     queryQueue.push([]); // INSERT ... DO NOTHING RETURNING → conflict, nothing inserted
-    queryQueue.push([{ active: true, github_repository_id: "111", index_state: "ready" }]); // winner bound another repo id
+    queryQueue.push([{ id: 17, index_generation: 1, active: true, github_repository_id: "111", index_state: "ready" }]); // winner bound another repo id
+    queryQueue.push([{ index_generation: 2 }]);
     queryQueue.push([]); // DELETE documents
     queryQueue.push([]); // DELETE status
-    queryQueue.push([{ index_generation: 2 }]);
     queryQueue.push([{ id: "job-race", generation: 2 }]);
 
     const result = await connectSource(ENV, "user-1", "DS-my-strategy", deps(Number(REPO_ID)));
@@ -1182,14 +2409,21 @@ describe("purgeSource", () => {
   });
 
   it("deletes documents, reindex_jobs, and the user_sources row (irreversible)", async () => {
-    queryQueue.push([{ source: "DS-my-strategy" }]); // sourceRows — found
+    queryQueue.push([{ id: 17, source: "DS-my-strategy" }]); // sourceRows — found
+    queryQueue.push([{ source: "DS-my-strategy" }]); // lock source until transaction commit
     queryQueue.push([{ cnt: 7 }]); // documents DELETE...RETURNING count
+    queryQueue.push([]); // DELETE file_index_status
     queryQueue.push([{ cnt: 2 }]); // reindex_jobs DELETE...RETURNING count
     queryQueue.push([]); // final DELETE user_sources
     const result = await purgeSource(ENV, "user-1", "DS-my-strategy");
     expect(result.status).toBe("purged");
     expect(result.documents_deleted).toBe(7);
     expect(result.jobs_deleted).toBe(2);
+    const statements = sqlCalls.map(([template]) => (template as TemplateStringsArray).join(" "));
+    expect(statements.findIndex(text => text.includes("FOR UPDATE")))
+      .toBeLessThan(statements.findIndex(text => text.includes("DELETE FROM")));
+    expect(sqlCalls.some(([template, ...values]) => (template as TemplateStringsArray).join(" ").includes("DELETE FROM")
+      && values.some(value => String(value).includes("file_index_status")))).toBe(true);
   });
 });
 
@@ -1237,9 +2471,7 @@ describe("personalGetDocumentWithSha (WP-7 Ф96 rework — live-first)", () => {
   });
 
   it("returns source_required on an index miss with several sources", async () => {
-    queryQueue.push([]); // ambiguity pre-check
     queryQueue.push([]); // v2 query
-    queryQueue.push([]); // legacy fallback
     queuedFetch([]);
     const twoSources = ctx({ sourceNames: ["DS-my-strategy", "DS-other"] });
     const result = await personalGetDocumentWithSha(ENV_WITH_APP, twoSources, "notes/unknown.md");
@@ -1330,13 +2562,13 @@ describe("writeToGitHub — sha case and length edge cases (WP-7 Ф96 round-2)",
 });
 
 describe("personalGetDocumentLive — sha shape validation (WP-7 Ф96 round-2)", () => {
-  it("returns null when GitHub hands back a malformed sha", async () => {
+  it("reports a malformed GitHub sha without treating it as a missing file", async () => {
     queuedFetch([
       ...installationTokenResponses(),
       responseJson({ sha: "not-a-real-sha", content: btoa("x"), encoding: "base64" }),
     ]);
-    const doc = await personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy");
-    expect(doc).toBeNull();
+    await expect(personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy"))
+      .rejects.toMatchObject({ code: "dependency_invalid_response", stage: "github_content" });
   });
 });
 
@@ -1355,21 +2587,22 @@ describe("personalGetDocumentWithSha — single source bypasses the index entire
   });
 });
 
-describe("writeToGitHub — warn-режим при перезаписи без expected_sha (решение 30.08)", () => {
+describe("writeToGitHub — enforced expected_sha on an existing path (WP-7 Ф99, closed 26.09)", () => {
   const CUR = "a".repeat(40);
 
-  it("overwrite of an existing file without expected_sha succeeds with an explicit warning", async () => {
-    queuedFetch([
+  it("rejects overwrite of an existing file with sha_required before any PUT", async () => {
+    const calls = queuedFetch([
       ...installationTokenResponses(),
       responseJson({ sha: CUR }),
-      responseJson({ content: { sha: "b".repeat(40), html_url: "https://github.test/x" } }),
     ]);
     const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "update", "update");
-    expect(result.success).toBe(true);
-    expect(result.warning).toMatch(/expected_sha не передан/);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe("sha_required");
+    expect(result.current_sha).toBe(CUR);
+    expect(calls.some(c => c.method === "PUT")).toBe(false);
   });
 
-  it("creating a new file carries no warning", async () => {
+  it("creating a new file needs no expected_sha and succeeds", async () => {
     queuedFetch([
       ...installationTokenResponses(),
       { ok: false, status: 404 } as Response,
@@ -1377,10 +2610,10 @@ describe("writeToGitHub — warn-режим при перезаписи без e
     ]);
     const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/new.md", "body", "create");
     expect(result.success).toBe(true);
-    expect(result.warning).toBeUndefined();
+    expect(result.reason).toBeUndefined();
   });
 
-  it("update with a matching expected_sha carries no warning", async () => {
+  it("update with a matching expected_sha succeeds", async () => {
     queuedFetch([
       ...installationTokenResponses(),
       responseJson({ sha: CUR }),
@@ -1388,6 +2621,269 @@ describe("writeToGitHub — warn-режим при перезаписи без e
     ]);
     const result = await writeToGitHub(ENV_WITH_APP, ctx(), "DS-my-strategy", "notes/idea.md", "update", "update", {}, CUR);
     expect(result.success).toBe(true);
-    expect(result.warning).toBeUndefined();
+    expect(result.reason).toBeUndefined();
+  });
+});
+
+
+describe("read failures remain distinguishable from missing documents", () => {
+  it("does not turn a source-context database failure into no connected sources", async () => {
+    queryQueue.push(new Error("synthetic database connection refused"));
+    await expect(resolveUserContext(ENV, "test-user")).rejects.toMatchObject({
+      code: "source_context_unavailable", stage: "context",
+    });
+    expect(sqlCalls).toHaveLength(1);
+  });
+
+  it.each([
+    ["document", () => personalGetDocument(ENV, ctx(), "note.md", "DS-my-strategy")],
+    ["sources", () => personalListSources(ENV, ctx())],
+    ["documents", () => personalListDocuments(ENV, ctx())],
+    ["paths", () => personalListPath(ENV, ctx())],
+  ] as const)("bounds a stalled %s query without declaring absence", async (_name, read) => {
+    vi.useFakeTimers();
+    queryQueue.push(new Promise(() => {}));
+    const assertion = expect(read()).rejects.toMatchObject({ code: "dependency_timeout", stage: "database" });
+    await vi.advanceTimersByTimeAsync(5_001);
+    await assertion;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps a keyword fallback database failure distinct from an empty search", async () => {
+    queuedFetch([responseJson({}, 403)]);
+    queryQueue.push(new Error("PRIVATE-DATABASE-DETAIL"));
+    await expect(personalSearchDocuments(ENV, ctx(), "finding my notes", undefined, 5))
+      .rejects.toMatchObject({ code: "dependency_unavailable", stage: "database" });
+  });
+
+  it.each([null, {}, { token: "" }])("identifies malformed installation-token responses at their own stage: %j", async body => {
+    queryQueue.push([{ installation_id: 42 }]);
+    queuedFetch([responseJson(body)]);
+    await expect(personalGetDocumentLive(ENV_WITH_APP, ctx(), "note.md", "DS-my-strategy"))
+      .rejects.toMatchObject({ code: "dependency_invalid_response", stage: "github_token" });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry embeddings before a long Retry-After", async () => {
+    queuedFetch([new Response("", { status: 429, headers: { "retry-after": "90" } })]);
+    await expect(personalGetEmbedding("synthetic", "query"))
+      .rejects.toMatchObject({ code: "dependency_rate_limited", retryAfterSeconds: 90 });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a malformed embedding before sending it to the vector database", async () => {
+    queuedFetch([responseJson({ data: [{ embedding: [1, 2] }] })]);
+    await expect(personalGetEmbedding("synthetic", "query"))
+      .rejects.toMatchObject({ code: "dependency_invalid_response", stage: "embeddings" });
+    expect(sqlCalls).toHaveLength(0);
+  });
+
+  it.each([403, 429, 503])("preserves GitHub Contents HTTP %i as an actionable failure", async status => {
+    queuedFetch([...installationTokenResponses(), responseJson({ message: "private upstream body" }, status)]);
+    await expect(personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy"))
+      .rejects.toMatchObject({ stage: "github_content", status });
+  });
+
+  it("preserves a GitHub installation-token refusal rather than claiming the file is absent", async () => {
+    queryQueue.push([{ installation_id: 42 }]);
+    queuedFetch([responseJson({ message: "private upstream body" }, 403)]);
+    await expect(personalGetDocumentLive(ENV_WITH_APP, ctx(), "notes/idea.md", "DS-my-strategy"))
+      .rejects.toMatchObject({ stage: "github_token", status: 403 });
+  });
+
+  it("falls back to scoped keyword search when embeddings refuse access, and marks degradation", async () => {
+    queuedFetch([responseJson({ error: "private upstream body" }, 403)]);
+    queryQueue.push([{ filename: "notes/idea.md", content: "keyword result", source: "DS-my-strategy", source_type: "ds", score: 0.8 }]);
+    const result = await personalSearchDocuments(ENV, ctx(), "finding my notes", "DS-my-strategy", 5);
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toBe("keyword result");
+    expect(result).toHaveProperty("degradation.status", 403);
+    const [template, ...values] = sqlCalls[0] as [TemplateStringsArray, ...unknown[]];
+    expect(template.join(" ")).toContain("user_id =");
+    expect(values).toContain(ctx().userId);
+    expect(values).toContainEqual(ctx().sourceNames);
+    expect(values).toContain("DS-my-strategy");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not expose provider response text in an embeddings failure", async () => {
+    queuedFetch([responseJson({ error: "PRIVATE-SENTINEL" }, 403)]);
+    let failure: unknown;
+    try { await personalGetEmbedding("synthetic-key", "synthetic query"); } catch (error) { failure = error; }
+    expect(failure).toMatchObject({ stage: "embeddings", status: 403 });
+    expect(String(failure)).not.toContain("PRIVATE-SENTINEL");
+  });
+});
+
+describe("private search normalizes SQL limits across every route", () => {
+  const hit = { filename: "notes/found.md", content: "found", source: "DS-my-strategy", source_type: "ds", score: 0.9 };
+  const cases: [unknown, number][] = [
+    [undefined, 5], [null, 5], ["20", 5], [NaN, 5], [Infinity, 5],
+    [-3, 1], [0, 1], [2.9, 2], [20, 20], [100_000, 20],
+  ];
+
+  for (const route of ["keyword", "vector", "embedding fallback", "low-confidence fallback", "empty keyword fallback"]) {
+    it.each(cases)(route + " sends a bounded SQL limit for %j", async (input, expected) => {
+      const isKeyword = route === "keyword" || route === "empty keyword fallback";
+      if (route !== "keyword") queuedFetch([route === "embedding fallback"
+        ? responseJson({}, 403)
+        : responseJson({ data: [{ embedding: Array(1024).fill(0.1) }] })]);
+      if (route === "empty keyword fallback") queryQueue.push([]);
+      if (route === "low-confidence fallback") queryQueue.push([{ ...hit, score: 0.1 }]);
+      queryQueue.push([hit]);
+
+      const result = await personalSearchDocuments(ENV, ctx(), isKeyword ? "DP.ROLE.039" : "finding my notes",
+        "DS-my-strategy", input as number);
+      expect(result[0]).toMatchObject({ filename: hit.filename, content: hit.content, score: hit.score });
+      expect(sqlCalls).toHaveLength(route === "low-confidence fallback" || route === "empty keyword fallback" ? 2 : 1);
+      for (const [template, ...values] of sqlCalls as [TemplateStringsArray, ...unknown[]][]) {
+        expect(template.join(" ")).toContain("LIMIT ");
+        expect(values.at(-1)).toBe(expected);
+        expect(values).toContain(ctx().userId);
+        expect(values).toContainEqual(ctx().sourceNames);
+        expect(values).toContain("DS-my-strategy");
+      }
+    });
+  }
+});
+
+describe("private search shares one overall deadline", () => {
+  const hit = { filename: "notes/found.md", content: "found", source: "DS-my-strategy", source_type: "ds", score: 0.9 };
+  const embeddingResponse = () => responseJson({ data: [{ embedding: Array(1024).fill(0.1) }] });
+  const capture = <T>(pending: Promise<T>) => pending.then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
+
+  it("allows a healthy nine-second unscoped keyword query", async () => {
+    vi.useFakeTimers();
+    queryQueue.push(new Promise(resolve => setTimeout(() => resolve([hit]), 9_000)));
+    const outcome = capture(personalSearchDocuments(ENV, ctx(), "DP.ROLE.039", undefined));
+    await vi.advanceTimersByTimeAsync(9_001);
+    expect(await outcome).toMatchObject({ value: [expect.objectContaining({ filename: hit.filename })], error: undefined });
+    expect(sqlCalls).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("gives a low-confidence keyword fallback only the remainder after embedding and vector search", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(resolve => setTimeout(() => resolve(embeddingResponse()), 7_000))));
+    let finishVector!: (rows: unknown[]) => void;
+    queryQueue.push(new Promise(resolve => { finishVector = resolve; }), new Promise(() => {}));
+    const outcome = capture(personalSearchDocuments(ENV, ctx(), "finding my notes", undefined));
+    await vi.advanceTimersByTimeAsync(15_000);
+    finishVector([{ ...hit, score: 0.1 }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sqlCalls).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(5_001);
+    expect(await outcome).toMatchObject({ error: { code: "dependency_timeout", stage: "database" } });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("bounds a stalled embedding plus stalled keyword database by twenty seconds total", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+    queryQueue.push(new Promise(() => {}));
+    let settled = false;
+    const outcome = capture(personalSearchDocuments(ENV, ctx(), "finding my notes", undefined)).then(result => { settled = true; return result; });
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(sqlCalls).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(11_999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await outcome).toMatchObject({ error: { code: "dependency_timeout", stage: "database" } });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(sqlCalls).toHaveLength(1); // the fallback started at 8s; no new read starts at 20s
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not retry a rate-limited embedding when Retry-After exceeds the remaining budget", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(resolve => setTimeout(() => resolve(
+      new Response("", { status: 429, headers: { "Retry-After": "3" } }),
+    ), 1_000))));
+    const outcome = capture(personalGetEmbedding("synthetic-key", "finding my notes", Date.now() + 3_000));
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await outcome).toMatchObject({ error: { code: "dependency_rate_limited", stage: "embeddings", retryAfterSeconds: 3 } });
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(sqlCalls).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("caps embeddings by the remaining three seconds after a slow empty keyword search", async () => {
+    vi.useFakeTimers();
+    queryQueue.push(new Promise(resolve => setTimeout(() => resolve([]), 17_000)));
+    const embedding = vi.fn((_url: unknown, _init?: RequestInit) => new Promise<Response>(() => {}));
+    vi.stubGlobal("fetch", embedding);
+    const outcome = capture(personalSearchDocuments(ENV, ctx(), "DP.ROLE.039", undefined));
+    await vi.advanceTimersByTimeAsync(17_000);
+    expect(embedding).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(await outcome).toMatchObject({ error: { code: "dependency_timeout" } });
+    expect(embedding.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    expect(sqlCalls).toHaveLength(1); // expired budget must not start another SQL query
+  });
+
+  it("starts no next dependency when the initial keyword read exhausts the whole budget", async () => {
+    vi.useFakeTimers();
+    queryQueue.push(new Promise(resolve => setTimeout(() => resolve([]), 20_000)));
+    const embedding = vi.fn();
+    vi.stubGlobal("fetch", embedding);
+    const outcome = capture(personalSearchDocuments(ENV, ctx(), "DP.ROLE.039", undefined));
+    await vi.advanceTimersByTimeAsync(20_001);
+    expect(await outcome).toMatchObject({ error: { code: "dependency_timeout" } });
+    expect(sqlCalls).toHaveLength(1);
+    expect(embedding).not.toHaveBeenCalled();
+  });
+
+  it.each(["success", "timeout"])("applies the same shared budget to memory search (%s)", async (mode) => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(resolve => setTimeout(() => resolve(embeddingResponse()), 7_000))));
+    let finishQuery!: (rows: unknown[]) => void;
+    queryQueue.push(new Promise(resolve => { finishQuery = resolve; }));
+    const outcome = capture(personalMemorySearch(ENV, ctx(), "finding my notes", undefined));
+    await vi.advanceTimersByTimeAsync(16_000); // embedding 7s, database 9s
+    if (mode === "success") {
+      finishQuery([{ ...hit, base_score: 0.9, updated_at: new Date().toISOString() }]);
+      expect(await outcome).toMatchObject({ value: [expect.objectContaining({ filename: hit.filename })], error: undefined });
+    } else {
+      await vi.advanceTimersByTimeAsync(4_001);
+      expect(await outcome).toMatchObject({ error: { code: "dependency_timeout", stage: "database" } });
+    }
+    expect(sqlCalls).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+
+it("reads all v2 chunks and legacy fallback in one document snapshot", async () => {
+  queryQueue.push([
+    { filename: "note.md", content: "one ", source: "DS-my-strategy", source_type: "ds", protocol_version: 2, chunk_ordinal: 1 },
+    { filename: "note.md", content: "two", source: "DS-my-strategy", source_type: "ds", protocol_version: 2, chunk_ordinal: 2 },
+    { filename: "note.md::old", content: "stale fragment", source: "DS-my-strategy", source_type: "ds", protocol_version: 1, chunk_ordinal: null },
+  ]);
+  const doc = await personalGetDocument(ENV, ctx(), "note.md", "DS-my-strategy");
+  expect(doc?.content).toBe("one two");
+  expect(sqlCalls).toHaveLength(1);
+  const statement = (sqlCalls[0][0] as TemplateStringsArray).join(" ");
+  expect(statement).toContain("PARTITION BY source");
+  expect(statement).toContain("OR representation_rank = 1");
+});
+
+describe("private search stage diagnostics", () => {
+  it("marks a stalled keyword read and returns a typed timeout without logging private inputs", async () => {
+    vi.useFakeTimers();
+    const logs = vi.spyOn(console, "info").mockImplementation(() => {});
+    queryQueue.push(new Promise(() => {}));
+    const pending = personalSearchDocuments(ENV, ctx(), "DP.ROLE.039 PRIVATE-QUERY", undefined);
+    const assertion = expect(pending).rejects.toMatchObject({ code: "dependency_timeout", stage: "database" });
+    expect(logs.mock.calls.map(([line]) => JSON.parse(line).stage)).toEqual(["search", "keyword"]);
+    await vi.advanceTimersByTimeAsync(20_000);
+    await assertion;
+    const events = logs.mock.calls.map(([line]) => JSON.parse(line));
+    expect(events.filter(row => row.phase === "end").map(row => [row.stage, row.outcome])).toEqual([["keyword", "error"], ["search", "error"]]);
+    expect(new Set(events.map(row => row.trace_id)).size).toBe(1);
+    expect(JSON.stringify(events)).not.toContain("PRIVATE-QUERY");
+    expect(JSON.stringify(events)).not.toContain(ctx().userId);
+    expect(sqlCalls).toHaveLength(1);
+    logs.mockRestore();
   });
 });

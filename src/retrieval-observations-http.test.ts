@@ -1,15 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import worker, { type Env } from "./index.js";
 
-const mocks = vi.hoisted(() => ({ verify: vi.fn(), enqueue: vi.fn() }));
+const mocks = vi.hoisted(() => ({ verify: vi.fn(), enqueue: vi.fn(), queries: [] as string[] }));
 vi.mock("./auth.js", async importOriginal => ({ ...await importOriginal<object>(), verifyJwtLocally: mocks.verify }));
 vi.mock("./retrieval-observations.js", async importOriginal => ({ ...await importOriginal<object>(), enqueueObservation: mocks.enqueue }));
 vi.mock("@neondatabase/serverless", () => ({ neon: vi.fn(), neonConfig: {}, Pool: vi.fn() }));
 vi.mock("./rls.js", () => ({
   createRequestPool: () => ({ end: async () => {} }),
   withUserContext: async (_dsn: string, _account: string, fn: (sql: unknown) => Promise<unknown>) => {
-    const sql = Object.assign(async () => [{ id: 10, filename: "fixture.md", source: "fixture", content: "Example",
-      source_type: "pack", score: 1, indexed_content_hash: "a".repeat(64) }], { unsafe: (value: string) => value });
+    const sql = Object.assign(async (parts: TemplateStringsArray, ...values: unknown[]) => {
+      mocks.queries.push(parts.map((part, index) => part + String(values[index] ?? "")).join(""));
+      return [{ id: 10, filename: "fixture.md", source: "fixture", content: "Example",
+        source_type: "pack", score: 1, indexed_content_hash: "a".repeat(64) }];
+    }, { unsafe: (value: string) => value });
     return fn(sql);
   },
 }));
@@ -25,7 +28,7 @@ function request(headers: Record<string, string> = {}): Request {
   }) });
 }
 
-beforeEach(() => { vi.clearAllMocks(); mocks.verify.mockResolvedValue(null); });
+beforeEach(() => { vi.clearAllMocks(); mocks.queries.length = 0; mocks.verify.mockResolvedValue(null); });
 
 describe("HTTP observation identity", () => {
   it.each<Record<string, string>>([
@@ -48,6 +51,9 @@ describe("HTTP observation identity", () => {
     expect(hit.observation_id).toMatch(/^[a-f0-9-]{36}$/);
     expect(hit).not.toHaveProperty("indexed_content_hash");
     expect(mocks.enqueue.mock.calls[0][3][0].indexed_content_hash).toBe("a".repeat(64));
+    expect(mocks.queries.some(query => query.includes("search_platform_keyword_candidates")
+      && query.includes("sha256(convert_to(chunk.content, 'UTF8'))")
+      && query.includes("chunk.account_id IS NULL"))).toBe(true);
   });
   it("preserves the original response without a runtime background scheduler", async () => {
     mocks.verify.mockResolvedValue("verified-account");

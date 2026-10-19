@@ -9,7 +9,8 @@
  * 5. Разные userId не смешиваются
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { createReadTrace } from "./read-failure.js";
 
 // --- Mocks ---
 
@@ -45,6 +46,8 @@ beforeEach(() => {
   mockQuery.mockResolvedValue({ rows: [] });
   mockEnd.mockResolvedValue(undefined);
 });
+
+afterEach(() => vi.restoreAllMocks());
 
 // --- Тест 1: SET LOCAL устанавливается для userId ---
 
@@ -167,5 +170,92 @@ describe("withUserContext — pool lifecycle", () => {
 
     expect(vi.mocked(Pool)).not.toHaveBeenCalled(); // no new Pool created inside withUserContext
     expect(mockEnd).not.toHaveBeenCalled(); // caller owns pool.end(), not withUserContext
+  });
+});
+
+describe("withUserContext — safe phase diagnostics", () => {
+  it("reports a stalled SQL start before completion, then returns unchanged rows", async () => {
+    const logs = vi.spyOn(console, "info").mockImplementation(() => {});
+    let finishQuery!: (value: { rows: { value: string }[] }) => void;
+    let queryStarted!: () => void;
+    const started = new Promise<void>((resolve) => { queryStarted = resolve; });
+    mockQuery.mockImplementation((query: string) => {
+      if (query === "SELECT $1") {
+        queryStarted();
+        return new Promise((resolve) => { finishQuery = resolve; });
+      }
+      return Promise.resolve({ rows: [] });
+    });
+
+    const pending = withUserContext(DB_URL, USER_A, (sql) => sql`SELECT ${42}`, undefined, createReadTrace("platform_search"));
+    await started;
+    const events = () => logs.mock.calls.map(([line]) => JSON.parse(String(line)));
+    expect(events().filter((event) => event.stage === "db_query").map((event) => event.phase)).toEqual(["start"]);
+    expect(mockQuery.mock.calls.some(([query]) => query === "COMMIT")).toBe(false);
+
+    finishQuery({ rows: [{ value: "private-result-sentinel" }] });
+    await expect(pending).resolves.toEqual([{ value: "private-result-sentinel" }]);
+    expect(JSON.stringify(events())).not.toContain("private-result-sentinel");
+    expect(mockQuery.mock.calls.filter(([query]) => String(query).includes("set_config")).map(([, args]) => args)).toEqual([
+      [USER_A], [USER_A], [USER_A], [USER_A], [USER_A],
+    ]);
+    expect(events().filter((event) => event.phase === "start").map((event) => event.stage)).toEqual([
+      "db_connect", "db_begin", "db_context", "db_query", "db_commit",
+    ]);
+    expect(events().filter((event) => event.stage === "db_query").map((event) => event.phase)).toEqual(["start", "end"]);
+    expect(mockRelease).toHaveBeenCalledOnce();
+    expect(mockEnd).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the original query error, rolls back and never logs SQL, identity or result data", async () => {
+    const logs = vi.spyOn(console, "info").mockImplementation(() => {});
+    const privateSql = "SELECT private_document FROM private_table WHERE token = $1";
+    const privateToken = "private-token-sentinel";
+    const original = new Error("private-exception-sentinel");
+    mockQuery.mockImplementation((query: string) => query === privateSql
+      ? Promise.reject(original)
+      : Promise.resolve({ rows: [] }));
+
+    await expect(withUserContext(DB_URL, USER_A, (sql) =>
+      sql`SELECT private_document FROM private_table WHERE token = ${privateToken}`,
+    undefined, createReadTrace("platform_search"))).rejects.toBe(original);
+
+    const events = logs.mock.calls.map(([line]) => JSON.parse(String(line)));
+    expect(events.find((event) => event.stage === "db_query" && event.phase === "end")).toMatchObject({ outcome: "error", error_kind: "unclassified" });
+    expect(events.filter((event) => event.stage === "db_rollback").map((event) => event.phase)).toEqual(["start", "end"]);
+    expect(mockQuery.mock.calls.map(([query]) => query)).not.toContain("COMMIT");
+    expect(mockRelease).toHaveBeenCalledOnce();
+    const serialized = JSON.stringify(events);
+    for (const value of [DB_URL, USER_A, USER_B, privateSql, privateToken, original.message]) {
+      expect(serialized).not.toContain(value);
+    }
+    for (const event of events) {
+      expect(Object.keys(event).every((key) => ["event", "trace_id", "operation", "stage", "phase", "elapsed_ms", "outcome", "error_kind"].includes(key))).toBe(true);
+    }
+  });
+
+  it("traces a context failure without running user SQL and preserves rollback", async () => {
+    const logs = vi.spyOn(console, "info").mockImplementation(() => {});
+    const original = new Error("context failure");
+    mockQuery.mockImplementation((query: string) => query.includes("set_config")
+      ? Promise.reject(original)
+      : Promise.resolve({ rows: [] }));
+    const callback = vi.fn(async () => []);
+
+    await expect(withUserContext(DB_URL, USER_A, callback, undefined, createReadTrace("platform_search"))).rejects.toBe(original);
+
+    expect(callback).not.toHaveBeenCalled();
+    expect(mockQuery.mock.calls.map(([query]) => query)).toContain("ROLLBACK");
+    expect(logs.mock.calls.map(([line]) => JSON.parse(String(line))).find((event) => event.stage === "db_context" && event.phase === "end")).toMatchObject({ outcome: "error" });
+  });
+
+  it("skips context diagnostics for anonymous calls and emits nothing without a trace", async () => {
+    const logs = vi.spyOn(console, "info").mockImplementation(() => {});
+    await withUserContext(DB_URL, null, async () => [], undefined, createReadTrace("platform_search"));
+    expect(logs.mock.calls.map(([line]) => JSON.parse(String(line))).some((event) => event.stage === "db_context")).toBe(false);
+
+    logs.mockClear();
+    await withUserContext(DB_URL, USER_A, async () => []);
+    expect(logs).not.toHaveBeenCalled();
   });
 });

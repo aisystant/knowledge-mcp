@@ -44,6 +44,12 @@ export const PRIVATE_TOOL_NAMES: ReadonlySet<string> = new Set([
   // dispatched name would collide after the gateway's strip (see index.ts comment on "reindex").
   "reindex",
   "reindex_status",
+  // WP-7 Ф176: list recent commits for a file's path — exposed as personal_history.
+  // Missing from this set left the dispatch handler unreachable (index.ts gates it
+  // behind PRIVATE_TOOL_NAMES.has(toolName)): tools/list advertised it, tools/call
+  // returned "Unknown tool" — found by cold-context audit, not caught by the test
+  // suite (no tools/list<->dispatch symmetry test existed).
+  "history",
   // WP-7 Ф97.2: per-file indexing status (personal_index_status). Data layer
   // (buildIndexStatusSuccessQuery/buildIndexStatusErrorQuery) lives in personal.ts;
   // the actual tools/list + dispatch entry is only wired in personal-knowledge-mcp's
@@ -119,6 +125,8 @@ export interface AuthorizeOpts {
   /** Neon `indicators` DB connection string. Only read when scopeGuardMode != "off". */
   indicatorsDatabaseUrl: string | undefined;
   scopeGuardMode: string | undefined; // "off" | "shadow" | "enforce" — mirrors env.SCOPE_GUARD_MODE
+  /** Destructive operations require an active scope check and deny on infrastructure failure. */
+  policy?: "configured" | "required";
   /** false for source-scoped admin ops (disconnect_source/purge_source — no path arg by design).
    * Default true. See checkBridgeWriteScope's requiresPath doc (WP-410 Pre-Close checklist). */
   requiresPath?: boolean;
@@ -147,10 +155,20 @@ export class JwtScopeGuard implements PrivateGuard {
   }
 
   async authorize(principal: Principal, opts: AuthorizeOpts): Promise<void> {
-    const mode = opts.scopeGuardMode ?? "off";
-    // Faithful port of runScopeGuard's early-out (personal-knowledge-mcp/src/index.ts:257-260):
-    // missing INDICATORS_DATABASE_URL is treated the same as mode="off" (silent no-op), not an
-    // infra failure to alarm on — this is inherited prod behavior, not a new design choice.
+    const required = opts.policy === "required";
+    const mode = required ? "enforce" : opts.scopeGuardMode ?? "off";
+    if (!opts.indicatorsDatabaseUrl && required) {
+      throw new ScopeDeniedError({
+        allow: false,
+        reason: "indicators_db_unavailable",
+        denyResponse: {
+          code: -32001,
+          message: "scope denied: deletion authorization is unavailable",
+          data: { reason: "indicators_db_unavailable", attempted_tool: opts.toolName },
+        },
+      });
+    }
+    // Existing write behavior remains configurable; required operations always enforce.
     if (mode === "off" || !opts.indicatorsDatabaseUrl) return;
 
     const { source, path, hasConflict } = extractBridgeSourcePath(opts.args);
@@ -206,7 +224,7 @@ export class JwtScopeGuard implements PrivateGuard {
 
     if (mode !== "enforce" || result.allow) return; // shadow/off never block; allow never blocks
 
-    if (shouldBlockOnScope(result.reason)) {
+    if (required || shouldBlockOnScope(result.reason)) {
       throw new ScopeDeniedError(result as ScopeCheckResult & { denyResponse: GuardDenyResponse });
     }
     // Infra failure under enforce → fail open with a loud alarm (a single pooled-endpoint

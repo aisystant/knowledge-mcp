@@ -1,3 +1,6 @@
+import { ReadFailure, createReadTrace, fetchReadResponse, readHttpFailure, readJson, withReadDeadline, type ReadTrace } from "../read-failure.js";
+import { normalizeSearchResultLimit } from "../search-limits.js";
+import { activeTeamBinding, issueTeamToken, repositoryToken, teamMarkdownFiles, teamRepositoryName, teamReposEnabled } from "./team-github.js";
 // Personal-corpus data layer for the private MCP mode (WP-410 срез-2b).
 // Ported from personal-knowledge-mcp/src/index.ts, then hardened in this private-mode layer:
 // resolveUserContext, GitHub App JWT signing, writeToGitHub, getInstallationToken.
@@ -8,11 +11,17 @@
 // see security-gate-b73-private-port.md §2, "не RLS — подтверждено 2026-06-11, relrowsecurity=f").
 
 import { neon } from "@neondatabase/serverless";
+import { isMap, isScalar, parseDocument } from "yaml";
+import {
+  POST_CONVENTION_PATH, PostScaffoldError, parsePostScaffold, parsePostConvention,
+  buildPostScaffold, verifyExistingScaffold, type PostScaffoldFile, type PostConvention,
+} from "../post-scaffold.js";
 import { getKnowledgeSchema, KNOWLEDGE_TABLES } from "../utils/db.js";
 import { provisionBridgeScopes } from "../scope.js";
 import { buildPathTree, extractTitle, utf8ByteLength, type PathEntry } from "../path-tree.js";
 import {
   githubBlobUrl,
+  githubCommitsApiUrl,
   githubContentsApiUrl,
   normalizeRepositoryPath,
   resolveSourcePath,
@@ -22,6 +31,7 @@ export {
   encodeGitHubContentsPath,
   githubBlobUrl,
   githubBranchApiUrl,
+  githubCommitsApiUrl,
   githubContentsApiUrl,
   normalizeRepositoryPath,
   resolveSourcePath,
@@ -33,6 +43,9 @@ export interface PersonalEnv {
   DATABASE_URL?: string;
   GITHUB_APP_ID?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
+  GITHUB_TEAM_REPOS_ENABLED?: boolean | string;
+  GITHUB_INTEGRATION_URL?: string;
+  GITHUB_BROKER_SHARED_SECRET?: string;
   KNOWLEDGE_DB_SCHEMA?: string;
   OPENROUTER_API_KEY?: string;
   /** Neon `indicators` DB. Required for provisionBridgeScopes (connect_source) — same DSN as PrivateGuard's authorize(). */
@@ -61,12 +74,13 @@ const GIT_BLOB_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const POST_CHANNEL_FILENAME = /^(?:(?:\d{2}-\d{2})|\d{1,4})-\d{1,2}-(?:club|facebook|linkedin|telegram|tenchat|x|youtube|dzen|habr)-\d{4}-\d{2}-\d{2}\.md$/i;
 
 export const POST_SCAFFOLD_REQUIRED_MESSAGE =
-  "Создание публикации через personal_write заблокировано: номер и канонический путь назначает scripts/new-post.py.";
+  "Создание публикации через personal_write заблокировано: сначала создайте канонический каркас через personal_new_post.";
 export const POST_SCAFFOLD_NEXT_ACTION =
-  "Сначала вызови personal_new_post, чтобы получить post_number, затем из корня DS-Knowledge-Index-Tseren запусти " +
-  "`python3 scripts/new-post.py --date YYYY-MM-DD --slug <slug> --title \"<title>\" --channels <channels> " +
-  "--post-number <из personal_new_post>`. Если shell или скрипт недоступны, остановись и сообщи о блокере; " +
-  "ASCII/manual fallback и ручное создание файла запрещены.";
+  "В браузере вызови personal_new_post с source, draft_id, artifact_type=post и scaffold={date,slug,title,channels}; " +
+  "он создаст файлы со статусом draft и вернёт пути. Прочитай personal_get_document(source, filename, include_sha:true), " +
+  "затем заполни через personal_write с expected_sha из чтения. " +
+  "Для локального сценария вызови personal_new_post без scaffold и запусти scripts/new-post.py " +
+  "--post-number <полученный номер> --draft-id <тот же UUID> с датой, slug и заголовком. ASCII/manual fallback и ручное создание запрещены.";
 export const EXISTENCE_CHECK_UNAVAILABLE_MESSAGE =
   "Не удалось надёжно определить, существует ли целевой файл в GitHub; запись остановлена без PUT.";
 export const EXISTENCE_CHECK_NEXT_ACTION =
@@ -93,11 +107,13 @@ export interface PersonalWriteResult {
   url?: string;
   indexing?: IndexingNotice;
   error?: string;
-  reason?: "post_scaffold_required" | "existence_check_unavailable" | "version_mismatch" | "invalid_expected_sha" | "github_validation_error";
+  reason?: "post_scaffold_required" | "existence_check_unavailable" | "version_mismatch" | "invalid_expected_sha"
+    | "sha_required" | "github_validation_error" | "fragment_not_found" | "fragment_ambiguous";
   next_action?: string;
   evidence?: ManagedPostEvidence;
   current_sha?: string | null;
-  warning?: string;
+  /** str_replace only: 1-indexed line numbers of every match, present on fragment_ambiguous. */
+  matching_lines?: number[];
 }
 
 function frontmatterDeclaresPost(content: string): boolean {
@@ -276,21 +292,24 @@ export async function resolveUserContext(
       const schema = getKnowledgeSchema(env);
       const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
       const includeReindexing = options.includeReindexing === true;
-      const rows = await sql`
+      const rows = await withReadDeadline("context", async () => sql`
         SELECT source, github_owner, github_repo, path_prefix, source_type
         FROM ${sql.unsafe(userSourcesTable)}
         WHERE user_id = ${userId} AND active = true
           AND (index_state = 'ready' OR ${includeReindexing} = true)
         ORDER BY source
-      `;
+      `, 5_000);
       if (rows.length > 0) {
-        const sources = rows.map(r => ({
+        const candidates = rows.map(r => ({
           source: r.source as string,
           githubOwner: r.github_owner as string,
           githubRepo: r.github_repo as string,
           pathPrefix: (r.path_prefix as string) || "",
           sourceType: (r.source_type as string) || "ds",
         }));
+        const allowed = await Promise.all(candidates.map(async candidate =>
+          !candidate.source.includes("/") || !!await activeTeamBinding(env, userId, candidate.source)));
+        const sources = candidates.filter((_, index) => allowed[index]);
         return {
           userId,
           sources,
@@ -298,12 +317,14 @@ export async function resolveUserContext(
         };
       }
     } catch (err) {
-      console.error(`resolveUserContext: DB error for user ${userId}, falling back to defaults:`, err instanceof Error ? err.message : err);
+      const failure = err instanceof ReadFailure ? err : new ReadFailure("source_context_unavailable", "context");
+      console.error(JSON.stringify({ event: "source_context_failed", ...failure.toJSON() }));
+      throw failure;
     }
   }
 
   // No sources found — return empty context (never leak other users' data)
-  console.warn(`resolveUserContext: no sources for user ${userId ?? "(anonymous)"} — returning empty context`);
+  console.info(JSON.stringify({ event: "source_context_empty" }));
   return { userId, sources: [], sourceNames: [] };
 }
 
@@ -392,6 +413,7 @@ export async function getInstallationToken(
   env: PersonalEnv,
   userId: string | null,
   repository: string,
+  request: typeof fetch = fetch,
 ): Promise<string | null> {
   if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY) return null;
   if (!userId) return null;
@@ -404,7 +426,7 @@ export async function getInstallationToken(
   // installation instead of whatever order Postgres happens to return
   // (peer-review finding, WP-7 2026-08-31).
   const rows = await sql`
-    SELECT installation_id
+    SELECT installation_id, github_user_id, github_username
     FROM ${sql.unsafe(installationsTable)}
     WHERE user_id = ${userId}
     ORDER BY updated_at DESC
@@ -415,9 +437,27 @@ export async function getInstallationToken(
 
   const jwt = await createGitHubAppJWT(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY);
 
+  if (teamReposEnabled(env)) {
+    const installation = await request(`https://api.github.com/app/installations/${installationId}`, {
+      redirect: "manual",
+      headers: { Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json",
+        "User-Agent": "aisystant-knowledge" },
+    });
+    if (!installation.ok) return null;
+    const body = await readJson(installation, "github_token") as {
+      account?: { id?: number; login?: string; type?: string };
+    } | null;
+    if (body?.account?.type !== "User"
+      || Number(body.account.id) !== Number(rows[0].github_user_id)
+      || body.account.login?.toLowerCase() !== String(rows[0].github_username).toLowerCase()) {
+      return null;
+    }
+  }
+
   // Token is narrowed to one repository even when the App was installed for all repos.
-  const tokenResp = await fetch(`https://api.github.com/app/installations/${installationId}/access_tokens`, {
+  const tokenResp = await request(`https://api.github.com/app/installations/${installationId}/access_tokens`, {
     method: "POST",
+    redirect: "manual",
     headers: {
       Authorization: `Bearer ${jwt}`,
       Accept: "application/vnd.github+json",
@@ -432,7 +472,10 @@ export async function getInstallationToken(
 
   if (!tokenResp.ok) return null;
 
-  const tokenData = (await tokenResp.json()) as { token: string };
+  const tokenData = await readJson(tokenResp, "github_token") as { token?: unknown } | null;
+  if (!tokenData || typeof tokenData.token !== "string" || !tokenData.token) {
+    throw new ReadFailure("dependency_invalid_response", "github_token");
+  }
   return tokenData.token;
 }
 
@@ -454,6 +497,7 @@ async function checkGitHubFileExistence(
   let response: Response;
   try {
     response = await githubFetch(apiUrl, {
+      redirect: "manual",
       headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
     });
   } catch {
@@ -522,8 +566,10 @@ export async function writeToGitHub(
   const repo = userSource.githubRepo;
   const getToken = dependencies.getInstallationToken ?? getInstallationToken;
   const githubFetch = dependencies.fetch ?? globalThis.fetch;
-  const token = await getToken(env, ctx.userId, repo);
-  if (!token) return { success: false, error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge` };
+  const lease = await repositoryToken(env, ctx, source, "write", () => getToken(env, ctx.userId, repo));
+  if (!lease) return { success: false, error: `Нет подтверждённого доступа к ${source}. Переподключите GitHub.` };
+  const token = lease.token;
+  try {
 
   const apiUrl = githubContentsApiUrl(owner, repo, fullPath);
   const existence = await checkGitHubFileExistence(githubFetch, apiUrl, token);
@@ -557,11 +603,26 @@ export async function writeToGitHub(
     if (existingSha?.toLowerCase() !== expectedSha.toLowerCase()) {
       return { success: false, reason: "version_mismatch", current_sha: existingSha ?? null, error: "Файл изменился с момента чтения — перечитай personal_get_document(includeSha: true) и повтори запись." };
     }
+  } else if (existingSha) {
+    // WP-7 Ф99: the rollout gate opened 30.08 was never closed by its own
+    // measured criterion (0 version-mismatch conflicts in a 2-week window) —
+    // it was closed by a live incident instead (external pilot, 26.09):
+    // a missing expectedSha against an existing path used to PUT anyway and
+    // warn only after the fact, so a concurrent edit made between the
+    // caller's (skipped) read and this write was already gone by the time
+    // the warning arrived. Rejecting here, before any PUT, is the only point
+    // a write against an unknown current version can still be stopped — the
+    // caller reads get_document(include_sha: true) and retries with that
+    // sha, exactly like a version_mismatch retry. A deliberate full replace
+    // stays possible the same way — no separate overwrite flag needed.
+    console.warn(JSON.stringify({ phase: "write_sha_required", severity: "warning", repo, path: fullPath }));
+    return { success: false, reason: "sha_required", current_sha: existingSha, error: "Файл уже существует — сначала прочитай personal_get_document(include_sha: true) и передай его sha в expected_sha. Осознанная полная замена содержимого возможна тем же способом: получить актуальный sha и передать его." };
   }
 
   // Create or update file
   const putResp = await githubFetch(apiUrl, {
     method: "PUT",
+    redirect: "manual",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge", "Content-Type": "application/json" },
     body: JSON.stringify({
       message,
@@ -585,42 +646,287 @@ export async function writeToGitHub(
   }
 
   const result = (await putResp.json()) as { content: { sha: string; html_url: string } };
-  // Overwriting an existing file without expected_sha succeeded, but any
-  // concurrent edit made after the caller's read is now silently gone. Kept
-  // non-blocking for old clients (pilot decision 30.08: warn now, enforce
-  // later once callers adopt the sha round-trip).
-  if (existingSha && expectedSha === undefined) {
-    return {
-      success: true,
-      sha: result.content.sha,
-      url: result.content.html_url,
-      indexing: INDEXING_ASYNC_NOTICE,
-      warning: "Файл существовал, а expected_sha не передан — параллельные правки могли быть молча перезаписаны. Перед правкой существующего файла читай get_document(include_sha: true) и передавай его sha в expected_sha.",
-    };
-  }
   return { success: true, sha: result.content.sha, url: result.content.html_url, indexing: INDEXING_ASYNC_NOTICE };
+  } finally {
+    await lease.release();
+  }
+}
+
+const APPEND_MAX_ATTEMPTS = 3;
+const APPEND_OPERATION_TAG = (id: string) => `[op:${id}]`;
+
+/** Joins old content and a new fragment with exactly one line break at the seam, regardless
+ * of trailing/leading breaks on either side, and matches the file's own PREDOMINANT CRLF/LF
+ * style rather than imposing one (WP-7 Ф204, round 8/9 cold review — a mismatched seam reads
+ * as diff noise in the file's own editor, not just a cosmetic nit). A file that is empty, or
+ * made of nothing but line breaks, gets the fragment as-is: there is no real content to seam
+ * against (Codex cold review, round 12 — the earlier `.length === 0` check alone still left a
+ * stray leading break for an all-newline old file, e.g. "\n\n" + "x" producing "\nx"). The EOL
+ * choice counts both styles rather than treating one stray CRLF as the whole file's style.
+ * The "nothing but line breaks" check matches `\r`/`\n` only, not `trim()` (Codex cold review,
+ * round 13 — `trim()` also strips plain spaces/tabs, so a file containing exactly " " would
+ * have been silently replaced by the fragment, losing that space). */
+export function joinAppendedContent(oldContent: string, fragment: string): string {
+  if (/^[\r\n]*$/.test(oldContent)) return fragment;
+  const crlfCount = (oldContent.match(/\r\n/g) ?? []).length;
+  const lfOnlyCount = (oldContent.match(/(?<!\r)\n/g) ?? []).length;
+  const eol = crlfCount > lfOnlyCount ? "\r\n" : "\n";
+  const trimmedOld = oldContent.replace(/(\r\n|\n)+$/, "");
+  const trimmedFragment = fragment.replace(/^(\r\n|\n)+/, "");
+  return trimmedOld + eol + trimmedFragment;
+}
+
+export interface PersonalAppendResult extends PersonalWriteResult {
+  retried?: number;
+  idempotent_replay?: boolean;
+}
+
+/**
+ * Append a fragment to an existing file without the caller ever reading or resending the
+ * rest of it (WP-7 Ф204 — the resident complaint this phase exists for: "cost of an edit
+ * equals the size of the file"). The actual PUT still writes the whole resulting file in one
+ * GitHub API call — Contents API has no partial write — this function only moves the
+ * read-modify-write step from the calling agent onto the server.
+ *
+ * `onConflict: "retry"` treats append as safe to replay onto whatever the current content
+ * turns out to be (appending can't destructively overwrite a concurrent edit the way a full
+ * replace can — both edits survive, ordered by which PUT lands second) — up to
+ * APPEND_MAX_ATTEMPTS GitHub round trips. `onConflict: "fail"` (default) behaves like an
+ * ordinary write: a stale `expectedSha`, or a race discovered only when the PUT itself is
+ * rejected, is reported as `version_mismatch` and nothing is retried.
+ *
+ * `operationId`, if given, makes retried append calls idempotent: before doing any work, the
+ * file's recent commit history (same mechanism as the `history` tool) is checked for one
+ * already carrying this id, so a client that retried after a dropped response does not
+ * duplicate the fragment (Codex cold review, round 8, Critical — a plain retry loop here
+ * would silently double-write on exactly the failure mode it exists to recover from).
+ *
+ * NOTE (round 9, correction to the original АрхГейт record): this repository has no
+ * content-level secret scanner for personal writes — `writeToGitHub` never had one, and this
+ * function does not add one. The ArchGate accepted for Ф204 assumed such a guard existed and
+ * would cover the appended fragment; that assumption was wrong. append therefore leaves the
+ * existing secret-leak exposure exactly where plain `write` already left it — unchanged, not
+ * worsened, but also not mitigated. Flagged to the pilot, not silently corrected in the record.
+ */
+export async function appendToGitHub(
+  env: PersonalEnv,
+  ctx: UserContext,
+  source: string,
+  path: string,
+  fragment: string,
+  message: string,
+  expectedSha: string,
+  options: { onConflict?: "fail" | "retry"; operationId?: string; dependencies?: Partial<GitHubApiDependencies> } = {},
+): Promise<PersonalAppendResult> {
+  if (fragment.trim().length === 0) {
+    return { success: false, error: "content пуст — append требует непустой фрагмент." };
+  }
+  if (!GIT_BLOB_SHA.test(expectedSha)) {
+    return { success: false, reason: "invalid_expected_sha", error: "expected_sha должен быть 40-символьным hex sha из get_document(include_sha: true); append не создаёт новые файлы." };
+  }
+  // Defense in depth (Codex cold review, round 12): index.ts's handler already validates this
+  // shape before calling in, but appendToGitHub is itself an exported function another caller
+  // could reach directly without going through that handler.
+  if (options.operationId !== undefined && (options.operationId.length === 0 || options.operationId.length > 128)) {
+    return { success: false, error: "operation_id должен быть непустой строкой до 128 символов." };
+  }
+
+  if (options.operationId !== undefined) {
+    const history = await personalGetDocumentHistory(env, ctx, source, path, 10);
+    if (history.success) {
+      const tag = APPEND_OPERATION_TAG(options.operationId);
+      const replay = history.entries.find(entry => entry.message.includes(tag));
+      // A prior commit already carries this operation_id: this is a retried call whose
+      // earlier PUT succeeded but whose response the client never saw — hand back that
+      // result instead of appending the same fragment a second time.
+      if (replay) return { success: true, sha: replay.sha, idempotent_replay: true, indexing: INDEXING_ASYNC_NOTICE };
+    }
+    // A history-lookup failure is not fatal here: it would only ever suppress a legitimate
+    // idempotent replay (annoying, not unsafe), while blocking the write entirely over a
+    // transient API error would be a worse outcome for a feature meant to make retries safer.
+  }
+
+  const onConflict = options.onConflict ?? "fail";
+  const taggedMessage = options.operationId ? `${message} ${APPEND_OPERATION_TAG(options.operationId)}` : message;
+  const maxAttempts = onConflict === "retry" ? APPEND_MAX_ATTEMPTS : 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const live = await personalGetDocumentLive(env, ctx, path, source);
+    if (!live) return { success: false, reason: "invalid_expected_sha", error: "Файл не найден — append работает только с уже существующим файлом (для нового используй mode: replace без expected_sha)." };
+
+    if (live.sha.toLowerCase() !== expectedSha.toLowerCase() && attempt === 1 && onConflict === "fail") {
+      return { success: false, reason: "version_mismatch", current_sha: live.sha, error: "Файл изменился с момента чтения — перечитай personal_get_document(include_sha: true) и повтори запись." };
+    }
+
+    const newContent = joinAppendedContent(live.content, fragment);
+    const result = await writeToGitHub(env, ctx, source, path, newContent, taggedMessage, options.dependencies, live.sha);
+    // The last attempt returns whatever it got, version_mismatch included — there is no more
+    // retrying left to do, and the caller needs the real reason, not a generic internal error
+    // (a bare `attempt === maxAttempts` check here, not `onConflict !== "retry"`, is what makes
+    // this correct for BOTH modes: "fail" already has maxAttempts=1, so its one attempt always
+    // is the last one; round-9 self-review caught the single-mode version of this as dead code
+    // that would have masked the final version_mismatch after exhausting retries).
+    if (result.success || result.reason !== "version_mismatch" || attempt === maxAttempts) {
+      return { ...result, retried: attempt - 1 };
+    }
+    // version_mismatch on this attempt's own PUT, more attempts left: someone else wrote between
+    // our GET and PUT. Loop — the next GET picks up whatever they left and appends onto it.
+  }
+  throw new Error("unreachable: the loop above always returns on attempt === maxAttempts");
+}
+
+/** 1-indexed line number of a character offset, for fragment_ambiguous's error — the caller
+ * needs to find each occurrence by eye, not by re-deriving offsets. */
+function lineNumberAt(content: string, offset: number): number {
+  let line = 1;
+  for (let i = 0; i < offset; i++) if (content.charCodeAt(i) === 10 /* \n */) line++;
+  return line;
+}
+
+/** Every start offset where `needle` occurs in `haystack`, INCLUDING overlapping matches, in
+ * order (Codex cold review, round 15 — Critical). Advancing `from` past the whole match
+ * (`at + needle.length`) undercounts a self-overlapping needle: "aba" occurs at both offset 0
+ * and offset 2 of "ababa", but a non-overlapping scan only ever finds the first and reports a
+ * false "exactly one occurrence" — the one case str_replace's uniqueness guarantee exists to
+ * catch. Advancing by 1 instead costs nothing here: `oldString` is bounded by one file's size,
+ * not run in a hot loop. */
+function findAllOccurrences(haystack: string, needle: string): number[] {
+  const offsets: number[] = [];
+  let from = 0;
+  while (true) {
+    const at = haystack.indexOf(needle, from);
+    if (at === -1) break;
+    offsets.push(at);
+    from = at + 1;
+  }
+  return offsets;
+}
+
+export interface PersonalStrReplaceResult extends PersonalWriteResult {
+  retried?: number;
+  idempotent_replay?: boolean;
+  dry_run?: boolean;
+}
+
+/**
+ * Replace one exact occurrence of `oldString` with `newString` without the caller ever
+ * resending the rest of the file (WP-7 Ф204, step 3 — the riskiest of the three: unlike
+ * append, a replace can silently land on the wrong text if the match isn't unique).
+ *
+ * Exact substring match only in this first version — no fuzzy or whitespace-normalized
+ * matching (deferred, same reasoning as dropping the redundant `cursor:'end'` selector in
+ * step 1: a known, documented simplification, not an oversight). `oldString` must occur in
+ * the current file EXACTLY ONCE: zero occurrences is `fragment_not_found`, two or more is
+ * `fragment_ambiguous` with every match's line number — never a guess at which one was meant.
+ *
+ * `onConflict:'retry'` is deliberately STRICTER than append's: a replace's precondition —
+ * "oldString still occurs exactly once" — is re-checked on every attempt against the content
+ * actually just read, and retrying stops the moment it stops holding (someone else's edit
+ * touched the matched region, or duplicated/removed it) rather than ploughing ahead the way
+ * append safely can. A race that leaves the precondition intact (an edit elsewhere in the
+ * file) is the only case a retry actually resolves.
+ *
+ * `dryRun` runs every check and returns what WOULD happen (the matched line, under
+ * `matching_lines`) without writing — never retries, since there is nothing to retry.
+ */
+export async function strReplaceInGitHub(
+  env: PersonalEnv,
+  ctx: UserContext,
+  source: string,
+  path: string,
+  oldString: string,
+  newString: string,
+  message: string,
+  expectedSha: string,
+  options: { onConflict?: "fail" | "retry"; operationId?: string; dryRun?: boolean; dependencies?: Partial<GitHubApiDependencies> } = {},
+): Promise<PersonalStrReplaceResult> {
+  if (oldString.length === 0) {
+    return { success: false, error: "old_string не может быть пустым." };
+  }
+  if (oldString === newString) {
+    return { success: false, error: "old_string и new_string совпадают — нечего заменять." };
+  }
+  if (!GIT_BLOB_SHA.test(expectedSha)) {
+    return { success: false, reason: "invalid_expected_sha", error: "expected_sha должен быть 40-символьным hex sha из get_document(include_sha: true); str_replace не создаёт новые файлы." };
+  }
+  if (options.operationId !== undefined && (options.operationId.length === 0 || options.operationId.length > 128)) {
+    return { success: false, error: "operation_id должен быть непустой строкой до 128 символов." };
+  }
+
+  if (options.operationId !== undefined && !options.dryRun) {
+    const history = await personalGetDocumentHistory(env, ctx, source, path, 10);
+    if (history.success) {
+      const tag = APPEND_OPERATION_TAG(options.operationId);
+      const replay = history.entries.find(entry => entry.message.includes(tag));
+      if (replay) return { success: true, sha: replay.sha, idempotent_replay: true, indexing: INDEXING_ASYNC_NOTICE };
+    }
+    // Same best-effort reasoning as appendToGitHub: a lookup failure only risks a missed
+    // replay, not an unsafe write, so it must not block the write itself.
+  }
+
+  const onConflict = options.onConflict ?? "fail";
+  const taggedMessage = options.operationId ? `${message} ${APPEND_OPERATION_TAG(options.operationId)}` : message;
+  const maxAttempts = onConflict === "retry" && !options.dryRun ? APPEND_MAX_ATTEMPTS : 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const live = await personalGetDocumentLive(env, ctx, path, source);
+    if (!live) return { success: false, reason: "invalid_expected_sha", error: "Файл не найден — str_replace работает только с уже существующим файлом." };
+
+    if (live.sha.toLowerCase() !== expectedSha.toLowerCase() && attempt === 1 && onConflict === "fail") {
+      return { success: false, reason: "version_mismatch", current_sha: live.sha, error: "Файл изменился с момента чтения — перечитай personal_get_document(include_sha: true) и повтори запись." };
+    }
+
+    const matches = findAllOccurrences(live.content, oldString);
+    if (matches.length === 0) {
+      return { success: false, reason: "fragment_not_found", error: "old_string не найден в текущем содержимом файла — перечитай файл, текст мог измениться." };
+    }
+    if (matches.length > 1) {
+      return { success: false, reason: "fragment_ambiguous", matching_lines: matches.map(offset => lineNumberAt(live.content, offset)), error: `old_string встречается ${matches.length} раз(а) — добавь контекст, чтобы указать ровно одно вхождение.` };
+    }
+
+    const matchStart = matches[0];
+    const matchLine = lineNumberAt(live.content, matchStart);
+    if (options.dryRun) {
+      return { success: true, dry_run: true, matching_lines: [matchLine], sha: live.sha };
+    }
+
+    const newContent = live.content.slice(0, matchStart) + newString + live.content.slice(matchStart + oldString.length);
+    const result = await writeToGitHub(env, ctx, source, path, newContent, taggedMessage, options.dependencies, live.sha);
+    if (result.success || result.reason !== "version_mismatch" || attempt === maxAttempts) {
+      return { ...result, retried: attempt - 1 };
+    }
+    // The precondition (exactly one match) is re-verified at the top of the next iteration
+    // against whatever the next GET actually returns — a race that broke it fails there with
+    // fragment_not_found/fragment_ambiguous, not a blind reapplication of this attempt's edit.
+  }
+  throw new Error("unreachable: the loop above always returns on attempt === maxAttempts");
 }
 
 // --- Post-number allocator (WP-560 Ф12) ---
-// Git-native atomic allocator, replacing the local filesystem scan `scripts/new-post.py`
-// used to do (duplicated post_number 190/191/196/197 under concurrent runs).
-//
-// Not routed through writeToGitHub: that function re-checks the file's sha fresh right
-// before the PUT, but sends whatever `content` the caller already built from an earlier
-// read — so a racing second call would still pass its sha check (the sha IS current)
-// while overwriting the first call's entry with content built from a stale, entry-missing
-// read. This loop always rebuilds `content` from the exact read that produced the sha it
-// sends, which is what actually closes the race.
+// All reads belong to one immutable Git commit. A new commit has that exact parent;
+// advancing the branch with force:false rejects a competing sibling commit, even if
+// the competing writer changed a post without touching the allocator log.
 
-/** Append-only log path in the managed Knowledge Index repo. One JSON object per line. */
 export const ALLOCATOR_LOG_PATH = "docs/_allocator-log.jsonl";
-
-/** Allowlist, not a free-form string — an unlisted type is a 400, not a new numbering series (WP-560 Ф12 round 1-2: unbounded artifact_type was flagged as unnecessary surface for a fix with exactly one live consumer). */
 export const ALLOCATOR_ALLOWED_ARTIFACT_TYPES = ["post"] as const;
 export type AllocatorArtifactType = (typeof ALLOCATOR_ALLOWED_ARTIFACT_TYPES)[number];
 
 const ALLOCATOR_DRAFT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ALLOCATOR_MAX_RETRIES = 5;
+const ALLOCATOR_BLOB_BATCH_SIZE = 40;
+const ALLOCATOR_MAX_BYTES = 8 * 1024 * 1024;
+const ALLOCATOR_MAX_BLOB_BYTES = 1024 * 1024;
+const ALLOCATOR_MAX_REQUESTS = 40;
+// The gateway gives tools/call 30s; leave room for routing and response serialization.
+const ALLOCATOR_DEADLINE_MS = 25_000;
+const CLUB_POST_PATH = /^docs\/.*-1-club-[^/]+\.md$/;
+const LEGACY_CLUB_NUMBER = /^(\d+)-1-club-/;
+
+type AllocatorFailureReason = "invalid_draft_id" | "invalid_artifact_type" | "unknown_source"
+  | "no_installation" | "allocator_conflict_exhausted" | "github_error"
+  | "invalid_allocator_state" | "post_number_ownership_conflict" | "allocator_budget_exceeded"
+  | "invalid_scaffold" | "invalid_post_convention" | "scaffold_conflict" | "path_authorization_required"
+  | "unsupported_team_operation";
 
 export interface AllocatorLogEntry {
   draft_id: string;
@@ -633,154 +939,467 @@ export interface AllocatePostNumberResult {
   success: boolean;
   post_number?: number;
   draft_id?: string;
-  /** true when draft_id was already allocated — same number returned, no new commit made. */
   reused?: boolean;
   error?: string;
-  reason?: "invalid_draft_id" | "invalid_artifact_type" | "unknown_source" | "no_installation" | "allocator_conflict_exhausted" | "github_error";
+  reason?: AllocatorFailureReason;
+  scaffold?: { status: "created" | "existing"; paths: string[]; commit_sha: string };
+  indexing?: typeof INDEXING_ASYNC_NOTICE;
+  next_action?: string;
 }
 
-async function readAllocatorLog(
-  githubFetch: typeof globalThis.fetch,
-  owner: string,
-  repo: string,
-  token: string,
-): Promise<{ entries: AllocatorLogEntry[]; sha: string | null }> {
-  const apiUrl = githubContentsApiUrl(owner, repo, ALLOCATOR_LOG_PATH);
-  const resp = await githubFetch(apiUrl, {
-    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
-  });
-  if (resp.status === 404) return { entries: [], sha: null };
-  if (!resp.ok) throw new Error(`GitHub API error reading allocator log (${resp.status}): ${await resp.text()}`);
+const SCAFFOLD_NEXT_ACTION = "Для каждого пути вызови personal_get_document с явными source, filename и include_sha:true; затем заполни существующий файл через personal_write с expected_sha из этого чтения. Каркас имеет статус draft; публикация готового текста выполняется отдельно.";
+const SCAFFOLD_INDEXING_NOTICE: IndexingNotice = {
+  status: "async", note: "Индексация для поиска выполняется отдельно. Для заполнения каркаса читай файлы напрямую с include_sha:true; ждать поискового индекса не нужно.",
+};
 
-  const data = (await resp.json()) as { content: string; sha: string };
-  const raw = decodeURIComponent(escape(atob(data.content.replace(/\n/g, ""))));
-  const entries = raw
-    .split("\n")
-    .map(line => line.trim())
-    .filter(Boolean)
-    .map(line => JSON.parse(line) as AllocatorLogEntry);
-  return { entries, sha: data.sha };
-}
+class AllocatorStateError extends Error {}
+class AllocatorBudgetError extends Error {}
 
-/**
- * PUT the full log content. `currentSha` must come from the SAME read that produced
- * `content` (see module note above) — never a sha fetched separately from the content
- * being sent. Returns `conflict: true` on any sha-mismatch signal (409, or 422 naming
- * "sha" — the latter covers "sha required" when the file appeared between our GET and
- * this PUT, same retryable race as an outright stale sha).
- */
-async function putAllocatorLog(
-  githubFetch: typeof globalThis.fetch,
-  owner: string,
-  repo: string,
-  token: string,
-  content: string,
-  message: string,
-  currentSha: string | null,
-): Promise<{ ok: true } | { ok: false; conflict: true } | { ok: false; conflict: false; error: string }> {
-  const apiUrl = githubContentsApiUrl(owner, repo, ALLOCATOR_LOG_PATH);
-  const resp = await githubFetch(apiUrl, {
-    method: "PUT",
-    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge", "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message,
-      content: btoa(unescape(encodeURIComponent(content))),
-      ...(currentSha ? { sha: currentSha } : {}),
-    }),
-  });
-  if (resp.ok) return { ok: true };
-
-  const errText = await resp.text();
-  if (resp.status === 409 || (resp.status === 422 && /sha/i.test(errText))) {
-    return { ok: false, conflict: true };
+function allocatorRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new AllocatorStateError("Invalid allocator/GitHub object.");
   }
-  return { ok: false, conflict: false, error: `GitHub API error ${resp.status}: ${errText}` };
+  return value as Record<string, unknown>;
 }
 
-/**
- * Allocate the next post number for `draftId`, idempotently. Calling again with the
- * same `draftId` (no TTL — a draft can sit unpushed for hours, WP-560 Ф12 round 1
- * blocker) returns the same number without a new commit, instead of racing a second
- * number into existence.
- */
-export async function allocatePostNumber(
-  env: PersonalEnv,
-  ctx: UserContext,
-  source: string,
-  draftId: string,
-  artifactType: string,
+function allocatorSha(value: unknown): string {
+  if (typeof value !== "string" || !GIT_BLOB_SHA.test(value)) {
+    throw new AllocatorStateError("Invalid Git object SHA.");
+  }
+  return value;
+}
+
+function isPostNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function parseAllocatorLog(raw: string): AllocatorLogEntry[] {
+  const draftIds = new Set<string>();
+  const numbers = new Set<number>();
+  return raw.split("\n").filter(line => line.trim()).map((line, index) => {
+    let value: Record<string, unknown>;
+    try {
+      value = allocatorRecord(JSON.parse(line));
+    } catch {
+      throw new AllocatorStateError(`Invalid allocator log JSON at entry ${index + 1}.`);
+    }
+    // JSON.parse establishes JSON syntax; YAML's JSON schema also rejects duplicate
+    // (including escaped-equivalent) keys instead of keeping only their last value.
+    const document = parseDocument(line, { uniqueKeys: true, schema: "json" });
+    const keys = Object.keys(value);
+    const expectedKeys = ["draft_id", "artifact_type", "post_number", "timestamp"];
+    if (document.errors.length || keys.length !== expectedKeys.length
+      || keys.some(key => !expectedKeys.includes(key))) {
+      throw new AllocatorStateError(`Invalid/duplicate allocator log keys at entry ${index + 1}.`);
+    }
+    const { draft_id: draftId, post_number: postNumber, artifact_type: type, timestamp } = value;
+    if (typeof draftId !== "string" || !ALLOCATOR_DRAFT_ID.test(draftId)
+      || type !== "post" || !isPostNumber(postNumber)
+      || typeof timestamp !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(timestamp)
+      || !Number.isFinite(Date.parse(timestamp))) {
+      throw new AllocatorStateError(`Invalid allocator log fields at entry ${index + 1}.`);
+    }
+    if (draftIds.has(draftId.toLowerCase()) || numbers.has(postNumber)) {
+      throw new AllocatorStateError("Duplicate draft_id or post_number in allocator log.");
+    }
+    draftIds.add(draftId.toLowerCase());
+    numbers.add(postNumber);
+    return value as unknown as AllocatorLogEntry;
+  });
+}
+
+interface HistoricalPost {
+  path: string;
+  postNumber: number;
+  draftId?: string;
+}
+
+// Parse YAML without evaluating aliases/merge keys. Only scalar ownership fields
+// participate in numbering; prose and unrelated frontmatter never claim a number.
+function historicalPost(content: string, path: string): HistoricalPost | null {
+  const lines = content.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").split("\n");
+  let header = "";
+  if (lines[0]?.trim() === "---") {
+    const end = lines.findIndex((line, index) => index > 0 && /^(---|\.\.\.)\s*$/.test(line));
+    if (end < 0) throw new AllocatorStateError(`Unclosed post frontmatter: ${path}`);
+    header = lines.slice(1, end).join("\n");
+  }
+  const document = parseDocument(header, { uniqueKeys: true });
+  if (document.errors.length || (document.contents !== null && !isMap(document.contents))) {
+    throw new AllocatorStateError(`Invalid post frontmatter: ${path}`);
+  }
+  if (isMap(document.contents) && document.contents.items.some(pair =>
+    !isScalar(pair.key) || typeof pair.key.value !== "string" || pair.key.value === "<<")) {
+    throw new AllocatorStateError(`Ambiguous post frontmatter keys: ${path}`);
+  }
+  const scalar = (name: string): string | undefined => {
+    const node = document.get(name, true);
+    if (node === undefined) return undefined;
+    if (name === "post_number" && isScalar(node) && node.value === null
+      && (node.tag === undefined || node.tag === "tag:yaml.org,2002:null")) return undefined;
+    const allowedTags = name === "draft_id" ? ["tag:yaml.org,2002:str"]
+      : ["tag:yaml.org,2002:str", "tag:yaml.org,2002:int"];
+    if (!isScalar(node) || !["PLAIN", "QUOTE_SINGLE", "QUOTE_DOUBLE"].includes(node.type ?? "")
+      || (node.tag !== undefined && !allowedTags.includes(node.tag))
+      || (typeof node.value !== "string" && typeof node.value !== "number")
+      || (name === "draft_id" && typeof node.value !== "string")) {
+      throw new AllocatorStateError(`Invalid ${name} scalar: ${path}`);
+    }
+    return typeof node.value === "number" ? node.source : node.value;
+  };
+  const numberText = scalar("post_number");
+  const draftId = scalar("draft_id");
+  if (numberText !== undefined && !/^\d+$/.test(numberText)) {
+    throw new AllocatorStateError(`Invalid post_number: ${path}`);
+  }
+  if (draftId !== undefined && !ALLOCATOR_DRAFT_ID.test(draftId)) {
+    throw new AllocatorStateError(`Invalid draft_id: ${path}`);
+  }
+  const legacy = path.split("/").at(-1)?.match(LEGACY_CLUB_NUMBER);
+  const claimedNumber = numberText ?? legacy?.[1];
+  if (claimedNumber === undefined) {
+    if (draftId !== undefined) throw new AllocatorStateError(`Draft ownership has no global post number: ${path}`);
+    return null;
+  }
+  const postNumber = Number(claimedNumber);
+  if (!isPostNumber(postNumber)) throw new AllocatorStateError(`Invalid post number: ${path}`);
+  return { path, postNumber, ...(draftId ? { draftId: draftId.toLowerCase() } : {}) };
+}
+
+class AllocatorGitClient {
+  private readonly baseUrl: string;
+  private readonly headers: Record<string, string>;
+  private readonly blobs = new Map<string, string>();
+  private requests = 0;
+  private blobBytes = 0;
+
+  constructor(private readonly githubFetch: typeof globalThis.fetch, private readonly owner: string,
+    private readonly repo: string, token: string, private readonly signal: AbortSignal,
+    private readonly deadline: number) {
+    this.baseUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+    this.headers = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json",
+      "User-Agent": "aisystant-knowledge", "Content-Type": "application/json" };
+  }
+
+  private async fetch(url: string, method: string, body?: unknown): Promise<Response> {
+    // The abort callback can wait behind synchronous YAML parsing; monotonic time
+    // also prevents a write from starting after the deadline in that same turn.
+    if (this.signal.aborted || performance.now() >= this.deadline || this.requests >= ALLOCATOR_MAX_REQUESTS) {
+      throw new AllocatorBudgetError("Allocator deadline or request budget exhausted; no further Git writes allowed.");
+    }
+    this.requests++;
+    // Workers fetch rejects an AllocatorGitClient receiver; invoke it as a function.
+    const githubFetch = this.githubFetch;
+    return githubFetch(url, { method, headers: this.headers, signal: this.signal,
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+  }
+
+  request(path: string, method = "GET", body?: unknown): Promise<Response> {
+    return this.fetch(`${this.baseUrl}${path}`, method, body);
+  }
+
+  async object(path: string, method = "GET", body?: unknown): Promise<Record<string, unknown>> {
+    const response = await this.request(path, method, body);
+    if (!response.ok) throw new Error(`GitHub ${method} ${path} failed (${response.status}).`);
+    return allocatorRecord(await response.json());
+  }
+
+  // GraphQL batches immutable blob IDs, not mutable paths. Validate every alias before
+  // accepting a batch: GraphQL can return partial data together with HTTP 200/errors.
+  async readBlobs(shas: string[]): Promise<Map<string, string>> {
+    const missing = [...new Set(shas)].filter(sha => !this.blobs.has(sha));
+    for (let offset = 0; offset < missing.length; offset += ALLOCATOR_BLOB_BATCH_SIZE) {
+      const batch = missing.slice(offset, offset + ALLOCATOR_BLOB_BATCH_SIZE);
+      const selections = batch.map((sha, index) =>
+        `b${index}: object(oid: "${allocatorSha(sha)}") { ... on Blob { oid byteSize isBinary isTruncated text } }`).join("\n");
+      const response = await this.fetch("https://api.github.com/graphql", "POST", {
+        query: `query AllocatorBlobs($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { ${selections} } }`,
+        variables: { owner: this.owner, repo: this.repo },
+      });
+      if (!response.ok) throw new Error(`GitHub blob batch failed (${response.status}).`);
+      const result = allocatorRecord(await response.json());
+      if (result.errors !== undefined) throw new AllocatorStateError("GitHub returned incomplete GraphQL blob data.");
+      const repository = allocatorRecord(allocatorRecord(result.data).repository);
+      for (const [index, sha] of batch.entries()) {
+        const blob = allocatorRecord(repository[`b${index}`]);
+        if (blob.oid !== sha || blob.isBinary !== false || blob.isTruncated !== false
+          || typeof blob.text !== "string" || typeof blob.byteSize !== "number"
+          || blob.byteSize !== utf8ByteLength(blob.text)) {
+          throw new AllocatorStateError("Incomplete or mismatched Git blob.");
+        }
+        this.blobBytes += blob.byteSize;
+        if (blob.byteSize > ALLOCATOR_MAX_BLOB_BYTES || this.blobBytes > ALLOCATOR_MAX_BYTES) {
+          throw new AllocatorBudgetError("Allocator historical content exceeds the bounded read budget.");
+        }
+        this.blobs.set(sha, blob.text);
+      }
+    }
+    return this.blobs;
+  }
+}
+
+interface AllocatorSnapshot {
+  head: string;
+  tree: string;
+  entries: AllocatorLogEntry[];
+  log: string;
+  posts: HistoricalPost[];
+  files: Record<string, unknown>[];
+  contents: Map<string, string>;
+}
+
+async function readSnapshotFiles(git: AllocatorGitClient, files: Record<string, unknown>[]): Promise<Map<string, string>> {
+  let totalBytes = 0;
+  for (const file of files) {
+    if (file.type !== "blob" || !["100644", "100755"].includes(String(file.mode))
+      || typeof file.size !== "number" || !Number.isSafeInteger(file.size) || file.size < 0) {
+      throw new AllocatorStateError("Allocator inputs must be complete regular Git files.");
+    }
+    totalBytes += file.size;
+    if (file.size > ALLOCATOR_MAX_BLOB_BYTES || totalBytes > ALLOCATOR_MAX_BYTES) {
+      throw new AllocatorBudgetError("Allocator historical content exceeds the bounded read budget.");
+    }
+  }
+  const blobs = await git.readBlobs(files.map(file => allocatorSha(file.sha)));
+  return new Map(files.map(file => [file.path as string, blobs.get(file.sha as string)!]));
+}
+
+async function readAllocatorSnapshot(git: AllocatorGitClient, branch: string, extraPaths: string[]): Promise<AllocatorSnapshot> {
+  const ref = await git.object(`/git/ref/heads/${encodeURIComponent(branch)}`);
+  const head = allocatorSha(allocatorRecord(ref.object).sha);
+  const commit = await git.object(`/git/commits/${head}`);
+  if (commit.sha !== head) throw new AllocatorStateError("Git commit does not match the requested snapshot.");
+  const tree = allocatorSha(allocatorRecord(commit.tree).sha);
+  const listing = await git.object(`/git/trees/${tree}?recursive=1`);
+  if (listing.sha !== tree || listing.truncated !== false || !Array.isArray(listing.tree)) {
+    throw new AllocatorStateError("Incomplete Git tree; allocator cannot establish the historical maximum.");
+  }
+  const treeEntries = listing.tree.map(allocatorRecord);
+  if (treeEntries.some(file => typeof file.path !== "string")) {
+    throw new AllocatorStateError("Incomplete Git tree entry path.");
+  }
+  const files = treeEntries.filter(file =>
+    file.path === ALLOCATOR_LOG_PATH || CLUB_POST_PATH.test(file.path as string) || extraPaths.includes(file.path as string));
+  if (new Set(files.map(file => file.path)).size !== files.length) {
+    throw new AllocatorStateError("Duplicate Git tree paths.");
+  }
+  const contents = await readSnapshotFiles(git, files);
+  let log = "";
+  const posts: HistoricalPost[] = [];
+  for (const file of files) {
+    const content = contents.get(file.path as string)!;
+    if (file.path === ALLOCATOR_LOG_PATH) log = content;
+    else if (CLUB_POST_PATH.test(file.path as string)) {
+      const post = historicalPost(content, file.path as string);
+      if (post) posts.push(post);
+    }
+  }
+  return { head, tree, entries: parseAllocatorLog(log), log, posts, files: treeEntries, contents };
+}
+
+// A removed club file must not make a partial multi-channel draft look like a
+// reservation that has never been materialized. The complete tree identifies
+// orphan folders cheaply; only their remaining Markdown blobs need inspection.
+async function assertNoOrphanScaffold(
+  git: AllocatorGitClient, snapshot: AllocatorSnapshot, convention: PostConvention, draftId: string, number: number,
+): Promise<void> {
+  const folderOf = (path: string) => path.slice(0, path.lastIndexOf("/"));
+  const clubFolders = new Set(snapshot.files.filter(file => CLUB_POST_PATH.test(file.path as string))
+    .map(file => folderOf(file.path as string)));
+  const orphanFolders = new Set(snapshot.files.filter(file => {
+    const path = file.path as string;
+    const folderName = folderOf(path).split("/").at(-1)!;
+    const conventionalFolder = ["new_post", "legacy_post", "legacy_alt_post"].some(name =>
+      new RegExp(convention.patterns[name as keyof PostConvention["patterns"]]).test(folderName));
+    return path.startsWith("docs/") && path.endsWith(".md") && !clubFolders.has(folderOf(path))
+      && (conventionalFolder || POST_CHANNEL_FILENAME.test(path.split("/").at(-1)!));
+  }).map(file => folderOf(file.path as string)));
+  const orphanFiles = snapshot.files.filter(file => orphanFolders.has(folderOf(file.path as string))
+    && (file.path as string).endsWith(".md"));
+  const contents = await readSnapshotFiles(git, orphanFiles);
+  for (const [path, content] of contents) {
+    const owner = historicalPost(content, path);
+    if (owner?.draftId === draftId || owner?.postNumber === number) {
+      throw new PostScaffoldError("scaffold_conflict", "An incomplete publication without its club file already owns this draft or number.");
+    }
+  }
+}
+
+interface PostCommit {
+  postNumber: number;
+  draftId: string;
+  entry?: AllocatorLogEntry;
+  files: PostScaffoldFile[];
+}
+
+async function commitPostReservation(
+  git: AllocatorGitClient, branch: string, snapshot: AllocatorSnapshot, plan: PostCommit,
+): Promise<{ status: "committed"; sha: string } | { status: "conflict" }> {
+  const files = [...plan.files];
+  if (plan.entry) {
+    const content = snapshot.log + (snapshot.log && !snapshot.log.endsWith("\n") ? "\n" : "")
+      + JSON.stringify(plan.entry) + "\n";
+    files.unshift({ path: ALLOCATOR_LOG_PATH, content });
+  }
+  const tree = await git.object("/git/trees", "POST", {
+    base_tree: snapshot.tree,
+    tree: files.map(file => ({ ...file, mode: "100644", type: "blob" })),
+  });
+  const commit = await git.object("/git/commits", "POST", {
+    message: `${plan.files.length ? "feat(post): scaffold" : "chore(allocator): allocate"} post #${plan.postNumber} (draft ${plan.draftId})`,
+    tree: allocatorSha(tree.sha), parents: [snapshot.head],
+  });
+  // A sibling commit cannot fast-forward the current ref: both allocators and legacy
+  // post writers invalidate this snapshot. Unreferenced tree/commit objects are harmless.
+  const sha = allocatorSha(commit.sha);
+  const response = await git.request(`/git/refs/heads/${encodeURIComponent(branch)}`, "PATCH", { sha, force: false });
+  if (response.ok) return { status: "committed", sha };
+  if (response.status === 409) return { status: "conflict" };
+  if (response.status === 422 && /not a fast[ -]forward|not fast[ -]forward/i.test(await response.text())) {
+    return { status: "conflict" };
+  }
+  throw new Error(`GitHub branch update failed (${response.status}).`);
+}
+
+function withinAllocatorDeadline<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const aborted = () => reject(new AllocatorBudgetError("Allocator operation deadline exhausted."));
+    signal.addEventListener("abort", aborted, { once: true });
+    operation.then(value => {
+      signal.removeEventListener("abort", aborted);
+      resolve(value);
+    }, error => {
+      signal.removeEventListener("abort", aborted);
+      reject(error);
+    });
+    if (signal.aborted) aborted();
+  });
+}
+
+export interface NewPostRequest {
+  source: string;
+  draftId: string;
+  artifactType: string;
+  scaffold?: unknown;
+}
+
+export interface NewPostDependencies extends Partial<GitHubApiDependencies> {
+  /** Every generated path is checked with the existing personal_write scope before Git mutations. */
+  authorizePaths?: (paths: string[]) => Promise<void>;
+}
+
+/** Reserve-only API remains compatible with existing local callers. */
+export function allocatePostNumber(
+  env: PersonalEnv, ctx: UserContext, source: string, draftId: string, artifactType: string,
   dependencies: Partial<GitHubApiDependencies> = {},
 ): Promise<AllocatePostNumberResult> {
-  if (!ALLOCATOR_DRAFT_ID.test(draftId)) {
+  return createPersonalPost(env, ctx, { source, draftId, artifactType }, dependencies);
+}
+
+/** Optional scaffold materialization and reservation share one atomic Git ref update. */
+export async function createPersonalPost(
+  env: PersonalEnv, ctx: UserContext, request: NewPostRequest, dependencies: NewPostDependencies = {},
+): Promise<AllocatePostNumberResult> {
+  const { source, draftId, artifactType } = request;
+  if (typeof draftId !== "string" || !ALLOCATOR_DRAFT_ID.test(draftId)) {
     return { success: false, reason: "invalid_draft_id", error: "draft_id должен быть UUID (v4/v7)." };
   }
-  if (!(ALLOCATOR_ALLOWED_ARTIFACT_TYPES as readonly string[]).includes(artifactType)) {
-    return {
-      success: false,
-      reason: "invalid_artifact_type",
-      error: `artifact_type должен быть одним из: ${ALLOCATOR_ALLOWED_ARTIFACT_TYPES.join(", ")}.`,
-    };
+  if (artifactType !== "post") {
+    return { success: false, reason: "invalid_artifact_type", error: "artifact_type должен быть post." };
   }
-
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return { success: false, reason: "unknown_source", error: `Unknown source: ${source}` };
-
-  const owner = userSource.githubOwner;
-  const repo = userSource.githubRepo;
-  const getToken = dependencies.getInstallationToken ?? getInstallationToken;
-  const githubFetch = dependencies.fetch ?? globalThis.fetch;
-  const token = await getToken(env, ctx.userId, repo);
-  if (!token) {
-    return {
-      success: false,
-      reason: "no_installation",
-      error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge`,
-    };
+  if (source.includes("/")) {
+    return { success: false, reason: "unsupported_team_operation", error: "Создание публикаций через общий репозиторий пока недоступно." };
   }
-
-  for (let attempt = 0; attempt < ALLOCATOR_MAX_RETRIES; attempt++) {
-    let entries: AllocatorLogEntry[];
-    let sha: string | null;
-    try {
-      ({ entries, sha } = await readAllocatorLog(githubFetch, owner, repo, token));
-    } catch (err) {
-      return { success: false, reason: "github_error", error: err instanceof Error ? err.message : String(err) };
+  const canonicalDraftId = draftId.toLowerCase();
+  const deadline = performance.now() + ALLOCATOR_DEADLINE_MS;
+  const signal = AbortSignal.timeout(ALLOCATOR_DEADLINE_MS);
+  try {
+    const scaffold = request.scaffold === undefined ? undefined : parsePostScaffold(request.scaffold);
+    if (scaffold && !dependencies.authorizePaths) {
+      return { success: false, reason: "path_authorization_required", error: "Scaffold creation requires authorization of every generated path." };
     }
-
-    const existing = entries.find(e => e.draft_id === draftId);
-    if (existing) {
-      return { success: true, post_number: existing.post_number, draft_id: draftId, reused: true };
+    if (scaffold && (userSource.githubOwner.toLowerCase() !== MANAGED_KNOWLEDGE_INDEX_OWNER
+      || userSource.githubRepo.toLowerCase() !== MANAGED_KNOWLEDGE_INDEX_REPO || userSource.pathPrefix)) {
+      throw new PostScaffoldError("invalid_scaffold", "Scaffold is only supported for the managed Knowledge Index root source.");
     }
-
-    const nextNumber = entries.reduce((max, e) => Math.max(max, e.post_number), 0) + 1;
-    const newEntry: AllocatorLogEntry = {
-      draft_id: draftId,
-      artifact_type: artifactType as AllocatorArtifactType,
-      post_number: nextNumber,
-      timestamp: new Date().toISOString(),
-    };
-    const newContent = entries.map(e => JSON.stringify(e)).concat(JSON.stringify(newEntry)).join("\n") + "\n";
-
-    const putResult = await putAllocatorLog(
-      githubFetch, owner, repo, token, newContent,
-      `chore(allocator): allocate post #${nextNumber} (draft ${draftId})`,
-      sha,
+    // Existing authentication has no cancellation parameter. Deadline failure stops
+    // this allocation; a late auth result cannot start repository reads or writes.
+    const token = await withinAllocatorDeadline(
+      (dependencies.getInstallationToken ?? getInstallationToken)(env, ctx.userId, userSource.githubRepo), signal,
     );
-    if (putResult.ok) {
-      return { success: true, post_number: nextNumber, draft_id: draftId, reused: false };
+    if (!token) return { success: false, reason: "no_installation", error: "No GitHub App installation found for this repository." };
+    const git = new AllocatorGitClient(dependencies.fetch ?? globalThis.fetch, userSource.githubOwner, userSource.githubRepo, token, signal, deadline);
+    const repository = await git.object("");
+    if (typeof repository.default_branch !== "string" || !repository.default_branch) {
+      throw new AllocatorStateError("Repository default branch is unavailable.");
     }
-    if (putResult.conflict) {
-      continue; // another allocation landed between our read and PUT — re-read and retry.
+    for (let attempt = 0; attempt < ALLOCATOR_MAX_RETRIES; attempt++) {
+      const snapshot = await readAllocatorSnapshot(git, repository.default_branch, scaffold ? [POST_CONVENTION_PATH] : []);
+      const existing = snapshot.entries.find(entry => entry.draft_id.toLowerCase() === canonicalDraftId);
+      const draftPosts = snapshot.posts.filter(post => post.draftId === canonicalDraftId);
+      if (draftPosts.some(post => post.postNumber !== existing?.post_number)) {
+        return { success: false, reason: "post_number_ownership_conflict",
+          error: "Публикация с этим draft_id уже существует, но её номер не совпадает с общим резервом." };
+      }
+      if (existing) {
+        const owners = snapshot.posts.filter(post => post.postNumber === existing.post_number);
+        if (owners.some(post => post.draftId !== canonicalDraftId) || owners.length > 1) {
+          return { success: false, reason: "post_number_ownership_conflict",
+            error: "Зарезервированный номер уже занят публикацией с неподтверждённым владельцем draft_id." };
+        }
+        if (!scaffold) return { success: true, post_number: existing.post_number, draft_id: canonicalDraftId, reused: true };
+      }
+      const reservedMax = snapshot.entries.reduce((max, entry) => Math.max(max, entry.post_number), 0);
+      const highest = snapshot.posts.reduce((max, post) => Math.max(max, post.postNumber), reservedMax);
+      const postNumber = existing?.post_number ?? highest + 1;
+      if (!isPostNumber(postNumber)) throw new AllocatorStateError("Post number exceeds the safe integer range.");
+      let files: PostScaffoldFile[] = [];
+      if (scaffold) {
+        const configText = snapshot.contents.get(POST_CONVENTION_PATH);
+        if (configText === undefined) throw new PostScaffoldError("invalid_post_convention", "Publication convention is absent from this repository snapshot.");
+        const convention = parsePostConvention(configText);
+        await assertNoOrphanScaffold(git, snapshot, convention, canonicalDraftId, postNumber);
+        if (draftPosts.length) {
+          const clubPath = draftPosts[0].path;
+          const folder = clubPath.slice(0, clubPath.lastIndexOf("/")) + "/";
+          const existingFiles = snapshot.files.filter(file => typeof file.path === "string" && file.path.startsWith(folder) && file.path.endsWith(".md"));
+          const contents = await readSnapshotFiles(git, existingFiles);
+          const paths = verifyExistingScaffold(scaffold, convention, clubPath, contents, postNumber, canonicalDraftId);
+          await withinAllocatorDeadline(dependencies.authorizePaths!(paths), signal);
+          return { success: true, post_number: postNumber, draft_id: canonicalDraftId, reused: true,
+            scaffold: { status: "existing", paths, commit_sha: snapshot.head }, indexing: SCAFFOLD_INDEXING_NOTICE, next_action: SCAFFOLD_NEXT_ACTION };
+        }
+        files = buildPostScaffold(scaffold, convention, snapshot.files.map(file => file.path as string), postNumber, canonicalDraftId).files;
+        // Version 1 must remain discoverable by the existing allocator and write
+        // gate even if a repository edit changes the shared naming template.
+        if (files.filter(file => CLUB_POST_PATH.test(file.path)).length !== 1
+          || files.some(file => !POST_CHANNEL_FILENAME.test(file.path.split("/").at(-1)!))) {
+          throw new PostScaffoldError("invalid_post_convention", "Generated channel names are incompatible with the version 1 publication protocol.");
+        }
+        await withinAllocatorDeadline(dependencies.authorizePaths!([...(existing ? [] : [ALLOCATOR_LOG_PATH]), ...files.map(file => file.path)]), signal);
+      }
+      const entry: AllocatorLogEntry | undefined = existing ? undefined : { draft_id: canonicalDraftId, artifact_type: "post",
+        post_number: postNumber, timestamp: new Date().toISOString() };
+      const result = await commitPostReservation(git, repository.default_branch, snapshot, {
+        postNumber, draftId: canonicalDraftId, entry, files,
+      });
+      if (result.status === "committed") {
+        return { success: true, post_number: postNumber, draft_id: canonicalDraftId, reused: !!existing,
+          ...(scaffold ? { scaffold: { status: "created", paths: files.map(file => file.path), commit_sha: result.sha }, indexing: SCAFFOLD_INDEXING_NOTICE, next_action: SCAFFOLD_NEXT_ACTION } : {}) };
+      }
     }
-    console.error(JSON.stringify({ phase: "allocator_put_failed", severity: "error", draft_id: draftId, repo, error: putResult.error }));
-    return { success: false, reason: "github_error", error: putResult.error };
+    return { success: false, reason: "allocator_conflict_exhausted",
+      error: `Не удалось выделить номер за ${ALLOCATOR_MAX_RETRIES} попыток: ветка меняется одновременно с резервированием.` };
+  } catch (error) {
+    const reason = error instanceof PostScaffoldError ? error.reason
+      : error instanceof AllocatorStateError ? "invalid_allocator_state"
+      : error instanceof AllocatorBudgetError || signal.aborted ? "allocator_budget_exceeded" : "github_error";
+    console.error(JSON.stringify({ phase: "allocator_failed", severity: "error", reason, repo: userSource.githubRepo }));
+    return { success: false, reason, error: error instanceof Error ? error.message : String(error) };
   }
-  console.error(JSON.stringify({ phase: "allocator_conflict_exhausted", severity: "error", draft_id: draftId, repo, attempts: ALLOCATOR_MAX_RETRIES }));
-  return {
-    success: false,
-    reason: "allocator_conflict_exhausted",
-    error: `Не удалось атомарно выделить номер за ${ALLOCATOR_MAX_RETRIES} попыток — слишком много конкурентных записей в лог.`,
-  };
 }
 
 /**
@@ -793,10 +1412,15 @@ export async function deleteFromGitHub(
   source: string,
   path: string,
   message: string,
+  expectedSha: string,
   dependencies: Partial<GitHubApiDependencies> = {},
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; warning?: string; reason?: string }> {
+  if (!/^[0-9a-fA-F]{40}$/.test(expectedSha)) {
+    return { success: false, reason: "invalid_expected_sha", error: "Перед удалением прочитай файл через personal_get_document с include_sha=true и передай его sha в expected_sha." };
+  }
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return { success: false, error: `Unknown source: ${source}` };
+  if (!ctx.userId) return { success: false, error: "Invalid user context: missing userId" };
 
   let normalizedPath: string;
   let fullPath: string;
@@ -810,23 +1434,53 @@ export async function deleteFromGitHub(
 
   const owner = userSource.githubOwner;
   const repo = userSource.githubRepo;
+  const sql = personalDb(env);
+  const schema = getKnowledgeSchema(env);
+  const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
+  let snapshot: { id: number; generation: number };
+  try {
+    const rows = await sql`
+      SELECT id, index_generation FROM ${sql.unsafe(userSourcesTable)}
+      WHERE user_id = ${ctx.userId} AND source = ${source}
+        AND github_owner = ${owner} AND github_repo = ${repo}
+        AND path_prefix = ${userSource.pathPrefix} AND active = true
+      LIMIT 1
+    `;
+    const id = Number(rows[0]?.id);
+    const generation = Number(rows[0]?.index_generation);
+    if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(generation) || generation <= 0) {
+      return { success: false, error: "Источник изменился или недоступен. Обновите подключённые источники перед удалением файла." };
+    }
+    snapshot = { id, generation };
+  } catch {
+    console.warn(JSON.stringify({ event: "personal_delete_snapshot_unavailable" }));
+    return { success: false, error: "Не удалось подтвердить подключённый источник. Файл в GitHub не удалён; повторите позже." };
+  }
+
   const getToken = dependencies.getInstallationToken ?? getInstallationToken;
   const githubFetch = dependencies.fetch ?? globalThis.fetch;
-  const token = await getToken(env, ctx.userId, repo);
-  if (!token) return { success: false, error: `No GitHub App installation found for ${owner}. Install the app: https://github.com/apps/aisystant-knowledge` };
+  const lease = await repositoryToken(env, ctx, source, "write", () => getToken(env, ctx.userId, repo));
+  if (!lease) return { success: false, error: `Нет подтверждённого доступа к ${source}. Переподключите GitHub.` };
+  const token = lease.token;
+  try {
 
   const apiUrl = githubContentsApiUrl(owner, repo, fullPath);
 
   const getResp = await githubFetch(apiUrl, {
+    redirect: "manual",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
   });
   if (!getResp.ok) {
     return { success: false, error: `File not found: ${path} in ${source}` };
   }
   const existing = (await getResp.json()) as { sha: string };
+  if (existing.sha.toLowerCase() !== expectedSha.toLowerCase()) {
+    return { success: false, reason: "version_mismatch", error: "Файл изменился после чтения. Прочитай актуальную версию и подтверди удаление заново." };
+  }
 
   const delResp = await githubFetch(apiUrl, {
     method: "DELETE",
+    redirect: "manual",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge", "Content-Type": "application/json" },
     body: JSON.stringify({ message, sha: existing.sha }),
   });
@@ -836,15 +1490,36 @@ export async function deleteFromGitHub(
     return { success: false, error: `GitHub API error ${delResp.status}: ${err}` };
   }
 
-  if (!ctx.userId) {
-    return { success: false, error: "Invalid user context: missing userId" };
-  }
-  const sql = personalDb(env);
-  const schema = getKnowledgeSchema(env);
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
-  await buildDeleteDocumentQuery(sql, documentsTable, source, ctx.userId, normalizedPath);
+  const statusTable = KNOWLEDGE_TABLES.file_index_status(schema);
+  try {
+    // Match the source-row lock used by rebind/purge/indexing. The row id also fences
+    // purge + reconnect, where a new source can restart at the same generation.
+    await sql.transaction([
+      sql`
+        SELECT 1 / (
+          SELECT COUNT(*) FROM (
+            SELECT id FROM ${sql.unsafe(userSourcesTable)}
+            WHERE user_id = ${ctx.userId} AND source = ${source}
+              AND id = ${snapshot.id} AND index_generation = ${snapshot.generation}
+              AND github_owner = ${owner} AND github_repo = ${repo}
+              AND path_prefix = ${userSource.pathPrefix} AND active = true
+            FOR UPDATE
+          ) AS current_source
+        )::int AS fence
+      `,
+      buildDeleteDocumentQuery(sql, documentsTable, source, ctx.userId, normalizedPath),
+      buildDeleteIndexStatusQuery(sql, statusTable, source, ctx.userId, normalizedPath),
+    ]);
+  } catch {
+    console.warn(JSON.stringify({ event: "personal_delete_index_cleanup_deferred" }));
+    return { success: true, warning: "Файл удалён из GitHub, но очистка поискового индекса отложена: источник изменился или индекс временно недоступен." };
+  }
 
   return { success: true };
+  } finally {
+    await lease.release();
+  }
 }
 
 // --- Personal search / read (WP-410 срез-2b, dual-mode private branch) ---
@@ -858,6 +1533,13 @@ const VECTOR_CONFIDENCE_THRESHOLD = 0.6;
 const OPENAI_MAX_ATTEMPTS = 4;
 const OPENAI_BASE_DELAY_MS = 500;
 const OPENAI_MAX_DELAY_MS = 10_000;
+const PERSONAL_SEARCH_BUDGET_MS = 20_000;
+
+function remainingSearchBudget(deadlineAt: number, stage: "database" | "embeddings"): number {
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) throw new ReadFailure("dependency_timeout", stage);
+  return remaining;
+}
 
 export type PersonalSearchResult = {
   filename: string;
@@ -868,6 +1550,38 @@ export type PersonalSearchResult = {
   github_url: string | null;
 };
 export type PersonalMemorySearchResult = PersonalSearchResult & { updated_at: string; age_days: number };
+
+/** Indexed team bytes are released only after a fresh user-scoped GitHub read. */
+async function currentIndexedResults<T extends PersonalSearchResult>(
+  env: PersonalEnv, ctx: UserContext, results: T[],
+): Promise<T[]> {
+  const verified = new Map<string, Promise<boolean>>();
+  const checked = await Promise.all(results.map(async result => {
+    if (!result.source.includes("/")) return result;
+    const filename = result.filename.split("::")[0];
+    const key = `${result.source}\0${filename}`;
+    if (!verified.has(key)) verified.set(key, (async () => {
+      try {
+        const sql = personalDb(env);
+        const table = KNOWLEDGE_TABLES.documents(getKnowledgeSchema(env));
+        const rows = await sql`
+          SELECT content FROM ${sql.unsafe(table)}
+          WHERE user_id = ${ctx.userId} AND source = ${result.source}
+            AND filename = ${filename} AND protocol_version = 2
+          ORDER BY chunk_ordinal
+        `;
+        if (!rows.length) return false;
+        const indexed = rows.map(row => String(row.content)).join("");
+        const live = await personalGetDocumentLive(env, ctx, filename, result.source);
+        return !!live && indexed === live.content;
+      } catch {
+        return false;
+      }
+    })());
+    return result.content.length > 0 && await verified.get(key) ? result : null;
+  }));
+  return checked.filter(result => result !== null) as T[];
+}
 
 function personalGithubUrl(ctx: UserContext, source: string, filename: string): string | null {
   const userSource = ctx.sources.find(s => s.source === source);
@@ -882,34 +1596,45 @@ function personalGithubUrl(ctx: UserContext, source: string, filename: string): 
 }
 
 // Exported for reuse by ./reindex.ts (WP-410 Деплой-2 группа Б) — same embedding call.
-export async function personalGetEmbedding(apiKey: string, text: string): Promise<number[]> {
-  let lastErr: unknown = null;
-  for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt++) {
-    const response = await fetch("https://openrouter.ai/api/v1/embeddings", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ input: [text], model: EMBEDDING_MODEL, dimensions: 1024 }),
-    });
-
-    if (response.ok) {
-      const data = (await response.json()) as { data: { embedding: number[] }[] };
-      return data.data[0].embedding;
+export async function personalGetEmbedding(apiKey: string, text: string, deadlineAt: number = Date.now() + 8_000): Promise<number[]> {
+  const embeddingDeadlineAt = Math.min(deadlineAt, Date.now() + 8_000);
+  const timeoutMs = remainingSearchBudget(embeddingDeadlineAt, "embeddings");
+  return withReadDeadline("embeddings", async signal => {
+    for (let attempt = 1; attempt <= OPENAI_MAX_ATTEMPTS; attempt++) {
+      remainingSearchBudget(embeddingDeadlineAt, "embeddings");
+      signal.throwIfAborted();
+      let response: Response;
+      try {
+        response = await fetch("https://openrouter.ai/api/v1/embeddings", {
+          method: "POST", signal,
+          headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ input: [text], model: EMBEDDING_MODEL, dimensions: 1024 }),
+        });
+      } catch {
+        throw new ReadFailure(signal.aborted ? "dependency_timeout" : "dependency_unavailable", "embeddings");
+      }
+      if (response.ok) {
+        const data = await readJson(response, "embeddings") as { data?: { embedding?: unknown }[] };
+        const embedding = data?.data?.[0]?.embedding;
+        if (!Array.isArray(embedding) || embedding.length !== 1024 || !embedding.every(n => typeof n === "number" && Number.isFinite(n))) {
+          throw new ReadFailure("dependency_invalid_response", "embeddings");
+        }
+        return embedding as number[];
+      }
+      const error = readHttpFailure(response, "embeddings");
+      if (response.status < 500 && response.status !== 429 || attempt === OPENAI_MAX_ATTEMPTS) throw error;
+      const delay = Math.max(error.retryAfterSeconds === undefined ? 0 : error.retryAfterSeconds * 1000,
+        Math.min(OPENAI_BASE_DELAY_MS * Math.pow(2, attempt - 1), OPENAI_MAX_DELAY_MS));
+      // Do not schedule an out-of-budget retry; the caller can honor Retry-After later.
+      if (delay >= remainingSearchBudget(embeddingDeadlineAt, "embeddings")) throw error;
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { signal.removeEventListener("abort", aborted); resolve(); }, delay);
+        const aborted = () => { clearTimeout(timer); reject(new ReadFailure("dependency_timeout", "embeddings")); };
+        signal.addEventListener("abort", aborted, { once: true });
+      });
     }
-
-    const errText = await response.text();
-    const isRetryable = response.status >= 500 || response.status === 429;
-    if (!isRetryable || attempt === OPENAI_MAX_ATTEMPTS) {
-      throw new Error(`OpenAI Embeddings error: ${response.status} ${errText}`);
-    }
-
-    const retryAfterHeader = response.headers.get("retry-after");
-    const retryAfterMs = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : 0;
-    const backoffMs = OPENAI_BASE_DELAY_MS * Math.pow(2, attempt - 1);
-    const delay = Math.min(Math.max(retryAfterMs, backoffMs), OPENAI_MAX_DELAY_MS);
-    lastErr = new Error(`OpenAI ${response.status}: ${errText.slice(0, 200)}`);
-    await new Promise((r) => setTimeout(r, delay));
-  }
-  throw lastErr instanceof Error ? lastErr : new Error("OpenAI Embeddings retry exhausted");
+    throw new ReadFailure("dependency_unavailable", "embeddings");
+  }, timeoutMs);
 }
 
 type PersonalQueryType = "keyword" | "vector";
@@ -925,7 +1650,8 @@ async function personalKeywordSearch(
   ctx: UserContext,
   query: string,
   source: string | undefined,
-  limit: number
+  limit: number,
+  deadlineAt: number,
 ): Promise<PersonalSearchResult[]> {
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
@@ -940,7 +1666,7 @@ async function personalKeywordSearch(
   const sectionRest = entityMatch ? query.replace(entityMatch[0], "").replace(/[§#]/g, "").trim() : null;
   const sectionPattern = sectionRest ? `%${sectionRest}%` : null;
 
-  const rows = await sql`
+  const rows = await withReadDeadline("database", async () => sql`
     SELECT filename, content, source, source_type,
            CASE
              WHEN filename ILIKE ${pattern} THEN 1.0
@@ -965,7 +1691,7 @@ async function personalKeywordSearch(
              CASE WHEN filename ILIKE ${pattern} THEN 0 ELSE 1 END,
              length(content) DESC
     LIMIT ${limit}
-  `;
+  `, remainingSearchBudget(deadlineAt, "database"));
 
   return rows.map((r) => ({
     filename: r.filename as string,
@@ -982,9 +1708,11 @@ async function personalVectorSearch(
   ctx: UserContext,
   query: string,
   source: string | undefined,
-  limit: number
+  limit: number,
+  deadlineAt: number,
+  trace: ReadTrace,
 ): Promise<PersonalSearchResult[]> {
-  const embedding = await personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query);
+  const embedding = await trace.run("embedding", () => personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query, deadlineAt));
   const vec = `[${embedding.join(",")}]`;
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
@@ -992,7 +1720,7 @@ async function personalVectorSearch(
   const src = source ?? null;
   const sourceNames = ctx.sourceNames;
 
-  const rows = await sql`
+  const rows = await trace.run("db_query", () => withReadDeadline("database", async () => sql`
     SELECT filename, content, source, source_type,
            1 - (embedding <=> ${vec}::vector) AS score
     FROM ${sql.unsafe(documentsTable)}
@@ -1001,7 +1729,7 @@ async function personalVectorSearch(
       AND (${src}::text IS NULL OR source = ${src})
     ORDER BY embedding <=> ${vec}::vector
     LIMIT ${limit}
-  `;
+  `, remainingSearchBudget(deadlineAt, "database")));
 
   return rows.map((r) => ({
     filename: r.filename as string,
@@ -1020,29 +1748,43 @@ export async function personalSearchDocuments(
   query: string,
   source: string | undefined,
   limit: number = 5
-): Promise<PersonalSearchResult[]> {
-  const queryType = detectPersonalQueryType(query);
+): Promise<PersonalSearchResult[] & { degradation?: ReturnType<ReadFailure["toJSON"]> }> {
+  limit = normalizeSearchResultLimit(limit);
+  const deadlineAt = Date.now() + PERSONAL_SEARCH_BUDGET_MS;
+  const trace = createReadTrace("personal_search");
+  const keyword = () => trace.run("keyword", () => personalKeywordSearch(env, ctx, query, source, limit, deadlineAt));
+  return trace.run("search", async () => {
+    const queryType = detectPersonalQueryType(query);
 
-  if (queryType === "keyword") {
-    const kwResults = await personalKeywordSearch(env, ctx, query, source, limit);
-    if (kwResults.length > 0) return kwResults;
-  }
-
-  const vectorResults = await personalVectorSearch(env, ctx, query, source, limit);
-
-  if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
-    const kwFallback = await personalKeywordSearch(env, ctx, query, source, limit);
-    if (kwFallback.length > 0) {
-      const seen = new Map<string, PersonalSearchResult>();
-      for (const r of [...kwFallback, ...vectorResults]) {
-        const existing = seen.get(r.filename);
-        if (!existing || r.score > existing.score) seen.set(r.filename, r);
-      }
-      return [...seen.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+    if (queryType === "keyword") {
+      const kwResults = await keyword();
+      if (kwResults.length > 0) return currentIndexedResults(env, ctx, kwResults);
     }
-  }
 
-  return vectorResults;
+    let vectorResults: PersonalSearchResult[];
+    try {
+      vectorResults = await trace.run("vector", () => personalVectorSearch(env, ctx, query, source, limit, deadlineAt, trace));
+    } catch (error) {
+      if (!(error instanceof ReadFailure) || error.stage !== "embeddings") throw error;
+      console.warn(JSON.stringify({ event: "personal_search_keyword_fallback", ...error.toJSON() }));
+      const fallback = await keyword();
+      return Object.assign(await currentIndexedResults(env, ctx, fallback), { degradation: error.toJSON() });
+    }
+
+    if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
+      const kwFallback = await keyword();
+      if (kwFallback.length > 0) {
+        const seen = new Map<string, PersonalSearchResult>();
+        for (const r of [...kwFallback, ...vectorResults]) {
+          const existing = seen.get(r.filename);
+          if (!existing || r.score > existing.score) seen.set(r.filename, r);
+        }
+        return currentIndexedResults(env, ctx, [...seen.values()].sort((a, b) => b.score - a.score).slice(0, limit));
+      }
+    }
+
+    return currentIndexedResults(env, ctx, vectorResults);
+  });
 }
 
 /** Private-mode `memory_search`: recency-weighted personal search. No public equivalent. */
@@ -1053,50 +1795,52 @@ export async function personalMemorySearch(
   recencyDays: number | undefined,
   limit: number = 5
 ): Promise<PersonalMemorySearchResult[]> {
-  const embedding = await personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query);
-  const vec = `[${embedding.join(",")}]`;
-  const sql = personalDb(env);
-  const schema = getKnowledgeSchema(env);
-  const documentsTable = KNOWLEDGE_TABLES.documents(schema);
-  const sourceNames = ctx.sourceNames;
-  const cutoff = recencyDays ? new Date(Date.now() - recencyDays * 24 * 60 * 60 * 1000).toISOString() : null;
+  limit = normalizeSearchResultLimit(limit);
+  const deadlineAt = Date.now() + PERSONAL_SEARCH_BUDGET_MS;
+  const trace = createReadTrace("memory_search");
+  return trace.run("search", async () => {
+    const embedding = await trace.run("embedding", () => personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query, deadlineAt));
+    const vec = `[${embedding.join(",")}]`;
+    const sql = personalDb(env);
+    const schema = getKnowledgeSchema(env);
+    const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+    const sourceNames = ctx.sourceNames;
+    const cutoff = recencyDays ? new Date(Date.now() - recencyDays * 24 * 60 * 60 * 1000).toISOString() : null;
 
-  const rows = await sql`
-    SELECT filename, content, source, source_type, updated_at,
-           1 - (embedding <=> ${vec}::vector) AS base_score
-    FROM ${sql.unsafe(documentsTable)}
-    WHERE user_id = ${ctx.userId}
-      AND source = ANY(${sourceNames})
-      AND (${cutoff}::timestamptz IS NULL OR updated_at >= ${cutoff}::timestamptz)
-    ORDER BY embedding <=> ${vec}::vector
-    LIMIT ${limit * 3}
-  `;
+    const rows = await trace.run("vector", () => withReadDeadline("database", async () => sql`
+      SELECT filename, content, source, source_type, updated_at,
+             1 - (embedding <=> ${vec}::vector) AS base_score
+      FROM ${sql.unsafe(documentsTable)}
+      WHERE user_id = ${ctx.userId}
+        AND source = ANY(${sourceNames})
+        AND (${cutoff}::timestamptz IS NULL OR updated_at >= ${cutoff}::timestamptz)
+      ORDER BY embedding <=> ${vec}::vector
+      LIMIT ${limit * 3}
+    `, remainingSearchBudget(deadlineAt, "database")));
 
-  const now = Date.now();
-  return rows
-    .map((r) => {
-      const ageDays = (now - new Date(r.updated_at as string).getTime()) / (1000 * 60 * 60 * 24);
-      const decayFactor = ageDays <= 14 ? 1.0 : ageDays <= 30 ? 0.7 : 0.4;
-      return {
-        filename: r.filename as string,
-        content: r.content as string,
-        source: (r.source as string) || "",
-        source_type: (r.source_type as string) || "",
-        score: (r.base_score as number) * decayFactor,
-        github_url: personalGithubUrl(ctx, (r.source as string) || "", r.filename as string),
-        updated_at: r.updated_at as string,
-        age_days: Math.round(ageDays),
-      };
-    })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+    const now = Date.now();
+    const results = rows
+      .map((r) => {
+        const ageDays = (now - new Date(r.updated_at as string).getTime()) / (1000 * 60 * 60 * 24);
+        const decayFactor = ageDays <= 14 ? 1.0 : ageDays <= 30 ? 0.7 : 0.4;
+        return {
+          filename: r.filename as string,
+          content: r.content as string,
+          source: (r.source as string) || "",
+          source_type: (r.source_type as string) || "",
+          score: (r.base_score as number) * decayFactor,
+          github_url: personalGithubUrl(ctx, (r.source as string) || "", r.filename as string),
+          updated_at: r.updated_at as string,
+          age_days: Math.round(ageDays),
+        };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
+    return currentIndexedResults(env, ctx, results);
+  });
 }
 
-/** Private-mode `get_document`: personal corpus only.
- * Reads the new chunk_ordinal format first (aggregating every chunk of the
- * document in order); falls back to the legacy LIMIT-1 read only while a
- * document hasn't been backfilled yet, so behavior never regresses during
- * the transition (WP-7 Ф94). */
+/** Read one scoped snapshot: all v2 chunks, or the first legacy fragment while backfill is pending. */
 export async function personalGetDocument(
   env: PersonalEnv,
   ctx: UserContext,
@@ -1113,36 +1857,53 @@ export async function personalGetDocument(
   }
   const normalizedFilename = separatorIndex === -1 ? baseName : `${baseName}${filename.slice(separatorIndex)}`;
 
+  if (source?.includes("/")) {
+    return personalGetDocumentLive(env, ctx, baseName, source);
+  }
+  if (!source && ctx.sourceNames.length === 1 && ctx.sourceNames[0].includes("/")) {
+    return personalGetDocumentLive(env, ctx, baseName, ctx.sourceNames[0]);
+  }
+  if (!source && ctx.sourceNames.some(name => name.includes("/"))) {
+    throw new AmbiguousSourceError(ctx.sourceNames);
+  }
+
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
   const src = source ?? null;
-  const sourceNames = ctx.sourceNames;
+  const sourceNames = ctx.sourceNames.filter(name => !name.includes("/"));
   const chunkPrefix = documentChunkPrefix(baseName);
 
-  // Ambiguity check runs across BOTH protocol versions together, before any
-  // data query — checking only v2 (or only legacy) rows would silently miss
-  // the migration-window case where source A is backfilled to v2 and source B
-  // still holds a v1 copy of the same filename (WP-7 Ф94, cold-context review).
-  if (src === null) {
-    const distinctSources = await sql`
-      SELECT DISTINCT source FROM ${sql.unsafe(documentsTable)}
+  const rows = await withReadDeadline("database", async () => sql`
+    WITH candidates AS (
+      SELECT filename, content, source, source_type, protocol_version, chunk_ordinal,
+        ROW_NUMBER() OVER (
+          PARTITION BY source
+          ORDER BY
+            CASE WHEN protocol_version = 2 AND filename = ${baseName} THEN 0 ELSE 1 END,
+            CASE WHEN protocol_version = 2 AND filename = ${baseName} THEN chunk_ordinal END,
+            CASE WHEN filename = ${normalizedFilename} THEN 0 ELSE 1 END,
+            filename
+        ) AS representation_rank
+      FROM ${sql.unsafe(documentsTable)}
       WHERE (filename = ${baseName} OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
-        AND user_id = ${ctx.userId} AND source = ANY(${sourceNames})
-    `;
-    if (distinctSources.length > 1) throw new AmbiguousSourceError(distinctSources.map(r => r.source as string));
+        AND user_id = ${ctx.userId}
+        AND source = ANY(${sourceNames})
+        AND (${src}::text IS NULL OR source = ${src})
+    )
+    SELECT filename, content, source, source_type, protocol_version, chunk_ordinal
+    FROM candidates
+    WHERE (protocol_version = 2 AND filename = ${baseName}) OR representation_rank = 1
+    ORDER BY source, representation_rank
+  `, 5_000);
+  // Only v2 base rows are reconstructed; null/old protocols retain their first fragment.
+  // Keep one legacy row per source so ambiguity is detected without transferring every fragment.
+  // Both ambiguity and representation selection use this single database snapshot.
+  if (src === null) {
+    const sources = [...new Set(rows.map(row => row.source as string))];
+    if (sources.length > 1) throw new AmbiguousSourceError(sources);
   }
-
-  const v2Rows = await sql`
-    SELECT filename, content, source, source_type, chunk_ordinal
-    FROM ${sql.unsafe(documentsTable)}
-    WHERE filename = ${baseName}
-      AND protocol_version = 2
-      AND user_id = ${ctx.userId}
-      AND source = ANY(${sourceNames})
-      AND (${src}::text IS NULL OR source = ${src})
-    ORDER BY chunk_ordinal
-  `;
+  const v2Rows = rows.filter(row => row.protocol_version === 2 && row.filename === baseName);
 
   if (v2Rows.length > 0) {
     const r0 = v2Rows[0];
@@ -1154,20 +1915,6 @@ export async function personalGetDocument(
       github_url: personalGithubUrl(ctx, (r0.source as string) || "", r0.filename as string),
     };
   }
-
-  const rows = await sql`
-    SELECT filename, content, source, source_type
-    FROM ${sql.unsafe(documentsTable)}
-    WHERE (filename = ${normalizedFilename}
-           OR left(filename, char_length(${chunkPrefix})) = ${chunkPrefix})
-      AND user_id = ${ctx.userId}
-      AND source = ANY(${sourceNames})
-      AND (${src}::text IS NULL OR source = ${src})
-    ORDER BY
-      CASE WHEN filename = ${normalizedFilename} THEN 0 ELSE 1 END,
-      filename
-    LIMIT 1
-  `;
 
   if (!rows.length) return null;
   const r = rows[0];
@@ -1232,6 +1979,7 @@ export async function personalGetDocumentLive(
   ctx: UserContext,
   filename: string,
   source: string,
+  ref?: string,
 ): Promise<{ filename: string; content: string; source: string; source_type: string; github_url: string | null; sha: string } | null> {
   const userSource = ctx.sources.find(s => s.source === source);
   if (!userSource) return null;
@@ -1245,35 +1993,39 @@ export async function personalGetDocumentLive(
 
   const owner = userSource.githubOwner;
   const repo = userSource.githubRepo;
-  const token = await getInstallationToken(env, ctx.userId, repo);
-  if (!token) return null;
-
-  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
-
-  // External response parsing (json, atob, UTF-8 decode) can throw; the
-  // dispatch layer expects null, not an exception.
   try {
-    const response = await fetch(apiUrl, {
-      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+    return await withReadDeadline("github_content", async signal => {
+      const lease = await repositoryToken(env, ctx, source, "read", () => getInstallationToken(env, ctx.userId, repo,
+        (input, init) => fetchReadResponse(input, init ?? {}, "github_token", signal)));
+      if (!lease) throw new ReadFailure("github_not_connected", "github_token");
+      const token = lease.token;
+      try {
+      const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}${ref !== undefined ? `?ref=${encodeURIComponent(ref)}` : ""}`;
+      const response = await fetchReadResponse(apiUrl, {
+        redirect: "manual",
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+      }, "github_content", signal);
+      const body = await readJson(response, "github_content") as { sha?: unknown; content?: unknown; encoding?: unknown };
+      if (!body || typeof body.sha !== "string" || !GIT_BLOB_SHA.test(body.sha)
+          || typeof body.content !== "string" || body.encoding !== "base64") {
+        throw new ReadFailure("dependency_invalid_response", "github_content");
+      }
+      let content: string;
+      try {
+        content = decodeURIComponent(escape(atob(body.content.replace(/\n/g, ""))));
+      } catch {
+        throw new ReadFailure("dependency_invalid_response", "github_content");
+      }
+      return { filename, content, source, source_type: userSource.sourceType,
+        github_url: personalGithubUrl(ctx, source, filename), sha: body.sha };
+      } finally {
+        await lease.release();
+      }
     });
-    if (!response.ok) return null;
-
-    const body = (await response.json()) as { sha?: unknown; content?: unknown; encoding?: unknown };
-    // Same sha shape check as the write path — a malformed sha handed out
-    // here would be rejected by write(expected_sha) later anyway, better to
-    // fail the read (peer-review round 2, 30.08).
-    if (typeof body.sha !== "string" || !/^[0-9a-f]{40}$|^[0-9a-f]{64}$/i.test(body.sha) || typeof body.content !== "string" || body.encoding !== "base64") return null;
-
-    return {
-      filename,
-      content: decodeURIComponent(escape(atob(body.content.replace(/\n/g, "")))),
-      source,
-      source_type: userSource.sourceType,
-      github_url: personalGithubUrl(ctx, source, filename),
-      sha: body.sha,
-    };
-  } catch {
-    return null;
+  } catch (error) {
+    // GitHub also hides inaccessible private resources behind 404. Do not assert absence.
+    if (error instanceof ReadFailure && error.stage === "github_content" && error.status === 404) return null;
+    throw error;
   }
 }
 
@@ -1286,6 +2038,7 @@ export async function personalGetDocumentWithSha(
   ctx: UserContext,
   filename: string,
   source?: string,
+  ref?: string,
 ): Promise<
   | { kind: "document"; filename: string; content: string; source: string; source_type: string; github_url: string | null; sha: string }
   | { kind: "source_required"; sources: string[] }
@@ -1310,33 +2063,105 @@ export async function personalGetDocumentWithSha(
     }
   }
 
-  const live = await personalGetDocumentLive(env, ctx, normalized, resolvedSource);
+  const live = await personalGetDocumentLive(env, ctx, normalized, resolvedSource, ref);
   return live ? { kind: "document", ...live } : null;
 }
 
-/** Private-mode `list_sources`: personal corpus only. */
+/** History for a file's path, most recent first (WP-7 Ф176 — recovery path
+ * after an accidental overwrite: find a prior sha here, then read it back
+ * via get_document(ref: sha)). GitHub's commits-by-path endpoint, not our own
+ * bookkeeping — no history to lose or migrate. */
+export async function personalGetDocumentHistory(
+  env: PersonalEnv,
+  ctx: UserContext,
+  source: string,
+  path: string,
+  limit: number = 10,
+): Promise<
+  | { success: true; entries: { sha: string; message: string; date: string | null; author: string | null }[] }
+  | { success: false; error: string }
+> {
+  const userSource = ctx.sources.find(s => s.source === source);
+  if (!userSource) return { success: false, error: `Unknown source: ${source}` };
+
+  let fullPath: string;
+  try {
+    fullPath = resolveSourcePath(userSource.pathPrefix, path).fullPath;
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : "Invalid repository path" };
+  }
+
+  const owner = userSource.githubOwner;
+  const repo = userSource.githubRepo;
+  const lease = await repositoryToken(env, ctx, source, "read", () => getInstallationToken(env, ctx.userId, repo));
+  if (!lease) return { success: false, error: `Нет подтверждённого доступа к ${source}. Переподключите GitHub.` };
+  const token = lease.token;
+  try {
+
+  // Same shape as normalizeSearchResultLimit (../index.ts) — `|| 10` here would
+  // treat an explicit 0 (truncates to falsy 0) as "absent" and silently return
+  // the default instead of the documented floor of 1 (cold-review finding).
+  const cappedLimit = Number.isFinite(limit) ? Math.min(Math.max(Math.trunc(limit), 1), 30) : 10;
+  const apiUrl = githubCommitsApiUrl(owner, repo, fullPath, cappedLimit);
+
+  let response: Response;
+  try {
+    response = await fetch(apiUrl, {
+      redirect: "manual",
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+    });
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : "GitHub request failed" };
+  }
+  if (!response.ok) {
+    const err = await response.text();
+    return { success: false, error: `GitHub API error ${response.status}: ${err}` };
+  }
+
+  const commits = (await response.json()) as Array<{ sha: string; commit: { message: string; author?: { date?: string; name?: string } } }>;
+  return {
+    success: true,
+    entries: commits.map(c => ({
+      sha: c.sha,
+      message: c.commit.message.split("\n")[0],
+      date: c.commit.author?.date ?? null,
+      author: c.commit.author?.name ?? null,
+    })),
+  };
+  } finally {
+    await lease.release();
+  }
+}
+
+/** Private-mode `list_sources`: count the same distinct files as `list_documents`, not chunks. */
 export async function personalListSources(
   env: PersonalEnv,
   ctx: UserContext
 ): Promise<{ source: string; source_type: string; doc_count: number }[]> {
   const sql = personalDb(env);
-  const sourceNames = ctx.sourceNames;
+  const sourceNames = ctx.sourceNames.filter(name => !name.includes("/"));
   const docsTable = KNOWLEDGE_TABLES.documents(getKnowledgeSchema(env));
 
-  const rows = await sql`
-    SELECT source, source_type, COUNT(*)::int AS doc_count
+  const rows = await withReadDeadline("database", async () => sql`
+    SELECT source, source_type, COUNT(DISTINCT filename)::int AS doc_count
     FROM ${sql.unsafe(docsTable)}
     WHERE user_id = ${ctx.userId}
       AND source = ANY(${sourceNames})
+      AND filename NOT LIKE '%::%'
     GROUP BY source, source_type
     ORDER BY source_type, source
-  `;
+  `, 5_000);
 
-  return rows.map((r) => ({
+  const personal = rows.map((r) => ({
     source: (r.source as string) || "",
     source_type: (r.source_type as string) || "",
     doc_count: r.doc_count as number,
   }));
+  const team = await Promise.all(ctx.sources.filter(s => s.source.includes("/")).map(async s => ({
+    source: s.source, source_type: s.sourceType,
+    doc_count: (await teamMarkdownFiles(env, ctx, s.source)).length,
+  })));
+  return [...personal, ...team];
 }
 
 /** Private-mode `list_documents`: personal corpus only. WP-7 Ф117 — before this, list_documents
@@ -1352,7 +2177,7 @@ export async function personalListDocuments(
   limit: number = 100
 ): Promise<{ filename: string; source: string; source_type: string; github_url: string | null; size_bytes: number }[]> {
   const sql = personalDb(env);
-  const sourceNames = ctx.sourceNames;
+  const sourceNames = ctx.sourceNames.filter(name => !name.includes("/"));
   const docsTable = KNOWLEDGE_TABLES.documents(getKnowledgeSchema(env));
   const src = source ?? null;
   const stype = sourceType ?? null;
@@ -1360,7 +2185,7 @@ export async function personalListDocuments(
   // WP-7 Ф122: GROUP BY + SUM(octet_length), not DISTINCT — a v2 document is stored as one
   // row per chunk_ordinal, all sharing the same filename (see personalGetDocument); a plain
   // per-row length would report only one chunk's size instead of the whole file's.
-  const rows = await sql`
+  const rows = await withReadDeadline("database", async () => sql`
     SELECT filename, source, source_type, SUM(octet_length(content))::bigint AS size_bytes
     FROM ${sql.unsafe(docsTable)}
     WHERE user_id = ${ctx.userId}
@@ -1371,9 +2196,9 @@ export async function personalListDocuments(
     GROUP BY filename, source, source_type
     ORDER BY source, filename
     LIMIT ${limit}
-  `;
+  `, 5_000);
 
-  return rows.map((r) => {
+  const personal = rows.map((r) => {
     const docSource = (r.source as string) || "";
     const docFilename = r.filename as string;
     return {
@@ -1384,6 +2209,15 @@ export async function personalListDocuments(
       size_bytes: Number(r.size_bytes ?? 0),
     };
   });
+  const teamSources = ctx.sources.filter(s => s.source.includes("/")
+    && (!source || s.source === source) && (!sourceType || s.sourceType === sourceType));
+  const team = (await Promise.all(teamSources.map(async teamSource =>
+    (await teamMarkdownFiles(env, ctx, teamSource.source)).map(file => ({
+      filename: file.path, source: teamSource.source, source_type: teamSource.sourceType,
+      github_url: personalGithubUrl(ctx, teamSource.source, file.path), size_bytes: file.size,
+    }))))).flat();
+  return [...personal, ...team].sort((a, b) => a.source.localeCompare(b.source)
+    || a.filename.localeCompare(b.filename)).slice(0, limit);
 }
 
 /** Private-mode `list_path`: personal corpus only. Same tree-building contract as the platform
@@ -1397,7 +2231,7 @@ export async function personalListPath(
   depth: number = 1
 ): Promise<PathEntry[]> {
   const sql = personalDb(env);
-  const sourceNames = ctx.sourceNames;
+  const sourceNames = ctx.sourceNames.filter(name => !name.includes("/"));
   const docsTable = KNOWLEDGE_TABLES.documents(getKnowledgeSchema(env));
   const src = source ?? null;
   const prefix = pathPrefix ?? "";
@@ -1412,7 +2246,7 @@ export async function personalListPath(
   // per document. string_agg in chunk_ordinal order reassembles the full content (same pattern
   // personalGetDocument already uses via v2Rows.map(...).join("")), fixing the duplicate-listing
   // bug and letting extractTitle/size see the whole document, not one chunk.
-  const rows = await sql`
+  const rows = await withReadDeadline("database", async () => sql`
     SELECT filename, source,
       string_agg(content, '' ORDER BY chunk_ordinal) AS full_content
     FROM ${sql.unsafe(docsTable)}
@@ -1424,7 +2258,7 @@ export async function personalListPath(
     GROUP BY filename, source
     ORDER BY source, filename
     LIMIT ${limit}
-  `;
+  `, 5_000);
 
   const docs = rows.map((r) => {
     const content = (r.full_content as string) || "";
@@ -1436,7 +2270,12 @@ export async function personalListPath(
     };
   });
 
-  return buildPathTree(docs, prefix, depth);
+  const teamSources = ctx.sources.filter(s => s.source.includes("/") && (!source || s.source === source));
+  const teamDocs = (await Promise.all(teamSources.map(async teamSource =>
+    (await teamMarkdownFiles(env, ctx, teamSource.source))
+      .filter(file => file.path.startsWith(prefix))
+      .map(file => ({ source: teamSource.source, path: file.path, title: null, size_bytes: file.size }))))).flat();
+  return buildPathTree([...docs, ...teamDocs].slice(0, limit), prefix, depth);
 }
 
 // --- connect_source (WP-410 срез-2b) ---
@@ -1472,6 +2311,124 @@ export interface ConnectSourceDependencies {
   fetch?: typeof globalThis.fetch;
 }
 
+async function provisionTeamSourceScope(env: PersonalEnv, userId: string, source: string): Promise<ConnectSourceResult["scope_provisioning"]> {
+  if (!env.INDICATORS_DATABASE_URL) return "skipped";
+  try {
+    await provisionBridgeScopes(neon(env.INDICATORS_DATABASE_URL), userId, source);
+    return "ok";
+  } catch {
+    return "failed";
+  }
+}
+
+async function connectTeamSource(env: PersonalEnv, userId: string, source: string): Promise<ConnectSourceResult> {
+  const name = teamRepositoryName(source);
+  if (!name || !teamReposEnabled(env)) {
+    return { source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
+      error: "Командный репозиторий недоступен." };
+  }
+  const binding = await activeTeamBinding(env, userId, source);
+  if (!binding) {
+    return { source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
+      error: "Репозиторий отсутствует среди доступных вам установок GitHub App. Повторите github_connect." };
+  }
+  const lease = await issueTeamToken(env, userId, binding, "read");
+  if (!lease) {
+    return { source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
+      error: "GitHub не подтвердил ваше право читать этот репозиторий." };
+  }
+  const stillNamed = lease.repository.toLowerCase() === source.toLowerCase();
+  const released = await lease.release();
+  if (!stillNamed || !released) {
+    return { source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
+      error: stillNamed ? "Не удалось завершить проверку токена GitHub. Повторите позже."
+        : "Репозиторий переименован. Повторите github_connect и выберите его новое имя." };
+  }
+
+  const sql = personalDb(env);
+  const schema = getKnowledgeSchema(env);
+  const userSources = KNOWLEDGE_TABLES.user_sources(schema);
+  const documents = KNOWLEDGE_TABLES.documents(schema);
+  const fileStatus = KNOWLEDGE_TABLES.file_index_status(schema);
+  const jobs = KNOWLEDGE_TABLES.reindex_jobs(schema);
+  const scopeProvisioning = await provisionTeamSourceScope(env, userId, source);
+  const [, connected] = await sql.transaction([
+    sql`SELECT set_config('app.user_id', ${userId}, true)`,
+    sql`SELECT github_repository_id, github_user_binding_id, active, index_state
+        FROM ${sql.unsafe(userSources)} WHERE user_id = ${userId} AND source = ${source}`,
+  ]);
+  const existing = connected[0];
+  if (existing && existing.active === true && existing.index_state === "ready"
+    && Number(existing.github_repository_id) === binding.repositoryId
+    && Number(existing.github_user_binding_id) === binding.repositoryId) {
+    return { source, status: "already_connected", scope_provisioning: scopeProvisioning,
+      reindex_triggered: false, message: scopeProvisioning === "failed"
+        ? "Репозиторий подключён для чтения; право записи через IWE пока не настроено."
+        : "Репозиторий уже подключён." };
+  }
+  if (existing && existing.active === true && existing.index_state === "reindexing"
+    && Number(existing.github_repository_id) === binding.repositoryId) {
+    const live = await sql`
+      SELECT id FROM ${sql.unsafe(jobs)} WHERE user_id = ${userId} AND source = ${source}
+        AND status IN ('pending', 'running') ORDER BY started_at DESC LIMIT 1
+    `;
+    if (live.length) return { source, status: "already_connected", scope_provisioning: scopeProvisioning,
+      reindex_triggered: false, reindex_job_id: String(live[0].id),
+      message: "Индекс репозитория уже строится." };
+  }
+  let jobId: string;
+  try {
+    const results = await sql.transaction([
+      sql`SELECT set_config('app.user_id', ${userId}, true)`,
+      sql`
+        INSERT INTO ${sql.unsafe(userSources)}
+          (user_id, source, github_owner, github_repo, source_type, active,
+           github_repository_id, github_user_binding_id, index_state)
+        VALUES (${userId}, ${source}, ${binding.owner}, ${binding.repository},
+                ${inferSourceType(binding.repository)}, true, ${binding.repositoryId},
+                ${binding.repositoryId}, 'reindexing')
+        ON CONFLICT (user_id, source) DO UPDATE SET
+          github_owner = EXCLUDED.github_owner, github_repo = EXCLUDED.github_repo,
+          github_repository_id = EXCLUDED.github_repository_id,
+          github_user_binding_id = EXCLUDED.github_user_binding_id,
+          active = true, index_state = 'reindexing',
+          index_generation = ${sql.unsafe(userSources)}.index_generation + 1
+        RETURNING index_generation
+      `,
+      sql`DELETE FROM ${sql.unsafe(documents)} WHERE user_id = ${userId} AND source = ${source}`,
+      sql`DELETE FROM ${sql.unsafe(fileStatus)} WHERE user_id = ${userId} AND source = ${source}`,
+      sql`UPDATE ${sql.unsafe(jobs)} SET status = 'cancelled'
+          WHERE user_id = ${userId} AND source = ${source} AND status IN ('pending', 'running')`,
+      sql`
+        INSERT INTO knowledge.github_team_reindex_subscriptions
+          (user_id, repository_id, installation_id, source, active)
+        VALUES (${userId}, ${binding.repositoryId}, ${binding.installationId}, ${source}, true)
+        ON CONFLICT (user_id, repository_id) DO UPDATE SET
+          installation_id = EXCLUDED.installation_id, source = EXCLUDED.source, active = true
+      `,
+      sql`
+        INSERT INTO ${sql.unsafe(jobs)} (user_id, source, status, generation)
+        SELECT ${userId}, ${source}, 'pending', index_generation
+        FROM ${sql.unsafe(userSources)} WHERE user_id = ${userId} AND source = ${source}
+        RETURNING id
+      `,
+    ]);
+    jobId = String(results[results.length - 1][0]?.id ?? "");
+    if (!jobId) throw new Error("No reindex job returned");
+  } catch {
+    return { source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
+      error: "Не удалось безопасно подготовить индекс. Подключение не завершено." };
+  }
+
+  return {
+    source, status: "rebound", scope_provisioning: scopeProvisioning,
+    reindex_triggered: false, reindex_job_id: jobId,
+    message: scopeProvisioning === "failed"
+      ? "Репозиторий подключён для чтения, но право записи через IWE не настроено. Повторите подключение после восстановления службы прав."
+      : "Репозиторий подключён. Поиск станет доступен после завершения индексации.",
+  };
+}
+
 /**
  * GitHub's immutable numeric repository id for owner/repo, as a decimal string. Never a JS
  * number on the comparison path: the column is BIGINT and the driver returns it as a string.
@@ -1498,6 +2455,7 @@ async function fetchGitHubRepositoryId(
   let response: Response;
   try {
     response = await githubFetch(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, {
+      redirect: "manual",
       headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
     });
   } catch {
@@ -1542,6 +2500,7 @@ export async function connectSource(
   source: string,
   dependencies: ConnectSourceDependencies = {},
 ): Promise<ConnectSourceResult> {
+  if (source.includes("/")) return connectTeamSource(env, userId, source);
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
   const githubInstallationsTable = KNOWLEDGE_TABLES.github_installations(schema);
@@ -1603,7 +2562,7 @@ export async function connectSource(
 
   const readCurrentRow = async () => {
     const rows = await sql`
-      SELECT active, github_repository_id, index_state FROM ${sql.unsafe(userSourcesTable)}
+      SELECT id, index_generation, active, github_repository_id, index_state FROM ${sql.unsafe(userSourcesTable)}
       WHERE user_id = ${userId} AND source = ${source}
       LIMIT 1
     `;
@@ -1672,25 +2631,29 @@ export async function connectSource(
     }
 
     if (rebindReason) {
-      // One transaction: (purge,) bind the identity, bump the generation (atomically in the
+      // One transaction: lock/bind the identity, bump the generation, then purge (atomically in the
       // DB, never read-modify-write), and create the reindex job carrying that generation.
       // A crash between any two of these can't leave a purged source without a job, and the
       // consumer fences every document write on the generation (see reindex.ts).
-      const purge = rebindReason === "stuck_index_recovery" ? [] : [
+      const purge = () => rebindReason === "stuck_index_recovery" ? [] : [
         sql`DELETE FROM ${sql.unsafe(documentsTable)} WHERE user_id = ${userId} AND source = ${source}`,
         sql`DELETE FROM ${sql.unsafe(statusTable)} WHERE user_id = ${userId} AND source = ${source}`,
       ];
       const results = await sql.transaction([
-        ...purge,
         sql`
-          UPDATE ${sql.unsafe(userSourcesTable)}
-          SET github_repository_id = ${repositoryId}::bigint,
-              github_owner = ${githubUsername}, github_repo = ${source},
-              active = true, index_state = 'reindexing',
-              index_generation = index_generation + 1
-          WHERE user_id = ${userId} AND source = ${source}
-          RETURNING index_generation
+          WITH rebound AS (
+            UPDATE ${sql.unsafe(userSourcesTable)}
+            SET github_repository_id = ${repositoryId}::bigint,
+                github_owner = ${githubUsername}, github_repo = ${source},
+                active = true, index_state = 'reindexing',
+                index_generation = index_generation + 1
+            WHERE user_id = ${userId} AND source = ${source}
+              AND id = ${current.id} AND index_generation = ${current.index_generation}
+            RETURNING index_generation
+          )
+          SELECT 1 / COUNT(*)::int AS source_fence FROM rebound
         `,
+        ...purge(),
         sql`
           INSERT INTO ${sql.unsafe(reindexJobsTable)} (user_id, source, status, generation)
           SELECT ${userId}, ${source}, 'pending', index_generation
@@ -1800,6 +2763,26 @@ export async function disconnectSource(
   const schema = getKnowledgeSchema(env);
   const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+  if (source.includes("/") && teamReposEnabled(env)) {
+    const statusTable = KNOWLEDGE_TABLES.file_index_status(schema);
+    const jobsTable = KNOWLEDGE_TABLES.reindex_jobs(schema);
+    const statements = await sql.transaction([
+      sql`SELECT active FROM ${sql.unsafe(userSourcesTable)} WHERE user_id = ${userId} AND source = ${source} FOR UPDATE`,
+      sql`SELECT COUNT(*)::int AS cnt FROM ${sql.unsafe(documentsTable)} WHERE user_id = ${userId} AND source = ${source}`,
+      sql`UPDATE ${sql.unsafe(userSourcesTable)} SET active = false, index_state = 'failed',
+            index_generation = index_generation + 1
+          WHERE user_id = ${userId} AND source = ${source} AND github_user_binding_id IS NOT NULL`,
+      sql`DELETE FROM ${sql.unsafe(documentsTable)} WHERE user_id = ${userId} AND source = ${source}`,
+      sql`DELETE FROM ${sql.unsafe(statusTable)} WHERE user_id = ${userId} AND source = ${source}`,
+      sql`UPDATE ${sql.unsafe(jobsTable)} SET status = 'cancelled' WHERE user_id = ${userId}
+            AND source = ${source} AND status IN ('pending', 'running')`,
+      sql`UPDATE knowledge.github_team_reindex_subscriptions SET active = false
+          WHERE user_id = ${userId} AND source = ${source}`,
+    ]);
+    const wasActive = statements[0][0]?.active === true;
+    return { source, status: wasActive ? "disconnected" : "already_disconnected",
+      documents_kept: 0 };
+  }
 
   const currentRows = await sql`
     SELECT active FROM ${sql.unsafe(userSourcesTable)}
@@ -1852,10 +2835,11 @@ export async function purgeSource(
   const schema = getKnowledgeSchema(env);
   const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
+  const statusTable = KNOWLEDGE_TABLES.file_index_status(schema);
   const reindexJobsTable = KNOWLEDGE_TABLES.reindex_jobs(schema);
 
   const sourceRows = await sql`
-    SELECT source FROM ${sql.unsafe(userSourcesTable)}
+    SELECT id, source FROM ${sql.unsafe(userSourcesTable)}
     WHERE user_id = ${userId} AND source = ${source}
     LIMIT 1
   `;
@@ -1864,7 +2848,18 @@ export async function purgeSource(
       error: `Source '${source}' не найден. Проверь list_sources.` };
   }
 
-  const [docResult, jobResult] = await Promise.all([
+  // Same lock order as the indexer/rebind: source, documents, status, jobs.
+  // Holding the source row until commit prevents an old queue job from repopulating a purge.
+  const [, docResult, , jobResult] = await sql.transaction([
+    sql`
+      SELECT 1 / (
+        SELECT COUNT(*) FROM (
+          SELECT id FROM ${sql.unsafe(userSourcesTable)}
+          WHERE user_id = ${userId} AND source = ${source} AND id = ${sourceRows[0].id}
+          FOR UPDATE
+        ) AS current_source
+      )::int AS source_fence
+    `,
     sql`
       WITH deleted AS (
         DELETE FROM ${sql.unsafe(documentsTable)}
@@ -1873,6 +2868,7 @@ export async function purgeSource(
       )
       SELECT COUNT(*)::int AS cnt FROM deleted
     `,
+    sql`DELETE FROM ${sql.unsafe(statusTable)} WHERE user_id = ${userId} AND source = ${source}`,
     sql`
       WITH deleted AS (
         DELETE FROM ${sql.unsafe(reindexJobsTable)}
@@ -1881,12 +2877,12 @@ export async function purgeSource(
       )
       SELECT COUNT(*)::int AS cnt FROM deleted
     `,
+    sql`DELETE FROM ${sql.unsafe(userSourcesTable)} WHERE user_id = ${userId} AND source = ${source}`,
+    ...(source.includes("/") && teamReposEnabled(env)
+      ? [sql`DELETE FROM knowledge.github_team_reindex_subscriptions
+               WHERE user_id = ${userId} AND source = ${source}`]
+      : []),
   ]);
-
-  await sql`
-    DELETE FROM ${sql.unsafe(userSourcesTable)}
-    WHERE user_id = ${userId} AND source = ${source}
-  `;
 
   return {
     source,

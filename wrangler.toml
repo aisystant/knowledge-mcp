@@ -15,6 +15,20 @@ KNOWLEDGE_DB_SCHEMA = "public"
 [triggers]
 crons = ["30 0 * * *", "*/15 * * * *"]  # WP-560 Ф11: + браузерные скиллы каждые 15 мин
 
+# WP-532 F9: batched full-ingest of oversized documents (FPF-Spec.md). Queues created 2026-09-29;
+# max_concurrency=2 keeps OpenRouter/DB load moderate. Kill switch: FULL_INGEST_DISABLED="true" (var).
+[[queues.producers]]
+queue = "full-ingest-batches"
+binding = "FULL_INGEST_QUEUE"
+
+[[queues.consumers]]
+queue = "full-ingest-batches"
+max_batch_size = 10
+max_batch_timeout = 5
+max_concurrency = 2
+max_retries = 5
+dead_letter_queue = "full-ingest-batches-dlq"
+
 # Secrets (set via `wrangler secret put`):
 # KNOWLEDGE_DATABASE_URL - Neon `knowledge` БД connection string. REQUIRED.
 #   Example: postgres://...@ep-dark-hall-ag8bo8lf-pooler.../knowledge?sslmode=require

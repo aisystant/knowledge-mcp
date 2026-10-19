@@ -75,6 +75,11 @@ export const KNOWLEDGE_TABLES = {
   documents: (schema: string) => qualifyTable("documents", schema),
   // WP-7 Ф97.2 (migration 021): per-file indexing status, queried by personal_index_status.
   file_index_status: (schema: string) => qualifyTable("file_index_status", schema),
+  // WP-532 Ф9 (migration 024): batched full-ingest for oversized platform documents
+  // (e.g. FPF-Spec.md) — draft rows written here, moved to knowledge_chunk only after
+  // every batch of a run is confirmed present (see syncFullIngestBatch in index.ts).
+  knowledge_chunk_staging: (schema: string) => qualifyTable("knowledge_chunk_staging", schema),
+  full_ingest_runs: (schema: string) => qualifyTable("full_ingest_runs", schema),
 };
 
 /**

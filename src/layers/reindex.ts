@@ -27,6 +27,7 @@ import {
   type PersonalEnv,
   type UserContext,
 } from "./personal.js";
+import { repositoryToken } from "./team-github.js";
 import {
   githubBranchApiUrl,
   githubContentsApiUrl,
@@ -57,9 +58,11 @@ interface ReindexRequest {
   user_id?: string;
   /**
    * Fencing token (WP-560 Ф3): the user_sources.index_generation this job was created for.
-   * null/undefined = legacy job without a generation (pre-migration-022), unfenced.
+   * Missing generation or job identity is rejected before any index mutation.
    */
   generation?: number | null;
+  /** Queue job identity prevents an old generation=1 job surviving purge/reconnect (ABA). */
+  job_id?: string;
 }
 
 interface ReindexFilesResult {
@@ -73,16 +76,20 @@ interface ReindexFilesResult {
 }
 
 /**
- * First statement of every publishing transaction of a fenced job. Divides by the number of
- * user_sources rows still at the job's generation: 1/0 raises inside the transaction, so the
- * whole batch rolls back — a superseded job cannot publish a single chunk, status row or delete
- * after purge+bump committed (WP-560 Ф3, DB-level equivalent of a row lock).
+ * Lock the source before touching chunks/status, in the same order as rebind and purge.
+ * A plain generation SELECT leaves a gap before the writes; FOR UPDATE holds the row until
+ * commit and rechecks the generation after waiting for a concurrent rebind. No matching row
+ * raises 1/0, rolling back a superseded job's whole publishing transaction.
  */
 function generationFence(sql: ReturnType<typeof personalDb>, userSourcesTable: string, userId: string, source: string, generation: number) {
   return sql`
     SELECT 1 / (
-      SELECT COUNT(*) FROM ${sql.unsafe(userSourcesTable)}
-      WHERE user_id = ${userId} AND source = ${source} AND index_generation = ${generation}
+      SELECT COUNT(*) FROM (
+        SELECT index_generation FROM ${sql.unsafe(userSourcesTable)}
+        WHERE user_id = ${userId} AND source = ${source} AND index_generation = ${generation}
+          AND active = true
+        FOR UPDATE
+      ) AS locked_source
     )::int AS fence
   `;
 }
@@ -95,18 +102,29 @@ function isFenceViolation(err: unknown): boolean {
 async function setSourceIndexState(
   sql: ReturnType<typeof personalDb>,
   userSourcesTable: string,
+  reindexJobsTable: string,
   userId: string,
   source: string,
   generation: number | null,
   state: "ready" | "failed",
+  jobId: string,
 ): Promise<void> {
   if (generation === null) return;
-  await sql`
+  await sql.transaction([
+    sql`SELECT source FROM ${sql.unsafe(userSourcesTable)}
+        WHERE user_id = ${userId} AND source = ${source} FOR UPDATE`,
+    sql`
     UPDATE ${sql.unsafe(userSourcesTable)}
     SET index_state = ${state}
     WHERE user_id = ${userId} AND source = ${source}
-      AND index_state = 'reindexing' AND index_generation = ${generation}
-  `;
+      AND active = true AND index_state = 'reindexing' AND index_generation = ${generation}
+      AND EXISTS (
+        SELECT 1 FROM ${sql.unsafe(reindexJobsTable)}
+        WHERE id = ${jobId}::uuid AND user_id = ${userId} AND source = ${source}
+          AND generation = ${generation}
+      )
+    `,
+  ]);
 }
 
 function generationColumn(value: unknown): number | null {
@@ -195,10 +213,13 @@ async function readFromGitHub(
   // source configuration must never reach the installation-token or Contents endpoints.
   const fullPath = resolveSourcePath(userSource.pathPrefix, path).fullPath;
 
-  const token = await getInstallationToken(env, ctx.userId, repo);
-  if (!token) return null;
+  const lease = await repositoryToken(env, ctx, source, "read", () => getInstallationToken(env, ctx.userId, repo));
+  if (!lease) return null;
+  const token = lease.token;
+  try {
 
   const resp = await fetch(githubContentsApiUrl(owner, repo, fullPath), {
+    redirect: "manual",
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github.raw+json",
@@ -208,6 +229,9 @@ async function readFromGitHub(
 
   if (!resp.ok) return null;
   return await resp.text();
+  } finally {
+    await lease.release();
+  }
 }
 
 /** Content hash for dedup — truncated to 16 chars, matches documents.hash VARCHAR(16). */
@@ -237,12 +261,20 @@ export async function personalReindexFiles(
   const documentsTable = KNOWLEDGE_TABLES.documents(schema);
   const statusTable = KNOWLEDGE_TABLES.file_index_status(schema);
   const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
+  const reindexJobsTable = KNOWLEDGE_TABLES.reindex_jobs(schema);
   const result: ReindexFilesResult = { processed: 0, deleted: 0, skipped: 0, errors: [], error_details: [], stale: false };
   const generation = req.generation ?? null;
 
   if (!req.user_id) {
     result.errors.push("Missing user_id: personal reindex requires authenticated user context");
     result.error_details.push({ path: "*", action: "n/a", reason: "missing user_id: authenticated user context required" });
+    return result;
+  }
+  if (generation === null || !req.job_id) {
+    const reason = "Missing job identity or generation: start a new reindex";
+    result.stale = true;
+    result.errors.push(reason);
+    result.error_details.push({ path: "*", action: "n/a", reason });
     return result;
   }
 
@@ -262,25 +294,31 @@ export async function personalReindexFiles(
   }
 
   // Cheap early exit; the transaction-level fence below is the actual guarantee.
-  if (generation !== null) {
-    const genRows = await sql`
-      SELECT index_generation FROM ${sql.unsafe(userSourcesTable)}
-      WHERE user_id = ${ctx.userId} AND source = ${req.source}
-      LIMIT 1
-    `;
-    if (generationColumn(genRows[0]?.index_generation) !== generation) {
-      result.stale = true;
-      return result;
-    }
+  const genRows = await sql`
+    SELECT index_generation FROM ${sql.unsafe(userSourcesTable)}
+    WHERE user_id = ${ctx.userId} AND source = ${req.source}
+    LIMIT 1
+  `;
+  if (generationColumn(genRows[0]?.index_generation) !== generation) {
+    result.stale = true;
+    return result;
   }
   const userId = ctx.userId;
   type PersonalQuery = ReturnType<typeof sql>;
   // Takes a factory so the fence is built (and, in tests, observed) strictly before the
   // statements it guards — mirroring its position as the first statement of the batch.
   const fenced = (build: () => PersonalQuery[]): PersonalQuery[] => {
-    if (generation === null) return build();
     const fence = generationFence(sql, userSourcesTable, userId, req.source, generation);
-    return [fence, ...build()];
+    // A separate statement starts a fresh READ COMMITTED snapshot AFTER acquiring the
+    // source lock. A pre-wait snapshot could still see a job removed by purge/reconnect.
+    const jobFence = sql`
+      SELECT 1 / (
+        SELECT COUNT(*) FROM ${sql.unsafe(reindexJobsTable)}
+        WHERE id = ${req.job_id}::uuid AND user_id = ${userId} AND source = ${req.source}
+          AND generation = ${generation} AND status = 'running'
+      )::int AS job_fence
+    `;
+    return [fence, jobFence, ...build()];
   };
 
   for (const file of req.files) {
@@ -433,7 +471,7 @@ export function relativeMarkdownPathsFromTree(
  */
 async function listMdFilesViaTrees(env: ReindexEnv, ctx: UserContext, source: string): Promise<string[]> {
   const userSource = ctx.sources.find((s) => s.source === source);
-  if (!userSource) return [];
+  if (!userSource) throw new Error("Cannot enumerate repository: source is unavailable");
 
   // Validate the configured source boundary before token acquisition or GitHub metadata calls.
   // Keep the canonical prefix for the later tree-boundary filter.
@@ -443,39 +481,51 @@ async function listMdFilesViaTrees(env: ReindexEnv, ctx: UserContext, source: st
       ? normalizeRepositoryPath(userSource.pathPrefix)
       : "";
   } catch {
-    return [];
+    throw new Error("Cannot enumerate repository: invalid source path prefix");
   }
 
-  const token = await getInstallationToken(env, ctx.userId, userSource.githubRepo);
-  if (!token) return [];
+  const lease = await repositoryToken(env, ctx, source, "read", () => getInstallationToken(env, ctx.userId, userSource.githubRepo));
+  if (!lease) throw new Error("Cannot enumerate repository: GitHub user access unavailable");
+  const token = lease.token;
+  try {
 
   const repoResp = await fetch(`https://api.github.com/repos/${userSource.githubOwner}/${userSource.githubRepo}`, {
+    redirect: "manual",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
   });
-  if (!repoResp.ok) return [];
-  const repoJson = (await repoResp.json()) as { default_branch?: string };
+  if (!repoResp.ok) throw new Error(`Cannot enumerate repository: GitHub metadata request failed (${repoResp.status})`);
+  const repoJson = (await repoResp.json()) as { default_branch?: string | null; id?: number; empty?: boolean; size?: number };
+  if (lease.repositoryId !== undefined && repoJson.id !== lease.repositoryId) {
+    throw new Error("Cannot enumerate repository: identity changed");
+  }
   const branch = repoJson.default_branch;
-  if (!branch) return [];
+  if (lease.repositoryId !== undefined && !branch && (repoJson.size === 0 || repoJson.empty === true)) return [];
+  if (typeof branch !== "string" || !branch) throw new Error("Cannot enumerate repository: missing default branch");
 
   const branchResp = await fetch(githubBranchApiUrl(userSource.githubOwner, userSource.githubRepo, branch), {
+    redirect: "manual",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
   });
-  if (!branchResp.ok) return [];
+  if (!branchResp.ok) throw new Error(`Cannot enumerate repository: GitHub branch request failed (${branchResp.status})`);
   const branchJson = (await branchResp.json()) as { commit?: { sha?: string } };
   const commitSha = branchJson.commit?.sha;
-  if (!commitSha) return [];
+  if (typeof commitSha !== "string" || !commitSha) throw new Error("Cannot enumerate repository: missing branch commit");
 
   const treeResp = await fetch(`https://api.github.com/repos/${userSource.githubOwner}/${userSource.githubRepo}/git/trees/${encodeURIComponent(commitSha)}?recursive=1`, {
+    redirect: "manual",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
   });
-  if (!treeResp.ok) return [];
+  if (!treeResp.ok) throw new Error(`Cannot enumerate repository: GitHub tree request failed (${treeResp.status})`);
   const treeJson = (await treeResp.json()) as { tree?: GitHubTreeEntry[]; truncated?: boolean };
-  if (!treeJson.tree) return [];
+  if (!Array.isArray(treeJson.tree)) throw new Error("Cannot enumerate repository: missing or invalid GitHub tree");
 
   if (treeJson.truncated) {
-    console.warn(`listMdFilesViaTrees: tree truncated for ${source} (>100k entries)`);
+    throw new Error("Cannot enumerate repository: GitHub tree is truncated; complete indexing cannot be guaranteed");
   }
   return relativeMarkdownPathsFromTree(treeJson.tree, normalizedPrefix);
+  } finally {
+    await lease.release();
+  }
 }
 
 // --- Reindex jobs: producer + status (faithful port of index.ts:2495-2660) ---
@@ -522,7 +572,7 @@ async function enqueueReindexBatches(
       SET status = 'succeeded', finished_at = NOW()
       WHERE id = ${jobId}::uuid`;
     if (kind === "full") {
-      await setSourceIndexState(sql, userSourcesTable, userId, source, generation, "ready");
+      await setSourceIndexState(sql, userSourcesTable, reindexJobsTable, userId, source, generation, "ready", jobId);
     }
     return { job_id: jobId, status: "running", message: `No files to reindex for ${source}.`, source };
   }
@@ -590,21 +640,23 @@ export async function startReindexJob(
   // a diagnosable state: job 'failed' + source 'failed' (fenced on the job's own generation).
   const failPreCreatedJob = async (reason: string): Promise<void> => {
     if (!options.jobId) return;
-    await sql`
-      UPDATE ${sql.unsafe(reindexJobsTable)}
-      SET status = 'failed', finished_at = NOW(), errors = ${JSON.stringify([reason])}::jsonb
-      WHERE id = ${options.jobId}::uuid AND status = 'pending'
-    `.catch((cleanupErr: unknown) => {
-      console.error(JSON.stringify({ phase: "pre_created_job_fail_cleanup_failed", job_id: options.jobId, source, error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) }));
-    });
-    await sql`
+    await sql.transaction([
+      sql`SELECT source FROM ${sql.unsafe(userSourcesTable)}
+          WHERE user_id = ${userId} AND source = ${source} FOR UPDATE`,
+      sql`
+        UPDATE ${sql.unsafe(reindexJobsTable)}
+        SET status = 'failed', finished_at = NOW(), errors = ${JSON.stringify([reason])}::jsonb
+        WHERE id = ${options.jobId}::uuid AND user_id = ${userId} AND source = ${source} AND status = 'pending'
+      `,
+      sql`
       UPDATE ${sql.unsafe(userSourcesTable)} u
       SET index_state = 'failed'
       FROM ${sql.unsafe(reindexJobsTable)} j
       WHERE j.id = ${options.jobId}::uuid AND j.user_id = u.user_id AND j.source = u.source
         AND u.index_state = 'reindexing' AND u.index_generation = j.generation
-    `.catch((cleanupErr: unknown) => {
-      console.error(JSON.stringify({ phase: "pre_created_job_source_fail_cleanup_failed", job_id: options.jobId, source, error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) }));
+      `,
+    ]).catch((cleanupErr: unknown) => {
+      console.error(JSON.stringify({ phase: "pre_created_job_fail_cleanup_failed", job_id: options.jobId, source, error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) }));
     });
   };
 
@@ -647,6 +699,7 @@ export async function startReindexJob(
           SELECT ${userId}, ${source}, 'pending', index_generation
           FROM ${sql.unsafe(userSourcesTable)}
           WHERE user_id = ${userId} AND source = ${source}
+          FOR UPDATE
           RETURNING id, generation, status
         `;
   } catch (err) {
@@ -701,7 +754,7 @@ export async function startReindexJob(
           errors = ${JSON.stringify([msg])}::jsonb
       WHERE id = ${jobId}::uuid`;
     // Fail-closed stays visible as 'failed', never silently 'ready' (WP-560 Ф3).
-    await setSourceIndexState(sql, userSourcesTable, userId, source, generation, "failed");
+    await setSourceIndexState(sql, userSourcesTable, reindexJobsTable, userId, source, generation, "failed", jobId);
     return { job_id: jobId, status: "failed", message: `Failed to start reindex: ${msg}`, source };
   }
 }
@@ -737,6 +790,14 @@ export async function startIncrementalReindexJob(
   const schema = getKnowledgeSchema(env);
   const reindexJobsTable = KNOWLEDGE_TABLES.reindex_jobs(schema);
   const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
+
+  if (source.includes("/")) {
+    const context = await resolveUserContext(env, userId);
+    const lease = await repositoryToken(env, context, source, "read", async () => null);
+    if (!lease) return { status: "skipped", reason: "github_permission_removed",
+      message: "GitHub access to this team repository is no longer available" };
+    await lease.release();
+  }
 
   const indexable: { path: string; action: "modified" | "removed" }[] = [];
   const rejected: string[] = [];
@@ -781,6 +842,7 @@ export async function startIncrementalReindexJob(
       FROM ${sql.unsafe(userSourcesTable)}
       WHERE user_id = ${userId} AND source = ${source}
         AND active = true AND auto_reindex_enabled = true
+      FOR UPDATE
       RETURNING id, generation
     `;
   } catch (err) {
@@ -872,7 +934,9 @@ export async function getReindexJobStatus(env: ReindexEnv, userId: string, jobId
  * same batch produces zero embeddings and zero INSERTs (skipped++). Ack/retry is per-message
  * (msg.ack() / msg.retry()), so a poison file cannot block the whole job.
  *
- * Completion: completed_batches = expected_batches → status='succeeded'. handleWatchdog (below)
+ * Completion: all batches finished → 'succeeded' only when the accumulated errors are empty,
+ * otherwise 'failed'. Per-file failures are acknowledged, not retried indefinitely; successful
+ * files and previously indexed versions remain intact. handleWatchdog (below)
  * marks stale 'running' jobs failed after NOW() - last_heartbeat_at > 60min — not wired to a
  * cron trigger yet (Деплой-2 группа В).
  */
@@ -916,8 +980,21 @@ export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env:
       }
 
       const generation = generationColumn(jobRows[0].generation);
+      if (generation === null) {
+        // Pre-migration jobs cannot establish which repository identity they belong to.
+        // Never publish them unfenced; a new explicit reindex creates a current-generation job.
+        await sql`
+          UPDATE ${sql.unsafe(KNOWLEDGE_TABLES.reindex_jobs(schema))}
+          SET status = 'cancelled', finished_at = NOW(),
+              errors = COALESCE(errors, '[]'::jsonb) || '["missing_generation: start a new reindex"]'::jsonb
+          WHERE id = ${job_id}::uuid AND status = 'running'
+        `;
+        console.warn(JSON.stringify({ phase: "consume_skip", reason: "missing_generation", job_id }));
+        msg.ack();
+        continue;
+      }
       const jobKind = (jobRows[0].kind as string) === "full" ? "full" : "incremental";
-      const result = await personalReindexFiles(env, { source, files, user_id, generation });
+      const result = await personalReindexFiles(env, { source, files, user_id, generation, job_id });
 
       if (result.stale) {
         // Superseded by a newer generation (rebind): drop the batch, never retry it, and
@@ -948,7 +1025,7 @@ export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env:
               last_heartbeat_at = NOW(),
               errors = COALESCE(errors, '[]'::jsonb) || ${errorsJson}::jsonb
           WHERE id = ${job_id}::uuid AND NOT (${batch_index} = ANY(completed_batch_indexes))
-          RETURNING completed_batches, expected_batches
+          RETURNING completed_batches, expected_batches, errors
       `;
 
       if (updated.length === 0) {
@@ -957,18 +1034,26 @@ export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env:
         continue;
       }
 
-      const { completed_batches, expected_batches } = updated[0] as { completed_batches: number; expected_batches: number | null };
+      const { completed_batches, expected_batches, errors } = updated[0] as {
+        completed_batches: number;
+        expected_batches: number | null;
+        errors: string[] | null;
+      };
       if (expected_batches !== null && completed_batches >= expected_batches) {
+        // Use errors accumulated by the atomic UPDATE, not just this batch's result: the
+        // final batch can succeed after an earlier one failed. Keep the existing status enum.
+        const completionStatus = errors?.length ? "failed" : "succeeded";
         await sql`
           UPDATE ${sql.unsafe(KNOWLEDGE_TABLES.reindex_jobs(schema))}
-            SET status = 'succeeded', finished_at = NOW()
+            SET status = ${completionStatus}, finished_at = NOW()
             WHERE id = ${job_id}::uuid AND status = 'running'
         `;
         // Only a full-tree rebuild may declare the source's index 'ready' — an incremental
         // (webhook push) job completing must never flip index_state, or a fast push-triggered
         // job could mark 'ready' while an unrelated full rebuild is still mid-flight (WP-545 Ф13).
         if (jobKind === "full") {
-          await setSourceIndexState(sql, userSourcesTable, user_id, source, generation, "ready");
+          await setSourceIndexState(sql, userSourcesTable, KNOWLEDGE_TABLES.reindex_jobs(schema), user_id, source, generation,
+            completionStatus === "succeeded" ? "ready" : "failed", job_id);
         }
       }
 
@@ -1052,7 +1137,7 @@ export async function handleWatchdog(env: ReindexEnv): Promise<void> {
     // whose full index is actually fine.
     for (const r of [...stale, ...abandoned]) {
       if ((r.kind as string) !== "full") continue;
-      await setSourceIndexState(sql, KNOWLEDGE_TABLES.user_sources(schema), r.user_id as string, r.source as string, generationColumn(r.generation), "failed");
+      await setSourceIndexState(sql, KNOWLEDGE_TABLES.user_sources(schema), KNOWLEDGE_TABLES.reindex_jobs(schema), r.user_id as string, r.source as string, generationColumn(r.generation), "failed", r.id as string);
     }
     console.log(JSON.stringify({
       phase: "watchdog_ok",

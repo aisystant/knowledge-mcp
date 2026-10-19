@@ -59,6 +59,13 @@ export function githubContentsApiUrl(owner: string, repo: string, path: string):
   return `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
 }
 
+/** GitHub commits endpoint filtered to one file's path — history for a file, most recent
+ * first (WP-7 Ф176: recovery path after an accidental overwrite). */
+export function githubCommitsApiUrl(owner: string, repo: string, path: string, perPage: number): string {
+  const encodedPath = encodeURIComponent(normalizeRepositoryPath(path));
+  return `https://api.github.com/repos/${owner}/${repo}/commits?path=${encodedPath}&per_page=${perPage}`;
+}
+
 /** GitHub branch endpoint; a legal slash in the branch name belongs to one URL segment. */
 export function githubBranchApiUrl(owner: string, repo: string, branch: string): string {
   if (!branch) throw new Error("GitHub branch must be non-empty");

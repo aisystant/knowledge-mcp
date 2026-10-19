@@ -1,3 +1,7 @@
+import { ReadFailure, withReadDeadline, readJson, createReadTrace, type ReadTrace } from "./read-failure.js";
+import { normalizeSearchResultLimit, SEARCH_RESULT_LIMIT_MAX } from "./search-limits.js";
+import { buildPrivateDocumentResponse, buildPrivateSearchResponse, enforcePrivateReadBudget, privateReadError, privateReadIdError, validateDocumentPageRequest } from "./personal-response-bounds.js";
+export { normalizeSearchResultLimit } from "./search-limits.js";
 /**
  * Knowledge MCP Server v4.1 — L2 Platform — Hybrid Search + Parent Retrieval + LLM Reranking + Feedback Loop
  *
@@ -12,7 +16,7 @@
  * - Vector low confidence (score < 0.6) → fallback to keyword + merge
  */
 
-import { neon, type Pool } from "@neondatabase/serverless";
+import { neon, type NeonQueryFunction, type Pool } from "@neondatabase/serverless";
 import { withUserContext, createRequestPool } from "./rls.js";
 import { beginObservation, enqueueObservation, recordObservationFeedback, expireObservations,
   type ObservationEnv, type ObservationRuntime } from "./retrieval-observations.js";
@@ -29,14 +33,18 @@ import { resolveMode, type McpMode } from "./mode.js";
 import { isToolAllowedInMode, JwtScopeGuard, ScopeDeniedError, PRIVATE_TOOL_NAMES, DUAL_MODE_TOOL_NAMES } from "./layers/private.js";
 import { provisionBridgeScopes } from "./scope.js";
 import { verifyJwtLocally, secretsEqual } from "./auth.js";
+import { fetchGitHubApi } from "./github-api.js";
 import {
   resolveUserContext,
   writeToGitHub,
   deleteFromGitHub,
-  allocatePostNumber,
+  createPersonalPost,
   personalSearchDocuments,
   personalGetDocument,
   personalGetDocumentWithSha,
+  personalGetDocumentHistory,
+  appendToGitHub,
+  strReplaceInGitHub,
   AmbiguousSourceError,
   personalListSources,
   personalListDocuments,
@@ -84,13 +92,38 @@ export interface Env extends ObservationEnv {
   SCOPE_GUARD_MODE?: string;
   GITHUB_APP_ID?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
+  /** Disabled by default until the team-repository acceptance gate is complete. */
+  GITHUB_TEAM_REPOS_ENABLED?: string;
+  GITHUB_INTEGRATION_URL?: string;
+  GITHUB_BROKER_SHARED_SECRET?: string;
+  /** WP-532 Ф9 follow-up (2026-10-01): optional token for api.github.com reads of the platform
+   *  sources (tree listing, blobs). Read access to public repositories is enough. Without it the
+   *  worker shares the anonymous 60/h quota of its egress address and the heartbeats starve. */
+  GITHUB_TOKEN?: string;
   // WP-545 Ф5: service-to-service secret for /reindex-full and /provision-bridge-scopes,
   // carried over from personal-knowledge-mcp (inherit-secrets cut-over — already live on
   // the worker, these two routes just never read it in the unified tree until now).
   INTERNAL_SERVICE_SECRET?: string;
+  // WP-7 Ф190: credentials of platform callers (gateway, n8n) that may call the learner tools
+  // without a user token, as comma-separated "name:secret" pairs so each can be revoked alone.
+  LEARNER_TOOLS_SERVICE_SECRETS?: string;
+  // "enforce": the learner tools refuse callers that present neither a verified JWT nor a
+  // service credential. Anything else (unset, "off"): observe only.
+  LEARNER_TOOLS_SERVICE_AUTH?: string;
   // WP-410 срез-2b Деплой-2 группа Б: reindex queue producer/consumer binding, same queue name
   // ("reindex") the personal-knowledge-mcp worker already runs under (inherit-secrets cut-over).
   REINDEX_QUEUE?: Queue<ReindexBatchMessage>;
+  // WP-532 Ф9: separate queue for batched full-ingest of oversized platform documents
+  // (e.g. FPF-Spec.md). Not REINDEX_QUEUE — that one is fenced on user_id/index_generation
+  // for personal sources; this path has no user, only a source+document_path pair, and
+  // its own single-writer guarantee lives in full_ingest_runs (migration 024), not a
+  // per-user fence. Optional: code degrades to logging-and-skipping oversized files when
+  // unbound, same pattern as REINDEX_QUEUE above — provisioning the actual Cloudflare
+  // Queue and wiring [[queues]] in wrangler.toml is a deploy-time step, not done by this
+  // change (see PR description).
+  FULL_INGEST_QUEUE?: Queue<FullIngestBatchMessage>;
+  /** WP-532 Ф9 kill switch: "true" stops NEW batched full-ingest runs (see fullIngestDisabled). */
+  FULL_INGEST_DISABLED?: string;
   /** Watchdog stale-job threshold override, minutes. Default 30 (see reindex.ts). Деплой-2 группа В. */
   WATCHDOG_STALE_MINUTES?: string;
 }
@@ -111,7 +144,7 @@ interface McpRequest {
 
 interface McpResponse {
   jsonrpc: "2.0";
-  id: string | number;
+  id: string | number | null;
   result?: unknown;
   error?: { code: number; message: string };
 }
@@ -180,6 +213,50 @@ const LARGE_FILE_THRESHOLD = CHUNK_CHAR_LIMIT;
 const MAX_FILE_CHARS = 1_000_000;
 
 /**
+ * WP-604 Ф14 (2026-10-19) — temporary deny-list, not a real ACL.
+ *
+ * Every row in knowledge_chunk with account_id IS NULL is returned by every
+ * platform-pool read path (search, get_document, list_sources, list_documents,
+ * list_path, the resolveDocument alias lookup) with no per-source authorization
+ * check — account_id IS NULL only distinguishes "platform pool" from "personal",
+ * not "this source was ever approved for anonymous/third-party readers" within
+ * the platform pool. Confirmed by a live negative probe 2026-10-19 (clean
+ * third-party account, no rights on any of these sources, still got full
+ * document text back through knowledge_search).
+ *
+ * This list hides these sources from every platform-pool read path below
+ * until Ф8' replaces it with real per-source ACL (see WP-604 card, "Фазы
+ * реализации"). Seven sources are the closed repositories inventoried in
+ * `inbox/WP-604/f13-evidence-2026-10-17.md` §2-4 whose publication decision is
+ * unconfirmed; `club-tseren-tserenov` is the pilot's personal Discourse export
+ * (see scripts/club-etl.py) misfiled with account_id IS NULL by the same class
+ * of bug, not a GitHub repository.
+ *
+ * Removing an entry here before Ф8' ships is a product decision (pilot signs
+ * off on each source's publication status, WP-604 "Открытое решение"), not a
+ * code change.
+ */
+export const PLATFORM_DENY_SOURCES = [
+  "DS-autonomous-agents",
+  "DS-ecosystem-development",
+  "PACK-agent-rules",
+  "PACK-autonomous-agents",
+  "PACK-engineering-management",
+  "PACK-systems-art",
+  "PACK-verification",
+  "club-tseren-tserenov",
+] as const;
+
+/** True when `source` must be hidden from platform-pool (account_id IS NULL) reads. */
+export function isPlatformDeniedSource(source: string | null | undefined): boolean {
+  return source != null && (PLATFORM_DENY_SOURCES as readonly string[]).includes(source);
+}
+
+// Plain mutable array for `= ANY($1::text[])` query params — the SQL client
+// takes `unknown[]`, and every call site below needs this shape once.
+const PLATFORM_DENY_SOURCES_PARAM: string[] = [...PLATFORM_DENY_SOURCES];
+
+/**
  * Pure size-admission check for reindexFiles(), split out so the policy is
  * unit-testable without the DB/GitHub/embedding side effects of the caller.
  * Returns a human-readable reason when the file is rejected, null when it's
@@ -200,9 +277,9 @@ const RERANK_LLM_WEIGHT = 0.7;
 // GitHub URL mapping: source name → base URL + path prefix.
 // Enables clickable source links in search results.
 const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> = {
-  "PACK-digital-platform": { base: "https://github.com/TserenTserenov/PACK-digital-platform/blob/main", pathPrefix: "pack/" },
+  "PACK-digital-platform": { base: "https://github.com/MimEcoSys/PACK-digital-platform/blob/main", pathPrefix: "pack/" },
   "PACK-personal": { base: "https://github.com/aisystant/PACK-personal/blob/main", pathPrefix: "pack/" },
-  "PACK-MIM": { base: "https://github.com/TserenTserenov/PACK-MIM/blob/main", pathPrefix: "pack/" },
+  "PACK-MIM": { base: "https://github.com/MimEcoSys/PACK-MIM/blob/main", pathPrefix: "pack/" },
   "SPF": { base: "https://github.com/TserenTserenov/SPF/blob/main", pathPrefix: "" },
   "FPF": { base: "https://github.com/ailev/FPF/blob/main", pathPrefix: "" },
   "DS-ecosystem-development": { base: "https://github.com/aisystant/DS-ecosystem-development/blob/main", pathPrefix: "" },
@@ -213,7 +290,7 @@ const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> =
   "FMT-exocortex-template": { base: "https://github.com/TserenTserenov/FMT-exocortex-template/blob/main", pathPrefix: "" },
   "FMT-s2r": { base: "https://github.com/TserenTserenov/FMT-s2r/blob/main", pathPrefix: "" },
   "DS-autonomous-agents": { base: "https://github.com/TserenTserenov/DS-autonomous-agents/blob/main", pathPrefix: "" },
-  "PACK-ecosystem": { base: "https://github.com/TserenTserenov/PACK-ecosystem/blob/main", pathPrefix: "pack/" },
+  "PACK-ecosystem": { base: "https://github.com/MimEcoSys/PACK-ecosystem/blob/main", pathPrefix: "pack/" },
   // WP-532 (2026-09-02): PACK-rhetoric is public — safe to add via the unauthenticated
   // readFromGitHubPublic() fetch this map feeds. PACK-systems-art, PACK-agent-rules,
   // PACK-verification and PACK-autonomous-agents (WP-545, 2026-09-10: the latter two
@@ -246,11 +323,96 @@ export function resolveGithubUrl(source: string, filename: string): string | nul
 
 // --- Helpers ---
 
-async function fetchEmbeddingOnce(apiKey: string, text: string): Promise<number[]> {
+const EMBEDDING_ENDPOINT = "https://openrouter.ai/api/v1/embeddings";
+
+// WP-7 F183: from a provider error body only a machine code reaches the log
+// (word chars, dots, hyphens). The free-text message is never logged, even
+// truncated: a provider can fill it with reflected data (cold review, Codex).
+// The body length is logged instead, to show the response shape.
+// The same discipline applies to every value the provider controls:
+// requestId/cfRay are kept only when they look like an identifier (else null),
+// statusText comes from a local table keyed by the numeric status.
+const SAFE_ERROR_CODE_RE = /^[\w.\-]{1,100}$/;
+const SAFE_REQUEST_ID_RE = /^[\w.\-]{1,128}$/;
+const SAFE_CF_RAY_RE = /^[\w.\-]{1,64}$/;
+const STATUS_TEXT_BY_CODE: Readonly<Record<number, string>> = {
+  400: "Bad Request",
+  401: "Unauthorized",
+  403: "Forbidden",
+  404: "Not Found",
+  408: "Request Timeout",
+  409: "Conflict",
+  429: "Too Many Requests",
+  500: "Internal Server Error",
+  502: "Bad Gateway",
+  503: "Service Unavailable",
+  504: "Gateway Timeout",
+};
+
+function safeHeaderValue(value: string | null | undefined, pattern: RegExp): string | null {
+  return value && pattern.test(value) ? value : null;
+}
+
+// Last line of defence: a shape regex cannot stop a reflected secret such as
+// "sk-secret-echo", so every provider-controlled string is also checked against
+// both secrets (the API key and the embedding input) before it is logged.
+// A value is treated as an echo when it contains the whole secret, is itself a
+// substring of the secret, or shares a LEAK_WINDOW-char window with it. The
+// window slides by 1, so a fragment that straddles a block boundary is caught.
+// The threshold is deliberate: a wrapper sharing fewer than LEAK_WINDOW chars
+// with a secret is not treated as a leak (short overlaps are coincidence for
+// identifiers). One rule for both secrets.
+const LEAK_WINDOW = 16;
+
+function echoesSecret(value: string, secret: string): boolean {
+  if (!secret) return false;
+  if (value.includes(secret) || secret.includes(value)) return true;
+  // "value contains a window of the secret" is the same statement as "a window of
+  // the value occurs in the secret". Sliding over the short value (<=128 chars)
+  // bounds the number of windows and allocations by the value, not by the secret.
+  // Each includes() over a huge secret is still linear, so an unbounded query is
+  // a cost to cap upstream, not here.
+  for (let i = 0; i + LEAK_WINDOW <= value.length; i++) {
+    if (secret.includes(value.slice(i, i + LEAK_WINDOW))) return true;
+  }
+  return false;
+}
+
+function containsSensitiveFragment(value: string, apiKey: string, text: string): boolean {
+  return !!value && (echoesSecret(value, apiKey) || echoesSecret(value, text));
+}
+
+function extractEmbeddingErrorCode(errText: string): string | null {
+  try {
+    const parsed = JSON.parse(errText) as { error?: { code?: unknown } };
+    const code = parsed.error?.code;
+    // A numeric code goes through the same charset filter as a string one:
+    // String(1e100) is "1e+100", and "+" is outside the allowed set.
+    const asText = typeof code === "number" ? String(code) : code;
+    return typeof asText === "string" && SAFE_ERROR_CODE_RE.test(asText) ? asText : null;
+  } catch {
+    return null;
+  }
+}
+
+function classifyEmbeddingHttpStatus(status: number): EmbeddingFailureReason {
+  if (status >= 400 && status < 500) return "http_4xx";
+  if (status >= 500) return "http_5xx";
+  return "http_other";
+}
+
+class EmbeddingHttpError extends Error {
+  constructor(readonly status: number, readonly requestId: string | null, message: string) {
+    super(message);
+    this.name = "EmbeddingHttpError";
+  }
+}
+
+async function fetchEmbeddingOnce(apiKey: string, text: string, attempt: number): Promise<number[]> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), EMBEDDING_TIMEOUT_MS);
   try {
-    const response = await fetch("https://openrouter.ai/api/v1/embeddings", {
+    const response = await fetch(EMBEDDING_ENDPOINT, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -265,8 +427,38 @@ async function fetchEmbeddingOnce(apiKey: string, text: string): Promise<number[
     });
 
     if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`OpenAI Embeddings error: ${response.status} ${errText}`);
+      // Read the body defensively: the log and status/requestId must materialise
+      // even when response.text() rejects.
+      const errText = await response.text().catch(() => "");
+      // WP-7 F183: before this log an embedding failure had no diagnostic field at
+      // all, so a production 403 could not be traced. requestId comes only from
+      // OpenRouter headers; cf-ray is a separate field (a Cloudflare ray is not a
+      // request id in the OpenRouter dashboard). Neither the embedding input nor
+      // the apiKey is logged, and the raw provider body reaches neither the log
+      // nor the error text.
+      const rawRequestId =
+        safeHeaderValue(response.headers?.get?.("x-openrouter-request-id"), SAFE_REQUEST_ID_RE) ??
+        safeHeaderValue(response.headers?.get?.("x-request-id"), SAFE_REQUEST_ID_RE);
+      const rawCfRay = safeHeaderValue(response.headers?.get?.("cf-ray"), SAFE_CF_RAY_RE);
+      const rawErrorCode = extractEmbeddingErrorCode(errText);
+      const requestId = rawRequestId && !containsSensitiveFragment(rawRequestId, apiKey, text) ? rawRequestId : null;
+      const cfRay = rawCfRay && !containsSensitiveFragment(rawCfRay, apiKey, text) ? rawCfRay : null;
+      const errorCode = rawErrorCode && !containsSensitiveFragment(rawErrorCode, apiKey, text) ? rawErrorCode : null;
+      console.error(JSON.stringify({
+        event: "embedding_http_error",
+        provider: "openrouter",
+        model: EMBEDDING_MODEL,
+        status: response.status,
+        statusText: STATUS_TEXT_BY_CODE[response.status] ?? null,
+        errorCategory: classifyEmbeddingHttpStatus(response.status),
+        attempt,
+        requestId,
+        cfRay,
+        url: EMBEDDING_ENDPOINT,
+        errorCode,
+        errorBodyLength: errText.length,
+      }));
+      throw new EmbeddingHttpError(response.status, requestId, `OpenRouter embeddings error: ${response.status}`);
     }
 
     const data = (await response.json()) as { data: { embedding: number[] }[] };
@@ -279,7 +471,12 @@ async function fetchEmbeddingOnce(apiKey: string, text: string): Promise<number[
 type EmbeddingFailureReason = "timeout" | "http_4xx" | "http_5xx" | "http_other" | "request_error";
 
 class EmbeddingUnavailableError extends Error {
-  constructor(readonly reason: EmbeddingFailureReason, cause: unknown) {
+  constructor(
+    readonly reason: EmbeddingFailureReason,
+    cause: unknown,
+    readonly status: number | null = null,
+    readonly requestId: string | null = null,
+  ) {
     super(`Embedding service unavailable after retry (${reason})`, { cause });
     this.name = "EmbeddingUnavailableError";
   }
@@ -288,8 +485,12 @@ class EmbeddingUnavailableError extends Error {
 function classifyEmbeddingFailure(error: unknown): EmbeddingFailureReason {
   if (error instanceof DOMException && error.name === "AbortError") return "timeout";
 
+  if (error instanceof EmbeddingHttpError) {
+    return classifyEmbeddingHttpStatus(error.status);
+  }
+
   const message = error instanceof Error ? error.message : "";
-  const statusMatch = message.match(/^OpenAI Embeddings error: (\d{3})\b/);
+  const statusMatch = message.match(/^OpenRouter embeddings error: (\d{3})\b/);
   if (statusMatch) {
     if (statusMatch[1].startsWith("4")) return "http_4xx";
     if (statusMatch[1].startsWith("5")) return "http_5xx";
@@ -302,12 +503,14 @@ function classifyEmbeddingFailure(error: unknown): EmbeddingFailureReason {
 // One retry: OpenRouter embeddings occasionally hangs past EMBEDDING_TIMEOUT_MS (issue #231).
 export async function getEmbedding(apiKey: string, text: string): Promise<number[]> {
   try {
-    return await fetchEmbeddingOnce(apiKey, text);
+    return await fetchEmbeddingOnce(apiKey, text, 1);
   } catch {
     try {
-      return await fetchEmbeddingOnce(apiKey, text);
+      return await fetchEmbeddingOnce(apiKey, text, 2);
     } catch (error) {
-      throw new EmbeddingUnavailableError(classifyEmbeddingFailure(error), error);
+      const status = error instanceof EmbeddingHttpError ? error.status : null;
+      const requestId = error instanceof EmbeddingHttpError ? error.requestId : null;
+      throw new EmbeddingUnavailableError(classifyEmbeddingFailure(error), error, status, requestId);
     }
   }
 }
@@ -390,14 +593,7 @@ export type SearchResult = {
 
 const SEARCH_RESPONSE_EXCERPT_CHARACTERS = 2_000;
 const SEARCH_RESPONSE_TRUNCATION_MARKER = "\n\n...[truncated; use get_document for the full document]";
-const SEARCH_RESULT_LIMIT_MAX = 20;
 export const SEARCH_TOOL_RESPONSE_BUDGET_BYTES = 32_000;
-
-export function normalizeSearchResultLimit(limit: number): number {
-  return Number.isFinite(limit)
-    ? Math.min(Math.max(Math.trunc(limit), 1), SEARCH_RESULT_LIMIT_MAX)
-    : 5;
-}
 
 function searchResponseExcerpt(
   value: string | undefined,
@@ -634,6 +830,7 @@ export async function resolveDocument(
                1.0 AS score
         FROM ${sql.unsafe(knowledgeChunkTable)}
         WHERE account_id IS NULL
+          AND NOT (source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
           AND parent_chunk_id IS NULL
           AND source_uri NOT LIKE '%::%'
           AND source = ${referenceAlias.source}
@@ -674,6 +871,7 @@ export async function resolveDocument(
                ) AS title
         FROM ${sql.unsafe(knowledgeChunkTable)}
         WHERE account_id IS NULL
+          AND NOT (source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
           AND parent_chunk_id IS NULL
           AND source_uri NOT LIKE '%::%'
           AND (${src}::text IS NULL OR source = ${src})
@@ -721,7 +919,8 @@ async function keywordSearch(
   sourceType?: string,
   limit: number = 5,
   userId?: string,
-  pool?: Pool
+  pool?: Pool,
+  trace?: ReadTrace
 ): Promise<SearchResult[]> {
   const src = source ?? null;
   const stype = sourceType ?? null;
@@ -738,58 +937,48 @@ async function keywordSearch(
     : null;
   const sectionPattern = sectionRest ? `%${sectionRest}%` : null;
 
-  // WP-268: knowledge_chunk schema. Aliases preserve external API contract:
-  //   legacy_id AS id, source_uri AS filename, source_kind AS source_type
-  // WP-410 Ф-knowledge-cleanup: public knowledge-mcp serves PLATFORM docs only.
-  //   account_id IS NULL = platform doc (visible to all). Personal docs (account_id set)
-  //   are served exclusively by personal-knowledge-mcp, never here — even with a token.
+  // Migration 029 exposes only platform candidates (account_id IS NULL), so GIN
+  // can filter before heap reads without broadening the worker's RLS privileges.
+  // The function keeps ranking and the global limit before materialization; its
+  // sort keys preserve the original order after truncating response excerpts.
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
-    SELECT legacy_id AS id, source_uri AS filename,
+    SELECT candidates.id, candidates.filename, candidates.content, candidates.source,
+           candidates.source_type, candidates.score,
            CASE WHEN ${["hash", "platform-text"].includes(env.RETRIEVAL_OBSERVATION_MODE ?? "")}
-                THEN encode(sha256(convert_to(content, 'UTF8')), 'hex') END AS indexed_content_hash,
-           CASE WHEN length(content) > ${SEARCH_RESPONSE_EXCERPT_CHARACTERS}
-                THEN left(content, ${SEARCH_RESPONSE_EXCERPT_CHARACTERS}) || ${SEARCH_RESPONSE_TRUNCATION_MARKER}
-                ELSE content END AS content,
-           source, source_kind AS source_type,
-           CASE
-             WHEN source_uri ILIKE ${pattern} THEN 1.0
-             WHEN ${entityPattern}::text IS NOT NULL
-                  AND source_uri ILIKE ${entityPattern}
-                  AND ${sectionPattern}::text IS NOT NULL
-                  AND content ILIKE ${sectionPattern} THEN 0.98
-             WHEN source_uri ILIKE ${entityPattern} AND ${entityPattern}::text IS NOT NULL THEN 0.95
-             WHEN content ILIKE ${pattern} THEN 0.90
-             WHEN search_vector @@ plainto_tsquery('simple', ${ftsQuery}) THEN 0.8
-             ELSE 0.5
-           END AS score
-    FROM ${sql.unsafe(knowledgeChunkTable)}
-    WHERE (content ILIKE ${pattern}
-           OR source_uri ILIKE ${pattern}
-           OR search_vector @@ plainto_tsquery('simple', ${ftsQuery})
-           OR (${entityPattern}::text IS NOT NULL AND source_uri ILIKE ${entityPattern}))
-      AND (${src}::text IS NULL OR source = ${src})
-      AND (${stype}::text IS NULL OR source_kind = ${stype})
-      AND account_id IS NULL
-    ORDER BY score DESC,
-             CASE WHEN source_uri ILIKE ${pattern} THEN 0 ELSE 1 END,
-             length(content) DESC
-    LIMIT ${limit}
-  `, pool);
+             THEN (SELECT encode(sha256(convert_to(chunk.content, 'UTF8')), 'hex')
+                   FROM ${sql.unsafe(knowledgeChunkTable)} AS chunk
+                   WHERE chunk.legacy_id = candidates.id AND chunk.account_id IS NULL)
+           END AS indexed_content_hash
+    FROM ${sql.unsafe(`${getKnowledgeSchema(env)}.search_platform_keyword_candidates`)}(
+      ${pattern}, ${entityPattern}, ${sectionPattern}, ${ftsQuery}, ${src}, ${stype}, ${limit}
+    ) AS candidates
+    ORDER BY candidates.score DESC, candidates.sort_path_priority, candidates.sort_content_length DESC
+  `, pool, trace);
 
-  return rows.map((r) => {
-    const source = (r.source as string) || "";
-    const filename = r.filename as string;
-    return {
-      id: r.id as number,
-      ...(r.indexed_content_hash ? { indexed_content_hash: r.indexed_content_hash as string } : {}),
-      filename,
-      content: r.content as string,
-      source,
-      source_type: (r.source_type as string) || "",
-      score: r.score as number,
-      github_url: resolveGithubUrl(source, filename),
-    };
-  });
+  // WP-604 Ф14: search_platform_keyword_candidates (migration 029) is a
+  // SECURITY DEFINER function with its own BYPASSRLS owner and restricted
+  // grants — changing its SQL is a migration, not a code deploy. Filtering
+  // the already-fetched rows here is a smaller, reversible surface for a
+  // temporary deny-list; it does cost ranking slots (a denied row still
+  // took one of the function's LIMIT-ed candidates), which is acceptable for
+  // an urgent patch that only needs to stop returning content, not preserve
+  // result completeness. Ф8' moves this into the query itself.
+  return rows
+    .filter((r) => !isPlatformDeniedSource(r.source as string))
+    .map((r) => {
+      const source = (r.source as string) || "";
+      const filename = r.filename as string;
+      return {
+        id: r.id as number,
+        ...(r.indexed_content_hash ? { indexed_content_hash: r.indexed_content_hash as string } : {}),
+        filename,
+        content: r.content as string,
+        source,
+        source_type: (r.source_type as string) || "",
+        score: r.score as number,
+        github_url: resolveGithubUrl(source, filename),
+      };
+    });
 }
 
 async function vectorSearch(
@@ -799,9 +988,11 @@ async function vectorSearch(
   sourceType?: string,
   limit: number = 5,
   userId?: string,
-  pool?: Pool
+  pool?: Pool,
+  trace?: ReadTrace
 ): Promise<SearchResult[]> {
-  const embedding = await getEmbedding(env.OPENROUTER_API_KEY, query);
+  const embed = () => getEmbedding(env.OPENROUTER_API_KEY, query);
+  const embedding = await (trace ? trace.run("embedding", embed) : embed());
   const vec = `[${embedding.join(",")}]`;
   const src = source ?? null;
   const stype = sourceType ?? null;
@@ -822,9 +1013,10 @@ async function vectorSearch(
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_kind = ${stype})
       AND account_id IS NULL
+      AND NOT (source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
     ORDER BY embedding <=> ${vec}::vector
     LIMIT ${limit}
-  `, pool);
+  `, pool, trace);
 
   return rows.map((r) => {
     const source = (r.source as string) || "";
@@ -879,77 +1071,81 @@ Include ALL candidates. Score based on how well the document answers the query.`
 Candidates:
 ${candidates.map((c) => `[${c.index}] ${c.filename}\n${c.snippet}`).join("\n\n")}`;
 
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), RERANK_TIMEOUT_MS);
-
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: RERANK_MODEL,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        temperature: 0,
-        response_format: { type: "json_object" },
-      }),
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      // Fallback: return original order
-      return results.slice(0, limit);
-    }
-
-    const data = (await response.json()) as {
-      choices: { message: { content: string } }[];
-    };
-
-    const content = data.choices[0]?.message?.content;
-    if (!content) return results.slice(0, limit);
-
-    // Parse LLM scores — handle both array and {scores: [...]} formats
-    const parsed = JSON.parse(content);
-    const scores: RerankScore[] = Array.isArray(parsed)
-      ? parsed
-      : Array.isArray(parsed.scores)
-        ? parsed.scores
-        : [];
-
-    if (scores.length === 0) return results.slice(0, limit);
-
-    // Build score map
-    const llmScoreMap = new Map<number, number>();
-    for (const s of scores) {
-      if (typeof s.index === "number" && typeof s.relevance_score === "number") {
-        llmScoreMap.set(s.index, Math.max(0, Math.min(1, s.relevance_score)));
-      }
-    }
-
-    // Compute hybrid score and reorder
-    const reranked = results.map((r, i) => {
-      const llmScore = llmScoreMap.get(i) ?? 0.5; // default 0.5 if missing
-      const hybridScore = r.score * RERANK_VECTOR_WEIGHT + llmScore * RERANK_LLM_WEIGHT;
-      return { ...r, score: hybridScore };
-    });
-
-    reranked.sort((a, b) => b.score - a.score);
-    return reranked.slice(0, limit);
-  } catch {
-    // Timeout or parse error — fallback to original order
+  const fallback = (reason: "timeout" | "request_failed" | "invalid_response"): SearchResult[] => {
+    console.warn(JSON.stringify({ event: "rerank_fallback", reason }));
     return results.slice(0, limit);
+  };
+
+  try {
+    return await withReadDeadline("reranking", async signal => {
+      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: RERANK_MODEL,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          temperature: 0,
+          response_format: { type: "json_object" },
+        }),
+        signal,
+      });
+
+      if (!response.ok) {
+        // Fallback: return original order
+        return fallback("request_failed");
+      }
+
+      const data = (await readJson(response, "reranking")) as {
+        choices: { message: { content: string } }[];
+      };
+
+      const content = data.choices[0]?.message?.content;
+      if (!content) return fallback("invalid_response");
+
+      // Parse LLM scores — handle both array and {scores: [...]} formats
+      const parsed = JSON.parse(content);
+      const scores: RerankScore[] = Array.isArray(parsed)
+        ? parsed
+        : Array.isArray(parsed.scores)
+          ? parsed.scores
+          : [];
+
+      if (scores.length === 0) return fallback("invalid_response");
+
+      // Build score map
+      const llmScoreMap = new Map<number, number>();
+      for (const s of scores) {
+        if (typeof s.index === "number" && typeof s.relevance_score === "number") {
+          llmScoreMap.set(s.index, Math.max(0, Math.min(1, s.relevance_score)));
+        }
+      }
+
+      // Compute hybrid score and reorder
+      const reranked = results.map((r, i) => {
+        const llmScore = llmScoreMap.get(i) ?? 0.5; // default 0.5 if missing
+        const hybridScore = r.score * RERANK_VECTOR_WEIGHT + llmScore * RERANK_LLM_WEIGHT;
+        return { ...r, score: hybridScore };
+      });
+
+      reranked.sort((a, b) => b.score - a.score);
+      return reranked.slice(0, limit);
+    }, RERANK_TIMEOUT_MS);
+  } catch (error) {
+    const reason = error instanceof ReadFailure && error.code === "dependency_timeout" ? "timeout"
+      : error instanceof ReadFailure && error.code === "dependency_invalid_response" ? "invalid_response"
+      : "request_failed";
+    return fallback(reason);
   }
 }
 
 /** Enrich search results with parent document content when available */
-export async function enrichWithParentContent(env: Env, results: SearchResult[], userId?: string, pool?: Pool): Promise<SearchResult[]> {
+export async function enrichWithParentContent(env: Env, results: SearchResult[], userId?: string, pool?: Pool, trace?: ReadTrace): Promise<SearchResult[]> {
   if (results.length === 0) return results;
 
   // Batch-fetch parent info for all results that are chunks (have parent_id)
@@ -975,7 +1171,8 @@ export async function enrichWithParentContent(env: Env, results: SearchResult[],
       )
       AND p.account_id IS NULL
       AND c.account_id IS NULL
-  `, pool);
+      AND NOT (p.source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
+  `, pool, trace);
 
   const parentMap = new Map<string, { parent_filename: string; parent_content: string }>();
   for (const row of parentRows) {
@@ -1003,69 +1200,95 @@ export async function searchDocuments(
   limit: number = 5,
   userId?: string
 ): Promise<SearchResult[]> {
-  limit = normalizeSearchResultLimit(limit);
-  // One pool for this call's whole DB round-trip chain (up to 4 sequential queries below),
-  // never reused past it — see rls.ts createRequestPool() for why (issue #231).
-  const pool = createRequestPool(activeDsn(env));
+  const trace = createReadTrace("platform_search");
+  return trace.run("search", async () => {
+    limit = normalizeSearchResultLimit(limit);
+    // One pool for this call's whole DB round-trip chain (up to 4 sequential queries below),
+    // never reused past it — see rls.ts createRequestPool() for why (issue #231).
+    const pool = createRequestPool(activeDsn(env));
+    const keyword = () => trace.run("keyword", () => keywordSearch(env, query, source, sourceType, limit, userId, pool, trace));
+    const enrich = (results: SearchResult[]) => trace.run("parent_content", () => enrichWithParentContent(env, results, userId, pool, trace));
+    const rerank = (results: SearchResult[]) => trace.run("rerank", () => rerankWithLLM(env.OPENROUTER_API_KEY, query, results, limit));
 
-  try {
-    const queryType = detectQueryType(query);
-
-    if (queryType === "keyword") {
-      // Keyword-first: skip embedding generation (~200ms saved), no reranking needed
-      const kwResults = await keywordSearch(env, query, source, sourceType, limit, userId, pool);
-      if (kwResults.length > 0) return await enrichWithParentContent(env, kwResults, userId, pool);
-      // Fallback to vector if keyword found nothing
-    }
-
-    // Vector path: fetch extra candidates for LLM reranking
-    const fetchLimit = Math.max(limit, RERANK_CANDIDATES);
-    let vectorResults: SearchResult[];
     try {
-      vectorResults = await vectorSearch(env, query, source, sourceType, fetchLimit, userId, pool);
-    } catch (error) {
-      if (!(error instanceof EmbeddingUnavailableError)) throw error;
+      const queryType = detectQueryType(query);
 
-      console.warn(JSON.stringify({
-        event: "knowledge_search_embedding_fallback",
-        reason: error.reason,
-        embedding_attempts: 2,
-        fallback: "keyword",
-        source_filter_present: source !== undefined,
-        source_type_filter_present: sourceType !== undefined,
-      }));
-
-      const fallbackResults = await keywordSearch(env, query, source, sourceType, limit, userId, pool);
-      return await enrichWithParentContent(env, fallbackResults, userId, pool);
-    }
-
-    // Low-confidence fallback: if vector top score < threshold, try keyword
-    if (vectorResults.length > 0 && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD) {
-      const kwFallback = await keywordSearch(env, query, source, sourceType, limit, userId, pool);
-      if (kwFallback.length > 0) {
-        // Merge: deduplicate by filename, keep highest score
-        const seen = new Map<string, SearchResult>();
-        for (const r of [...kwFallback, ...vectorResults]) {
-          const existing = seen.get(r.filename);
-          if (!existing || r.score > existing.score) {
-            seen.set(r.filename, r);
-          }
-        }
-        const merged = [...seen.values()].sort((a, b) => b.score - a.score);
-        // Rerank merged results
-        const reranked = await rerankWithLLM(env.OPENROUTER_API_KEY, query, merged, limit);
-        return await enrichWithParentContent(env, reranked, userId, pool);
+      if (queryType === "keyword") {
+        // Keyword-first: skip embedding generation (~200ms saved), no reranking needed
+        const kwResults = await keyword();
+        if (kwResults.length > 0) return await enrich(kwResults);
+        // Fallback to vector if keyword found nothing
       }
-    }
 
-    // LLM rerank vector results → return top-K
-    const reranked = await rerankWithLLM(env.OPENROUTER_API_KEY, query, vectorResults, limit);
-    return await enrichWithParentContent(env, reranked, userId, pool);
-  } finally {
-    await pool.end().catch((err) => {
-      console.error("[search] pool.end() failed (contained):", err);
-    });
-  }
+      // Vector path: fetch extra candidates for LLM reranking
+      const fetchLimit = Math.max(limit, RERANK_CANDIDATES);
+      let vectorResults: SearchResult[];
+      try {
+        vectorResults = await trace.run("vector", () => vectorSearch(env, query, source, sourceType, fetchLimit, userId, pool, trace));
+      } catch (error) {
+        if (!(error instanceof EmbeddingUnavailableError)) throw error;
+
+        console.warn(JSON.stringify({
+          event: "knowledge_search_embedding_fallback",
+          reason: error.reason,
+          // Correlation keys: they match the "embedding_http_error" record of the last attempt.
+          status: error.status,
+          request_id: error.requestId,
+          embedding_attempts: 2,
+          fallback: "keyword",
+          source_filter_present: source !== undefined,
+          source_type_filter_present: sourceType !== undefined,
+        }));
+
+        const fallbackResults = await keyword();
+        return await enrich(fallbackResults);
+      }
+
+      // Keyword fallback when the vector path cannot stand on its own: the top hit is below
+      // the confidence threshold, OR the ANN query legitimately returned nothing (chunks
+      // without an embedding, or a narrow source/source_type filter). Previously only the
+      // low-confidence case fell back to keyword search — a legitimately empty vector result
+      // skipped it entirely and returned `[]` with no fallback at all. A keyword-typed query
+      // already ran keywordSearch above and found nothing, so it's not repeated here.
+      const vectorEmpty = vectorResults.length === 0;
+      const vectorLowConfidence = !vectorEmpty && vectorResults[0].score < VECTOR_CONFIDENCE_THRESHOLD;
+      if (queryType !== "keyword" && (vectorEmpty || vectorLowConfidence)) {
+        const kwFallback = await keyword();
+        if (vectorEmpty) {
+          // Same privacy contract as knowledge_search_embedding_fallback: no query text, no key.
+          console.warn(JSON.stringify({
+            event: "knowledge_search_vector_empty",
+            fallback: "keyword",
+            keyword_result_count: kwFallback.length,
+            source_filter_present: source !== undefined,
+            source_type_filter_present: sourceType !== undefined,
+          }));
+        }
+        if (kwFallback.length > 0) {
+          // Merge: deduplicate by filename, keep highest score
+          const seen = new Map<string, SearchResult>();
+          for (const r of [...kwFallback, ...vectorResults]) {
+            const existing = seen.get(r.filename);
+            if (!existing || r.score > existing.score) {
+              seen.set(r.filename, r);
+            }
+          }
+          const merged = [...seen.values()].sort((a, b) => b.score - a.score);
+          // Rerank merged results
+          const reranked = await rerank(merged);
+          return await enrich(reranked);
+        }
+      }
+
+      // LLM rerank vector results → return top-K
+      const reranked = await rerank(vectorResults);
+      return await enrich(reranked);
+    } finally {
+      await trace.run("pool_close", () => pool.end()).catch(() => {
+        console.warn(JSON.stringify({ event: "search_pool_close_failed", reason: "dependency_unavailable" }));
+      });
+    }
+  });
 }
 
 async function getDocument(
@@ -1084,6 +1307,7 @@ async function getDocument(
     WHERE source_uri = ${filename}
       AND (${src}::text IS NULL OR source = ${src})
       AND account_id IS NULL
+      AND NOT (source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
     LIMIT 1
   `);
 
@@ -1103,6 +1327,8 @@ async function getDocument(
 interface DocumentHeading {
   level: number;
   title: string;
+  line: number;
+  offset: number;
 }
 
 async function getDocumentStructure(
@@ -1114,21 +1340,102 @@ async function getDocumentStructure(
   const doc = await getDocument(env, filename, source, userId);
   if (!doc) return null;
 
-  const headings: DocumentHeading[] = [];
-  for (const line of doc.content.split("\n")) {
-    const match = line.match(/^(#{1,6})\s+(.+)$/);
-    if (match) {
-      headings.push({
-        level: match[1].length,
-        title: match[2].trim(),
-      });
-    }
-  }
+  return { filename: doc.filename, headings: documentHeadings(doc.content) };
+}
 
-  return {
-    filename: doc.filename,
-    headings,
-  };
+// CommonMark allows a fence to be indented up to 3 spaces; 4+ is an indented code block, not a
+// fence (Codex cold review, round 8). Anchored at line start, not `trimStart()`, for that reason.
+// The opener may be followed by anything (an info string like "python" or "js linenums"); only
+// the closer is required to contain nothing but the fence character itself.
+const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})/;
+const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})\s*$/;
+
+/** `line`/`offset` are additive (WP-7 Ф204): existing consumers reading only
+ * {level, title} are unaffected. A heading inside a fenced code block or the
+ * leading YAML frontmatter is not a real section boundary and is skipped —
+ * otherwise `## comment syntax` in a snippet would shadow the real section.
+ * Fences remember their own opening marker and length (Kimi cold review,
+ * round 8): a plain toggle on any ```/~~~ line misreads a fenced block that
+ * itself contains a shorter nested fence (a ```markdown block showcasing a
+ * ```python snippet), or one fenced with the other character, as closed one
+ * line early. CommonMark's own rule — a fence closes only on a line of the
+ * SAME character repeated at least as many times as the opener, with
+ * nothing else on it — avoids both. */
+function documentHeadings(content: string): DocumentHeading[] {
+  const headings: DocumentHeading[] = [];
+  const lines = content.split("\n");
+  // CRLF files keep a trailing \r on every split element (only "\n" is the delimiter). JS regex
+  // `.` and `$` do not cross it, so every pattern below silently matched nothing at all on a
+  // CRLF file before this strip (Kimi cold review, round 9 — found empirically, not by inspection:
+  // the heading regex returned null outright on a line ending in \r, not a corrupted title as
+  // first suspected). `offset` still accumulates the UNSTRIPPED `line.length`, so byte positions
+  // into the original `content` stay exact.
+  const stripCR = (line: string) => line.endsWith("\r") ? line.slice(0, -1) : line;
+  // A leading "---" with no closing "---" anywhere after it is not frontmatter at all — just a
+  // thematic break (Kimi + Codex cold review, round 8) — so it must not swallow every heading
+  // in the file. `lines.length > 1` because a bare "---" on the only line of a file is already
+  // handled correctly either way (nothing follows it to lose).
+  const inFrontmatterAtAll = stripCR(lines[0]) === "---" && lines.length > 1 && lines.slice(1).some(l => stripCR(l) === "---");
+  let inFrontmatter = inFrontmatterAtAll;
+  let fence: { char: string; length: number } | null = null;
+  let offset = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const line = stripCR(raw);
+    if (inFrontmatter) {
+      if (i > 0 && line === "---") inFrontmatter = false;
+    } else if (fence) {
+      const close = line.match(FENCE_CLOSE);
+      if (close && close[1][0] === fence.char && close[1].length >= fence.length) fence = null;
+    } else {
+      const opens = line.match(FENCE_OPEN);
+      if (opens) {
+        fence = { char: opens[1][0], length: opens[1].length };
+      } else {
+        // Up to 3 leading spaces, same CommonMark tolerance already applied to fences above
+        // (Kimi cold review, round 10).
+        const heading = line.match(/^ {0,3}(#{1,6})\s+(.+)$/);
+        // CommonMark ATX headings allow an optional closing run of # chars ("## Foo ##") that is
+        // not part of the title (Kimi cold review, round 9) — stripped before trimming.
+        if (heading) headings.push({ level: heading[1].length, title: heading[2].replace(/\s+#+\s*$/, "").trim(), line: i + 1, offset });
+      }
+    }
+    offset += raw.length + 1; // the \r (if any) is part of the original document's bytes
+  }
+  return headings;
+}
+
+type SectionLookup =
+  | { ok: true; start: number; end: number }
+  | { ok: false; reason: "section_not_found"; headings: DocumentHeading[] }
+  | { ok: false; reason: "section_ambiguous"; matches: { level: number; line: number }[] };
+
+/** A section runs from its heading to the next heading of the same or higher
+ * importance (lower or equal `level`) — the standard outline convention — or
+ * to the end of the document (WP-7 Ф204, `get_document(section: "...")`). */
+function resolveSection(content: string, title: string): SectionLookup {
+  const headings = documentHeadings(content);
+  const matches = headings.filter(h => h.title === title);
+  if (matches.length === 0) return { ok: false, reason: "section_not_found", headings };
+  if (matches.length > 1) {
+    return { ok: false, reason: "section_ambiguous", matches: matches.map(h => ({ level: h.level, line: h.line })) };
+  }
+  const match = matches[0];
+  const next = headings.find(h => h.offset > match.offset && h.level <= match.level);
+  return { ok: true, start: match.offset, end: next ? next.offset : content.length };
+}
+
+/** Shared by the live and indexed `get_document` paths below, which otherwise repeat the same
+ * not-found/ambiguous JSON error shape for a `section` argument (WP-7 Ф204). */
+function sectionWindowOrError(id: string | number, content: string, title: string):
+  { bound: { start: number; end: number }; errorResult?: undefined }
+  | { bound?: undefined; errorResult: { jsonrpc: "2.0"; id: string | number; result: { content: { type: "text"; text: string }[]; isError: true } } } {
+  const lookup = resolveSection(content, title);
+  if (lookup.ok) return { bound: { start: lookup.start, end: lookup.end } };
+  const payload = lookup.reason === "section_not_found"
+    ? { error: lookup.reason, message: "Заголовок не найден — вот оглавление файла.", headings: lookup.headings }
+    : { error: lookup.reason, message: "Заголовок встречается несколько раз — уточни какой (см. matches).", matches: lookup.matches };
+  return { errorResult: { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(payload) }], isError: true } } };
 }
 
 // WP-7 Ф117: extractTitle/PathEntry/buildPathTree moved to ./path-tree.ts so layers/personal.ts
@@ -1154,6 +1461,7 @@ async function listSources(
     FROM ${sql.unsafe(knowledgeChunkTable)}
     WHERE (${stype}::text IS NULL OR source_kind = ${stype})
       AND account_id IS NULL
+      AND NOT (source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
     GROUP BY source, source_kind
     ORDER BY source_kind, source
   `);
@@ -1191,6 +1499,7 @@ async function listDocuments(
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_kind = ${stype})
       AND account_id IS NULL
+      AND NOT (source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
     GROUP BY source_uri, source, source_kind
     ORDER BY source, source_uri
     LIMIT ${limit}
@@ -1236,6 +1545,7 @@ async function listPath(
       AND (${src}::text IS NULL OR source = ${src})
       AND (${prefix}::text = '' OR source_uri LIKE ${likePrefix} ESCAPE '\')
       AND account_id IS NULL
+      AND NOT (source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
     ORDER BY source, source_uri
     LIMIT ${limit}
   `);
@@ -1379,6 +1689,7 @@ async function analyzeVerbalization(
              1 - (embedding <=> ${vecStr}::vector) AS similarity
       FROM ${sql.unsafe(conceptsTable)}
       WHERE status = 'active'
+        AND (source_repo IS NULL OR NOT (source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       ORDER BY embedding <=> ${vecStr}::vector
       LIMIT 50
     `;
@@ -1390,6 +1701,7 @@ async function analyzeVerbalization(
       WHERE status = 'active'
         AND (${domain}::text IS NULL OR domain = ${domain})
         AND (${level}::text IS NULL OR level = ${level})
+        AND (source_repo IS NULL OR NOT (source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       LIMIT 100
     `;
   }
@@ -1659,26 +1971,37 @@ ${miscCatalog}
     recommendations.push("Понятия упомянуты, но слабо связаны между собой. Попробуйте объяснить связи.");
   }
 
-  // 6. Update learner mastery (Ф5) — Bayesian update per matched concept
+  // 6. Update learner mastery (Ф5) — Bayesian update per matched concept.
+  // The write runs inside withUserContext: the mastery table is under row-level security keyed
+  // by app.user_id and the worker's role does not bypass it (WP-7 Ф188), so a write from the
+  // plain connection is rejected. A failed write must not discard the analysis already computed.
+  let masteryUpdated = false;
   if (userId && matched.length > 0) {
     const ALPHA = 0.3; // learning rate
-    for (const m of matched) {
-      const conceptRow = topicConcepts.find((c) => c.code === m.code);
-      if (!conceptRow) continue;
+    try {
+      await withUserContext(activeDsn(env), userId, async (tx) => {
+        for (const m of matched) {
+          const conceptRow = topicConcepts.find((c) => c.code === m.code);
+          if (!conceptRow) continue;
 
-      // Bayesian update: M_new = M_old + α * (score - M_old)
-      await sql`
-        INSERT INTO ${sql.unsafe(masteryTable)}
-          (user_id, concept_id, mastery, attempts, last_score, last_assessed_at)
-        VALUES (${userId}, ${conceptRow.id}, ${ALPHA * m.score}, 1, ${m.score}, NOW())
-        ON CONFLICT (user_id, concept_id) DO UPDATE SET
-          mastery = ${sql.unsafe(masteryTable)}.mastery +
-            ${ALPHA} * (${m.score} - ${sql.unsafe(masteryTable)}.mastery),
-          attempts = ${sql.unsafe(masteryTable)}.attempts + 1,
-          last_score = ${m.score},
-          last_assessed_at = NOW(),
-          updated_at = NOW()
-      `;
+          // Bayesian update: M_new = M_old + α * (score - M_old)
+          await tx`
+            INSERT INTO ${tx.unsafe(masteryTable)}
+              (user_id, concept_id, mastery, attempts, last_score, last_assessed_at)
+            VALUES (${userId}, ${conceptRow.id}, ${ALPHA * m.score}, 1, ${m.score}, NOW())
+            ON CONFLICT (user_id, concept_id) DO UPDATE SET
+              mastery = ${tx.unsafe(masteryTable)}.mastery +
+                ${ALPHA} * (${m.score} - ${tx.unsafe(masteryTable)}.mastery),
+              attempts = ${tx.unsafe(masteryTable)}.attempts + 1,
+              last_score = ${m.score},
+              last_assessed_at = NOW(),
+              updated_at = NOW()
+          `;
+        }
+      });
+      masteryUpdated = true;
+    } catch (err) {
+      console.error(JSON.stringify({ event: "mastery_update_failed", error: err instanceof Error ? err.message : String(err) }));
     }
   }
 
@@ -1691,7 +2014,7 @@ ${miscCatalog}
     edge_coverage: Math.round(edgeCoverage * 1000) / 1000,
     misconceptions_found: foundMisconceptions,
     recommendations,
-    mastery_updated: !!userId,
+    mastery_updated: masteryUpdated,
   };
 }
 
@@ -1785,34 +2108,45 @@ async function getConceptStatus(
   const sql = db(env);
   let rows: ConceptStatusRow[];
 
+  // WP-604 Ф14-б (2026-10-19) — same temporary deny-list as PLATFORM_DENY_SOURCES
+  // on knowledge_chunk, applied here to concept_graph.concepts (separate DB/schema,
+  // not covered by Ф14's original patch). superseded_by must be re-derived from the
+  // filtered `sb` join (not the raw c.superseded_by id) so a denied successor's id
+  // isn't exposed even when its code/name are already hidden by the join condition.
   if (ref.concept_id) {
     rows = await sql`
-      SELECT c.id, c.code, c.name, c.status, c.misconception, c.superseded_by,
+      SELECT c.id, c.code, c.name, c.status, c.misconception, sb.id AS superseded_by,
              sb.code AS superseded_by_code, sb.name AS superseded_by_name,
              c.level, c.domain, c.definition
       FROM ${sql.unsafe(conceptsTable)} c
       LEFT JOIN ${sql.unsafe(conceptsTable)} sb ON sb.id = c.superseded_by
+        AND (sb.source_repo IS NULL OR NOT (sb.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       WHERE c.id = ${ref.concept_id}
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       LIMIT 1
     ` as ConceptStatusRow[];
   } else if (ref.code) {
     rows = await sql`
-      SELECT c.id, c.code, c.name, c.status, c.misconception, c.superseded_by,
+      SELECT c.id, c.code, c.name, c.status, c.misconception, sb.id AS superseded_by,
              sb.code AS superseded_by_code, sb.name AS superseded_by_name,
              c.level, c.domain, c.definition
       FROM ${sql.unsafe(conceptsTable)} c
       LEFT JOIN ${sql.unsafe(conceptsTable)} sb ON sb.id = c.superseded_by
+        AND (sb.source_repo IS NULL OR NOT (sb.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       WHERE c.code = ${ref.code}
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       LIMIT 1
     ` as ConceptStatusRow[];
   } else if (ref.name) {
     rows = await sql`
-      SELECT c.id, c.code, c.name, c.status, c.misconception, c.superseded_by,
+      SELECT c.id, c.code, c.name, c.status, c.misconception, sb.id AS superseded_by,
              sb.code AS superseded_by_code, sb.name AS superseded_by_name,
              c.level, c.domain, c.definition
       FROM ${sql.unsafe(conceptsTable)} c
       LEFT JOIN ${sql.unsafe(conceptsTable)} sb ON sb.id = c.superseded_by
+        AND (sb.source_repo IS NULL OR NOT (sb.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       WHERE LOWER(c.name) = LOWER(${ref.name})
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       ORDER BY c.status = 'active' DESC, c.id
       LIMIT 1
     ` as ConceptStatusRow[];
@@ -1847,6 +2181,7 @@ async function searchConceptByName(
            similarity(c.name, ${name}) AS similarity
     FROM ${sql.unsafe(conceptsTable)} c
     WHERE c.name % ${name}
+      AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       ${opts.include_inactive ? sql`` : sql`AND c.status = 'active'`}
     ORDER BY similarity DESC, c.id
     LIMIT ${limit}
@@ -1916,6 +2251,8 @@ async function expandConcept(
       WHERE (e.from_concept_id = ANY(${frontier}::bigint[])
           OR e.to_concept_id = ANY(${frontier}::bigint[]))
         AND e.edge_type = ANY(${edgeTypes}::text[])
+        AND (fc.source_repo IS NULL OR NOT (fc.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
+        AND (tc.source_repo IS NULL OR NOT (tc.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
         ${opts.include_inactive ? sql`` : sql`AND fc.status = 'active' AND tc.status = 'active'`}
     ` as Array<{
       edge_id: number;
@@ -2028,6 +2365,7 @@ async function expandArtifact(
     FROM ${sql.unsafe(conceptsTable)}
     WHERE code = ANY(${seedCodes}::text[])
       AND node_type = 'artifact'
+      AND (source_repo IS NULL OR NOT (source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
   ` as Array<{ id: number; code: string | null; name: string; level: string; domain: string | null; node_type: string }>;
 
   const seedIds = seedRows.map((r) => r.id);
@@ -2057,6 +2395,8 @@ async function expandArtifact(
       WHERE e.from_concept_id = ANY(${frontier}::bigint[])
         AND e.edge_type = ANY(${edgeTypes}::text[])
         AND fc.node_type = 'artifact'
+        AND (fc.source_repo IS NULL OR NOT (fc.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
+        AND (tc.source_repo IS NULL OR NOT (tc.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
     ` as Array<{
       edge_id: number;
       from_concept_id: number;
@@ -2122,12 +2462,16 @@ async function getGraphStats(env: Env) {
       GROUP BY edge_type ORDER BY cnt DESC
     `;
 
+    // WP-604 Ф14-б: orphans/suspicious_edges/top_central return concept
+    // code/name individually (not just counts) — same deny-list as the other
+    // concept-graph reads above.
     const orphans = await sql`
       SELECT c.code, c.name, c.level
       FROM ${sql.unsafe(conceptsTable)} c
       LEFT JOIN ${sql.unsafe(conceptEdgesTable)} e1 ON e1.from_concept_id = c.id
       LEFT JOIN ${sql.unsafe(conceptEdgesTable)} e2 ON e2.to_concept_id = c.id
       WHERE c.status = 'active' AND e1.id IS NULL AND e2.id IS NULL
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       LIMIT 20
     `;
 
@@ -2141,6 +2485,8 @@ async function getGraphStats(env: Env) {
       JOIN ${sql.unsafe(conceptsTable)} c2 ON c2.id = e.to_concept_id
       WHERE e.edge_type = 'specializes'
         AND e.weight_source = 'embedding'
+        AND (c1.source_repo IS NULL OR NOT (c1.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
+        AND (c2.source_repo IS NULL OR NOT (c2.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
         AND e.weight < 0.8
       LIMIT 20
     `;
@@ -2150,6 +2496,7 @@ async function getGraphStats(env: Env) {
       FROM ${sql.unsafe(conceptsTable)} c
       LEFT JOIN ${sql.unsafe(conceptEdgesTable)} e ON e.from_concept_id = c.id OR e.to_concept_id = c.id
       WHERE c.status = 'active'
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       GROUP BY c.id, c.code, c.name
       ORDER BY connections DESC
       LIMIT 10
@@ -2203,13 +2550,16 @@ async function getLearnerProgress(env: Env, userId: string, domain: string | und
       ORDER BY total_concepts DESC
     `;
 
-    // Top mastered concepts
+    // Top mastered concepts. WP-604 Ф14-б: user_id scopes the mastery row, not
+    // visibility of the underlying concept — same deny-list as the rest of
+    // concept_graph.
     const topMastered = await sql`
       SELECT c.code, c.name, c.level, lm.mastery, lm.attempts, lm.last_assessed_at
       FROM ${sql.unsafe(masteryTable)} lm
       JOIN ${sql.unsafe(conceptsTable)} c ON c.id = lm.concept_id
       WHERE lm.user_id = ${userId}
         AND (${domain}::text IS NULL OR c.domain = ${domain})
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       ORDER BY lm.mastery DESC
       LIMIT 10
     `;
@@ -2221,6 +2571,7 @@ async function getLearnerProgress(env: Env, userId: string, domain: string | und
       JOIN ${sql.unsafe(conceptsTable)} c ON c.id = lm.concept_id
       WHERE lm.user_id = ${userId} AND lm.mastery < 0.5 AND lm.attempts >= 1
         AND (${domain}::text IS NULL OR c.domain = ${domain})
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       ORDER BY lm.mastery ASC
       LIMIT 10
     `;
@@ -2235,6 +2586,7 @@ async function getLearnerProgress(env: Env, userId: string, domain: string | und
       WHERE c.status = 'active' AND lm.id IS NULL
         AND c.level IN ('guide', 'pack')
         AND (${domain}::text IS NULL OR c.domain = ${domain})
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       GROUP BY c.id, c.code, c.name, c.level, c.domain
       ORDER BY connections DESC
       LIMIT 5
@@ -2312,7 +2664,7 @@ export const TOOLS = [
   {
     name: "get_document",
     description:
-      "Get a specific document by filename, or extract its heading structure (table of contents). Use format=headings to see the outline without reading the full content. For a personal-source document you intend to edit and write back, pass include_sha: true — the returned sha is what write's expected_sha needs to detect a concurrent edit.",
+      "Get a specific document by filename, or extract its heading structure (table of contents). Use format=headings to see the outline without reading the full content. For a personal-source document you intend to edit and write back, pass include_sha: true — the returned sha is what write's expected_sha needs to detect a concurrent edit. To read a PRIOR version instead of the current one, pass ref (a commit sha from personal_history, or any git ref GitHub accepts) — this implies a live read the same way include_sha does.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2324,6 +2676,7 @@ export const TOOLS = [
           description: "Output format: full (default) returns document content, headings returns h1-h6 outline",
         },
         include_sha: { type: "boolean", description: "Personal sources only: read the live version straight from GitHub (not the search index). The response is then a JSON object {filename, source, sha, content} — use its sha as write's expected_sha. Set true whenever you intend to edit and write this document back. If the document is not in the index yet, pass source explicitly. Not combinable with format=headings." },
+        ref: { type: "string", minLength: 1, description: "Personal sources only (WP-7 Ф176): a git ref (commit sha, branch or tag) to read that specific version instead of the current one — e.g. a sha from personal_history, or current_sha returned by a failed write. Forces a live GitHub read, same as include_sha. Not combinable with format=headings." },
       },
       required: ["filename"],
     },
@@ -2515,20 +2868,6 @@ export const TOOLS = [
     },
   },
   {
-    name: "reindex_source",
-    description:
-      "Trigger full or partial reindex of a knowledge source (platform L2 or personal L4). Scans all .md files from GitHub, chunks, embeds, and upserts to Neon. For large sources (>1000 files) use dry_run to list files, then call in batches via 'files' param. For L2 platform sources — no auth needed. For L4 personal sources — requires user registration in user_sources.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        source: { type: "string", description: "Source name (e.g. 'docs-courses', 'PACK-personal')" },
-        dry_run: { type: "boolean", description: "Preview files to be indexed without DB writes (default: false)" },
-        files: { type: "array", items: { type: "string" }, description: "Explicit list of file paths to reindex (batch mode). If omitted, scans all .md files from GitHub." },
-      },
-      required: ["source"],
-    },
-  },
-  {
     name: "concept_expand",
     description:
       "BFS-обход графа от seed-концептов: возвращает соседей через рёбра specializes/part_of/related/prerequisite. Используй когда пользователь задал термин и тебе нужны связанные понятия для развёрнутого ответа (DP.METHOD.042 сценарии: определение, Pack-обучение, онтологические ответы). Автоматически фильтрует deprecated/superseded в выдаче. Обновляет last_traversed_at на пройденных рёбрах.",
@@ -2593,27 +2932,85 @@ export const TOOLS = [
   },
 ];
 
-const PUBLIC_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set(["resolve_document"]);
+// WP-7 F183: in private mode these public tools have no personal implementation
+// (the personal DB has no platform knowledge.* tables) and failed with a raw
+// Postgres error, verbatim the user's complaint. They are withdrawn as an
+// unsupported personal contract: use the public-mode feedback for platform
+// documents. load_skill is deliberately NOT in the set: the gateway builds
+// personal_* from the backend tools/list, so hiding it would drop
+// personal_load_skill (WP-560 F10/F11).
+export const PUBLIC_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "resolve_document",
+  "feedback",
+  "feedback_stats",
+]);
+
+// WP-7 F186: withdrawn from the MCP surface in every mode. reindex_source ran a full
+// platform (L2) reindex without any sign-in. A call without an explicit file list, dry_run
+// included, spends the shared GitHub quota to list the source; a real run also reads every
+// file from GitHub and spends the shared embedding key (changed files only). Concurrent
+// runs (delete, then insert per file, no transaction or single-flight) can leave a stale
+// or partial index. Platform sources are reindexed by the secret-protected POST /reindex route
+// and the scheduled job; personal sources use the private-mode "reindex" tool. The
+// refusal comes first in tools/call, before mode handling, so it does not depend on
+// userId, headers or arguments. Not to be confused with PUBLIC_ONLY_TOOL_NAMES,
+// which hides tools in private mode only.
+export const WITHDRAWN_TOOL_MESSAGES: ReadonlyMap<string, string> = new Map([
+  [
+    "reindex_source",
+    'Tool "reindex_source" is withdrawn: platform sources are reindexed by the secret-protected /reindex route ' +
+      'and the scheduled job; personal sources use the private-mode "reindex" tool',
+  ],
+]);
 
 // Private-only tools (WP-410 срез-2b) — only surfaced in tools/list when MCP_MODE=private.
 // Ported from personal-knowledge-mcp/src/index.ts getTools() write/propose_capture entries.
 // No per-user `source` enum here (unlike the original getTools(ctx)): knowledge-mcp's tool
 // list is a static const, not rebuilt per-request; source is validated at runtime instead
 // (isToolAllowedInMode + ctx.sourceNames check in the handler) — same enforcement, no schema hint.
-const PRIVATE_TOOLS = [
+export const PRIVATE_TOOLS = [
   {
     name: "write",
-    description: "Write a file to a personal knowledge repo via GitHub. Existing files and new ordinary/service Markdown are supported; search indexing is triggered asynchronously by the push and is NOT confirmed in the result (indexing.status: async) — this is expected and needs no follow-up call. When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, a concurrent edit from another session can be silently overwritten. A new publication-like file (frontmatter type: post or a channel filename) under TserenTserenov/DS-Knowledge-Index-Tseren docs/ is server-blocked: create it with scripts/new-post.py; if shell is unavailable, stop instead of using an ASCII/manual fallback.",
+    description: "Write a file to a personal knowledge repo via GitHub. Existing files and new ordinary/service Markdown are supported; search indexing is triggered asynchronously by the push and is NOT confirmed in the result (indexing.status: async) — this is expected and needs no follow-up call. When editing an existing file (not creating a new one), always pass expected_sha from a prior get_document(include_sha: true) call — without it, the write is refused with reason: sha_required rather than overwriting an unknown current version (WP-7 Ф99). A new publication-like file (frontmatter type: post or a channel filename) under TserenTserenov/DS-Knowledge-Index-Tseren docs/ is server-blocked: create its canonical draft with new_post(scaffold), then edit the returned existing paths with expected_sha. Local shell clients may use scripts/new-post.py with a validated shared reservation. To edit an EXISTING file without resending the rest of it, use mode:'append' (add to the end) or mode:'str_replace' (change one exact piece) instead of reading the whole file and rewriting it yourself (WP-7 Ф204).",
     inputSchema: {
       type: "object",
       properties: {
         source: { type: "string", description: "Target repo (source name)" },
         path: { type: "string", description: "File path relative to repo root (e.g. 'notes/my-note.md')" },
-        content: { type: "string", description: "File content (markdown)" },
-        message: { type: "string", description: "Commit message (default: 'Update via Aisystant MCP')" },
-        expected_sha: { type: "string", pattern: "^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$", description: "sha from get_document(include_sha: true), required when editing an existing file. If the file changed since you read it, the write is refused with reason: version_mismatch instead of silently overwriting the newer content. Omit only when creating a brand-new file (never pass an empty string)." },
+        content: { type: "string", description: "Required for mode:'replace' (default): the file's full content. Required for mode:'append': just the fragment to add at the end — never resend the rest of the file. Must be omitted for mode:'str_replace', which uses old_string/new_string instead." },
+        mode: { type: "string", enum: ["replace", "append", "str_replace"], description: "'replace' (default): content is the whole file, as today. 'append' (WP-7 Ф204): content is a fragment added after the current end of an EXISTING file. 'str_replace' (WP-7 Ф204): old_string/new_string replace one exact piece of an EXISTING file. append/str_replace both require expected_sha and an already-existing file; the server reads the current file and writes the result in one commit — you never read or resend the rest of it. Not for creating new files." },
+        old_string: { type: "string", minLength: 1, description: "mode:'str_replace' only. The exact text to replace — must occur in the current file's content EXACTLY ONCE (byte-for-byte, including whitespace and line endings). Zero matches: error fragment_not_found. Two or more: error fragment_ambiguous with every match's line number — add surrounding lines to old_string until it is unique, do not guess which one was meant." },
+        new_string: { type: "string", description: "mode:'str_replace' only. Replaces the single old_string match verbatim — no line-break or whitespace normalization is applied to either string." },
+        dry_run: { type: "boolean", description: "mode:'str_replace' only. true: run every check (expected_sha, uniqueness) and report the result (matching_lines) WITHOUT writing anything — use to confirm old_string is unique before committing to the real call. Never retries even with on_conflict:'retry' (default false)." },
+        on_conflict: { type: "string", enum: ["fail", "retry"], description: "mode:'append'/'str_replace' only. 'fail' (default): a concurrent edit since expected_sha was read is reported as version_mismatch, nothing is written — re-read and retry yourself. 'retry': the server re-reads the current file and tries again, up to 3 times. For append this is always safe (appending never overwrites someone else's edit, both survive). For str_replace it is safe only when old_string is STILL the sole match in the freshly re-read content — if someone else's edit broke that, retry stops and reports fragment_not_found/fragment_ambiguous instead of guessing. Ignored for mode:'replace'." },
+        operation_id: { type: "string", minLength: 1, maxLength: 128, description: "mode:'append'/'str_replace' only (ignored by dry_run). An id you generate once per logical edit and send on every retry of that SAME call (e.g. after a dropped response). If a prior call with this id already committed, you get that same result back (idempotent_replay: true) instead of the edit being applied a second time. Best-effort (checked against the last 10 commits on the path): a retry sent before the earlier call's commit becomes visible, or after 10+ other commits landed on the same path meanwhile, can still duplicate the edit — do not rely on this alone for a file multiple agents write to concurrently. Reuse across different edits defeats this — generate a new one each time you decide to make a new edit." },
+        expected_sha: { type: "string", pattern: "^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$", description: "sha from get_document(include_sha: true). Required whenever the path already exists — omitting it there is refused with reason: sha_required (not a silent overwrite); required unconditionally for mode:'append'/'str_replace'. If the file changed since you read it, the write is refused with reason: version_mismatch instead (on_conflict:'retry' resolves this itself instead of refusing, where safe — see on_conflict). Omit only when creating a brand-new file with mode:'replace' (never pass an empty string)." },
       },
-      required: ["source", "path", "content"],
+      required: ["source", "path"],
+    },
+  },
+  {
+    // WP-7 Ф176: recovery path after an accidental overwrite (missing expected_sha used to
+    // silently overwrite before Ф99; sha_required stops the write now, but a version already
+    // lost to the old warn-mode behavior — or to a version_mismatch retry the caller answered
+    // wrong — still needed a way back). List candidate shas here, then read one back with
+    // get_document(ref: sha).
+    name: "history",
+    description: "List recent commits for one file's path in a personal knowledge repo — most recent first. Use to find a prior sha after an accidental overwrite or a version_mismatch/sha_required write error, then read that version with get_document(ref: sha). GitHub's own commit history, not a separate log — nothing to lose track of.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: { type: "string", description: "Target repo (source name)" },
+        path: { type: "string", description: "File path relative to repo root, same as write's path" },
+        limit: { type: "number", minimum: 1, maximum: 30, description: "Maximum number of commits to return (default: 10)" },
+      },
+      required: ["source", "path"],
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
   },
   {
@@ -2631,28 +3028,44 @@ const PRIVATE_TOOLS = [
   },
   {
     name: "new_post",
-    description: "Atomically allocate the next post number for a new Knowledge Index publication (WP-560 Ф12). Call this BEFORE scripts/new-post.py and pass the returned post_number via that script's existing --post-number flag, instead of letting the script scan for it locally. Idempotent: calling again with the same draft_id (e.g. after an interrupted run) returns the same number instead of allocating a new one, so a draft can sit unpushed for hours without a duplicate.",
+    description: "Reserve a unique Knowledge Index post number, or atomically create its draft publication scaffold. Provide scaffold metadata in browser sessions: the server creates canonical club/channel files and returns paths, without needing shell. Read each returned path with personal_get_document(source, filename, include_sha:true), then fill that existing file with personal_write(expected_sha from the read); this works before search indexing finishes. Without scaffold, returns a reservation for scripts/new-post.py --post-number N --draft-id UUID. Reuse the same draft_id on retry; changed metadata or incomplete existing scaffolds are refused instead of overwritten. Creation leaves status:draft; it does not publish ready content.",
     inputSchema: {
       type: "object",
       properties: {
-        source: { type: "string", description: "Target repo (source name), e.g. the connected DS-Knowledge-Index-Tseren source" },
-        draft_id: { type: "string", pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", description: "UUID generated once per draft (v4/v7). Reusing it on retry returns the already-allocated number instead of a new one." },
-        artifact_type: { type: "string", enum: ["post"], description: "Kind of artifact being scaffolded. Only 'post' is supported today." },
+        source: { type: "string", description: "Connected Knowledge Index source name" },
+        draft_id: { type: "string", pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", description: "Stable UUID generated once per draft; use the same value on retries" },
+        artifact_type: { type: "string", enum: ["post"] },
+        scaffold: {
+          type: "object", additionalProperties: false,
+          description: "Optional metadata to create the draft files server-side; omission only reserves the number",
+          properties: {
+            date: { type: "string", description: "Publication date YYYY-MM-DD" },
+            slug: { type: "string", maxLength: 100, description: "Lowercase ASCII slug with hyphens" },
+            title: { type: "string", minLength: 1, maxLength: 300 },
+            audience: { type: "string", enum: ["wide", "community", "advanced"], default: "community" },
+            channels: { type: "array", items: { type: "string" }, maxItems: 16, description: "Convention channel names; club is always included" },
+            source_knowledge: { type: "string", maxLength: 1000 },
+            content_plan: { type: "string", maxLength: 1000 },
+            related_wp: { type: "integer", minimum: 1 },
+          },
+          required: ["date", "slug", "title"],
+        },
       },
       required: ["source", "draft_id", "artifact_type"],
     },
   },
   {
     name: "delete",
-    description: "Delete a file from a personal knowledge repo via GitHub.",
+    description: "Удаляет файл из личного репозитория и поиска. Сначала прочитай точный файл через personal_get_document(source, filename, include_sha=true), назови человеку источник и путь, получи явное подтверждение удаления и передай прочитанный sha как expected_sha. Если файл изменился, повтори чтение и подтверждение.",
     inputSchema: {
       type: "object",
       properties: {
         source: { type: "string", description: "Target repo (source name)" },
         path: { type: "string", description: "File path relative to repo root" },
+        expected_sha: { type: "string", pattern: "^[0-9a-fA-F]{40}$", description: "SHA подтверждённой версии из personal_get_document(include_sha=true)" },
         message: { type: "string", description: "Commit message (default: 'Delete via Aisystant MCP')" },
       },
-      required: ["source", "path"],
+      required: ["source", "path", "expected_sha"],
     },
   },
   {
@@ -2694,7 +3107,7 @@ const PRIVATE_TOOLS = [
     // mechanically strips "personal_" from the caller-facing name to get this name (see
     // gateway-mcp src/index.ts:1468-1478). Naming this "personal_reindex_source" instead (first
     // draft of this session) meant a call to gateway's "personal_reindex_source" stripped down
-    // to backend name "reindex_source" — the OLD PUBLIC tool below, wrong DB for personal data.
+    // to backend name "reindex_source" — the formerly public tool of that name (withdrawn in F186), wrong DB for personal data.
     // Caught by the live canary, not by review or tests (neither exercises the gateway hop).
     name: "reindex",
     description: "Manually (re)trigger an async reindex of an already-connected personal source. Not needed for newly connected sources — connect_source does this automatically. Use for stuck/stale content, or after a bulk edit in the source repo. Returns a job_id; poll personal_reindex_status with it. (Exposed by the gateway as personal_reindex.)",
@@ -2751,9 +3164,104 @@ const PRIVATE_TOOLS = [
   },
 ];
 
+// Private read contracts differ; never mutate the shared public definitions.
+function privateToolDefinition(tool: (typeof TOOLS)[number]) {
+  if (tool.name === "get_document") return {
+    ...tool,
+    description: "Read a personal document (32000 UTF-8 response bytes). Small legacy responses keep their shape; oversized reads require cursor:'start', then next_cursor. complete covers the selected representation; indexed legacy data may be a fragment. Use include_sha:true for the exact live file and collect all pages before editing. Headings are never partial. For just the end or one heading of a large file, use tail_lines or section instead of paging through cursor from the start (WP-7 Ф204) — pick exactly one of cursor, tail_lines, section. Reading right after your OWN write without include_sha can return the pre-write content: search indexing happens asynchronously after the push, and a plain read (no include_sha, no ref) serves from that index, not live GitHub — tail_lines and section are no exception, they page the same stale copy if include_sha is omitted. Always pass include_sha:true (or ref) to see what you just wrote.",
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: {
+        ...tool.inputSchema.properties,
+        cursor: { type: "string", maxLength: 512, description: "Private full reads only: 'start' opts into JSON pages; copy next_cursor with the same filename/source/include_sha/ref. On document_changed, discard pages and restart. Each page rechecks access. Not combinable with headings, tail_lines or section." },
+        tail_lines: { type: "integer", minimum: 1, description: "Private full reads only: the last N whole lines of the document, cheaper than paging from the start when you only need the end (e.g. before appending). If the budget cannot fit N lines, returns as many as fit with truncated:true; if even one line cannot fit, returns its tail with partial_line:true rather than nothing. Not combinable with cursor or section." },
+        section: { type: "string", description: "Private full reads only: the content under one heading (its title, exact match — copy it from format:'headings' rather than retyping, leading/trailing whitespace is not trimmed), up to the next heading of the same or higher level or the end of the document. Headings inside fenced code blocks or YAML frontmatter do not count. No match returns the document's heading outline (error section_not_found); more than one match returns their line numbers (error section_ambiguous) — call get_document(format:'headings') or disambiguate and retry. A section larger than the budget pages the same way as cursor, via next_cursor. Not combinable with cursor or tail_lines." },
+      },
+    },
+  };
+  if (tool.name !== "search") return tool;
+  return {
+    ...tool,
+    description: "Search personal sources by keyword or semantic similarity (max 20 hits, 32000 UTF-8 response bytes). Content excerpts are marked when shortened; all selected hits are retained or an explicit size error is returned. Use get_document, with cursor:'start' for large documents. source_type is ignored.",
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: {
+        ...tool.inputSchema.properties,
+        source: { ...tool.inputSchema.properties.source, description: "Filter by a connected personal source" },
+        source_type: { ...tool.inputSchema.properties.source_type, description: "Ignored in private mode; use source to select a personal source" },
+        limit: { ...tool.inputSchema.properties.limit, description: "Maximum results: finite numbers are truncated and clamped to 1..20; other values use 5 (default)." },
+      },
+    },
+  };
+}
+
 // --- MCP handler ---
 
-export async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public", rawRequest?: Request, observationRuntime?: ObservationRuntime): Promise<McpResponse> {
+// WP-7 Ф187: the learner id of learner_progress / analyze_verbalization keys row-level
+// security (withUserContext), so a verified JWT subject always wins over the argument.
+// A verified but blank subject still wins: it never falls through to the caller's value.
+// Without a JWT nothing changes: the argument is used exactly as before, because platform
+// callers such as hw-checker send it directly and carry no token, and the gateway forwards
+// opaque tokens this worker cannot verify after binding the argument itself.
+// Whitespace-only values are no id (the gateway trims the verified subject the same way).
+export function resolveLearnerId(jwtSubject: string | undefined, args: Record<string, unknown>): string | undefined {
+  if (jwtSubject !== undefined) return jwtSubject.trim() || undefined;
+  const argument = typeof args.user_id === "string" ? args.user_id.trim() : "";
+  return argument || undefined;
+}
+
+// WP-7 Ф190: who is calling a learner tool. Three outcomes only: a verified JWT, a verified
+// service credential, or neither. An Authorization header that did not verify (a forged JWT, an
+// opaque gateway token) counts as neither: the worker cannot tell it from garbage.
+export const SERVICE_AUTH_HEADER = "X-IWE-Service-Auth";
+export type LearnerCaller = { kind: "jwt" } | { kind: "service"; name: string } | { kind: "unauthenticated" };
+
+export function classifyLearnerCaller(env: Env, jwtSubject: string | undefined, rawRequest: Request | undefined): LearnerCaller {
+  if (jwtSubject !== undefined) return { kind: "jwt" };
+  const presented = rawRequest?.headers.get(SERVICE_AUTH_HEADER);
+  if (presented && env.LEARNER_TOOLS_SERVICE_SECRETS) {
+    let matched: string | undefined;
+    // Compare against every configured secret without stopping at the first match.
+    for (const pair of env.LEARNER_TOOLS_SERVICE_SECRETS.split(",")) {
+      const separator = pair.indexOf(":");
+      if (separator <= 0) continue;
+      const secret = pair.slice(separator + 1).trim();
+      if (secret && secretsEqual(presented, secret)) matched ??= pair.slice(0, separator).trim();
+    }
+    if (matched) return { kind: "service", name: matched };
+  }
+  return { kind: "unauthenticated" };
+}
+
+// Records who called a learner tool (no ids, no secrets) and, in enforce mode, refuses callers
+// that are neither a verified user nor a platform service. Returns an error message or null.
+export function gateLearnerCall(env: Env, tool: string, caller: LearnerCaller, argumentIdPresent: boolean): string | null {
+  console.log(JSON.stringify({
+    event: "learner_tool_caller",
+    tool,
+    caller: caller.kind,
+    service: caller.kind === "service" ? caller.name : undefined,
+    argument_id_present: argumentIdPresent,
+    mode: env.LEARNER_TOOLS_SERVICE_AUTH === "enforce" ? "enforce" : "off",
+  }));
+  if (caller.kind === "unauthenticated" && env.LEARNER_TOOLS_SERVICE_AUTH === "enforce") {
+    return `${tool} requires a verified user token or a platform service credential`;
+  }
+  return null;
+}
+
+export async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public", rawRequest?: Request, jwtSubject?: string, observationRuntime?: ObservationRuntime): Promise<McpResponse> {
+  const boundedRead = mode === "private" && request.method === "tools/call"
+    && (request.params?.name === "search" || request.params?.name === "get_document");
+  if (boundedRead) {
+    const idError = privateReadIdError(request.id);
+    if (idError) return idError;
+  }
+  const response = await handleMcpRequestImpl(request, env, userId, mode, rawRequest, jwtSubject, observationRuntime);
+  return boundedRead ? enforcePrivateReadBudget(response) : response;
+}
+
+async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: string | undefined, mode: McpMode, rawRequest?: Request, jwtSubject?: string, observationRuntime?: ObservationRuntime): Promise<McpResponse> {
   const { id, method, params } = request;
 
   try {
@@ -2775,7 +3283,7 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
           id,
           result: {
             tools: mode === "private"
-              ? [...TOOLS.filter(tool => !PUBLIC_ONLY_TOOL_NAMES.has(tool.name)), ...PRIVATE_TOOLS]
+              ? [...TOOLS.filter(tool => !PUBLIC_ONLY_TOOL_NAMES.has(tool.name)).map(privateToolDefinition), ...PRIVATE_TOOLS]
               : TOOLS,
           },
         };
@@ -2783,6 +3291,11 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
       case "tools/call": {
         const toolName = (params as { name: string }).name;
         const args = (params as { arguments: Record<string, unknown> }).arguments || {};
+
+        const withdrawnMessage = WITHDRAWN_TOOL_MESSAGES.get(toolName);
+        if (withdrawnMessage) {
+          return { jsonrpc: "2.0", id, error: { code: -32601, message: withdrawnMessage } };
+        }
 
         if (mode === "private" && PUBLIC_ONLY_TOOL_NAMES.has(toolName)) {
           return {
@@ -2854,9 +3367,16 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             // reuses personal_write's grant rather than a dedicated scope for one narrow op.
             new_post: "personal_write",
           };
-          // new_post carries no file path (it commits to a fixed internal log path, not a
-          // caller-supplied one) — same shape as disconnect_source/purge_source below.
-          const PATH_NOT_REQUIRED_TOOLS: ReadonlySet<string> = new Set(["disconnect_source", "purge_source", "new_post"]);
+          // new_post has no caller-selected path. Its allocator-only branch writes the
+          // fixed log; scaffold creation additionally authorizes every generated path
+          // after planning and before any Git mutation (see its handler below).
+          // propose_capture returns a preview only (no repo write happens here — the caller
+          // confirms with a separate `write` call, which IS path-checked); suggested_path is
+          // optional by the tool's own schema and the handler below fills a default when it's
+          // omitted, but that fill happens AFTER this scope check — omitting it here previously
+          // denied a legitimate call with the same path_not_allowed text a missing path gets.
+          // Found alongside the required-argument gap, 2026-09-24 (peer-session with Kimi+Codex).
+          const PATH_NOT_REQUIRED_TOOLS: ReadonlySet<string> = new Set(["disconnect_source", "purge_source", "new_post", "propose_capture"]);
           const canonicalToolName = SCOPE_CHECKED_TOOLS[toolName];
 
           if (canonicalToolName) {
@@ -2868,6 +3388,7 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
                 activeSources: ctx.sourceNames,
                 indicatorsDatabaseUrl: env.INDICATORS_DATABASE_URL,
                 scopeGuardMode: env.SCOPE_GUARD_MODE,
+                policy: toolName === "delete" ? "required" : "configured",
                 requiresPath: !PATH_NOT_REQUIRED_TOOLS.has(toolName),
               });
             } catch (err) {
@@ -2881,7 +3402,6 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
           if (toolName === "write") {
             const source = args.source as string;
             const path = args.path as string;
-            const content = args.content as string;
             const message = (args.message as string) || "Update via Aisystant MCP";
 
             if (!ctx.sourceNames.includes(source)) {
@@ -2889,8 +3409,71 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             }
 
             const expectedSha = args.expected_sha as string | undefined;
-            const writeResult = await writeToGitHub(env, ctx, source, path, content, message, {}, expectedSha);
+            const mode = (args.mode as string | undefined) ?? "replace";
+
+            if (mode === "append" || mode === "str_replace") {
+              // Mirrors the inline validation style already used in this handler (e.g. the
+              // ref === "" check above) rather than relying on client-side schema enforcement,
+              // which this server does not apply to tool arguments (WP-7 Ф204).
+              if (expectedSha === undefined) {
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `mode: '${mode}' требует expected_sha — прочитай personal_get_document(include_sha: true) и передай его sha.` }], isError: true } };
+              }
+              const onConflictArg = args.on_conflict;
+              if (onConflictArg !== undefined && onConflictArg !== "fail" && onConflictArg !== "retry") {
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "on_conflict должен быть 'fail' или 'retry'." }], isError: true } };
+              }
+              const operationIdArg = args.operation_id;
+              if (operationIdArg !== undefined && (typeof operationIdArg !== "string" || operationIdArg.length === 0 || operationIdArg.length > 128)) {
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "operation_id должен быть непустой строкой до 128 символов." }], isError: true } };
+              }
+              const sharedOptions = { onConflict: onConflictArg as "fail" | "retry" | undefined, operationId: operationIdArg as string | undefined };
+
+              if (mode === "append") {
+                if (typeof args.content !== "string") {
+                  return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "mode: 'append' требует content (строку с добавляемым фрагментом)." }], isError: true } };
+                }
+                const appendResult = await appendToGitHub(env, ctx, source, path, args.content, message, expectedSha, sharedOptions);
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(appendResult, null, 2) }] } };
+              }
+
+              // mode === "str_replace"
+              if (typeof args.old_string !== "string" || args.old_string.length === 0) {
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "mode: 'str_replace' требует непустой old_string." }], isError: true } };
+              }
+              if (typeof args.new_string !== "string") {
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "mode: 'str_replace' требует new_string (строка, может быть пустой)." }], isError: true } };
+              }
+              const dryRunArg = args.dry_run;
+              if (dryRunArg !== undefined && typeof dryRunArg !== "boolean") {
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "dry_run должен быть булевым значением." }], isError: true } };
+              }
+              const replaceResult = await strReplaceInGitHub(env, ctx, source, path, args.old_string, args.new_string, message, expectedSha, {
+                ...sharedOptions, dryRun: dryRunArg === true,
+              });
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(replaceResult, null, 2) }] } };
+            }
+            if (mode !== "replace") {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `mode должен быть 'replace', 'append' или 'str_replace', получено: ${JSON.stringify(mode)}.` }], isError: true } };
+            }
+
+            if (typeof args.content !== "string") {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "mode: 'replace' требует content (строку с полным содержимым файла)." }], isError: true } };
+            }
+            const writeResult = await writeToGitHub(env, ctx, source, path, args.content, message, {}, expectedSha);
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(writeResult, null, 2) }] } };
+          }
+
+          if (toolName === "history") {
+            const source = args.source as string;
+            const path = args.path as string;
+            const limit = args.limit as number | undefined;
+
+            if (!ctx.sourceNames.includes(source)) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
+            }
+
+            const historyResult = await personalGetDocumentHistory(env, ctx, source, path, limit);
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(historyResult, null, 2) }], ...(historyResult.success ? {} : { isError: true }) } };
           }
 
           if (toolName === "propose_capture") {
@@ -2919,14 +3502,41 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
           if (toolName === "delete") {
             const source = args.source as string;
             const path = args.path as string;
-            const message = (args.message as string) || "Delete via Aisystant MCP";
+            const suppliedSha = args.expected_sha;
+            const suppliedMessage = typeof args.message === "string" ? args.message : undefined;
+            // Clients that connected before expected_sha became required still expose
+            // source/path/message only. Carry the already-read blob SHA in their existing
+            // message field; never write this transport marker into the Git commit.
+            const legacyPrefix = "IWE-DELETE-SHA:";
+            const legacySha = suppliedMessage?.startsWith(legacyPrefix)
+              ? suppliedMessage.slice(legacyPrefix.length)
+              : undefined;
 
             if (!ctx.sourceNames.includes(source)) {
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
             }
 
-            const deleteResult = await deleteFromGitHub(env, ctx, source, path, message);
-            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(deleteResult, null, 2) }] } };
+            if (suppliedSha === undefined && !/^[0-9a-fA-F]{40}$/.test(legacySha ?? "")) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({
+                success: false,
+                reason: "expected_sha_required",
+                error: "Файл не удалён: нужен SHA версии, которую подтвердил человек.",
+                next_action: "Прочитай точный файл через personal_get_document(source, filename, include_sha=true), назови человеку источник и путь и получи явное подтверждение удаления. Если в схеме personal_delete нет expected_sha, повтори вызов с теми же source/path и message='IWE-DELETE-SHA:<sha из чтения>' (ровно 40 hex-символов). Переподключение не требуется.",
+              }) }], isError: true } };
+            }
+            if (suppliedSha !== undefined && legacySha !== undefined) {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({
+                success: false,
+                reason: "conflicting_sha_arguments",
+                error: "Передай SHA только одним способом: expected_sha или совместимый маркер в message.",
+              }) }], isError: true } };
+            }
+
+            const expectedSha = (suppliedSha ?? legacySha) as string;
+            const message = legacySha !== undefined ? "Delete via Aisystant MCP" : suppliedMessage || "Delete via Aisystant MCP";
+
+            const deleteResult = await deleteFromGitHub(env, ctx, source, path, message, expectedSha);
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(deleteResult, null, 2) }], ...(deleteResult.success ? {} : { isError: true }) } };
           }
 
           if (toolName === "new_post") {
@@ -2938,7 +3548,19 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
             }
 
-            const allocateResult = await allocatePostNumber(env, ctx, source, draftId, artifactType);
+            const allocateResult = await createPersonalPost(env, ctx, {
+              source, draftId, artifactType, scaffold: args.scaffold,
+            }, {
+              authorizePaths: async (paths) => {
+                for (const path of paths) {
+                  await guard.authorize(principal, {
+                    toolName: "personal_write", args: { ...args, source, path }, requestId,
+                    activeSources: ctx.sourceNames, indicatorsDatabaseUrl: env.INDICATORS_DATABASE_URL,
+                    scopeGuardMode: env.SCOPE_GUARD_MODE, requiresPath: true,
+                  });
+                }
+              },
+            });
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(allocateResult, null, 2) }] } };
           }
 
@@ -3085,25 +3707,40 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
               ctx,
               args.query as string,
               args.source as string | undefined,
-              (args.limit as number) || 5
+              normalizeSearchResultLimit(args.limit)
             );
-            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] } };
+            return buildPrivateSearchResponse(id, results, results.degradation);
           }
 
           if (toolName === "get_document") {
+            const pageError = validateDocumentPageRequest(args);
+            if (pageError) return privateReadError(id, pageError.code, pageError.message);
             const filename = args.filename as string;
+            const ref = args.ref as string | undefined;
+            const tailLines = args.tail_lines as number | undefined;
+            const sectionTitle = args.section as string | undefined;
 
-            if (args.include_sha === true) {
+            // GitHub's Contents API treats an empty ref value as "no ref" and returns the
+            // default-branch (current) version — not an error. Passing that empty ref through
+            // silently, uncaught. Reject it explicitly instead of relying on GitHub's own
+            // resolution (cold-review finding, verify session 26.09).
+            if (ref === "") {
+              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "ref не может быть пустой строкой — передай конкретный sha/ветку/тег из personal_history или не передавай параметр вовсе." }], isError: true } };
+            }
+
+            if (args.include_sha === true || ref !== undefined) {
               // WP-7 Ф96 (reworked after verify peer-session 30.08): live-first,
               // index only as a source hint; sha travels INSIDE the text content
               // as a JSON envelope — a non-standard result sibling is invisible
               // to MCP clients. A headings outline has no meaningful sha pairing.
+              // WP-7 Ф176: a ref forces the same live path — the search index
+              // only ever holds the current version, never a prior one.
               if (args.format === "headings") {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "include_sha и format=headings несовместимы: sha относится к полному содержимому файла. Убери один из параметров." }], isError: true } };
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "include_sha/ref и format=headings несовместимы: оба относятся к полному содержимому конкретной версии файла. Убери один из параметров." }], isError: true } };
               }
               let liveResult;
               try {
-                liveResult = await personalGetDocumentWithSha(env, ctx, filename, args.source as string | undefined);
+                liveResult = await personalGetDocumentWithSha(env, ctx, filename, args.source as string | undefined, ref);
               } catch (e) {
                 if (e instanceof AmbiguousSourceError) {
                   return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `filename exists in multiple sources (${e.sources.join(", ")}) — pass source to disambiguate` }], isError: true } };
@@ -3111,12 +3748,23 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
                 throw e;
               }
               if (!liveResult) {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Документ не найден на GitHub (или недоступен). Проверь filename и source." }], isError: true } };
+                const refHint = ref ? ` Или ref «${ref}» не существует для этого файла — проверь через personal_history.` : "";
+                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Документ не найден на GitHub (или недоступен). Проверь filename и source.${refHint}` }], isError: true } };
               }
               if (liveResult.kind === "source_required") {
                 return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ error: "source_required", message: "Документа нет в индексе — для живого чтения с GitHub передай source явно.", sources: liveResult.sources }) }], isError: true } };
               }
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ filename: liveResult.filename, source: liveResult.source, sha: liveResult.sha, content: liveResult.content }, null, 2) }] } };
+              let liveSection;
+              if (sectionTitle !== undefined) {
+                const resolved = sectionWindowOrError(id, liveResult.content, sectionTitle);
+                if (resolved.errorResult) return resolved.errorResult;
+                liveSection = resolved.bound;
+              }
+              return await buildPrivateDocumentResponse(id, liveResult, {
+                userId: principal.userId, live: true, ref, cursor: args.cursor,
+                ...(tailLines !== undefined ? { tailLines } : {}),
+                ...(liveSection ? { section: liveSection } : {}),
+              });
             }
 
             let doc;
@@ -3131,7 +3779,18 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             if (!doc) {
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Document not found" }], isError: true } };
             }
-            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: doc.content }] } };
+            let indexedSection;
+            if (sectionTitle !== undefined) {
+              const resolved = sectionWindowOrError(id, doc.content, sectionTitle);
+              if (resolved.errorResult) return resolved.errorResult;
+              indexedSection = resolved.bound;
+            }
+            return await buildPrivateDocumentResponse(id, doc, {
+              userId: principal.userId, live: false, cursor: args.cursor,
+              ...(args.format === "headings" ? { headings: documentHeadings(doc.content) } : {}),
+              ...(tailLines !== undefined ? { tailLines } : {}),
+              ...(indexedSection ? { section: indexedSection } : {}),
+            });
           }
 
           if (toolName === "list_documents") {
@@ -3341,13 +4000,15 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
         }
 
         if (toolName === "analyze_verbalization") {
+          const refusal = gateLearnerCall(env, toolName, classifyLearnerCaller(env, jwtSubject, rawRequest), typeof args.user_id === "string" && args.user_id.trim() !== "");
+          if (refusal) return { jsonrpc: "2.0", id, error: { code: -32001, message: refusal } };
           const result = await analyzeVerbalization(
             env,
             args.text as string,
             args.topic as string | undefined,
             args.domain as string | undefined,
             args.level as string | undefined,
-            args.user_id as string | undefined
+            resolveLearnerId(jwtSubject, args)
           );
           return {
             jsonrpc: "2.0",
@@ -3366,9 +4027,15 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
         }
 
         if (toolName === "learner_progress") {
+          const refusal = gateLearnerCall(env, toolName, classifyLearnerCaller(env, jwtSubject, rawRequest), typeof args.user_id === "string" && args.user_id.trim() !== "");
+          if (refusal) return { jsonrpc: "2.0", id, error: { code: -32001, message: refusal } };
+          const learnerId = resolveLearnerId(jwtSubject, args);
+          if (!learnerId) {
+            return { jsonrpc: "2.0", id, error: { code: -32602, message: "user_id is required" } };
+          }
           const progress = await getLearnerProgress(
             env,
-            args.user_id as string,
+            learnerId,
             args.domain as string | undefined
           );
           return {
@@ -3437,53 +4104,6 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
             jsonrpc: "2.0",
             id,
             result: { content: [{ type: "text", text: JSON.stringify(hits, null, 2) }] },
-          };
-        }
-
-        if (toolName === "reindex_source") {
-          const source = args.source as string;
-          const dryRun = (args.dry_run as boolean) || false;
-          const explicitFiles = args.files as string[] | undefined;
-
-          if (!SOURCE_GITHUB_BASE[source]) {
-            // This tool only knows the fixed platform (L2) corpus map (PACK-*/ZP/FPF/SPF/docs-*).
-            // A personal (L4) GitHub source with the same-looking name is a frequent mix-up —
-            // it bit this code's own author once (see the naming note near "reindex_source" in
-            // tools/list above) and an agent again on 2026-08-31 (WP-7 peer-session
-            // 2026-08-31-46-wp7-reindex-verify-tail) — hence the explicit pointer below instead
-            // of a bare "not found".
-            return {
-              jsonrpc: "2.0",
-              id,
-              result: {
-                content: [{ type: "text", text: JSON.stringify({
-                  error: `Unknown source: ${source}. This tool (reindex_source) is for the shared platform corpus (PACK-*, ZP, FPF, SPF, docs-*) only. For a personal GitHub source, use personal_reindex instead.`,
-                }) }],
-                isError: true,
-              },
-            };
-          }
-
-          const files = explicitFiles ?? await listGitHubFiles(source);
-          if (dryRun) {
-            return {
-              jsonrpc: "2.0",
-              id,
-              result: {
-                content: [{ type: "text", text: JSON.stringify({ source, files_found: files.length, sample_files: files.slice(0, 20) }) }],
-              },
-            };
-          }
-
-          const reindexReq: ReindexRequest = {
-            source,
-            files: files.map((path) => ({ path, action: "modified" })),
-          };
-          const result = await reindexFiles(env, reindexReq);
-          return {
-            jsonrpc: "2.0",
-            id,
-            result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
           };
         }
 
@@ -3660,6 +4280,12 @@ export async function handleMcpRequest(request: McpRequest, env: Env, userId?: s
         return { jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } };
     }
   } catch (err) {
+    if (err instanceof ReadFailure) {
+      console.warn(JSON.stringify({ event: "read_dependency_failed", ...err.toJSON() }));
+      return { jsonrpc: "2.0", id, result: {
+        content: [{ type: "text", text: JSON.stringify(err.toJSON()) }], isError: true,
+      } };
+    }
     return {
       jsonrpc: "2.0",
       id,
@@ -3701,14 +4327,12 @@ async function readFromGitHubPublic(source: string, filePath: string): Promise<s
   return await resp.text();
 }
 
-async function fetchGitHubTree(owner: string, repo: string, branch: string): Promise<Response> {
-  return fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, {
-    headers: { "User-Agent": "aisystant-knowledge-mcp" },
-  });
+function fetchGitHubTree(owner: string, repo: string, branch: string, token: string | undefined): Promise<Response> {
+  return fetchGitHubApi(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, token);
 }
 
-// WP-545 (2026-09-10): this endpoint is called unauthenticated (60 req/hour per IP,
-// shared across every Worker invocation on this account/region) — a failed response
+// WP-545 (2026-09-10): without env.GITHUB_TOKEN this endpoint is called unauthenticated (60 req/hour
+// per IP, shared across every Worker invocation on this account/region) — a failed response
 // needs to say WHETHER retrying makes sense, not just that it failed. A 5xx or network
 // hiccup is worth one immediate retry; a rate-limit (403 + Remaining=0, or an explicit
 // Retry-After) is not — hammering it again a few hundred ms later only makes the
@@ -3738,7 +4362,7 @@ function classifyGitHubTreeFailure(resp: Response): { retryable: boolean; resetA
  * List all .md files from a GitHub repo via Trees API (recursive).
  * Returns paths relative to repo root (including pathPrefix if present).
  */
-async function listGitHubFiles(source: string): Promise<string[]> {
+async function listGitHubFiles(source: string, token: string | undefined): Promise<string[]> {
   const config = SOURCE_GITHUB_BASE[source];
   // Both of these are static config errors (missing/malformed registry entry) — a
   // 15-minute retry can't fix a typo, tag terminal same as the HTTP-failure paths below.
@@ -3748,11 +4372,11 @@ async function listGitHubFiles(source: string): Promise<string[]> {
   if (!match) throw new Error(`Invalid GitHub base URL for source: ${source} ${TERMINAL_ERROR_TAG}`);
   const [, owner, repo, branch] = match;
 
-  let resp = await fetchGitHubTree(owner, repo, branch);
+  let resp = await fetchGitHubTree(owner, repo, branch, token);
   let failure = resp.ok ? null : classifyGitHubTreeFailure(resp);
   if (failure?.retryable) {
     await new Promise((r) => setTimeout(r, 300 + Math.random() * 500));
-    resp = await fetchGitHubTree(owner, repo, branch);
+    resp = await fetchGitHubTree(owner, repo, branch, token);
     failure = resp.ok ? null : classifyGitHubTreeFailure(resp);
   }
   if (!resp.ok) {
@@ -4068,13 +4692,13 @@ export default {
       // If no Authorization header → fall back to x-user-id for internal/platform requests
       // (e.g. reindexer calls that don't carry a user token).
       let userId: string | undefined;
-      let verifiedAccountId: string | undefined;
+      let jwtSubject: string | undefined; // set only by a verified JWT, never by x-user-id
       const authHeader = request.headers.get("Authorization");
       if (authHeader?.startsWith("Bearer ") && env.ORY_URL) {
         const token = authHeader.slice(7);
         const sub = await verifyJwtLocally(env.ORY_URL, token);
         userId = sub ?? undefined;
-        verifiedAccountId = userId;
+        jwtSubject = userId;
         // Note: opaque tokens (from Gateway /userinfo flow) return null sub → userId=undefined,
         // treated as unauthenticated. Gateway should only forward JWTs to knowledge-mcp.
       } else {
@@ -4082,8 +4706,8 @@ export default {
       }
 
       const body = (await request.json()) as McpRequest;
-      const response = await handleMcpRequest(body, env, userId, mode, request,
-        ctx ? { verifiedAccountId, waitUntil: task => ctx.waitUntil(task) } : undefined);
+      const response = await handleMcpRequest(body, env, userId, mode, request, jwtSubject,
+        ctx ? { verifiedAccountId: jwtSubject, waitUntil: task => ctx.waitUntil(task) } : undefined);
       const responseHeaders: Record<string, string> = {
         ...corsHeaders,
         "Content-Type": "application/json",
@@ -4316,6 +4940,50 @@ export default {
       });
     }
 
+    // WP-532 Ф9: deliberate trigger for the batched full-ingest of oversized platform documents
+    // (FPF-Spec.md). The daily cron is the normal path; this route lets a person start the FIRST
+    // live run and watch it, and lets a dry run report the plan (chunk count, queue messages,
+    // skip reason) without writing anything. dry_run defaults to TRUE — writing needs an explicit
+    // `"dry_run": false`. Same platform secret as /reindex; never available on the personal worker.
+    if (url.pathname === "/full-ingest" && request.method === "POST") {
+      const json = (status: number, payload: unknown) =>
+        new Response(JSON.stringify(payload), { status, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      if (resolveMode(env.MCP_MODE) === "private") {
+        return json(503, { error: "Service Unavailable", reason: "not_available_in_private_mode" });
+      }
+      if (!env.REINDEX_SECRET) {
+        return json(503, { error: "Service Unavailable", reason: "reindex_secret_not_configured" });
+      }
+      if (env.PERSONAL_REINDEX_SECRET && secretsEqual(env.REINDEX_SECRET, env.PERSONAL_REINDEX_SECRET)) {
+        return json(503, { error: "Service Unavailable", reason: "reindex_secrets_not_distinguishable" });
+      }
+      const auth = request.headers.get("Authorization");
+      const presented = auth?.startsWith("Bearer ") ? auth.slice(7) : "";
+      if (!presented || !secretsEqual(presented, env.REINDEX_SECRET)) {
+        return json(401, { error: "Unauthorized" });
+      }
+      let body: { source?: string; path?: string; dry_run?: boolean };
+      try {
+        body = ((await request.json()) ?? {}) as typeof body;
+      } catch {
+        return json(400, { error: "Bad Request", reason: "invalid_json" });
+      }
+      const source = typeof body.source === "string" ? body.source : "";
+      if (!FULL_INGEST_SOURCES.includes(source)) {
+        return json(400, { error: "Bad Request", reason: "source_not_in_full_ingest_sources", allowed: FULL_INGEST_SOURCES });
+      }
+      const dryRun = body.dry_run !== false;
+      try {
+        const results = await runOversizedFullIngest(env, source, { dryRun, path: body.path });
+        console.log(JSON.stringify({ phase: "full_ingest_manual_trigger", source, dry_run: dryRun, results }));
+        return json(200, { source, dry_run: dryRun, results });
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        console.error(JSON.stringify({ phase: "full_ingest_manual_trigger_failed", source, dry_run: dryRun, error: message }));
+        return json(502, { error: "Bad Gateway", message });
+      }
+    }
+
     if (url.pathname === "/health") {
       return new Response(JSON.stringify({
         ok: true,
@@ -4393,6 +5061,10 @@ export default {
       ctx.waitUntil((async () => {
         await rebuildSkillsIndex(env);
         await retryPendingHeartbeatSources(env);
+        // WP-532 Ф9: DB-only, no GitHub calls — doesn't compete for the rate-limit
+        // window the two calls above are sequenced to protect.
+        await retryStalledFullIngestSwaps(env);
+        await abandonStaleFullIngestRuns(env);
       })());
     } else {
       ctx.waitUntil(runHeartbeat(env));
@@ -4403,19 +5075,31 @@ export default {
   // (see ./layers/reindex.ts). Only private-mode deploys bind REINDEX_QUEUE at all (public
   // knowledge-mcp's wrangler.toml has no [[queues]] section) — the mode check is defensive,
   // matching the scheduled() heartbeat-skip pattern above, not an expected runtime path.
-  async queue(batch: MessageBatch<ReindexBatchMessage>, env: Env): Promise<void> {
-    if (resolveMode(env.MCP_MODE) !== "private") {
-      console.warn(JSON.stringify({ phase: "reindex_queue_skipped_public_mode", batch_size: batch.messages.length }));
+  async queue(batch: MessageBatch<ReindexBatchMessage | FullIngestBatchMessage>, env: Env): Promise<void> {
+    // WP-532 Ф9: attemptFullIngestSwap() reads the shared knowledgeChunkTable module-
+    // level variable (see initTables() and the WP-560 Ф11 incident note on it) — queue()
+    // never needed it before (handleQueue()/layers/reindex.ts resolve their own table
+    // references per-call), so this entry point never called initTables(). Same bug
+    // class Ф11 already fixed for scheduled(), just not here since nothing exercised it.
+    initTables(env);
+    // WP-532 Ф9: FULL_INGEST_QUEUE_NAME is bound only on the public deployment (unlike
+    // REINDEX_QUEUE below, which is private-only) — routed first, by queue name, before
+    // the private-mode gate that would otherwise reject it.
+    // A public deployment binds exactly one queue consumer (this one), so any batch it receives
+    // belongs here even if the queue was created under another name — silently acknowledging an
+    // unknown queue's messages would hide a naming slip until the run times out.
+    if (batch.queue === FULL_INGEST_QUEUE_NAME || resolveMode(env.MCP_MODE) !== "private") {
+      await handleFullIngestBatch(batch as MessageBatch<FullIngestBatchMessage>, env);
       return;
     }
-    await handleQueue(batch, env);
+    await handleQueue(batch as MessageBatch<ReindexBatchMessage>, env);
   },
 };
 
 // --- WP-339 Ф5+Ф6: Heartbeat + drift detector ---
 
 // Pack sources checked on every heartbeat run. Mirrors PACK-* keys in SOURCE_GITHUB_BASE.
-const HEARTBEAT_PACK_SOURCES = Object.keys(SOURCE_GITHUB_BASE).filter(
+export const HEARTBEAT_PACK_SOURCES = Object.keys(SOURCE_GITHUB_BASE).filter(
   (s) => s.startsWith("PACK-")
 );
 
@@ -4433,18 +5117,56 @@ const STALENESS_ALERT_HOURS = 48;
 //     knowledge_chunk rows knowledge_search actually reads (concept-indexer.ts says as
 //     much: "Non-Pack sources ... remain in full ingest").
 // This is a daily full pass through reindexFiles() instead — see syncFullIngestSource().
-// Scope: FPF only for now (SPF deferred — internal source, pilot can reindex manually
-// after a push; revisit once this has run stably for a while).
-const FULL_INGEST_SOURCES = ["FPF"];
+//
+// SPF added 2026-09-29 (peer-session Claude+Kimi+Codex, WP-532): same gap as FPF —
+// SPF has no GitHub App installed and isn't a PACK-* name, so neither the webhook nor
+// the drift-heartbeat above ever touches it. Unlike FPF, SPF is the pilot's own repo
+// (TserenTserenov/SPF, not an external author's) — pushing to it is the pilot's own
+// action, so there's no cross-owner consistency question, only "server sees only what
+// was pushed, not uncommitted local edits" (same as every other source here). Measured
+// before adding: 46 .md files, 288KB total (github API, 2026-09-29) — same order of
+// magnitude as FPF's 7 files, well inside the per-file MAX_FILE_CHARS limit and no
+// concern for Worker CPU time. Not gated on "FPF has run stably for a while" as the
+// previous comment here planned — that couldn't be checked (see syncFullIngestSource's
+// health-write addition, same commit): there was no queryable row for FPF's daily run
+// at all until this change, only Worker console logs. Going in in the same commit as
+// that observability fix rather than waiting on a signal nothing was producing.
+export const FULL_INGEST_SOURCES = ["FPF", "SPF"];
+
+// WP-532 Ф10 (2026-10-02): pure decision extracted out of runHeartbeat() so the order is
+// unit-testable without mocking GitHub, OpenRouter and two Neon databases — same reasoning
+// as resolveScheduledJob() above (WP-560 Ф11: "a silent fallthrough/reorder here is exactly
+// the bug class that nearly dropped the daily PACK/FPF heartbeat"). FULL_INGEST_SOURCES first:
+// FPF/SPF get one chance a day to run the batched full-ingest of oversized documents, and a
+// pack source whose own reindex overruns this invocation's time budget (live case,
+// 2026-10-02: PACK-digital-platform, 1735 files, four consecutive timeouts) must not be able
+// to consume the whole budget before FPF/SPF even start.
+//
+// Temporary mitigation, not a fix: both groups still run sequentially, one `await` after
+// another, inside the same invocation's time budget — this only changes WHICH group goes
+// first, not whether a slow one can still exhaust that budget. If FPF or SPF's ordinary
+// (non-batched) reindexFiles() path ever has to process a large diff the same way
+// PACK-digital-platform does today, it would now delay or block every pack source instead.
+// The real fix is the same kind of batched, resumable, time-boxed processing WP-532 Ф9
+// already built for one oversized document, generalized to a source's whole file list —
+// tracked as a capture, not a new work item invented here.
+export function heartbeatSourceOrder(): { first: readonly string[]; second: readonly string[] } {
+  return { first: FULL_INGEST_SOURCES, second: HEARTBEAT_PACK_SOURCES };
+}
 
 interface GitHubFileMeta {
   path: string;
   /** Bytes, from the GitHub Trees API — not the same unit as MAX_FILE_CHARS (JS string
    *  length). See partitionFilesBySize(). */
   size: number;
+  /** Git blob SHA — content-addressed, immutable. WP-532 Ф9: batched full-ingest pins
+   *  this before enqueueing so every batch fetches the exact same bytes regardless of
+   *  what happens on the branch afterward (readGitHubBlobBySha), not a second read of
+   *  "whatever HEAD is now". */
+  sha: string;
 }
 
-async function listGitHubFilesWithSize(source: string): Promise<GitHubFileMeta[]> {
+async function listGitHubFilesWithSize(source: string, token: string | undefined): Promise<GitHubFileMeta[]> {
   const config = SOURCE_GITHUB_BASE[source];
   if (!config) throw new Error(`Unknown source: ${source}`);
 
@@ -4452,12 +5174,10 @@ async function listGitHubFilesWithSize(source: string): Promise<GitHubFileMeta[]
   if (!match) throw new Error(`Invalid GitHub base URL for source: ${source}`);
 
   const [, owner, repo, branch] = match;
-  const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, {
-    headers: { "User-Agent": "aisystant-knowledge-mcp" },
-  });
+  const resp = await fetchGitHubTree(owner, repo, branch, token);
 
   if (!resp.ok) throw new Error(`GitHub Trees API ${resp.status} for ${source}`);
-  const data = await resp.json() as { tree: Array<{ path: string; type: string; size?: number }>; truncated?: boolean };
+  const data = await resp.json() as { tree: Array<{ path: string; type: string; size?: number; sha: string }>; truncated?: boolean };
   if (data.truncated) {
     throw new Error(`GitHub tree truncated for ${source} — too many files.`);
   }
@@ -4467,7 +5187,28 @@ async function listGitHubFilesWithSize(source: string): Promise<GitHubFileMeta[]
       f.path.endsWith(".md") &&
       (!config.pathPrefix || f.path.startsWith(config.pathPrefix))
     )
-    .map((f) => ({ path: f.path, size: f.size ?? 0 }));
+    .map((f) => ({ path: f.path, size: f.size ?? 0, sha: f.sha }));
+}
+
+/**
+ * Read a file's exact content by its immutable Git blob SHA — not by branch, which can move
+ * while a batched full-ingest run (WP-532 Ф9) is in progress. Asks for the RAW media type so the
+ * body is the file itself: the default JSON+base64 form, decoded with Uint8Array.from(atob(...)),
+ * grew the heap to 526 MB on the 15.6 MB FPF-Spec.md (Worker isolate limit: 128 MB), measured
+ * 2026-09-29. One anonymous API call per run — see the 60 requests/hour note above.
+ */
+async function readGitHubBlobBySha(source: string, sha: string, token: string | undefined): Promise<string | null> {
+  const config = SOURCE_GITHUB_BASE[source];
+  if (!config) return null;
+  const match = config.base.match(/github\.com\/([^/]+)\/([^/]+)\/blob\//);
+  if (!match) return null;
+  const [, owner, repo] = match;
+
+  const resp = await fetchGitHubApi(`https://api.github.com/repos/${owner}/${repo}/git/blobs/${sha}`, token, {
+    Accept: "application/vnd.github.raw+json",
+  });
+  if (!resp.ok) return null;
+  return await resp.text();
 }
 
 /**
@@ -4492,52 +5233,809 @@ export function partitionFilesBySize<T extends { size: number }>(
   return { eligible, excluded };
 }
 
+// --- WP-532 Ф9: batched full-ingest for files over MAX_FILE_CHARS ---
+//
+// Why this exists: a file this large (FPF-Spec.md: 15.6 MB, 5896 chunks under chunkLargeFile)
+// cannot go through reindexFiles()'s sequential per-chunk path inside one Worker invocation,
+// and that path deletes the old rows first — a run that dies midway leaves the document
+// missing from search. This path stages everything invisibly to search and swaps it into
+// knowledge_chunk in ONE transaction, only when the whole document is ready.
+//
+// Design, "freeze then embed" (peer-session 2026-09-29-09-wp532-batched-full-ingest, Claude +
+// Kimi + Codex; it replaces the first design of session 2026-09-29-02):
+//  1. Producer (daily cron, or POST /full-ingest): pins the blob by its immutable Git SHA, reads
+//     it ONCE, chunks it ONCE and writes every chunk's text into knowledge_chunk_staging with
+//     embedding NULL, then fans index ranges out over the queue.
+//  2. Consumers only embed: SELECT their range WHERE embedding IS NULL, embed, UPDATE. They never
+//     touch GitHub and never re-chunk, so a redeploy in the middle of a run cannot make producer
+//     and consumers disagree about chunk boundaries, and a redelivered message costs nothing.
+//  3. attemptFullIngestSwap() is the only writer to knowledge_chunk. The CAS running -> swapping
+//     and every later statement live in one transaction; each statement after the CAS is guarded
+//     by status = 'swapping', so a consumer that loses the CAS changes nothing.
+//
+// Measured facts that shaped this (real FPF-Spec.md, Node/V8; a Worker isolate has 128 MB):
+//  - Uint8Array.from(atob(...), fn) on the 15.6 MB blob grows the heap 42 -> 526 MB. The blob is
+//    therefore read with the raw media type and resp.text() — no base64 anywhere.
+//  - One INSERT carrying the whole document text: 15.7 MB request body, ~63 MB peak heap, well
+//    inside the 64 MB Neon HTTP limit.
+//  - Anonymous GitHub API: 60 requests/hour per IP, shared with every other job of this account
+//    (see the WP-545 note at classifyGitHubTreeFailure) -> exactly one API call per run.
+//  - Cloudflare Queues sendBatch: at most 100 messages and 256 KB per call.
+
+const FULL_INGEST_QUEUE_NAME = "full-ingest-batches";
+// Chunks per queue message. Not measured; bounded by embedding latency (a message embeds this
+// many chunks one after another) and by the 15 min consumer wall clock.
+const FULL_INGEST_BATCH_SIZE = 10;
+// A run that has been running this long is treated as dead (abandonStaleFullIngestRuns). A first
+// run is expected to take 20-60 minutes (590 messages x ~4-11 s at concurrency 2).
+const FULL_INGEST_RUN_TTL_HOURS = 4;
+// Queues sendBatch limits are 100 messages / 256 KB; stay under the byte cap with margin.
+const QUEUE_SEND_BATCH_MAX_MESSAGES = 100;
+const QUEUE_SEND_BATCH_MAX_BYTES = 200 * 1024;
+// Staging inserts go out as one sql.transaction per group. Bounded by rows and by total text so
+// a group of worst-case chunks (78 K chars each) stays far below the 64 MB Neon HTTP body limit.
+const STAGING_INSERT_GROUP_MAX_ROWS = 50;
+const STAGING_INSERT_GROUP_MAX_CHARS = 2_000_000;
+// The parent row (whole document) is appended in slices of this many characters.
+const PARENT_PIECE_CHARS = 1_000_000;
+const FULL_INGEST_RETRY_BASE_SECONDS = 30;
+const FULL_INGEST_RETRY_MAX_SECONDS = 300;
+
+// What neon(url) returns: rows as objects, not the "full results" form.
+type KnowledgeSql = NeonQueryFunction<false, false>;
+
+interface FullIngestBatchMessage {
+  run_id: string;
+  source: string;
+  document_path: string;
+  /** Half-open range over the CHILD chunk indices (index 0 is the parent row, written by the
+   *  producer and never part of a range). Chunk texts live in staging, not in the message. */
+  batch_start: number;
+  batch_end: number;
+}
+
+export interface FullIngestStartResult {
+  path: string;
+  outcome:
+    | "queued"
+    | "unchanged"
+    | "in_progress"
+    | "disabled"
+    | "queue_unbound"
+    | "fetch_failed"
+    | "failed"
+    | "dry_run";
+  total_chunks?: number;
+  messages?: number;
+  run_id?: string;
+  source_revision?: string;
+  detail?: string;
+}
+
+/** Table names and identity of one batched run, shared by the producer helpers. */
+interface FullIngestRunContext {
+  knowledgeSql: KnowledgeSql;
+  runsTable: string;
+  stagingTable: string;
+  runId: string;
+  source: string;
+  sourceKind: string;
+  path: string;
+}
+
+/**
+ * Half-open [batch_start, batch_end) ranges over child indices 1..totalChunks-1 (index 0 is the
+ * parent row, written directly by the caller, never part of a range here). Pure and separate
+ * from startBatchedFullIngest() so it is unit-tested without a DB/GitHub/queue — this range
+ * math is exactly the kind of off-by-one surface that broke silently in an earlier draft.
+ */
+export function buildFullIngestBatchRanges(totalChunks: number, batchSize: number): { batch_start: number; batch_end: number }[] {
+  const ranges: { batch_start: number; batch_end: number }[] = [];
+  for (let start = 1; start < totalChunks; start += batchSize) {
+    ranges.push({ batch_start: start, batch_end: Math.min(start + batchSize, totalChunks) });
+  }
+  return ranges;
+}
+
+/** Kill switch for NEW runs only. Runs already in flight are stopped by pausing queue delivery
+ *  and/or setting their full_ingest_runs row to 'abandoned' (see the launch runbook). */
+export function fullIngestDisabled(env: { FULL_INGEST_DISABLED?: string }): boolean {
+  return env.FULL_INGEST_DISABLED === "true";
+}
+
+/** Splits queue messages into sendBatch calls that respect both the message-count and the
+ *  total-bytes limits (a single oversized item still goes out alone rather than being lost). */
+export function splitForSendBatch<T>(
+  items: T[],
+  maxCount: number = QUEUE_SEND_BATCH_MAX_MESSAGES,
+  maxBytes: number = QUEUE_SEND_BATCH_MAX_BYTES,
+): T[][] {
+  const encoder = new TextEncoder();
+  const groups: T[][] = [];
+  let current: T[] = [];
+  let currentBytes = 0;
+  for (const item of items) {
+    const bytes = encoder.encode(JSON.stringify(item)).length;
+    if (current.length > 0 && (current.length >= maxCount || currentBytes + bytes > maxBytes)) {
+      groups.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(item);
+    currentBytes += bytes;
+  }
+  if (current.length > 0) groups.push(current);
+  return groups;
+}
+
+/** Groups staging rows so one sql.transaction stays small in both row count and text volume. */
+export function groupStagingRows<T extends { content: string }>(
+  rows: T[],
+  maxRows: number = STAGING_INSERT_GROUP_MAX_ROWS,
+  maxChars: number = STAGING_INSERT_GROUP_MAX_CHARS,
+): T[][] {
+  const groups: T[][] = [];
+  let current: T[] = [];
+  let currentChars = 0;
+  for (const row of rows) {
+    if (current.length > 0 && (current.length >= maxRows || currentChars + row.content.length > maxChars)) {
+      groups.push(current);
+      current = [];
+      currentChars = 0;
+    }
+    current.push(row);
+    currentChars += row.content.length;
+  }
+  if (current.length > 0) groups.push(current);
+  return groups;
+}
+
+/** Retry delay for a redelivered queue message: 30 s, 60 s, 120 s, 240 s, then 300 s. */
+export function fullIngestRetryDelaySeconds(attempts: number): number {
+  const n = Math.max(1, Math.floor(attempts));
+  return Math.min(FULL_INGEST_RETRY_MAX_SECONDS, FULL_INGEST_RETRY_BASE_SECONDS * 2 ** (n - 1));
+}
+
+/**
+ * Same suffix rule as scripts/ingest.ts (repeated chunk names get "#2", "#3", ...): the manual
+ * loader and this path then produce the SAME source_uri for the same chunk, and the swap's plain
+ * INSERT cannot trip idx_kc_source_uri_source_account on a repeated section title. (Today
+ * FPF-Spec.md has no repeated names; a future edition may.)
+ */
+export function dedupeChunkFilenames<T extends { filename: string }>(chunks: T[]): T[] {
+  const seen = new Map<string, number>();
+  return chunks.map((chunk) => {
+    const count = seen.get(chunk.filename) ?? 0;
+    seen.set(chunk.filename, count + 1);
+    return count > 0 ? { ...chunk, filename: `${chunk.filename}#${count + 1}` } : chunk;
+  });
+}
+
+/**
+ * Marks a run abandoned and drops its staging rows in ONE statement. A crash between two separate
+ * statements would leave rows nobody cleans (the sweep only looks at what it flips itself), which
+ * is how the first design leaked a 15 MB parent row per failed start.
+ */
+async function abandonRunAndDropStaging(ctx: FullIngestRunContext): Promise<void> {
+  const { knowledgeSql, runsTable, stagingTable, runId } = ctx;
+  await knowledgeSql`
+    WITH changed AS (
+      UPDATE ${knowledgeSql.unsafe(runsTable)} SET status = 'abandoned'
+      WHERE run_id = ${runId} AND status IN ('running', 'swapping')
+      RETURNING run_id
+    ), doomed AS (
+      SELECT run_id FROM changed
+      UNION
+      SELECT run_id FROM ${knowledgeSql.unsafe(runsTable)} WHERE run_id = ${runId} AND status = 'abandoned'
+    )
+    DELETE FROM ${knowledgeSql.unsafe(stagingTable)} WHERE run_id IN (SELECT run_id FROM doomed)
+  `;
+}
+
+/**
+ * What the producer must know before spending a 15 MB download: is a run already in flight, and
+ * which blob is currently installed. "Installed" means the last swapped run whose parent row is
+ * STILL live — the manual loader (scripts/ingest.ts) can overwrite the document after our swap,
+ * and the parent row's chunk_uuid is the run_id of the swap that installed it, so a mismatch
+ * means the live copy is no longer ours and the document must be rebuilt even at the same SHA.
+ */
+async function readFullIngestState(
+  knowledgeSql: KnowledgeSql,
+  runsTable: string,
+  source: string,
+  path: string,
+): Promise<{ active: number; installedRevision: string | null }> {
+  const [state] = await knowledgeSql`
+    SELECT
+      (SELECT count(*) FROM ${knowledgeSql.unsafe(runsTable)}
+         WHERE source = ${source} AND document_path = ${path} AND status IN ('running', 'swapping'))::int AS active,
+      (SELECT r.source_revision FROM ${knowledgeSql.unsafe(runsTable)} r
+         WHERE r.source = ${source} AND r.document_path = ${path} AND r.status = 'swapped'
+           AND EXISTS (SELECT 1 FROM ${knowledgeSql.unsafe(knowledgeChunkTable)} k
+                       WHERE k.chunk_uuid = r.run_id::uuid AND k.account_id IS NULL)
+         ORDER BY r.swapped_at DESC NULLS LAST
+         LIMIT 1) AS installed_revision
+  ` as { active: number; installed_revision: string | null }[];
+  return { active: state.active, installedRevision: state.installed_revision };
+}
+
+/** Single-writer claim: the partial unique index uq_running_ingest_per_doc makes a second
+ *  concurrent claim for the same document impossible, not merely unlikely. */
+async function claimFullIngestRun(ctx: FullIngestRunContext, sha: string, totalChunks: number): Promise<boolean> {
+  const { knowledgeSql, runsTable, runId, source, path } = ctx;
+  const claimed = await knowledgeSql`
+    INSERT INTO ${knowledgeSql.unsafe(runsTable)}
+      (run_id, source, document_path, source_revision, total_chunks, status)
+    VALUES (${runId}, ${source}, ${path}, ${sha}, ${totalChunks}, 'running')
+    ON CONFLICT (source, document_path) WHERE status = 'running' DO NOTHING
+    RETURNING run_id
+  ` as unknown[];
+  return claimed.length > 0;
+}
+
+/** Parent row (index 0): the whole document. It goes in PIECES (an empty row, then appended slices):
+ *  one INSERT carrying 15.6 MB would put a second and third copy of the text (JSON body, encoded
+ *  bytes) in memory exactly when the chunks already exist, the worst moment for a 128 MB isolate.
+ *  Every statement is conditional on the run still being 'running', so a sweep that abandoned a
+ *  slow start stops all further writes. */
+async function insertStagingParent(ctx: FullIngestRunContext, content: string, contentHashValue: string): Promise<void> {
+  const { knowledgeSql, runsTable, stagingTable, runId, source, sourceKind, path } = ctx;
+  await knowledgeSql`
+    INSERT INTO ${knowledgeSql.unsafe(stagingTable)}
+      (run_id, chunk_index, role, chunk_uuid, parent_chunk_uuid, chunk_id, document_path,
+       paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, collection_kind)
+    SELECT ${runId}::text, 0, 'parent', ${runId}::uuid, NULL::uuid, ${path + "::p0"}::text, ${path}::text,
+           0, ${contentHashValue}::text, ${path}::text, ''::text, ${source}::text, ${sourceKind}::text, ${contentHashValue}::text,
+           NULL, 'platform'
+    FROM ${knowledgeSql.unsafe(runsTable)} r
+    WHERE r.run_id = ${runId} AND r.status = 'running'
+  `;
+  for (let offset = 0; offset < content.length; offset += PARENT_PIECE_CHARS) {
+    const piece = content.slice(offset, offset + PARENT_PIECE_CHARS);
+    await knowledgeSql`
+      UPDATE ${knowledgeSql.unsafe(stagingTable)} s SET content = s.content || ${piece}::text
+      WHERE s.run_id = ${runId} AND s.chunk_index = 0
+        AND EXISTS (SELECT 1 FROM ${knowledgeSql.unsafe(runsTable)} r WHERE r.run_id = s.run_id AND r.status = 'running')
+    `;
+  }
+}
+
+/** Child rows (indices 1..N): every chunk's text with embedding NULL, in bounded transactions.
+ *  chunk_uuid is generated here and each child points at the parent (whose chunk_uuid is the
+ *  run_id), so the swap can copy everything with one INSERT ... SELECT and no second pass. */
+async function insertStagingChildren(ctx: FullIngestRunContext, chunks: { filename: string; content: string }[]): Promise<void> {
+  const { knowledgeSql, runsTable, stagingTable, runId, source, sourceKind } = ctx;
+  const rows = chunks.map((c, k) => ({ index: k + 1, filename: c.filename, content: c.content }));
+  for (const group of groupStagingRows(rows)) {
+    const statements = [];
+    for (const row of group) {
+      const rowHash = await contentHash(row.content);
+      statements.push(knowledgeSql`
+        INSERT INTO ${knowledgeSql.unsafe(stagingTable)}
+          (run_id, chunk_index, role, chunk_uuid, parent_chunk_uuid, chunk_id, document_path,
+           paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, collection_kind)
+        SELECT ${runId}::text, ${row.index}::int, 'child', ${crypto.randomUUID()}::uuid, ${runId}::uuid,
+               ${row.filename + "::p" + row.index}::text, ${row.filename}::text, ${row.index}::int, ${rowHash}::text,
+               ${row.filename}::text, ${row.content}::text, ${source}::text, ${sourceKind}::text, ${rowHash}::text,
+               NULL, 'platform'
+        FROM ${knowledgeSql.unsafe(runsTable)} r
+        WHERE r.run_id = ${runId} AND r.status = 'running'
+      `);
+    }
+    await knowledgeSql.transaction(statements);
+  }
+}
+
+/**
+ * Producer: decides whether the document needs a run, reads it once, chunks it once, stages every
+ * chunk's text, and fans index ranges out over the queue. dryRun does everything up to (and
+ * including) chunking and reports the plan, but writes nothing and enqueues nothing.
+ *
+ * Fail-safe by construction: any failure after the run row is claimed abandons the run and
+ * removes its staging rows; live knowledge_chunk rows are only ever touched by the swap.
+ */
+async function startBatchedFullIngest(
+  env: Env,
+  source: string,
+  file: GitHubFileMeta,
+  opts: { dryRun?: boolean } = {},
+): Promise<FullIngestStartResult> {
+  const dryRun = opts.dryRun === true;
+  const result = (r: Omit<FullIngestStartResult, "path">): FullIngestStartResult => ({ path: file.path, ...r });
+
+  if (fullIngestDisabled(env)) {
+    console.log(JSON.stringify({ phase: "full_ingest_disabled", source, path: file.path }));
+    return result({ outcome: "disabled" });
+  }
+  // A dry run must work before the queue exists — that is when it is most useful.
+  if (!dryRun && !env.FULL_INGEST_QUEUE) {
+    console.log(JSON.stringify({ phase: "full_ingest_batch_queue_unbound", source, path: file.path }));
+    return result({ outcome: "queue_unbound" });
+  }
+
+  // Both new tables live in the KNOWLEDGE database (not health): the swap moves rows into
+  // knowledge_chunk within one transaction, possible only inside one Postgres database.
+  const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
+  const schema = getKnowledgeSchema(env);
+  const ctx: FullIngestRunContext = {
+    knowledgeSql,
+    runsTable: KNOWLEDGE_TABLES.full_ingest_runs(schema),
+    stagingTable: KNOWLEDGE_TABLES.knowledge_chunk_staging(schema),
+    runId: crypto.randomUUID(),
+    source,
+    sourceKind: resolveSourceType(source),
+    path: file.path,
+  };
+
+  try {
+    const state = await readFullIngestState(knowledgeSql, ctx.runsTable, source, file.path);
+    if (state.active > 0) {
+      console.log(JSON.stringify({ phase: "full_ingest_batch_already_running", source, path: file.path }));
+      return result({ outcome: "in_progress" });
+    }
+    if (state.installedRevision === file.sha) {
+      console.log(JSON.stringify({ phase: "full_ingest_unchanged", source, path: file.path, sha: file.sha }));
+      return result({ outcome: "unchanged", source_revision: file.sha });
+    }
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    console.error(JSON.stringify({ phase: "full_ingest_state_check_failed", source, path: file.path, error: detail }));
+    return result({ outcome: "failed", detail: `state check failed: ${detail}` });
+  }
+
+  let content: string | null;
+  try {
+    content = await readGitHubBlobBySha(source, file.sha, env.GITHUB_TOKEN);
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    console.error(JSON.stringify({ phase: "full_ingest_batch_fetch_failed", source, path: file.path, sha: file.sha, error: detail }));
+    return result({ outcome: "fetch_failed", detail });
+  }
+  if (content === null) {
+    console.error(JSON.stringify({ phase: "full_ingest_batch_fetch_failed", source, path: file.path, sha: file.sha }));
+    return result({ outcome: "fetch_failed" });
+  }
+  const parentHash = await contentHash(content);
+  const chunks = dedupeChunkFilenames(chunkLargeFile(content, file.path));
+  if (chunks.length === 0) {
+    console.error(JSON.stringify({ phase: "full_ingest_batch_no_chunks", source, path: file.path, sha: file.sha }));
+    return result({ outcome: "failed", detail: "no chunks" });
+  }
+  // Parent occupies index 0; children occupy 1..chunks.length.
+  const totalChunks = chunks.length + 1;
+  const ranges = buildFullIngestBatchRanges(totalChunks, FULL_INGEST_BATCH_SIZE);
+
+  if (dryRun) {
+    console.log(JSON.stringify({ phase: "full_ingest_dry_run", source, path: file.path, sha: file.sha, total_chunks: totalChunks, messages: ranges.length }));
+    return result({ outcome: "dry_run", total_chunks: totalChunks, messages: ranges.length, source_revision: file.sha });
+  }
+
+  try {
+    // The download and chunking took seconds: look again before claiming, so a run that finished
+    // or started meanwhile does not cause a pointless rebuild.
+    const again = await readFullIngestState(knowledgeSql, ctx.runsTable, source, file.path);
+    if (again.active > 0 || again.installedRevision === file.sha) {
+      console.log(JSON.stringify({ phase: "full_ingest_state_changed_meanwhile", source, path: file.path }));
+      return result({ outcome: again.active > 0 ? "in_progress" : "unchanged", source_revision: file.sha });
+    }
+    if (!(await claimFullIngestRun(ctx, file.sha, totalChunks))) {
+      console.log(JSON.stringify({ phase: "full_ingest_batch_already_running", source, path: file.path }));
+      return result({ outcome: "in_progress" });
+    }
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    console.error(JSON.stringify({ phase: "full_ingest_batch_claim_failed", source, path: file.path, error: detail }));
+    return result({ outcome: "failed", detail: `claim failed: ${detail}` });
+  }
+
+  try {
+    await insertStagingParent(ctx, content, parentHash);
+    // The full text is in the database now; drop the only large reference before the child
+    // inserts (best effort — chunks built with an empty title prefix can still slice into it).
+    content = null;
+    await insertStagingChildren(ctx, chunks);
+
+    // Publish only a fully staged run: a half-staged run must never reach a consumer.
+    const [staged] = await knowledgeSql`
+      SELECT (SELECT count(*) FROM ${knowledgeSql.unsafe(ctx.stagingTable)} WHERE run_id = ${ctx.runId})::int AS cnt,
+             (SELECT status FROM ${knowledgeSql.unsafe(ctx.runsTable)} WHERE run_id = ${ctx.runId}) AS status
+    ` as { cnt: number; status: string | null }[];
+    if (staged.cnt !== totalChunks || staged.status !== "running") {
+      throw new Error(`staging incomplete: ${staged.cnt} of ${totalChunks} rows, run status ${staged.status}`);
+    }
+
+    const messages: FullIngestBatchMessage[] = ranges.map((r) => ({
+      run_id: ctx.runId, source, document_path: file.path, batch_start: r.batch_start, batch_end: r.batch_end,
+    }));
+    for (const slice of splitForSendBatch(messages)) {
+      await env.FULL_INGEST_QUEUE!.sendBatch(slice.map((m) => ({ body: m })));
+    }
+
+    console.log(JSON.stringify({
+      phase: "full_ingest_batch_started", source, path: file.path, run_id: ctx.runId,
+      total_chunks: totalChunks, messages: messages.length,
+    }));
+    return result({ outcome: "queued", run_id: ctx.runId, total_chunks: totalChunks, messages: messages.length, source_revision: file.sha });
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    // Whatever was staged or enqueued is now worthless: consumers that already got a message
+    // see status != 'running' and acknowledge it without work.
+    await abandonRunAndDropStaging(ctx)
+      .catch((e2) => console.error(JSON.stringify({ phase: "full_ingest_abandon_failed", run_id: ctx.runId, error: e2 instanceof Error ? e2.message : String(e2) })));
+    console.error(JSON.stringify({ phase: "full_ingest_batch_start_failed", source, path: file.path, run_id: ctx.runId, error: detail }));
+    return result({ outcome: "failed", run_id: ctx.runId, detail });
+  }
+}
+
+/**
+ * Consumer: embeds the still-empty rows of its range and tries the swap. Never reads GitHub and
+ * never re-chunks: the texts were frozen in staging by the producer. Redelivery is free — only
+ * rows with embedding IS NULL are selected, so finished work is never paid for twice.
+ */
+async function handleFullIngestBatch(batch: MessageBatch<FullIngestBatchMessage>, env: Env): Promise<void> {
+  const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
+  const runsTable = KNOWLEDGE_TABLES.full_ingest_runs(getKnowledgeSchema(env));
+  const stagingTable = KNOWLEDGE_TABLES.knowledge_chunk_staging(getKnowledgeSchema(env));
+
+  for (const msg of batch.messages) {
+    const { run_id, source, document_path, batch_start, batch_end } = msg.body;
+    try {
+      const [run] = await knowledgeSql`
+        SELECT status FROM ${knowledgeSql.unsafe(runsTable)} WHERE run_id = ${run_id}
+      ` as { status: string }[];
+      if (!run || run.status !== "running") {
+        console.log(JSON.stringify({ phase: "full_ingest_batch_skip_not_running", run_id, status: run?.status ?? "missing" }));
+        msg.ack();
+        continue;
+      }
+
+      const pending = await knowledgeSql`
+        SELECT chunk_index, content FROM ${knowledgeSql.unsafe(stagingTable)}
+        WHERE run_id = ${run_id} AND role = 'child' AND embedding IS NULL
+          AND chunk_index >= ${batch_start} AND chunk_index < ${batch_end}
+        ORDER BY chunk_index
+      ` as { chunk_index: number; content: string }[];
+
+      for (const row of pending) {
+        const embedding = await getEmbedding(env.OPENROUTER_API_KEY, row.content.slice(0, CHUNK_CHAR_LIMIT));
+        const vec = `[${embedding.join(",")}]`;
+        // Conditional on the run still running and the row still empty: a sweep or a parallel
+        // duplicate delivery can only make this a no-op, never a double write.
+        await knowledgeSql`
+          UPDATE ${knowledgeSql.unsafe(stagingTable)} s SET embedding = ${vec}::vector
+          WHERE s.run_id = ${run_id} AND s.chunk_index = ${row.chunk_index} AND s.embedding IS NULL
+            AND EXISTS (SELECT 1 FROM ${knowledgeSql.unsafe(runsTable)} r WHERE r.run_id = s.run_id AND r.status = 'running')
+        `;
+      }
+
+      console.log(JSON.stringify({ phase: "full_ingest_range_done", run_id, source, path: document_path, batch_start, batch_end, embedded: pending.length }));
+      await attemptFullIngestSwap(env, run_id);
+      msg.ack();
+    } catch (e) {
+      console.error(JSON.stringify({ phase: "full_ingest_batch_error", run_id, source, path: document_path, attempts: msg.attempts, error: e instanceof Error ? e.message : String(e) }));
+      msg.retry({ delaySeconds: fullIngestRetryDelaySeconds(msg.attempts) });
+    }
+  }
+}
+
+/**
+ * CAS + atomic swap, the only writer to knowledge_chunk on this path. Everything is ONE
+ * transaction (sql.transaction): the first statement takes the same advisory lock the manual
+ * loader (scripts/ingest.ts) takes for this document, the CAS flips running -> swapping only when
+ * the run is provably complete, and every later statement is guarded by status = 'swapping' — a
+ * caller that loses the CAS therefore changes NOTHING (the first design let its unguarded
+ * "DELETE FROM staging" run after every lost CAS and erase the run's own work).
+ *
+ * The next-to-last statement asserts the live row count; a mismatch raises (division by zero) and
+ * rolls the whole transaction back, so the previous edition of the document is never lost.
+ */
+async function attemptFullIngestSwap(env: Env, runId: string): Promise<void> {
+  const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
+  const runsTable = KNOWLEDGE_TABLES.full_ingest_runs(getKnowledgeSchema(env));
+  const stagingTable = KNOWLEDGE_TABLES.knowledge_chunk_staging(getKnowledgeSchema(env));
+
+  // Document identity comes from the run row, not from the queue message.
+  const [run] = await knowledgeSql`
+    SELECT source, document_path FROM ${knowledgeSql.unsafe(runsTable)} WHERE run_id = ${runId} AND status = 'running'
+  ` as { source: string; document_path: string }[];
+  if (!run) return;
+
+  const results = await knowledgeSql.transaction([
+    // Same key as scripts/ingest.ts (`source::unit`), so the two writers serialize.
+    knowledgeSql`SELECT pg_advisory_xact_lock(hashtext(${run.source + "::" + run.document_path}))`,
+    knowledgeSql`
+      UPDATE ${knowledgeSql.unsafe(runsTable)} r SET status = 'swapping'
+      WHERE r.run_id = ${runId} AND r.status = 'running' AND r.total_chunks >= 1
+        AND (SELECT count(*) FROM ${knowledgeSql.unsafe(stagingTable)} s WHERE s.run_id = r.run_id) = r.total_chunks
+        AND EXISTS (
+          SELECT 1 FROM ${knowledgeSql.unsafe(stagingTable)} p
+          WHERE p.run_id = r.run_id AND p.chunk_index = 0 AND p.role = 'parent'
+            AND p.embedding IS NULL AND p.parent_chunk_uuid IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM ${knowledgeSql.unsafe(stagingTable)} s
+              WHERE s.run_id = r.run_id AND (
+                s.chunk_index < 0 OR s.chunk_index >= r.total_chunks
+                OR (s.chunk_index = 0 AND s.staging_id <> p.staging_id)
+                OR (s.chunk_index > 0 AND (s.role <> 'child' OR s.embedding IS NULL OR s.parent_chunk_uuid IS DISTINCT FROM p.chunk_uuid))
+              )
+            )
+        )
+      RETURNING r.run_id
+    `,
+    // account_id IS NULL, not a variable: every source in FULL_INGEST_SOURCES is a platform
+    // source (kc_kind_consistency requires collection_kind='platform' rows to carry account_id
+    // NULL). starts_with, not LIKE: a document_path containing "_" or "%" must not widen the delete.
+    knowledgeSql`
+      DELETE FROM ${knowledgeSql.unsafe(knowledgeChunkTable)} k
+      USING ${knowledgeSql.unsafe(runsTable)} r
+      WHERE r.run_id = ${runId} AND r.status = 'swapping'
+        AND k.source = r.source AND k.account_id IS NULL
+        AND (k.source_uri = r.document_path OR starts_with(k.source_uri, r.document_path || '::'))
+    `,
+    knowledgeSql`
+      INSERT INTO ${knowledgeSql.unsafe(knowledgeChunkTable)}
+        (chunk_uuid, chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, parent_chunk_id, account_id, collection_kind)
+      SELECT s.chunk_uuid, s.chunk_id, s.document_path, s.paragraph_pos, s.content_hash, s.source_uri, s.content, s.source, s.source_kind, s.hash, s.embedding, s.parent_chunk_uuid, NULL, s.collection_kind
+      FROM ${knowledgeSql.unsafe(stagingTable)} s
+      WHERE s.run_id = ${runId}
+        AND EXISTS (SELECT 1 FROM ${knowledgeSql.unsafe(runsTable)} r WHERE r.run_id = s.run_id AND r.status = 'swapping')
+      ORDER BY s.chunk_index
+    `,
+    knowledgeSql`
+      DELETE FROM ${knowledgeSql.unsafe(stagingTable)} s
+      WHERE s.run_id = ${runId}
+        AND EXISTS (SELECT 1 FROM ${knowledgeSql.unsafe(runsTable)} r WHERE r.run_id = s.run_id AND r.status = 'swapping')
+    `,
+    // Post-condition: the live copy must hold exactly total_chunks rows now. A mismatch means
+    // something is wrong with the data (raise -> the transaction, including the CAS, rolls back).
+    // The divisor depends on the row on purpose: a literal 1 / 0 is folded at PLAN time and would
+    // fail every swap (found by the PostgreSQL integration test).
+    knowledgeSql`
+      SELECT CASE WHEN (
+        SELECT count(*) FROM ${knowledgeSql.unsafe(knowledgeChunkTable)} k
+        WHERE k.source = r.source AND k.account_id IS NULL
+          AND (k.source_uri = r.document_path OR starts_with(k.source_uri, r.document_path || '::'))
+      ) = r.total_chunks THEN 1 ELSE 1 / (r.total_chunks - r.total_chunks) END AS ok
+      FROM ${knowledgeSql.unsafe(runsTable)} r
+      WHERE r.run_id = ${runId} AND r.status = 'swapping'
+    `,
+    knowledgeSql`
+      UPDATE ${knowledgeSql.unsafe(runsTable)} SET status = 'swapped', swapped_at = now()
+      WHERE run_id = ${runId} AND status = 'swapping'
+    `,
+  ]);
+
+  if (Array.isArray(results[1]) && results[1].length > 0) {
+    console.log(JSON.stringify({ phase: "full_ingest_swapped", run_id: runId, source: run.source, path: run.document_path }));
+  }
+}
+
+/**
+ * Scheduled sweep (wired into the existing 15-min "skills" tick, not a new cron trigger): a run
+ * stuck in 'running' or 'swapping' past its TTL is dead. Also removes the staging rows of EVERY
+ * abandoned run, including ones abandoned by other paths — the first design only cleaned what
+ * the sweep itself flipped and left orphans (a 15 MB parent row per failed start) forever.
+ * One statement, so a crash cannot mark a run abandoned without cleaning it.
+ */
+export async function abandonStaleFullIngestRuns(env: Env): Promise<void> {
+  const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
+  const runsTable = KNOWLEDGE_TABLES.full_ingest_runs(getKnowledgeSchema(env));
+  const stagingTable = KNOWLEDGE_TABLES.knowledge_chunk_staging(getKnowledgeSchema(env));
+  try {
+    const cleaned = await knowledgeSql`
+      WITH stale AS (
+        UPDATE ${knowledgeSql.unsafe(runsTable)}
+        SET status = 'abandoned'
+        WHERE status IN ('running', 'swapping')
+          AND created_at < now() - make_interval(hours => ${FULL_INGEST_RUN_TTL_HOURS}::int)
+        RETURNING run_id
+      ), doomed AS (
+        SELECT run_id FROM stale
+        UNION
+        SELECT run_id FROM ${knowledgeSql.unsafe(runsTable)} WHERE status = 'abandoned'
+      ), removed AS (
+        DELETE FROM ${knowledgeSql.unsafe(stagingTable)} WHERE run_id IN (SELECT run_id FROM doomed) RETURNING run_id
+      )
+      SELECT run_id, count(*)::int AS rows FROM removed GROUP BY run_id
+    ` as { run_id: string; rows: number }[];
+    if (cleaned.length === 0) return;
+    console.log(JSON.stringify({ phase: "full_ingest_staging_cleaned", runs: cleaned }));
+  } catch (e) {
+    console.error(JSON.stringify({ phase: "full_ingest_stale_sweep_failed", error: e instanceof Error ? e.message : String(e) }));
+  }
+}
+
+/**
+ * Recovery for a run that is fully embedded but was never swapped (its last message failed the
+ * swap and exhausted its retries, or was lost): try the swap again from the scheduled tick instead
+ * of letting the run expire after the TTL and paying for the whole document again tomorrow.
+ * minAgeMinutes keeps it away from runs whose last messages are still being delivered.
+ */
+export async function retryStalledFullIngestSwaps(env: Env, minAgeMinutes: number = 10): Promise<void> {
+  const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
+  const runsTable = KNOWLEDGE_TABLES.full_ingest_runs(getKnowledgeSchema(env));
+  const stagingTable = KNOWLEDGE_TABLES.knowledge_chunk_staging(getKnowledgeSchema(env));
+  try {
+    const ready = await knowledgeSql`
+      SELECT r.run_id FROM ${knowledgeSql.unsafe(runsTable)} r
+      WHERE r.status = 'running' AND r.created_at < now() - make_interval(mins => ${minAgeMinutes}::int)
+        AND (SELECT count(*) FROM ${knowledgeSql.unsafe(stagingTable)} s WHERE s.run_id = r.run_id) = r.total_chunks
+        AND NOT EXISTS (SELECT 1 FROM ${knowledgeSql.unsafe(stagingTable)} s
+                        WHERE s.run_id = r.run_id AND s.role = 'child' AND s.embedding IS NULL)
+    ` as { run_id: string }[];
+    for (const { run_id } of ready) {
+      try {
+        await attemptFullIngestSwap(env, run_id);
+      } catch (e) {
+        console.error(JSON.stringify({ phase: "full_ingest_swap_recovery_failed", run_id, error: e instanceof Error ? e.message : String(e) }));
+      }
+    }
+  } catch (e) {
+    console.error(JSON.stringify({ phase: "full_ingest_swap_recovery_query_failed", error: e instanceof Error ? e.message : String(e) }));
+  }
+}
+
+/**
+ * Daily entry to the batched path for the oversized files of one source. Never throws: a failure
+ * becomes a line in the freshness row's error text (so it is visible on the drift dashboard)
+ * instead of aborting the caller. "queue_unbound" and "disabled" are expected states, not errors.
+ */
+async function startOversizedFullIngests(env: Env, source: string, excluded: GitHubFileMeta[]): Promise<string[]> {
+  const problems: string[] = [];
+  for (const f of excluded) {
+    console.log(JSON.stringify({ phase: "full_ingest_excluded", source, path: f.path, size_bytes: f.size, reason: `over MAX_FILE_CHARS prefilter (limit ${MAX_FILE_CHARS} bytes)` }));
+    try {
+      const r = await startBatchedFullIngest(env, source, f);
+      if (r.outcome === "failed" || r.outcome === "fetch_failed") {
+        problems.push(`${f.path}: batched ingest ${r.outcome}${r.detail ? ` (${r.detail})` : ""}`);
+      }
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      console.error(JSON.stringify({ phase: "full_ingest_batch_unexpected_error", source, path: f.path, error: message }));
+      problems.push(`${f.path}: batched ingest crashed (${message})`);
+    }
+  }
+  return problems;
+}
+
+/**
+ * Manual entry point behind POST /full-ingest: lists the source's oversized files and starts (or,
+ * with dryRun, only plans) the batched ingest for each. The daily cron reaches the same
+ * startBatchedFullIngest() through syncFullIngestSource().
+ */
+async function runOversizedFullIngest(env: Env, source: string, opts: { dryRun: boolean; path?: string }): Promise<FullIngestStartResult[]> {
+  const { excluded } = partitionFilesBySize(await listGitHubFilesWithSize(source, env.GITHUB_TOKEN), MAX_FILE_CHARS);
+  const targets = opts.path ? excluded.filter((f) => f.path === opts.path) : excluded;
+  const results: FullIngestStartResult[] = [];
+  for (const file of targets) {
+    results.push(await startBatchedFullIngest(env, source, file, { dryRun: opts.dryRun }));
+  }
+  return results;
+}
+
 /**
  * Daily full-ingest pass for a source with no push-webhook (see FULL_INGEST_SOURCES).
  * Unchanged files cost one GitHub fetch + one hash SELECT each — reindexFiles() checks
  * the content hash before any DELETE/INSERT or embedding call — so running this against
  * every file every day is cheap as long as the file count stays small (checked live for
- * FPF: 7 total .md files, 2026-09-02).
+ * FPF: 7 total .md files, 2026-09-02; SPF: 46 files / 288KB total, 2026-09-29 — same
+ * order of magnitude, well under a size or CPU-time concern).
  *
  * Scope of this first pass: only additions/modifications. A file removed upstream stays
  * in the index until someone reindexes explicitly — detecting removals here would need a
  * DB-vs-GitHub diff like the PACK-* branch above; deferred to keep this change narrow.
- * Also no single-flight guard against an overlapping manual reindex_source call on the
+ * Also no single-flight guard against an overlapping manual POST /reindex call on the
  * same source — acceptable at once-a-day cron frequency, revisit if that changes.
+ * (The public reindex_source tool that used to add unauthenticated callers was withdrawn, F186.)
+ *
+ * Freshness write (2026-09-29, peer-session Claude+Kimi+Codex, WP-532): before this,
+ * the only record of a run was console.log/console.error inside the Worker — with no
+ * queryable row, nobody could tell a healthy daily cron from a cron that silently
+ * stopped firing after the first run (found live: health.graph_freshness_events had
+ * zero rows for source=FPF, 27 days after this function first shipped). Same table,
+ * same non-blocking pattern as rebuildSkillsIndex() below — reused under the real
+ * source name (FPF/SPF), not a pseudo-label, since neither name collides with the
+ * PACK-* heartbeat rows already in that table.
+ *
+ * github_count/db_count keep the SAME meaning here as in runHeartbeatForSource() for
+ * PACK-* sources ("files GitHub has" vs "files the index has"), not this function's
+ * own found/eligible split — a cold review caught the first version of this write
+ * putting eligibleCount (files that passed the size pre-filter) into db_count. That
+ * silently changes what `drift` (GENERATED ALWAYS AS github_count - db_count, migration
+ * 015, indexed and read by the Metabase drift dashboard) means for these two rows
+ * versus every other row in the same table — a size-prefilter exclusion isn't GitHub-
+ * vs-DB drift, and a dashboard filtering `ABS(drift) > 5` across all sources uniformly
+ * would get a number that means something different for FPF/SPF than for PACK-*
+ * without any way to tell the two apart from the column alone. db_count here is a real
+ * `count(DISTINCT source_uri)` against knowledge_chunk, mirroring the concept_graph
+ * artifact count PACK-* rows use — genuinely comparable, not reused for convenience.
  */
 async function syncFullIngestSource(env: Env, source: string): Promise<void> {
   const startedAt = Date.now();
-  try {
-    const allFiles = await listGitHubFilesWithSize(source);
-    const { eligible, excluded } = partitionFilesBySize(allFiles, MAX_FILE_CHARS);
+  let foundCount = 0;
+  let eligibleCount = 0;
+  let processed = 0;
+  let skipped = 0;
+  let errors: string[] = [];
+  // Same distinction as rebuildSkillsIndex()'s ranToCompletion: whether the RUN
+  // finished, not whether every file in it was clean. A single persistently bad
+  // file must not make the freshness signal look permanently stuck.
+  let ranToCompletion = false;
 
-    for (const f of excluded) {
-      console.log(JSON.stringify({ phase: "full_ingest_excluded", source, path: f.path, size_bytes: f.size, reason: `over MAX_FILE_CHARS prefilter (limit ${MAX_FILE_CHARS} bytes)` }));
-    }
+  try {
+    const allFiles = await listGitHubFilesWithSize(source, env.GITHUB_TOKEN);
+    foundCount = allFiles.length;
+    const { eligible, excluded } = partitionFilesBySize(allFiles, MAX_FILE_CHARS);
+    eligibleCount = eligible.length;
 
     const result = await reindexFiles(env, {
       source,
       files: eligible.map((f) => ({ path: f.path, action: "modified" as const })),
     });
+    processed = result.processed;
+    skipped = result.skipped;
+    errors = result.errors;
+    ranToCompletion = true;
+
+    // WP-532 Ф9: files over MAX_FILE_CHARS go through the batched path — LAST, and in their own
+    // guard. The pass above is the one that already works every day; the batched path (one 15 MB
+    // download, thousands of staged rows) must not be able to delay or abort it.
+    errors = errors.concat(await startOversizedFullIngests(env, source, excluded));
 
     console.log(JSON.stringify({
-      phase: result.errors.length > 0 ? "full_ingest_partial" : "full_ingest_ok",
+      phase: errors.length > 0 ? "full_ingest_partial" : "full_ingest_ok",
       source,
-      found: allFiles.length,
-      eligible: eligible.length,
+      found: foundCount,
+      eligible: eligibleCount,
       excluded: excluded.length,
-      processed: result.processed,
-      skipped: result.skipped,
-      errors: result.errors,
+      processed,
+      skipped,
+      errors,
       duration_ms: Date.now() - startedAt,
     }));
   } catch (e) {
+    errors = [e instanceof Error ? e.message : String(e)];
     console.error(JSON.stringify({
       phase: "full_ingest_error",
       source,
-      error: e instanceof Error ? e.message : String(e),
+      error: errors[0],
       duration_ms: Date.now() - startedAt,
     }));
+  }
+
+  // Real DB artifact count for drift semantics — see the function comment above for
+  // why this can't be eligibleCount. Its own try/catch: a failed count must not lose
+  // the freshness row entirely (falls back to eligibleCount, the best count already in
+  // hand, rather than skipping the INSERT below and losing the whole signal for today).
+  let dbCount = eligibleCount;
+  try {
+    const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
+    const chunkTable = KNOWLEDGE_TABLES.knowledge_chunk(getKnowledgeSchema(env));
+    const [row] = await knowledgeSql`
+      SELECT count(DISTINCT source_uri)::int AS cnt
+      FROM ${knowledgeSql.unsafe(chunkTable)}
+      WHERE source = ${source}
+    `;
+    dbCount = row.cnt as number;
+  } catch (e) {
+    console.error(JSON.stringify({ phase: "full_ingest_db_count_failed", source, error: e instanceof Error ? e.message : String(e) }));
+  }
+
+  try {
+    const healthSql = neon(env.HEALTH_DATABASE_URL.replace("-pooler", ""));
+    const healthSchema = getHealthSchema(env);
+    const freshTable = HEALTH_TABLES.graph_freshness_events(healthSchema);
+    await healthSql`
+      INSERT INTO ${healthSql.unsafe(freshTable)}
+        (source, github_count, db_count, reindexed, reindex_processed, reindex_skipped, error)
+      VALUES (
+        ${source}, ${foundCount}, ${dbCount},
+        ${ranToCompletion}, ${processed}, ${skipped},
+        ${errors.length > 0 ? errors.join("; ") : null}
+      )
+    `;
+  } catch (e) {
+    console.error(JSON.stringify({ phase: "full_ingest_health_write_failed", source, error: e instanceof Error ? e.message : String(e) }));
   }
 }
 
@@ -4579,7 +6077,7 @@ async function rebuildSkillsIndex(env: Env): Promise<void> {
   let ranToCompletion = false;
 
   try {
-    const allFiles = await listGitHubFilesWithSize(SKILLS_SOURCE);
+    const allFiles = await listGitHubFilesWithSize(SKILLS_SOURCE, env.GITHUB_TOKEN);
     const skillFiles = allFiles.filter((f) => SKILL_FILE_PATTERN.test(f.path));
     foundCount = skillFiles.length;
     const { eligible, excluded } = partitionFilesBySize(skillFiles, MAX_FILE_CHARS);
@@ -4695,7 +6193,7 @@ async function runHeartbeatForSource(
 
   try {
     // 1. GitHub file count — O(1) API call via Trees endpoint
-    const files = await listGitHubFiles(source);
+    const files = await listGitHubFiles(source, env.GITHUB_TOKEN);
     githubCount = files.length;
 
     // 2. DB artifact count
@@ -4784,7 +6282,15 @@ async function runHeartbeat(env: Env): Promise<void> {
   const freshTable = HEALTH_TABLES.graph_freshness_events(healthSchema);
   const healthSql = neon(env.HEALTH_DATABASE_URL.replace("-pooler", ""));
 
-  for (const source of HEARTBEAT_PACK_SOURCES) {
+  // WP-532 Ф10: order is heartbeatSourceOrder()'s call, not a literal list here — see its
+  // comment for why FULL_INGEST_SOURCES must go first.
+  const { first, second } = heartbeatSourceOrder();
+
+  for (const source of first) {
+    await syncFullIngestSource(env, source);
+  }
+
+  for (const source of second) {
     // Mirrors the guard retryPendingHeartbeatSources() applies — without this, a
     // catch-up tick's still-running reindex would get a second, concurrent nightly
     // run of the same source colliding with it (WP-545, cold review found this gap
@@ -4803,10 +6309,6 @@ async function runHeartbeat(env: Env): Promise<void> {
       console.error(`[heartbeat] in-progress check failed for ${source}, proceeding anyway:`, e instanceof Error ? e.message : e);
     }
     await runHeartbeatForSource(env, source, ct, freshTable);
-  }
-
-  for (const source of FULL_INGEST_SOURCES) {
-    await syncFullIngestSource(env, source);
   }
 
   console.log("[heartbeat] complete");
