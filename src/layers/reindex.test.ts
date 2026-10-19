@@ -512,6 +512,9 @@ describe("reindex enumeration failures", () => {
   it.each([
     { name: "repository 503", responses: [503] },
     { name: "branch 403", responses: [repository, 403] },
+    { name: "missing branch in a nonempty repository", responses: [{ default_branch: "main", size: 1 }, 404] },
+    { name: "empty-size repository with another branch", responses: [{ default_branch: "main", size: 0 }, 404, [{ name: "other" }]] },
+    { name: "empty-size repository with inaccessible branches", responses: [{ default_branch: "main", size: 0 }, 404, 403] },
     { name: "missing branch commit", responses: [repository, {}] },
     { name: "tree 429", responses: [repository, branch, 429] },
     { name: "missing tree", responses: [repository, branch, {}] },
@@ -555,6 +558,25 @@ describe("reindex enumeration failures", () => {
     const sendBatch = vi.fn();
     const result = await startReindexJob({ ...ENV, REINDEX_QUEUE: { sendBatch } as unknown as Queue<ReindexBatchMessage> }, USER_ID, "DS-my-strategy");
     expect(result.message).toContain("No files");
+    expect(sendBatch).not.toHaveBeenCalled();
+    expect(latestSqlCallContaining("status = 'succeeded'")).toBeDefined();
+    expect(latestSqlCallContaining("index_state = 'reindexing' AND index_generation =")[2]).toBe("ready");
+  });
+
+  it("accepts a new repository whose default branch has not been created yet", async () => {
+    queryQueue.push([], [{ id: "job-uninitialized", generation: 3 }], [sourceRow()]);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ default_branch: "main", size: 0 }) })
+      .mockResolvedValueOnce({ ok: false, status: 404 })
+      .mockResolvedValueOnce({ ok: true, json: async () => [] });
+    vi.stubGlobal("fetch", fetchMock);
+    const sendBatch = vi.fn();
+
+    const result = await startReindexJob({ ...ENV, REINDEX_QUEUE: { sendBatch } as unknown as Queue<ReindexBatchMessage> }, USER_ID, "DS-my-strategy");
+
+    expect(result.message).toContain("No files");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls[2][0]).toContain("/branches?per_page=1");
     expect(sendBatch).not.toHaveBeenCalled();
     expect(latestSqlCallContaining("status = 'succeeded'")).toBeDefined();
     expect(latestSqlCallContaining("index_state = 'reindexing' AND index_generation =")[2]).toBe("ready");
