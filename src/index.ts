@@ -1668,6 +1668,7 @@ async function analyzeVerbalization(
              1 - (embedding <=> ${vecStr}::vector) AS similarity
       FROM ${sql.unsafe(conceptsTable)}
       WHERE status = 'active'
+        AND (source_repo IS NULL OR NOT (source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       ORDER BY embedding <=> ${vecStr}::vector
       LIMIT 50
     `;
@@ -1679,6 +1680,7 @@ async function analyzeVerbalization(
       WHERE status = 'active'
         AND (${domain}::text IS NULL OR domain = ${domain})
         AND (${level}::text IS NULL OR level = ${level})
+        AND (source_repo IS NULL OR NOT (source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       LIMIT 100
     `;
   }
@@ -2085,34 +2087,45 @@ async function getConceptStatus(
   const sql = db(env);
   let rows: ConceptStatusRow[];
 
+  // WP-604 Ф14-б (2026-10-19) — same temporary deny-list as PLATFORM_DENY_SOURCES
+  // on knowledge_chunk, applied here to concept_graph.concepts (separate DB/schema,
+  // not covered by Ф14's original patch). superseded_by must be re-derived from the
+  // filtered `sb` join (not the raw c.superseded_by id) so a denied successor's id
+  // isn't exposed even when its code/name are already hidden by the join condition.
   if (ref.concept_id) {
     rows = await sql`
-      SELECT c.id, c.code, c.name, c.status, c.misconception, c.superseded_by,
+      SELECT c.id, c.code, c.name, c.status, c.misconception, sb.id AS superseded_by,
              sb.code AS superseded_by_code, sb.name AS superseded_by_name,
              c.level, c.domain, c.definition
       FROM ${sql.unsafe(conceptsTable)} c
       LEFT JOIN ${sql.unsafe(conceptsTable)} sb ON sb.id = c.superseded_by
+        AND (sb.source_repo IS NULL OR NOT (sb.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       WHERE c.id = ${ref.concept_id}
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       LIMIT 1
     ` as ConceptStatusRow[];
   } else if (ref.code) {
     rows = await sql`
-      SELECT c.id, c.code, c.name, c.status, c.misconception, c.superseded_by,
+      SELECT c.id, c.code, c.name, c.status, c.misconception, sb.id AS superseded_by,
              sb.code AS superseded_by_code, sb.name AS superseded_by_name,
              c.level, c.domain, c.definition
       FROM ${sql.unsafe(conceptsTable)} c
       LEFT JOIN ${sql.unsafe(conceptsTable)} sb ON sb.id = c.superseded_by
+        AND (sb.source_repo IS NULL OR NOT (sb.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       WHERE c.code = ${ref.code}
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       LIMIT 1
     ` as ConceptStatusRow[];
   } else if (ref.name) {
     rows = await sql`
-      SELECT c.id, c.code, c.name, c.status, c.misconception, c.superseded_by,
+      SELECT c.id, c.code, c.name, c.status, c.misconception, sb.id AS superseded_by,
              sb.code AS superseded_by_code, sb.name AS superseded_by_name,
              c.level, c.domain, c.definition
       FROM ${sql.unsafe(conceptsTable)} c
       LEFT JOIN ${sql.unsafe(conceptsTable)} sb ON sb.id = c.superseded_by
+        AND (sb.source_repo IS NULL OR NOT (sb.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       WHERE LOWER(c.name) = LOWER(${ref.name})
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       ORDER BY c.status = 'active' DESC, c.id
       LIMIT 1
     ` as ConceptStatusRow[];
@@ -2147,6 +2160,7 @@ async function searchConceptByName(
            similarity(c.name, ${name}) AS similarity
     FROM ${sql.unsafe(conceptsTable)} c
     WHERE c.name % ${name}
+      AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       ${opts.include_inactive ? sql`` : sql`AND c.status = 'active'`}
     ORDER BY similarity DESC, c.id
     LIMIT ${limit}
@@ -2216,6 +2230,8 @@ async function expandConcept(
       WHERE (e.from_concept_id = ANY(${frontier}::bigint[])
           OR e.to_concept_id = ANY(${frontier}::bigint[]))
         AND e.edge_type = ANY(${edgeTypes}::text[])
+        AND (fc.source_repo IS NULL OR NOT (fc.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
+        AND (tc.source_repo IS NULL OR NOT (tc.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
         ${opts.include_inactive ? sql`` : sql`AND fc.status = 'active' AND tc.status = 'active'`}
     ` as Array<{
       edge_id: number;
@@ -2328,6 +2344,7 @@ async function expandArtifact(
     FROM ${sql.unsafe(conceptsTable)}
     WHERE code = ANY(${seedCodes}::text[])
       AND node_type = 'artifact'
+      AND (source_repo IS NULL OR NOT (source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
   ` as Array<{ id: number; code: string | null; name: string; level: string; domain: string | null; node_type: string }>;
 
   const seedIds = seedRows.map((r) => r.id);
@@ -2357,6 +2374,8 @@ async function expandArtifact(
       WHERE e.from_concept_id = ANY(${frontier}::bigint[])
         AND e.edge_type = ANY(${edgeTypes}::text[])
         AND fc.node_type = 'artifact'
+        AND (fc.source_repo IS NULL OR NOT (fc.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
+        AND (tc.source_repo IS NULL OR NOT (tc.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
     ` as Array<{
       edge_id: number;
       from_concept_id: number;
@@ -2422,12 +2441,16 @@ async function getGraphStats(env: Env) {
       GROUP BY edge_type ORDER BY cnt DESC
     `;
 
+    // WP-604 Ф14-б: orphans/suspicious_edges/top_central return concept
+    // code/name individually (not just counts) — same deny-list as the other
+    // concept-graph reads above.
     const orphans = await sql`
       SELECT c.code, c.name, c.level
       FROM ${sql.unsafe(conceptsTable)} c
       LEFT JOIN ${sql.unsafe(conceptEdgesTable)} e1 ON e1.from_concept_id = c.id
       LEFT JOIN ${sql.unsafe(conceptEdgesTable)} e2 ON e2.to_concept_id = c.id
       WHERE c.status = 'active' AND e1.id IS NULL AND e2.id IS NULL
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       LIMIT 20
     `;
 
@@ -2441,6 +2464,8 @@ async function getGraphStats(env: Env) {
       JOIN ${sql.unsafe(conceptsTable)} c2 ON c2.id = e.to_concept_id
       WHERE e.edge_type = 'specializes'
         AND e.weight_source = 'embedding'
+        AND (c1.source_repo IS NULL OR NOT (c1.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
+        AND (c2.source_repo IS NULL OR NOT (c2.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
         AND e.weight < 0.8
       LIMIT 20
     `;
@@ -2450,6 +2475,7 @@ async function getGraphStats(env: Env) {
       FROM ${sql.unsafe(conceptsTable)} c
       LEFT JOIN ${sql.unsafe(conceptEdgesTable)} e ON e.from_concept_id = c.id OR e.to_concept_id = c.id
       WHERE c.status = 'active'
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       GROUP BY c.id, c.code, c.name
       ORDER BY connections DESC
       LIMIT 10
@@ -2503,13 +2529,16 @@ async function getLearnerProgress(env: Env, userId: string, domain: string | und
       ORDER BY total_concepts DESC
     `;
 
-    // Top mastered concepts
+    // Top mastered concepts. WP-604 Ф14-б: user_id scopes the mastery row, not
+    // visibility of the underlying concept — same deny-list as the rest of
+    // concept_graph.
     const topMastered = await sql`
       SELECT c.code, c.name, c.level, lm.mastery, lm.attempts, lm.last_assessed_at
       FROM ${sql.unsafe(masteryTable)} lm
       JOIN ${sql.unsafe(conceptsTable)} c ON c.id = lm.concept_id
       WHERE lm.user_id = ${userId}
         AND (${domain}::text IS NULL OR c.domain = ${domain})
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       ORDER BY lm.mastery DESC
       LIMIT 10
     `;
@@ -2521,6 +2550,7 @@ async function getLearnerProgress(env: Env, userId: string, domain: string | und
       JOIN ${sql.unsafe(conceptsTable)} c ON c.id = lm.concept_id
       WHERE lm.user_id = ${userId} AND lm.mastery < 0.5 AND lm.attempts >= 1
         AND (${domain}::text IS NULL OR c.domain = ${domain})
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       ORDER BY lm.mastery ASC
       LIMIT 10
     `;
@@ -2535,6 +2565,7 @@ async function getLearnerProgress(env: Env, userId: string, domain: string | und
       WHERE c.status = 'active' AND lm.id IS NULL
         AND c.level IN ('guide', 'pack')
         AND (${domain}::text IS NULL OR c.domain = ${domain})
+        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       GROUP BY c.id, c.code, c.name, c.level, c.domain
       ORDER BY connections DESC
       LIMIT 5
