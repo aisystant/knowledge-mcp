@@ -506,7 +506,22 @@ async function listMdFilesViaTrees(env: ReindexEnv, ctx: UserContext, source: st
     redirect: "manual",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
   });
-  if (!branchResp.ok) throw new Error(`Cannot enumerate repository: GitHub branch request failed (${branchResp.status})`);
+  if (!branchResp.ok) {
+    // GitHub reports default_branch="main" for a newly created repository even
+    // before its first commit. Confirm that no branches exist before treating a
+    // missing default branch as an empty repository.
+    if (branchResp.status === 404 && (repoJson.size === 0 || repoJson.empty === true)) {
+      const branchesResp = await fetch(
+        `https://api.github.com/repos/${userSource.githubOwner}/${userSource.githubRepo}/branches?per_page=1`,
+        { redirect: "manual", headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" } },
+      );
+      if (branchesResp.ok) {
+        const branches = await branchesResp.json();
+        if (Array.isArray(branches) && branches.length === 0) return [];
+      }
+    }
+    throw new Error(`Cannot enumerate repository: GitHub branch request failed (${branchResp.status})`);
+  }
   const branchJson = (await branchResp.json()) as { commit?: { sha?: string } };
   const commitSha = branchJson.commit?.sha;
   if (typeof commitSha !== "string" || !commitSha) throw new Error("Cannot enumerate repository: missing branch commit");
