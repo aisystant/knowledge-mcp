@@ -207,6 +207,50 @@ const LARGE_FILE_THRESHOLD = CHUNK_CHAR_LIMIT;
 const MAX_FILE_CHARS = 1_000_000;
 
 /**
+ * WP-604 Ф14 (2026-10-19) — temporary deny-list, not a real ACL.
+ *
+ * Every row in knowledge_chunk with account_id IS NULL is returned by every
+ * platform-pool read path (search, get_document, list_sources, list_documents,
+ * list_path, the resolveDocument alias lookup) with no per-source authorization
+ * check — account_id IS NULL only distinguishes "platform pool" from "personal",
+ * not "this source was ever approved for anonymous/third-party readers" within
+ * the platform pool. Confirmed by a live negative probe 2026-10-19 (clean
+ * third-party account, no rights on any of these sources, still got full
+ * document text back through knowledge_search).
+ *
+ * This list hides these sources from every platform-pool read path below
+ * until Ф8' replaces it with real per-source ACL (see WP-604 card, "Фазы
+ * реализации"). Seven sources are the closed repositories inventoried in
+ * `inbox/WP-604/f13-evidence-2026-10-17.md` §2-4 whose publication decision is
+ * unconfirmed; `club-tseren-tserenov` is the pilot's personal Discourse export
+ * (see scripts/club-etl.py) misfiled with account_id IS NULL by the same class
+ * of bug, not a GitHub repository.
+ *
+ * Removing an entry here before Ф8' ships is a product decision (pilot signs
+ * off on each source's publication status, WP-604 "Открытое решение"), not a
+ * code change.
+ */
+export const PLATFORM_DENY_SOURCES = [
+  "DS-autonomous-agents",
+  "DS-ecosystem-development",
+  "PACK-agent-rules",
+  "PACK-autonomous-agents",
+  "PACK-engineering-management",
+  "PACK-systems-art",
+  "PACK-verification",
+  "club-tseren-tserenov",
+] as const;
+
+/** True when `source` must be hidden from platform-pool (account_id IS NULL) reads. */
+export function isPlatformDeniedSource(source: string | null | undefined): boolean {
+  return source != null && (PLATFORM_DENY_SOURCES as readonly string[]).includes(source);
+}
+
+// Plain mutable array for `= ANY($1::text[])` query params — the SQL client
+// takes `unknown[]`, and every call site below needs this shape once.
+const PLATFORM_DENY_SOURCES_PARAM: string[] = [...PLATFORM_DENY_SOURCES];
+
+/**
  * Pure size-admission check for reindexFiles(), split out so the policy is
  * unit-testable without the DB/GitHub/embedding side effects of the caller.
  * Returns a human-readable reason when the file is rejected, null when it's
@@ -775,6 +819,7 @@ export async function resolveDocument(
                1.0 AS score
         FROM ${sql.unsafe(knowledgeChunkTable)}
         WHERE account_id IS NULL
+          AND NOT (source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
           AND parent_chunk_id IS NULL
           AND source_uri NOT LIKE '%::%'
           AND source = ${referenceAlias.source}
@@ -815,6 +860,7 @@ export async function resolveDocument(
                ) AS title
         FROM ${sql.unsafe(knowledgeChunkTable)}
         WHERE account_id IS NULL
+          AND NOT (source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
           AND parent_chunk_id IS NULL
           AND source_uri NOT LIKE '%::%'
           AND (${src}::text IS NULL OR source = ${src})
@@ -892,19 +938,29 @@ async function keywordSearch(
     ORDER BY score DESC, sort_path_priority, sort_content_length DESC
   `, pool, trace);
 
-  return rows.map((r) => {
-    const source = (r.source as string) || "";
-    const filename = r.filename as string;
-    return {
-      id: r.id as number,
-      filename,
-      content: r.content as string,
-      source,
-      source_type: (r.source_type as string) || "",
-      score: r.score as number,
-      github_url: resolveGithubUrl(source, filename),
-    };
-  });
+  // WP-604 Ф14: search_platform_keyword_candidates (migration 029) is a
+  // SECURITY DEFINER function with its own BYPASSRLS owner and restricted
+  // grants — changing its SQL is a migration, not a code deploy. Filtering
+  // the already-fetched rows here is a smaller, reversible surface for a
+  // temporary deny-list; it does cost ranking slots (a denied row still
+  // took one of the function's LIMIT-ed candidates), which is acceptable for
+  // an urgent patch that only needs to stop returning content, not preserve
+  // result completeness. Ф8' moves this into the query itself.
+  return rows
+    .filter((r) => !isPlatformDeniedSource(r.source as string))
+    .map((r) => {
+      const source = (r.source as string) || "";
+      const filename = r.filename as string;
+      return {
+        id: r.id as number,
+        filename,
+        content: r.content as string,
+        source,
+        source_type: (r.source_type as string) || "",
+        score: r.score as number,
+        github_url: resolveGithubUrl(source, filename),
+      };
+    });
 }
 
 async function vectorSearch(
@@ -937,6 +993,7 @@ async function vectorSearch(
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_kind = ${stype})
       AND account_id IS NULL
+      AND NOT (source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
     ORDER BY embedding <=> ${vec}::vector
     LIMIT ${limit}
   `, pool, trace);
@@ -1093,6 +1150,7 @@ export async function enrichWithParentContent(env: Env, results: SearchResult[],
       )
       AND p.account_id IS NULL
       AND c.account_id IS NULL
+      AND NOT (p.source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
   `, pool, trace);
 
   const parentMap = new Map<string, { parent_filename: string; parent_content: string }>();
@@ -1228,6 +1286,7 @@ async function getDocument(
     WHERE source_uri = ${filename}
       AND (${src}::text IS NULL OR source = ${src})
       AND account_id IS NULL
+      AND NOT (source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
     LIMIT 1
   `);
 
@@ -1381,6 +1440,7 @@ async function listSources(
     FROM ${sql.unsafe(knowledgeChunkTable)}
     WHERE (${stype}::text IS NULL OR source_kind = ${stype})
       AND account_id IS NULL
+      AND NOT (source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
     GROUP BY source, source_kind
     ORDER BY source_kind, source
   `);
@@ -1418,6 +1478,7 @@ async function listDocuments(
       AND (${src}::text IS NULL OR source = ${src})
       AND (${stype}::text IS NULL OR source_kind = ${stype})
       AND account_id IS NULL
+      AND NOT (source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
     GROUP BY source_uri, source, source_kind
     ORDER BY source, source_uri
     LIMIT ${limit}
@@ -1463,6 +1524,7 @@ async function listPath(
       AND (${src}::text IS NULL OR source = ${src})
       AND (${prefix}::text = '' OR source_uri LIKE ${likePrefix} ESCAPE '\')
       AND account_id IS NULL
+      AND NOT (source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
     ORDER BY source, source_uri
     LIMIT ${limit}
   `);

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, PRIVATE_TOOLS, PUBLIC_ONLY_TOOL_NAMES, WITHDRAWN_TOOL_MESSAGES, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob, FULL_INGEST_SOURCES, HEARTBEAT_PACK_SOURCES, heartbeatSourceOrder, buildFullIngestBatchRanges, fullIngestDisabled, splitForSendBatch, groupStagingRows, fullIngestRetryDelaySeconds, dedupeChunkFilenames } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, PRIVATE_TOOLS, PUBLIC_ONLY_TOOL_NAMES, WITHDRAWN_TOOL_MESSAGES, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob, FULL_INGEST_SOURCES, HEARTBEAT_PACK_SOURCES, heartbeatSourceOrder, buildFullIngestBatchRanges, fullIngestDisabled, splitForSendBatch, groupStagingRows, fullIngestRetryDelaySeconds, dedupeChunkFilenames, PLATFORM_DENY_SOURCES, isPlatformDeniedSource } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import worker from "./index.js";
 import { PRIVATE_TOOL_NAMES } from "./layers/private.js";
@@ -537,6 +537,26 @@ describe("checkFileSizeAdmission", () => {
     const reason = checkFileSizeAdmission(1_000_001);
     expect(reason).not.toBeNull();
     expect(reason).toContain("1000000");
+  });
+});
+
+// --- isPlatformDeniedSource (WP-604 Ф14, 2026-10-19 — temporary deny-list
+// closing a live leak: a clean third-party account with no rights on these
+// sources got full document text back through knowledge_search) ---
+describe("isPlatformDeniedSource", () => {
+  it("denies every source on the list", () => {
+    for (const source of PLATFORM_DENY_SOURCES) {
+      expect(isPlatformDeniedSource(source)).toBe(true);
+    }
+  });
+
+  it("allows a source not on the list", () => {
+    expect(isPlatformDeniedSource("PACK-digital-platform")).toBe(false);
+  });
+
+  it("allows null/undefined (callers pass this for 'no source filter')", () => {
+    expect(isPlatformDeniedSource(null)).toBe(false);
+    expect(isPlatformDeniedSource(undefined)).toBe(false);
   });
 });
 
@@ -1685,6 +1705,26 @@ describe("searchDocuments empty-vector keyword fallback", () => {
       event: "knowledge_search_vector_empty",
       keyword_result_count: 0,
     });
+  });
+
+  it("drops a denied platform source from keyword results (WP-604 Ф14)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockEmbeddingResponse([0.1, 0.2, 0.3]));
+    globalThis.fetch = fetchMock;
+    const keywordRows = [
+      { id: 1, filename: "closed-doc.md", content: "секретный текст", source: "PACK-verification", source_type: "pack", score: 0.95 },
+      { id: 2, filename: "open-doc.md", content: "открытый текст", source: "docs-courses", source_type: "course", score: 0.9 },
+    ];
+    // DB call order: vectorSearch (empty) → keywordSearch (both rows) → enrichWithParentContent.
+    const rowBatches = [[], keywordRows, []];
+    let dbCall = 0;
+    mockWithUserContextImpl = (fn) => fn(makeMockSql(rowBatches[dbCall++] ?? []));
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const results = await searchDocuments(env, "мим мастер роль");
+
+    expect(results).toHaveLength(1);
+    expect(results.map((r) => r.source)).toEqual(["docs-courses"]);
+    expect(results.find((r) => r.source === "PACK-verification")).toBeUndefined();
   });
 
   it("does not repeat keyword search for a keyword-typed query that already found nothing", async () => {
