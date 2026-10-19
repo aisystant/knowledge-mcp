@@ -18,6 +18,8 @@ export { normalizeSearchResultLimit } from "./search-limits.js";
 
 import { neon, type NeonQueryFunction, type Pool } from "@neondatabase/serverless";
 import { withUserContext, createRequestPool } from "./rls.js";
+import { beginObservation, enqueueObservation, recordObservationFeedback, expireObservations,
+  type ObservationEnv, type ObservationRuntime } from "./retrieval-observations.js";
 import {
   getKnowledgeSchema,
   getConceptGraphSchema,
@@ -57,7 +59,7 @@ import { handleQueue, handleWatchdog, startReindexJob, startIncrementalReindexJo
 
 // --- Types ---
 
-export interface Env {
+export interface Env extends ObservationEnv {
   /** Cloudflare runtime version id/tag; exposed on /health for deploy provenance checks. */
   CF_VERSION_METADATA?: WorkerVersionMetadata;
   /** Neon `knowledge` БД connection string (knowledge_chunk + concept_graph). Required. */
@@ -585,6 +587,8 @@ export type SearchResult = {
   github_url: string | null;
   parent_content?: string;
   parent_filename?: string;
+  /** Internal full-index version; omitted from the client excerpt. */
+  indexed_content_hash?: string;
 };
 
 const SEARCH_RESPONSE_EXCERPT_CHARACTERS = 2_000;
@@ -616,7 +620,7 @@ export function compactSearchResultsForResponse(
   results: SearchResult[],
   characterCap: number = SEARCH_RESPONSE_EXCERPT_CHARACTERS,
 ): SearchResult[] {
-  return results.map(result => ({
+  return results.map(({ indexed_content_hash: _indexedHash, ...result }) => ({
     ...result,
     content: searchResponseExcerpt(result.content, characterCap) ?? "",
     ...(result.parent_content === undefined
@@ -630,6 +634,7 @@ export function buildSearchToolResponse(
   id: string | number,
   results: SearchResult[],
   budgetBytes: number = SEARCH_TOOL_RESPONSE_BUDGET_BYTES,
+  observationId?: string,
 ): McpResponse {
   const boundedResults = results.slice(0, SEARCH_RESULT_LIMIT_MAX);
   const responseBytes = (response: McpResponse): number => (
@@ -639,10 +644,12 @@ export function buildSearchToolResponse(
     jsonrpc: "2.0",
     id,
     result: {
+      ...(observationId ? { _meta: { "retrieval/observation_id": observationId, "retrieval/persistence": "scheduled" } } : {}),
       content: [{
         type: "text",
         text: JSON.stringify(
-          compactSearchResultsForResponse(boundedResults.slice(0, resultCount), characterCap),
+          compactSearchResultsForResponse(boundedResults.slice(0, resultCount), characterCap)
+            .map(hit => observationId ? { ...hit, observation_id: observationId } : hit),
           null,
           2,
         ),
@@ -935,11 +942,17 @@ async function keywordSearch(
   // The function keeps ranking and the global limit before materialization; its
   // sort keys preserve the original order after truncating response excerpts.
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
-    SELECT id, filename, content, source, source_type, score
+    SELECT candidates.id, candidates.filename, candidates.content, candidates.source,
+           candidates.source_type, candidates.score,
+           CASE WHEN ${["hash", "platform-text"].includes(env.RETRIEVAL_OBSERVATION_MODE ?? "")}
+             THEN (SELECT encode(sha256(convert_to(chunk.content, 'UTF8')), 'hex')
+                   FROM ${sql.unsafe(knowledgeChunkTable)} AS chunk
+                   WHERE chunk.legacy_id = candidates.id AND chunk.account_id IS NULL)
+           END AS indexed_content_hash
     FROM ${sql.unsafe(`${getKnowledgeSchema(env)}.search_platform_keyword_candidates`)}(
       ${pattern}, ${entityPattern}, ${sectionPattern}, ${ftsQuery}, ${src}, ${stype}, ${limit}
-    )
-    ORDER BY score DESC, sort_path_priority, sort_content_length DESC
+    ) AS candidates
+    ORDER BY candidates.score DESC, candidates.sort_path_priority, candidates.sort_content_length DESC
   `, pool, trace);
 
   // WP-604 Ф14: search_platform_keyword_candidates (migration 029) is a
@@ -957,6 +970,7 @@ async function keywordSearch(
       const filename = r.filename as string;
       return {
         id: r.id as number,
+        ...(r.indexed_content_hash ? { indexed_content_hash: r.indexed_content_hash as string } : {}),
         filename,
         content: r.content as string,
         source,
@@ -987,6 +1001,8 @@ async function vectorSearch(
   // WP-7 Ф-L2-PRIVACY: explicit account_id filter — defense-in-depth alongside RLS (mvp/015).
   const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
     SELECT legacy_id AS id, source_uri AS filename,
+           CASE WHEN ${["hash", "platform-text"].includes(env.RETRIEVAL_OBSERVATION_MODE ?? "")}
+                THEN encode(sha256(convert_to(content, 'UTF8')), 'hex') END AS indexed_content_hash,
            CASE WHEN length(content) > ${SEARCH_RESPONSE_EXCERPT_CHARACTERS}
                 THEN left(content, ${SEARCH_RESPONSE_EXCERPT_CHARACTERS}) || ${SEARCH_RESPONSE_TRUNCATION_MARKER}
                 ELSE content END AS content,
@@ -1007,6 +1023,7 @@ async function vectorSearch(
     const filename = r.filename as string;
     return {
       id: r.id as number,
+      ...(r.indexed_content_hash ? { indexed_content_hash: r.indexed_content_hash as string } : {}),
       filename,
       content: r.content as string,
       source,
@@ -2767,6 +2784,8 @@ export const TOOLS = [
         document_id: { type: "number", description: "ID of the document from search results" },
         query: { type: "string", description: "Original search query that returned this document" },
         helpfulness: { type: "boolean", description: "true if document was helpful, false otherwise" },
+        observation_id: { type: "string", description: "Optional observation_id from the exact search result; binds feedback to that returned snapshot. If not yet persisted, retry." },
+        cited: { type: "boolean", description: "Whether this returned fragment was cited in the answer; omit when unknown. Independent of helpfulness." },
       },
       required: ["document_id", "query", "helpfulness"],
     },
@@ -3231,18 +3250,18 @@ export function gateLearnerCall(env: Env, tool: string, caller: LearnerCaller, a
   return null;
 }
 
-export async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public", rawRequest?: Request, jwtSubject?: string): Promise<McpResponse> {
+export async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public", rawRequest?: Request, jwtSubject?: string, observationRuntime?: ObservationRuntime): Promise<McpResponse> {
   const boundedRead = mode === "private" && request.method === "tools/call"
     && (request.params?.name === "search" || request.params?.name === "get_document");
   if (boundedRead) {
     const idError = privateReadIdError(request.id);
     if (idError) return idError;
   }
-  const response = await handleMcpRequestImpl(request, env, userId, mode, rawRequest, jwtSubject);
+  const response = await handleMcpRequestImpl(request, env, userId, mode, rawRequest, jwtSubject, observationRuntime);
   return boundedRead ? enforcePrivateReadBudget(response) : response;
 }
 
-async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: string | undefined, mode: McpMode, rawRequest?: Request, jwtSubject?: string): Promise<McpResponse> {
+async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: string | undefined, mode: McpMode, rawRequest?: Request, jwtSubject?: string, observationRuntime?: ObservationRuntime): Promise<McpResponse> {
   const { id, method, params } = request;
 
   try {
@@ -3869,7 +3888,10 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
             (args.limit as number) || 5,
             userId
           );
-          return buildSearchToolResponse(id, results);
+          const observation = beginObservation(env, observationRuntime, mode);
+          const response = buildSearchToolResponse(id, results, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, observation?.id);
+          enqueueObservation(env, observation, args.query as string, results, response);
+          return response;
         }
 
         if (toolName === "get_document") {
@@ -3950,6 +3972,10 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
         }
 
         if (toolName === "feedback") {
+          if (args.observation_id !== undefined) {
+            const result = await recordObservationFeedback(env, observationRuntime, args);
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(result) }] } };
+          }
           const result = await recordFeedback(
             env,
             args.document_id as number,
@@ -4630,7 +4656,7 @@ export function resolveScheduledJob(mode: McpMode, cron: string): "watchdog" | "
 // --- HTTP server ---
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     // WP-268 Phase 3: Schema parameterization for database migrations
     initTables(env);
 
@@ -4680,7 +4706,8 @@ export default {
       }
 
       const body = (await request.json()) as McpRequest;
-      const response = await handleMcpRequest(body, env, userId, mode, request, jwtSubject);
+      const response = await handleMcpRequest(body, env, userId, mode, request, jwtSubject,
+        ctx ? { verifiedAccountId: jwtSubject, waitUntil: task => ctx.waitUntil(task) } : undefined);
       const responseHeaders: Record<string, string> = {
         ...corsHeaders,
         "Content-Type": "application/json",
@@ -5024,6 +5051,7 @@ export default {
     // never runs fetch() first. See initTables() above for the full incident note.
     initTables(env);
     const job = resolveScheduledJob(resolveMode(env.MCP_MODE), _event.cron);
+    if (env.RETRIEVAL_OBSERVATION_DATABASE_URL) ctx.waitUntil(expireObservations(env));
     if (job === "watchdog") {
       ctx.waitUntil(handleWatchdog(env));
     } else if (job === "skills") {

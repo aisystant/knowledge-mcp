@@ -85,6 +85,8 @@ def extracted_query(source: str) -> str:
     query = query.replace("${sql.unsafe(knowledgeChunkTable)}", "public.knowledge_chunk")
     query = query.replace("${sql.unsafe(`${getKnowledgeSchema(env)}.search_platform_keyword_candidates`)}",
                           "public.search_platform_keyword_candidates")
+    query = query.replace('${["hash", "platform-text"].includes(env.RETRIEVAL_OBSERVATION_MODE ?? "")}',
+                          "${observationEnabled}")
     query = query.replace("%", "%%")
     query = re.sub(r"\$\{(\w+)\}", lambda match: "%(" + match[1] + ")s", query)
     check("${" not in query, "Caller SQL template changed; update the explicit extractor")
@@ -98,7 +100,8 @@ def parameters(query: str, source=None, kind=None, limit=20) -> dict:
     return dict(pattern="%" + query + "%", ftsQuery=query.replace("-", " "),
                 entityPattern="%" + code + "%" if code else None,
                 sectionPattern="%" + rest + "%" if rest else None,
-                src=source, stype=kind, limit=limit, SEARCH_RESPONSE_EXCERPT_CHARACTERS=2000,
+                src=source, stype=kind, limit=limit, observationEnabled=False,
+                SEARCH_RESPONSE_EXCERPT_CHARACTERS=2000,
                 SEARCH_RESPONSE_TRUNCATION_MARKER="\n\n...[truncated; use get_document for the full document]")
 
 
@@ -219,8 +222,19 @@ def equivalence_and_attacks(connection, old: str, new: str, owner: str, outsider
     for case in cases:
         expected = connection.execute(old, case).fetchall()
         actual = connection.execute(new, case).fetchall()
-        check(expected == actual, "Original/candidate SQL differs in values, ordering, or scores")
+        observed = [{key: value for key, value in row.items() if key != "indexed_content_hash"}
+                    for row in actual]
+        check(expected == observed, "Original/candidate SQL differs in values, ordering, or scores")
+        check(all(row["indexed_content_hash"] is None for row in actual),
+              "Disabled observation unexpectedly computed a content hash")
         check(not any(row["id"] in (13, 14) for row in actual), "Private candidate escaped public SQL")
+    enabled = connection.execute(new, parameters("DP.TEST.007", limit=1) | {"observationEnabled": True}).fetchall()
+    check(bool(enabled), "Observation hash fixture returned no public candidate")
+    full_content = connection.execute(
+        "SELECT content FROM public.knowledge_chunk WHERE legacy_id=%s AND account_id IS NULL",
+        (enabled[0]["id"],)).fetchone()["content"]
+    check(enabled[0]["indexed_content_hash"] == hashlib.sha256(full_content.encode()).hexdigest(),
+          "Observation did not hash the full indexed content for the returned candidate")
     fts_rows = connection.execute(new, parameters("spectral canary")).fetchall()
     check(any(row["id"] == 4 and str(row["score"]) == "0.8" for row in fts_rows),
           "Stored FTS canary vanished or lost its original score")
