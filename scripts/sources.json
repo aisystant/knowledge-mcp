@@ -91,16 +91,6 @@
     ]
   },
   {
-    "source": "DS-ecosystem-development",
-    "source_type": "ds",
-    "path": "~/IWE/DS-ecosystem-development",
-    "exclude": [
-      "node_modules/",
-      ".git/",
-      "images/"
-    ]
-  },
-  {
     "source": "DS-autonomous-agents",
     "source_type": "ds",
     "path": "~/IWE/DS-autonomous-agents",
