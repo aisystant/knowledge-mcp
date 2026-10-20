@@ -52,6 +52,44 @@ function loadRegistry(): SourceConfig[] {
   return registry;
 }
 
+/**
+ * A single UPDATE ... RETURNING over a large source (hundreds of thousands of rows,
+ * e.g. DS-my-strategy at ~396k) times out on Neon's HTTP driver: the RETURNING clause
+ * ships every updated chunk_uuid back over HTTP just to count them, and that payload
+ * blows past the driver's header timeout before Postgres is even done (found live,
+ * 20.10 — HeadersTimeoutError mid-run, 33/38 sources already committed, the rest never
+ * attempted). Each UPDATE here is scoped to its own batch via LIMIT, so every HTTP
+ * round trip carries at most BATCH_SIZE rows regardless of the source's total size.
+ * Idempotent and resumable: re-running after a failed source only touches rows that
+ * are still source_class IS NULL.
+ */
+const BATCH_SIZE = 2000;
+
+async function backfillSource(
+  sql: ReturnType<typeof neon>,
+  entry: SourceConfig,
+  accountId: string | null
+): Promise<number> {
+  let totalUpdated = 0;
+  while (true) {
+    const batch = (await sql`
+      UPDATE public.knowledge_chunk
+      SET source_class = ${entry.source_class}, source_owner = ${entry.source_owner}
+      WHERE chunk_uuid IN (
+        SELECT chunk_uuid FROM public.knowledge_chunk
+        WHERE source = ${entry.source}
+          AND account_id IS NOT DISTINCT FROM ${accountId}::uuid
+          AND source_class IS NULL
+        LIMIT ${BATCH_SIZE}
+      )
+      RETURNING chunk_uuid
+    `) as unknown[];
+    totalUpdated += batch.length;
+    if (batch.length < BATCH_SIZE) break;
+  }
+  return totalUpdated;
+}
+
 /** Same (source, user_id) pair must not appear twice with a different class/owner. */
 function checkNoConflicts(registry: SourceConfig[]): void {
   const seen = new Map<string, SourceConfig>();
@@ -93,6 +131,7 @@ async function main() {
   console.log(`Rows with source_class IS NULL before backfill: ${beforeNull[0].n}`);
 
   let updated = 0;
+  const failedSources: string[] = [];
   for (const entry of registry) {
     const accountId: string | null = entry.user_id ?? null;
     if (dryRun) {
@@ -105,16 +144,14 @@ async function main() {
       console.log(`  [dry-run] ${entry.source}: would update ${toUpdate[0].n} rows`);
       continue;
     }
-    const result = (await sql`
-      UPDATE public.knowledge_chunk
-      SET source_class = ${entry.source_class}, source_owner = ${entry.source_owner}
-      WHERE source = ${entry.source}
-        AND account_id IS NOT DISTINCT FROM ${accountId}::uuid
-        AND source_class IS NULL
-      RETURNING chunk_uuid
-    `) as unknown[];
-    updated += result.length;
-    console.log(`  ${entry.source}: updated ${result.length} rows`);
+    try {
+      const n = await backfillSource(sql, entry, accountId);
+      updated += n;
+      console.log(`  ${entry.source}: updated ${n} rows`);
+    } catch (err) {
+      console.error(`  ${entry.source}: FAILED — ${(err as Error).message}`);
+      failedSources.push(entry.source);
+    }
   }
 
   if (dryRun) {
@@ -123,6 +160,9 @@ async function main() {
   }
 
   console.log(`\nBackfill done. Total rows updated: ${updated}`);
+  if (failedSources.length > 0) {
+    console.error(`Failed sources (re-run to retry — idempotent): ${failedSources.join(", ")}`);
+  }
 
   const registrySources = new Set(registry.map((e) => e.source));
   const remaining = (await sql`
