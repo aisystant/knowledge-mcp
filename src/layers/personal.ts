@@ -108,6 +108,7 @@ export interface PersonalWriteResult {
   indexing?: IndexingNotice;
   error?: string;
   reason?: "post_scaffold_required" | "existence_check_unavailable" | "version_mismatch" | "invalid_expected_sha"
+    | "github_write_denied"
     | "sha_required" | "github_validation_error" | "fragment_not_found" | "fragment_ambiguous";
   next_action?: string;
   evidence?: ManagedPostEvidence;
@@ -566,8 +567,12 @@ export async function writeToGitHub(
   const repo = userSource.githubRepo;
   const getToken = dependencies.getInstallationToken ?? getInstallationToken;
   const githubFetch = dependencies.fetch ?? globalThis.fetch;
-  const lease = await repositoryToken(env, ctx, source, "write", () => getToken(env, ctx.userId, repo));
-  if (!lease) return { success: false, error: `Нет подтверждённого доступа к ${source}. Переподключите GitHub.` };
+  let writeDenied = false;
+  const lease = await repositoryToken(env, ctx, source, "write", () => getToken(env, ctx.userId, repo),
+    () => { writeDenied = true; });
+  if (!lease) return writeDenied
+    ? { success: false, reason: "github_write_denied", error: `GitHub не подтвердил право записи в ${source}. Проверьте права на репозиторий; если чтение работает, переподключать GitHub не нужно.` }
+    : { success: false, error: `Нет подтверждённого доступа к ${source}. Переподключите GitHub.` };
   const token = lease.token;
   try {
 
@@ -1459,8 +1464,12 @@ export async function deleteFromGitHub(
 
   const getToken = dependencies.getInstallationToken ?? getInstallationToken;
   const githubFetch = dependencies.fetch ?? globalThis.fetch;
-  const lease = await repositoryToken(env, ctx, source, "write", () => getToken(env, ctx.userId, repo));
-  if (!lease) return { success: false, error: `Нет подтверждённого доступа к ${source}. Переподключите GitHub.` };
+  let writeDenied = false;
+  const lease = await repositoryToken(env, ctx, source, "write", () => getToken(env, ctx.userId, repo),
+    () => { writeDenied = true; });
+  if (!lease) return writeDenied
+    ? { success: false, reason: "github_write_denied", error: `GitHub не подтвердил право записи в ${source}. Проверьте права на репозиторий; если чтение работает, переподключать GitHub не нужно.` }
+    : { success: false, error: `Нет подтверждённого доступа к ${source}. Переподключите GitHub.` };
   const token = lease.token;
   try {
 
