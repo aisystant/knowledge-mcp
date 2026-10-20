@@ -57,12 +57,42 @@ const SKIP_PATTERNS = [
 
 // --- Types ---
 
+// Классификация происхождения знания (WP-596 Ф7, зонтик WP-542) — метаданные для
+// будущего регионального разделения, НЕ механизм контроля доступа. Доступ по-прежнему
+// решают collection_kind/account_id; source_class/source_owner только классифицируют.
+export type SourceClass = "methodology" | "personal" | "team" | "public_user";
+
 export interface SourceConfig {
   source: string;
   source_type: "pack" | "guides" | "ds" | "content";
   path: string;
   exclude?: string[];
   user_id?: string; // если задан → personal collection (account_id, collection_kind='personal')
+  source_class: SourceClass;
+  source_owner: string; // "platform" для методологии, иначе имя пилота/команды — не account_id
+}
+
+const VALID_SOURCE_CLASSES: readonly SourceClass[] = ["methodology", "personal", "team", "public_user"];
+
+/**
+ * Проверяет весь набор конфигов сразу и собирает ВСЕ ошибки, а не падает на первой —
+ * иначе исправление по одной source за прогон индексации (WP-596 Ф7, уточнение Codex).
+ */
+export function validateSourceConfigs(configs: SourceConfig[]): void {
+  const errors: string[] = [];
+  for (const config of configs) {
+    if (!config.source_class || !VALID_SOURCE_CLASSES.includes(config.source_class)) {
+      errors.push(
+        `"${config.source}": source_class отсутствует или невалиден (ожидается одно из: ${VALID_SOURCE_CLASSES.join(", ")}), получено: ${JSON.stringify(config.source_class)}`
+      );
+    }
+    if (!config.source_owner || config.source_owner.trim() === "") {
+      errors.push(`"${config.source}": source_owner отсутствует или пуст`);
+    }
+  }
+  if (errors.length > 0) {
+    throw new Error(`Невалидные источники (${errors.length}):\n  - ${errors.join("\n  - ")}`);
+  }
 }
 
 // --- OpenAI Embeddings (REST API) ---
@@ -244,7 +274,7 @@ export async function ingestSource(
   sql: NeonQueryFunction<false, false>,
   apiKey: string
 ): Promise<number> {
-  const { source, source_type, path: basePath } = config;
+  const { source, source_type, path: basePath, source_class, source_owner } = config;
   // Personal vs platform: use user_id from config if present
   const collectionKind = config.user_id ? 'personal' : 'platform';
   const accountId: string | null = config.user_id ?? null;
@@ -381,18 +411,21 @@ export async function ingestSource(
     INSERT INTO public.knowledge_chunk (
       chunk_id, document_path, paragraph_pos, content_hash, hash,
       source, source_uri, source_kind, collection_kind, account_id,
+      source_class, source_owner,
       content, embedding, parent_chunk_id, indexed_at
     )
     VALUES (
       ${`${doc.filename}::p${pos}`}, ${doc.filename}, ${pos}, ${doc.hash}, ${doc.hash},
       ${source}, ${doc.filename}, ${source_type}, ${collectionKind}, ${accountId}::uuid,
+      ${source_class}, ${source_owner},
       ${doc.content}, ${`[${embeddingByFilename.get(doc.filename)!.join(",")}]`}::vector,
       ${parentUuid}::uuid, NOW()
     )
     ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
     DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding,
       content_hash = EXCLUDED.content_hash, hash = EXCLUDED.hash,
-      parent_chunk_id = EXCLUDED.parent_chunk_id, indexed_at = EXCLUDED.indexed_at
+      parent_chunk_id = EXCLUDED.parent_chunk_id, indexed_at = EXCLUDED.indexed_at,
+      source_class = EXCLUDED.source_class, source_owner = EXCLUDED.source_owner
     RETURNING chunk_uuid
   `;
 
@@ -420,11 +453,13 @@ export async function ingestSource(
         INSERT INTO public.knowledge_chunk (
           chunk_uuid, chunk_id, document_path, paragraph_pos, content_hash, hash,
           source, source_uri, source_kind, collection_kind, account_id,
+          source_class, source_owner,
           content, embedding, indexed_at
         )
         VALUES (
           ${parentUuid}::uuid, ${`${parent.filename}::p0`}, ${parent.filename}, 0, ${parent.hash}, ${parent.hash},
           ${source}, ${parent.filename}, ${source_type}, ${collectionKind}, ${accountId}::uuid,
+          ${source_class}, ${source_owner},
           ${parent.content}, NULL, NOW()
         )
       `);
@@ -505,6 +540,10 @@ async function main() {
   if (args.includes("--config")) {
     const configPath = args[args.indexOf("--config") + 1];
     const configs: SourceConfig[] = JSON.parse(readFileSync(configPath, "utf-8"));
+    // WP-596 Ф7: валидировать ВЕСЬ набор до первого ingestSource() — источник без
+    // class/owner не проходит молча, и ошибка показывает все невалидные source сразу,
+    // не по одной за прогон.
+    validateSourceConfigs(configs);
     console.log(`Ingesting ${configs.length} sources from ${configPath}`);
     let total = 0;
     const failedSources: string[] = [];
@@ -526,8 +565,11 @@ async function main() {
     const typeIdx = args.indexOf("--type");
     const pathIdx = args.indexOf("--path");
 
-    if (sourceIdx === -1 || typeIdx === -1 || pathIdx === -1) {
-      console.error("Usage: npx tsx scripts/ingest.ts --source NAME --type pack|guides|ds --path /path/to/repo");
+    const classIdx = args.indexOf("--class");
+    const ownerIdx = args.indexOf("--owner");
+
+    if (sourceIdx === -1 || typeIdx === -1 || pathIdx === -1 || classIdx === -1 || ownerIdx === -1) {
+      console.error("Usage: npx tsx scripts/ingest.ts --source NAME --type pack|guides|ds --path /path/to/repo --class methodology|personal|team|public_user --owner OWNER");
       console.error("       npx tsx scripts/ingest.ts --config scripts/sources.json");
       process.exit(1);
     }
@@ -540,7 +582,10 @@ async function main() {
       source_type: args[typeIdx + 1] as "pack" | "guides" | "ds",
       path: args[pathIdx + 1],
       user_id: userId,
+      source_class: args[classIdx + 1] as SourceClass,
+      source_owner: args[ownerIdx + 1],
     };
+    validateSourceConfigs([config]);
 
     // Guard: block platform ingest when path is covered by a personal source config
     const personalConfigPath = join(__dirname, "sources-personal.json");

@@ -86,7 +86,9 @@ fi
 export DATABASE_URL
 export OPENAI_API_KEY
 
-npx tsx scripts/ingest.ts   --source "club-${USERNAME}"   --type content   --path "$EXPORT_DIR"
+# WP-596 Ф7: --class/--owner обязательны у ingest.ts с этой фазы — клубные посты
+# принадлежат конкретному участнику ($USERNAME), не платформе.
+npx tsx scripts/ingest.ts   --source "club-${USERNAME}"   --type content   --path "$EXPORT_DIR"   --class personal   --owner "$USERNAME"
 
 echo ""
 echo "[3/3] Done. $(date -Iseconds)"

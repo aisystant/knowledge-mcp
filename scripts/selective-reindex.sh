@@ -59,6 +59,8 @@ log "Sources requested: ${REQUESTED[*]}"
 # sees 4 tab-separated fields — an omitted trailing field on an L2 (platform)
 # row would silently shift nothing here since it's already last, but making the
 # arity explicit avoids relying on that fact.
+# WP-596 Ф7: source_class/source_owner обязательны для ingest.ts (--class/--owner) —
+# резолвим их из того же sources.json, тем же образом, что уже резолвится user_id.
 RESOLVED=$(python3 - "${REQUESTED[@]}" << PYEOF
 import sys, json
 sources = json.load(open("$SOURCES_JSON"))
@@ -68,7 +70,7 @@ for name in requested:
     if name in source_map:
         s = source_map[name]
         path = s["path"].replace("~", "$HOME")
-        print(f"{s['source']}\t{s['source_type']}\t{path}\t{s.get('user_id', '')}")
+        print(f"{s['source']}\t{s['source_type']}\t{path}\t{s.get('user_id', '')}\t{s['source_class']}\t{s['source_owner']}")
     else:
         print(f"ERROR\t{name}\tnot found in sources.json", file=sys.stderr)
         sys.exit(1)
@@ -82,7 +84,7 @@ PYEOF
 cd "$MCP_DIR"
 
 FAILED_SOURCES=()
-while IFS=$'\t' read -r SOURCE SOURCE_TYPE SOURCE_PATH USER_ID; do
+while IFS=$'\t' read -r SOURCE SOURCE_TYPE SOURCE_PATH USER_ID SOURCE_CLASS SOURCE_OWNER; do
     log "→ Indexing: $SOURCE ($SOURCE_TYPE) from $SOURCE_PATH"
 
     UID_ARGS=()
@@ -95,7 +97,7 @@ while IFS=$'\t' read -r SOURCE SOURCE_TYPE SOURCE_PATH USER_ID; do
     # source, before Ф27-2's own FAILED_SOURCES logic ever ran). The
     # `${arr[@]+"${arr[@]}"}` form is the standard nounset-safe empty-array
     # expansion — expands to nothing when UID_ARGS is empty instead of erroring.
-    OUTPUT=$(npx tsx scripts/ingest.ts --source "$SOURCE" --type "$SOURCE_TYPE" --path "$SOURCE_PATH" ${UID_ARGS[@]+"${UID_ARGS[@]}"} 2>&1) || {
+    OUTPUT=$(npx tsx scripts/ingest.ts --source "$SOURCE" --type "$SOURCE_TYPE" --path "$SOURCE_PATH" --class "$SOURCE_CLASS" --owner "$SOURCE_OWNER" ${UID_ARGS[@]+"${UID_ARGS[@]}"} 2>&1) || {
         log "ERROR: ingest failed for $SOURCE"
         log "$OUTPUT"
         FAILED_SOURCES+=("$SOURCE")
