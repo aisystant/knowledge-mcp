@@ -108,6 +108,43 @@ function responseJson(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 
+describe("team repository write diagnostics", () => {
+  const source = "MimEcoSys/editorial-lpf";
+  const teamContext = ctx({
+    sources: [{ source, githubOwner: "MimEcoSys", githubRepo: "editorial-lpf", pathPrefix: "", sourceType: "ds" }],
+    sourceNames: [source],
+  });
+  const env: PersonalEnv = {
+    ...ENV, GITHUB_TEAM_REPOS_ENABLED: true,
+    GITHUB_INTEGRATION_URL: "https://broker.example", GITHUB_BROKER_SHARED_SECRET: "test-secret",
+  };
+
+  it.each([
+    ["github_repository_permission_denied", "github_write_denied"],
+    ["reauthorization_or_access_required", undefined],
+  ])("reports broker reason %s without attempting a GitHub write", async (brokerError, expectedReason) => {
+    queryQueue.push([], [{ repository_id: 42, installation_id: 7,
+      github_owner: "MimEcoSys", github_repo: "editorial-lpf", generation: 1 }]);
+    const request = vi.fn(async (_input: RequestInfo | URL) => responseJson({ error: brokerError }, 403));
+    vi.stubGlobal("fetch", request);
+    try {
+      const result = await writeToGitHub(env, teamContext, source, "README.md", "new text", "test");
+      expect(result.success).toBe(false);
+      expect(result.reason).toBe(expectedReason);
+      if (expectedReason) {
+        expect(result.error).toContain("право записи");
+        expect(result.error).not.toContain("Переподключите GitHub");
+      } else {
+        expect(result.error).toContain("Переподключите GitHub");
+      }
+      expect(request).toHaveBeenCalledOnce();
+      expect(String(request.mock.calls[0][0])).toContain("/internal/github-user-token/issue");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 /** getInstallationToken() looks up installation_id from knowledge.github_installations
  * (one queryQueue row, pushed here as a side effect since every call site spreads this
  * helper right before its queuedFetch setup) and then issues exactly one HTTP call

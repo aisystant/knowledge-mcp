@@ -53,11 +53,14 @@ export interface TeamTokenLease {
   release(): Promise<boolean>;
 }
 
+export type TeamTokenDenial = "github_repository_permission_denied";
+
 export async function issueTeamToken(
   env: PersonalEnv,
   userId: string,
   binding: TeamBinding,
   permission: "read" | "write",
+  onDenied?: (reason: TeamTokenDenial) => void,
 ): Promise<TeamTokenLease | null> {
   if (!teamReposEnabled(env) || !env.GITHUB_INTEGRATION_URL || !env.GITHUB_BROKER_SHARED_SECRET) return null;
   const base = new URL(env.GITHUB_INTEGRATION_URL);
@@ -69,7 +72,15 @@ export async function issueTeamToken(
     body: JSON.stringify({ user_id: userId, repository_id: binding.repositoryId, permission }),
     signal: AbortSignal.timeout(20_000),
   });
-  if (!response.ok) return null;
+  if (!response.ok) {
+    if (response.status === 403 && permission === "write") {
+      const denial = await response.json().catch(() => null) as { error?: unknown } | null;
+      if (denial?.error === "github_repository_permission_denied") {
+        onDenied?.("github_repository_permission_denied");
+      }
+    }
+    return null;
+  }
   const data = await response.json() as {
     access_token?: unknown; repository_id?: unknown; repository?: unknown;
     visibility?: unknown; generation?: unknown;
@@ -118,6 +129,7 @@ export async function repositoryToken(
   source: string,
   permission: "read" | "write",
   legacyToken: () => Promise<string | null>,
+  onDenied?: (reason: TeamTokenDenial) => void,
 ): Promise<{ token: string; repositoryId?: number; release(): Promise<void> } | null> {
   if (!source.includes("/")) {
     const token = await legacyToken();
@@ -127,7 +139,7 @@ export async function repositoryToken(
   if (!ctx.userId) return null;
   const binding = await activeTeamBinding(env, ctx.userId, source);
   if (!binding) return null;
-  const lease = await issueTeamToken(env, ctx.userId, binding, permission);
+  const lease = await issueTeamToken(env, ctx.userId, binding, permission, onDenied);
   if (!lease || lease.repository.toLowerCase() !== source.toLowerCase()) {
     if (lease) await lease.release();
     return null;
