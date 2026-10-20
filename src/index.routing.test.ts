@@ -95,6 +95,8 @@ vi.mock("./layers/personal.js", () => ({
     entries: [{ sha: "a".repeat(40), message: "PRIVATE_SENTINEL commit", date: "2026-09-26T00:00:00Z", author: "Tester" }],
   }),
   connectSource: vi.fn(),
+  disconnectSource: vi.fn(),
+  purgeSource: vi.fn(),
   writeToGitHub: vi.fn(),
   appendToGitHub: vi.fn(),
   strReplaceInGitHub: vi.fn(),
@@ -123,7 +125,7 @@ vi.mock("./layers/private.js", async (importOriginal) => {
 });
 
 const { handleMcpRequest, TOOLS, default: worker } = await import("./index.js");
-const { AmbiguousSourceError, resolveUserContext, personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalListSources, personalListDocuments, personalListPath, writeToGitHub, appendToGitHub, strReplaceInGitHub, deleteFromGitHub } = await import("./layers/personal.js");
+const { AmbiguousSourceError, resolveUserContext, personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalListSources, personalListDocuments, personalListPath, writeToGitHub, appendToGitHub, strReplaceInGitHub, deleteFromGitHub, disconnectSource, purgeSource } = await import("./layers/personal.js");
 
 const ENV = {
   KNOWLEDGE_DATABASE_URL: "postgres://fake-public",
@@ -200,6 +202,64 @@ describe("dual-mode routing: private mode reaches the personal layer, never the 
     }, "private");
     expect((response.result as { isError?: boolean }).isError).toBe(true);
     expect(deleteFromGitHub).not.toHaveBeenCalled();
+  });
+
+  // WP-596 Ф4: deleteFromGitHub/personalGetDocumentHistory return free-text success:false
+  // failures — gitOperationErrorCode (index.ts) classifies them by `reason` where set and by
+  // the functions' own fixed message vocabulary otherwise. These exercise that classifier
+  // through the real dispatch branch, not a unit call.
+  describe("error_code for delete/history success:false (WP-596 Ф4)", () => {
+    const sha = "a".repeat(40);
+
+    it("classifies a GitHub write-permission refusal as auth", async () => {
+      vi.mocked(deleteFromGitHub).mockResolvedValueOnce({
+        success: false, reason: "github_write_denied", error: "GitHub не подтвердил право записи",
+      });
+      const response = await callTool("delete", { source: "DS-my-strategy", path: "notes/a.md", expected_sha: sha }, "private");
+      expect((response.result as { isError?: boolean; error_code?: string }).isError).toBe(true);
+      expect((response.result as { error_code?: string }).error_code).toBe("auth");
+    });
+
+    it("classifies an unrecognized GitHub API failure as upstream, not a caller mistake", async () => {
+      vi.mocked(deleteFromGitHub).mockResolvedValueOnce({
+        success: false, error: "GitHub API error 500: internal error",
+      });
+      const response = await callTool("delete", { source: "DS-my-strategy", path: "notes/a.md", expected_sha: sha }, "private");
+      expect((response.result as { isError?: boolean; error_code?: string }).isError).toBe(true);
+      expect((response.result as { error_code?: string }).error_code).toBe("upstream");
+    });
+
+    it("classifies a stale expected_sha (version_mismatch) as validation", async () => {
+      vi.mocked(personalGetDocumentHistory).mockResolvedValueOnce({
+        success: false, error: "Файл изменился", reason: "version_mismatch",
+      } as never);
+      const response = await callTool("history", { source: "DS-my-strategy", path: "notes/a.md" }, "private");
+      expect((response.result as { isError?: boolean; error_code?: string }).isError).toBe(true);
+      expect((response.result as { error_code?: string }).error_code).toBe("validation");
+    });
+
+    // Cold-review finding (this session): disconnectSource/purgeSource's only error path
+    // is "no such source for this user" — hardcoding error_code: "upstream" for both was
+    // wrong; neither function has a DB-exception branch that would make upstream correct.
+    it("classifies disconnect_source on an unconnected source as not_found", async () => {
+      vi.mocked(disconnectSource).mockResolvedValueOnce({
+        source: "DS-my-strategy", status: "already_disconnected", documents_kept: 0,
+        error: "Source 'DS-my-strategy' не подключён. Проверь list_sources.",
+      });
+      const response = await callTool("disconnect_source", { source: "DS-my-strategy" }, "private");
+      expect((response.result as { isError?: boolean; error_code?: string }).isError).toBe(true);
+      expect((response.result as { error_code?: string }).error_code).toBe("not_found");
+    });
+
+    it("classifies purge_source on an unknown source as not_found", async () => {
+      vi.mocked(purgeSource).mockResolvedValueOnce({
+        source: "DS-my-strategy", status: "not_found", documents_deleted: 0, jobs_deleted: 0,
+        error: "Source 'DS-my-strategy' не найден. Проверь list_sources.",
+      });
+      const response = await callTool("purge_source", { source: "DS-my-strategy", confirm: true }, "private");
+      expect((response.result as { isError?: boolean; error_code?: string }).isError).toBe(true);
+      expect((response.result as { error_code?: string }).error_code).toBe("not_found");
+    });
   });
 
   it("advertises the private search implementation without changing the public catalog or accepted schema", async () => {
@@ -806,7 +866,7 @@ describe("private read contract", () => {
   const syntheticDoc = { filename: "notes/bounds.md", source: "DS-my-strategy", source_type: "ds",
     github_url: null, content: '😀Яe\u0301\r\n"\\'.repeat(8_000) };
   const toolResult = (response: Awaited<ReturnType<typeof callTool>>) =>
-    response.result as { content: { text: string }[]; isError?: boolean };
+    response.result as { content: { text: string }[]; isError?: boolean; error_code?: string };
   const parsed = (response: Awaited<ReturnType<typeof callTool>>) => JSON.parse(toolResult(response).content[0].text);
   const bounded = (response: unknown) => expect(Buffer.byteLength(JSON.stringify(response), "utf8")).toBeLessThanOrEqual(32_000);
 
@@ -942,6 +1002,9 @@ describe("private read contract", () => {
       expect(toolResult(response).isError).toBe(true);
       expect(JSON.stringify(response)).not.toContain(long);
       expect(parsed(response).error).toBe(scenario === "dependency" ? "dependency_unavailable" : "response_too_large");
+      // dependency_unavailable is an upstream problem; response_too_large is this server's own
+      // response not fitting the budget — also upstream, not the caller's mistake (WP-596 Ф4).
+      expect(toolResult(response).error_code).toBe("upstream");
     });
 
   it("honors headings without returning the document body", async () => {
@@ -972,18 +1035,20 @@ describe("private read contract", () => {
       expect(parsed(response).content).toBe("## Tasks\n- a\n- b\n");
     });
 
-    it("reports section_not_found with the outline instead of guessing", async () => {
+    it("reports section_not_found with the outline instead of guessing (WP-596 Ф4: a real miss, error_code:not_found)", async () => {
       vi.mocked(personalGetDocument).mockResolvedValueOnce(withSections);
       const response = await callTool("get_document", { filename: withSections.filename, section: "Nope" }, "private");
       expect(toolResult(response).isError).toBe(true);
+      expect(toolResult(response).error_code).toBe("not_found");
       expect(parsed(response)).toMatchObject({ error: "section_not_found" });
       expect(parsed(response).headings.map((h: { title: string }) => h.title)).toEqual(["Intro", "Tasks", "Diary"]);
     });
 
-    it("reports section_ambiguous with line numbers instead of picking one", async () => {
+    it("reports section_ambiguous with line numbers instead of picking one — not a failure (WP-596 Ф4): the match list IS the useful answer", async () => {
       vi.mocked(personalGetDocument).mockResolvedValueOnce({ ...withSections, content: "## Same\na\n## Same\nb" });
       const response = await callTool("get_document", { filename: withSections.filename, section: "Same" }, "private");
-      expect(toolResult(response).isError).toBe(true);
+      expect(toolResult(response).isError).toBeUndefined();
+      expect(toolResult(response).error_code).toBeUndefined();
       expect(parsed(response)).toMatchObject({ error: "section_ambiguous", matches: [{ level: 2, line: 1 }, { level: 2, line: 3 }] });
     });
 

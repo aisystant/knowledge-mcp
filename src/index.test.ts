@@ -163,7 +163,7 @@ describe("deterministic document resolver", () => {
       },
       {} as Env,
     );
-    expect(response.result).toEqual(expect.objectContaining({ isError: true }));
+    expect(response.result).toEqual(expect.objectContaining({ isError: true, error_code: "validation" }));
   });
 
   it("reads only an unambiguous high-confidence match", () => {

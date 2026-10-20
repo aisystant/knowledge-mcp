@@ -149,6 +149,26 @@ interface McpResponse {
   error?: { code: number; message: string };
 }
 
+/** WP-596 Ф4: one of four buckets an isError:true tool result can carry, telling the caller
+ * whether retrying, authenticating, fixing its arguments, or giving up is the right next move. */
+type ToolErrorCode = "not_found" | "validation" | "auth" | "upstream";
+
+/** Build an isError:true tool result with a structured error_code — the shape dozens of
+ * hand-written `{ isError: true }` literals in this dispatcher collapsed into. `content` is
+ * JSON.stringify'd when it is not already a string, matching how call sites built either
+ * plain text or a JSON payload before this helper existed. */
+function toolError(id: string | number, content: string | object, errorCode: ToolErrorCode): McpResponse {
+  return {
+    jsonrpc: "2.0",
+    id,
+    result: {
+      content: [{ type: "text", text: typeof content === "string" ? content : JSON.stringify(content) }],
+      isError: true,
+      error_code: errorCode,
+    },
+  };
+}
+
 // --- Reindex types ---
 
 interface ReindexFile {
@@ -1426,16 +1446,45 @@ function resolveSection(content: string, title: string): SectionLookup {
 }
 
 /** Shared by the live and indexed `get_document` paths below, which otherwise repeat the same
- * not-found/ambiguous JSON error shape for a `section` argument (WP-7 Ф204). */
+ * not-found/ambiguous JSON shape for a `section` argument (WP-7 Ф204).
+ *
+ * "section_ambiguous" is NOT a failure (WP-596 Ф4): the caller asked for one heading, several
+ * matched, and the response hands back exactly the list needed to pick one and retry — that is
+ * useful content, not an empty-handed refusal. "section_not_found" stays a real miss: the
+ * heading does not exist, and the returned outline is only a courtesy fallback, not an answer
+ * to what was asked. */
 function sectionWindowOrError(id: string | number, content: string, title: string):
   { bound: { start: number; end: number }; errorResult?: undefined }
-  | { bound?: undefined; errorResult: { jsonrpc: "2.0"; id: string | number; result: { content: { type: "text"; text: string }[]; isError: true } } } {
+  | { bound?: undefined; errorResult: McpResponse } {
   const lookup = resolveSection(content, title);
   if (lookup.ok) return { bound: { start: lookup.start, end: lookup.end } };
-  const payload = lookup.reason === "section_not_found"
-    ? { error: lookup.reason, message: "Заголовок не найден — вот оглавление файла.", headings: lookup.headings }
-    : { error: lookup.reason, message: "Заголовок встречается несколько раз — уточни какой (см. matches).", matches: lookup.matches };
-  return { errorResult: { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(payload) }], isError: true } } };
+  if (lookup.reason === "section_not_found") {
+    return { errorResult: toolError(id, {
+      error: lookup.reason, message: "Заголовок не найден — вот оглавление файла.", headings: lookup.headings,
+    }, "not_found") };
+  }
+  return { errorResult: {
+    jsonrpc: "2.0", id,
+    result: { content: [{ type: "text", text: JSON.stringify({
+      error: lookup.reason, message: "Заголовок встречается несколько раз — уточни какой (см. matches).", matches: lookup.matches,
+    }) }] },
+  } };
+}
+
+/** Classifies success:false failures from personal.ts's delete/history GitHub operations into
+ * the four MCP error_code buckets (WP-596 Ф4). `reason` (set by deleteFromGitHub for some of
+ * its failures) takes priority; the message prefixes below are personal.ts's own fixed
+ * vocabulary for these two functions — not externally-controlled text — so matching on them is
+ * no less stable than matching `reason` itself. Falls back to "upstream": an unrecognized
+ * failure here is a GitHub/DB dependency problem, not a caller mistake. */
+function gitOperationErrorCode(result: { reason?: string; error?: string }): ToolErrorCode {
+  if (result.reason === "invalid_expected_sha" || result.reason === "version_mismatch") return "validation";
+  if (result.reason === "github_write_denied") return "auth";
+  const message = result.error ?? "";
+  if (message.startsWith("Unknown source:") || message === "Invalid user context: missing userId" || message.startsWith("Repository path must")) return "validation";
+  if (message.startsWith("File not found:")) return "not_found";
+  if (message.includes("Переподключите GitHub")) return "auth";
+  return "upstream";
 }
 
 // WP-7 Ф117: extractTitle/PathEntry/buildPathTree moved to ./path-tree.ts so layers/personal.ts
@@ -3323,15 +3372,9 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
           const guard = new JwtScopeGuard(env.ORY_URL);
           const principal = await guard.authenticate(rawRequest);
           if (!principal) {
-            return {
-              jsonrpc: "2.0", id,
-              result: {
-                content: [{ type: "text", text: JSON.stringify({
-                  error: { code: -32001, message: "unauthenticated", data: { reason: "unauthenticated", attempted_tool: toolName } },
-                }) }],
-                isError: true,
-              },
-            };
+            return toolError(id, {
+              error: { code: -32001, message: "unauthenticated", data: { reason: "unauthenticated", attempted_tool: toolName } },
+            }, "auth");
           }
 
           const ctx = await resolveUserContext(env, principal.userId);
@@ -3393,7 +3436,7 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
               });
             } catch (err) {
               if (err instanceof ScopeDeniedError) {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ error: err.denyResponse }) }], isError: true } };
+                return toolError(id, { error: err.denyResponse }, "auth");
               }
               throw err;
             }
@@ -3405,7 +3448,7 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
             const message = (args.message as string) || "Update via Aisystant MCP";
 
             if (!ctx.sourceNames.includes(source)) {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
+              return toolError(id, `Error: source must be one of: ${ctx.sourceNames.join(", ")}`, "validation");
             }
 
             const expectedSha = args.expected_sha as string | undefined;
@@ -3416,21 +3459,21 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
               // ref === "" check above) rather than relying on client-side schema enforcement,
               // which this server does not apply to tool arguments (WP-7 Ф204).
               if (expectedSha === undefined) {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `mode: '${mode}' требует expected_sha — прочитай personal_get_document(include_sha: true) и передай его sha.` }], isError: true } };
+                return toolError(id, `mode: '${mode}' требует expected_sha — прочитай personal_get_document(include_sha: true) и передай его sha.`, "validation");
               }
               const onConflictArg = args.on_conflict;
               if (onConflictArg !== undefined && onConflictArg !== "fail" && onConflictArg !== "retry") {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "on_conflict должен быть 'fail' или 'retry'." }], isError: true } };
+                return toolError(id, "on_conflict должен быть 'fail' или 'retry'.", "validation");
               }
               const operationIdArg = args.operation_id;
               if (operationIdArg !== undefined && (typeof operationIdArg !== "string" || operationIdArg.length === 0 || operationIdArg.length > 128)) {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "operation_id должен быть непустой строкой до 128 символов." }], isError: true } };
+                return toolError(id, "operation_id должен быть непустой строкой до 128 символов.", "validation");
               }
               const sharedOptions = { onConflict: onConflictArg as "fail" | "retry" | undefined, operationId: operationIdArg as string | undefined };
 
               if (mode === "append") {
                 if (typeof args.content !== "string") {
-                  return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "mode: 'append' требует content (строку с добавляемым фрагментом)." }], isError: true } };
+                  return toolError(id, "mode: 'append' требует content (строку с добавляемым фрагментом).", "validation");
                 }
                 const appendResult = await appendToGitHub(env, ctx, source, path, args.content, message, expectedSha, sharedOptions);
                 return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(appendResult, null, 2) }] } };
@@ -3438,14 +3481,14 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
 
               // mode === "str_replace"
               if (typeof args.old_string !== "string" || args.old_string.length === 0) {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "mode: 'str_replace' требует непустой old_string." }], isError: true } };
+                return toolError(id, "mode: 'str_replace' требует непустой old_string.", "validation");
               }
               if (typeof args.new_string !== "string") {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "mode: 'str_replace' требует new_string (строка, может быть пустой)." }], isError: true } };
+                return toolError(id, "mode: 'str_replace' требует new_string (строка, может быть пустой).", "validation");
               }
               const dryRunArg = args.dry_run;
               if (dryRunArg !== undefined && typeof dryRunArg !== "boolean") {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "dry_run должен быть булевым значением." }], isError: true } };
+                return toolError(id, "dry_run должен быть булевым значением.", "validation");
               }
               const replaceResult = await strReplaceInGitHub(env, ctx, source, path, args.old_string, args.new_string, message, expectedSha, {
                 ...sharedOptions, dryRun: dryRunArg === true,
@@ -3453,11 +3496,11 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
               return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(replaceResult, null, 2) }] } };
             }
             if (mode !== "replace") {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `mode должен быть 'replace', 'append' или 'str_replace', получено: ${JSON.stringify(mode)}.` }], isError: true } };
+              return toolError(id, `mode должен быть 'replace', 'append' или 'str_replace', получено: ${JSON.stringify(mode)}.`, "validation");
             }
 
             if (typeof args.content !== "string") {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "mode: 'replace' требует content (строку с полным содержимым файла)." }], isError: true } };
+              return toolError(id, "mode: 'replace' требует content (строку с полным содержимым файла).", "validation");
             }
             const writeResult = await writeToGitHub(env, ctx, source, path, args.content, message, {}, expectedSha);
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(writeResult, null, 2) }] } };
@@ -3469,11 +3512,12 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
             const limit = args.limit as number | undefined;
 
             if (!ctx.sourceNames.includes(source)) {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
+              return toolError(id, `Error: source must be one of: ${ctx.sourceNames.join(", ")}`, "validation");
             }
 
             const historyResult = await personalGetDocumentHistory(env, ctx, source, path, limit);
-            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(historyResult, null, 2) }], ...(historyResult.success ? {} : { isError: true }) } };
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(historyResult, null, 2) }],
+              ...(historyResult.success ? {} : { isError: true, error_code: gitOperationErrorCode(historyResult) }) } };
           }
 
           if (toolName === "propose_capture") {
@@ -3513,30 +3557,31 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
               : undefined;
 
             if (!ctx.sourceNames.includes(source)) {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
+              return toolError(id, `Error: source must be one of: ${ctx.sourceNames.join(", ")}`, "validation");
             }
 
             if (suppliedSha === undefined && !/^[0-9a-fA-F]{40}$/.test(legacySha ?? "")) {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({
+              return toolError(id, {
                 success: false,
                 reason: "expected_sha_required",
                 error: "Файл не удалён: нужен SHA версии, которую подтвердил человек.",
                 next_action: "Прочитай точный файл через personal_get_document(source, filename, include_sha=true), назови человеку источник и путь и получи явное подтверждение удаления. Если в схеме personal_delete нет expected_sha, повтори вызов с теми же source/path и message='IWE-DELETE-SHA:<sha из чтения>' (ровно 40 hex-символов). Переподключение не требуется.",
-              }) }], isError: true } };
+              }, "validation");
             }
             if (suppliedSha !== undefined && legacySha !== undefined) {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({
+              return toolError(id, {
                 success: false,
                 reason: "conflicting_sha_arguments",
                 error: "Передай SHA только одним способом: expected_sha или совместимый маркер в message.",
-              }) }], isError: true } };
+              }, "validation");
             }
 
             const expectedSha = (suppliedSha ?? legacySha) as string;
             const message = legacySha !== undefined ? "Delete via Aisystant MCP" : suppliedMessage || "Delete via Aisystant MCP";
 
             const deleteResult = await deleteFromGitHub(env, ctx, source, path, message, expectedSha);
-            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(deleteResult, null, 2) }], ...(deleteResult.success ? {} : { isError: true }) } };
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(deleteResult, null, 2) }],
+              ...(deleteResult.success ? {} : { isError: true, error_code: gitOperationErrorCode(deleteResult) }) } };
           }
 
           if (toolName === "new_post") {
@@ -3545,7 +3590,7 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
             const artifactType = args.artifact_type as string;
 
             if (!ctx.sourceNames.includes(source)) {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
+              return toolError(id, `Error: source must be one of: ${ctx.sourceNames.join(", ")}`, "validation");
             }
 
             const allocateResult = await createPersonalPost(env, ctx, {
@@ -3629,23 +3674,28 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
           if (toolName === "reindex") {
             const source = (args.source as string)?.trim();
             if (!source) {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Error: source required" }], isError: true } };
+              return toolError(id, "Error: source required", "validation");
             }
             if (!ctx.sourceNames.includes(source)) {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: source must be one of: ${ctx.sourceNames.join(", ")}` }], isError: true } };
+              return toolError(id, `Error: source must be one of: ${ctx.sourceNames.join(", ")}`, "validation");
             }
             const reindexResult = await startReindexJob(env, principal.userId, source);
-            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(reindexResult, null, 2) }], isError: reindexResult.status === "failed" } };
+            // "upstream" is correct only because the ctx.sourceNames check above makes
+            // startReindexJob's own "Unknown source"/"job not found" failures unreachable
+            // here; a future caller that skips that check or forwards a jobId must not
+            // inherit this label unexamined.
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(reindexResult, null, 2) }],
+              ...(reindexResult.status === "failed" ? { isError: true, error_code: "upstream" } : {}) } };
           }
 
           if (toolName === "reindex_status") {
             const jobId = (args.job_id as string)?.trim();
             if (!jobId) {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Error: job_id required" }], isError: true } };
+              return toolError(id, "Error: job_id required", "validation");
             }
             const status = await getReindexJobStatus(env, principal.userId, jobId);
             if (!status) {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Error: no job ${jobId} found for this user` }], isError: true } };
+              return toolError(id, `Error: no job ${jobId} found for this user`, "not_found");
             }
             return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(status, null, 2) }] } };
           }
@@ -3653,23 +3703,30 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
           if (toolName === "disconnect_source") {
             const source = (args.source as string)?.trim();
             if (!source) {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Error: source required" }], isError: true } };
+              return toolError(id, "Error: source required", "validation");
             }
             const disconnectResult = await disconnectSource(env, principal.userId, source);
-            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(disconnectResult, null, 2) }], isError: !!disconnectResult.error } };
+            // disconnectSource's only error path is "no such active source for this user"
+            // (status stays "already_disconnected") — a not_found condition, not an upstream
+            // failure; it has no DB-exception branch that would populate .error otherwise.
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(disconnectResult, null, 2) }],
+              ...(disconnectResult.error ? { isError: true, error_code: "not_found" } : {}) } };
           }
 
           if (toolName === "purge_source") {
             const source = (args.source as string)?.trim();
             const confirm = args.confirm as boolean;
             if (!source) {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Error: source required" }], isError: true } };
+              return toolError(id, "Error: source required", "validation");
             }
             if (!confirm) {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Error: confirm must be true — это необратимое удаление всех данных репозитория." }], isError: true } };
+              return toolError(id, "Error: confirm must be true — это необратимое удаление всех данных репозитория.", "validation");
             }
             const purgeResult = await purgeSource(env, principal.userId, source);
-            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(purgeResult, null, 2) }], isError: !!purgeResult.error } };
+            // purgeSource's only error path is status:"not_found" (no such source for this
+            // user) — a not_found condition, not an upstream failure.
+            return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(purgeResult, null, 2) }],
+              ...(purgeResult.error ? { isError: true, error_code: "not_found" } : {}) } };
           }
 
           // Defensive: every name in PRIVATE_TOOL_NAMES must have a dispatch branch above —
@@ -3689,15 +3746,9 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
           const guard = new JwtScopeGuard(env.ORY_URL);
           const principal = await guard.authenticate(rawRequest);
           if (!principal) {
-            return {
-              jsonrpc: "2.0", id,
-              result: {
-                content: [{ type: "text", text: JSON.stringify({
-                  error: { code: -32001, message: "unauthenticated", data: { reason: "unauthenticated", attempted_tool: toolName } },
-                }) }],
-                isError: true,
-              },
-            };
+            return toolError(id, {
+              error: { code: -32001, message: "unauthenticated", data: { reason: "unauthenticated", attempted_tool: toolName } },
+            }, "auth");
           }
           const ctx = await resolveUserContext(env, principal.userId);
 
@@ -3725,7 +3776,7 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
             // silently, uncaught. Reject it explicitly instead of relying on GitHub's own
             // resolution (cold-review finding, verify session 26.09).
             if (ref === "") {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "ref не может быть пустой строкой — передай конкретный sha/ветку/тег из personal_history или не передавай параметр вовсе." }], isError: true } };
+              return toolError(id, "ref не может быть пустой строкой — передай конкретный sha/ветку/тег из personal_history или не передавай параметр вовсе.", "validation");
             }
 
             if (args.include_sha === true || ref !== undefined) {
@@ -3736,23 +3787,23 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
               // WP-7 Ф176: a ref forces the same live path — the search index
               // only ever holds the current version, never a prior one.
               if (args.format === "headings") {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "include_sha/ref и format=headings несовместимы: оба относятся к полному содержимому конкретной версии файла. Убери один из параметров." }], isError: true } };
+                return toolError(id, "include_sha/ref и format=headings несовместимы: оба относятся к полному содержимому конкретной версии файла. Убери один из параметров.", "validation");
               }
               let liveResult;
               try {
                 liveResult = await personalGetDocumentWithSha(env, ctx, filename, args.source as string | undefined, ref);
               } catch (e) {
                 if (e instanceof AmbiguousSourceError) {
-                  return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `filename exists in multiple sources (${e.sources.join(", ")}) — pass source to disambiguate` }], isError: true } };
+                  return toolError(id, `filename exists in multiple sources (${e.sources.join(", ")}) — pass source to disambiguate`, "validation");
                 }
                 throw e;
               }
               if (!liveResult) {
                 const refHint = ref ? ` Или ref «${ref}» не существует для этого файла — проверь через personal_history.` : "";
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `Документ не найден на GitHub (или недоступен). Проверь filename и source.${refHint}` }], isError: true } };
+                return toolError(id, `Документ не найден на GitHub (или недоступен). Проверь filename и source.${refHint}`, "not_found");
               }
               if (liveResult.kind === "source_required") {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ error: "source_required", message: "Документа нет в индексе — для живого чтения с GitHub передай source явно.", sources: liveResult.sources }) }], isError: true } };
+                return toolError(id, JSON.stringify({ error: "source_required", message: "Документа нет в индексе — для живого чтения с GitHub передай source явно.", sources: liveResult.sources }), "validation");
               }
               let liveSection;
               if (sectionTitle !== undefined) {
@@ -3772,12 +3823,12 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
               doc = await personalGetDocument(env, ctx, filename, args.source as string | undefined);
             } catch (e) {
               if (e instanceof AmbiguousSourceError) {
-                return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `filename exists in multiple sources (${e.sources.join(", ")}) — pass source to disambiguate` }], isError: true } };
+                return toolError(id, `filename exists in multiple sources (${e.sources.join(", ")}) — pass source to disambiguate`, "validation");
               }
               throw e;
             }
             if (!doc) {
-              return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "Document not found" }], isError: true } };
+              return toolError(id, "Document not found", "not_found");
             }
             let indexedSection;
             if (sectionTitle !== undefined) {
@@ -3836,11 +3887,7 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
               && (typeof limit !== "number" || !Number.isFinite(limit) || limit < 2 || limit > 5)
             )
           ) {
-            return {
-              jsonrpc: "2.0",
-              id,
-              result: { content: [{ type: "text", text: "invalid resolve_document arguments" }], isError: true },
-            };
+            return toolError(id, "invalid resolve_document arguments", "validation");
           }
 
           const matches = await resolveDocument(
@@ -3904,11 +3951,7 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
               userId
             );
             if (!structure) {
-              return {
-                jsonrpc: "2.0",
-                id,
-                result: { content: [{ type: "text", text: "Document not found" }], isError: true },
-              };
+              return toolError(id, "Document not found", "not_found");
             }
             return {
               jsonrpc: "2.0",
@@ -3919,11 +3962,7 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
 
           const doc = await getDocument(env, args.filename as string, args.source as string | undefined, userId);
           if (!doc) {
-            return {
-              jsonrpc: "2.0",
-              id,
-              result: { content: [{ type: "text", text: "Document not found" }], isError: true },
-            };
+            return toolError(id, "Document not found", "not_found");
           }
           return {
             jsonrpc: "2.0",
@@ -4239,21 +4278,13 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
         if (toolName === "load_skill") {
           const skillName = args.skill_name as string;
           if (!/^[a-z0-9_-]+$/.test(skillName)) {
-            return {
-              jsonrpc: "2.0",
-              id,
-              result: { content: [{ type: "text", text: `Invalid skill name: ${skillName}. Use only lowercase letters, numbers, hyphens and underscores.` }], isError: true },
-            };
+            return toolError(id, `Invalid skill name: ${skillName}. Use only lowercase letters, numbers, hyphens and underscores.`, "validation");
           }
           try {
             const filename = `.claude/skills/${skillName}/SKILL.md`;
             const doc = await getDocument(env, filename, "FMT-exocortex-template", userId);
             if (!doc) {
-              return {
-                jsonrpc: "2.0",
-                id,
-                result: { content: [{ type: "text", text: `Skill not found: ${skillName}. Use list_documents(source: "FMT-exocortex-template") to discover available skills.` }], isError: true },
-              };
+              return toolError(id, `Skill not found: ${skillName}. Use list_documents(source: "FMT-exocortex-template") to discover available skills.`, "not_found");
             }
             return {
               jsonrpc: "2.0",
@@ -4262,11 +4293,7 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
             };
           } catch (err) {
             const msg = err instanceof Error ? err.message : "Unknown error";
-            return {
-              jsonrpc: "2.0",
-              id,
-              result: { content: [{ type: "text", text: `Error loading skill: ${msg}` }], isError: true },
-            };
+            return toolError(id, `Error loading skill: ${msg}`, "upstream");
           }
         }
 
@@ -4281,10 +4308,9 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
     }
   } catch (err) {
     if (err instanceof ReadFailure) {
-      console.warn(JSON.stringify({ event: "read_dependency_failed", ...err.toJSON() }));
-      return { jsonrpc: "2.0", id, result: {
-        content: [{ type: "text", text: JSON.stringify(err.toJSON()) }], isError: true,
-      } };
+      const failure = err.toJSON();
+      console.warn(JSON.stringify({ event: "read_dependency_failed", ...failure }));
+      return toolError(id, failure, failure.error_code);
     }
     return {
       jsonrpc: "2.0",

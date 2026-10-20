@@ -54,6 +54,15 @@ describe("safe read diagnostics", () => {
     expect(diagnostic.retryable).toBe(status === 429 || status >= 500);
   });
 
+  it("maps error_code to auth only for dependency_access_denied, upstream for every other ReadFailure (WP-596 Ф4)", () => {
+    const denied = readHttpFailure(new Response("", { status: 401 }), "github_content").toJSON();
+    expect(denied).toMatchObject({ error: "dependency_access_denied", error_code: "auth" });
+    const unavailable = readHttpFailure(new Response("", { status: 503 }), "github_content").toJSON();
+    expect(unavailable).toMatchObject({ error: "dependency_unavailable", error_code: "upstream" });
+    const rateLimited = readHttpFailure(new Response("", { status: 429 }), "github_content").toJSON();
+    expect(rateLimited).toMatchObject({ error: "dependency_rate_limited", error_code: "upstream" });
+  });
+
   it("classifies a rate-limited GitHub 403 and honors its wait instruction", () => {
     const response = new Response("", { status: 403, headers: { "retry-after": "90", "x-github-request-id": "https://private.invalid?secret=value" } });
     const diagnostic = readHttpFailure(response, "github_token").toJSON();
