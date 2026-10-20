@@ -142,39 +142,61 @@ export async function teamMarkdownFiles(
   if (!source.includes("/") || !ctx.sources.some(s => s.source === source)) return [];
   const lease = await repositoryToken(env, ctx, source, "read", async () => null);
   if (!lease?.repositoryId) return [];
-  const headers = { Authorization: `Bearer ${lease.token}`, Accept: "application/vnd.github+json" };
-  const base = `https://api.github.com/repos/${source.split("/").map(encodeURIComponent).join("/")}`;
-  const get = async (url: string): Promise<unknown> => {
-    const response = await fetch(url, { headers, redirect: "manual", signal: AbortSignal.timeout(15_000) });
-    if (!response.ok) throw new Error("GitHub repository listing unavailable");
-    return response.json();
-  };
   try {
-    const metadata = await get(base) as { id?: unknown; full_name?: unknown;
-      default_branch?: unknown; size?: unknown };
-    if (metadata.id !== lease.repositoryId || typeof metadata.full_name !== "string"
-      || metadata.full_name.toLowerCase() !== source.toLowerCase()) {
-      throw new Error("GitHub repository identity changed");
-    }
-    if (!metadata.default_branch && metadata.size === 0) return [];
-    if (typeof metadata.default_branch !== "string" || !metadata.default_branch) {
-      throw new Error("GitHub default branch unavailable");
-    }
-    const branch = await get(`${base}/branches/${encodeURIComponent(metadata.default_branch)}`) as {
-      commit?: { sha?: unknown };
-    };
-    if (typeof branch.commit?.sha !== "string") throw new Error("GitHub branch unavailable");
-    const tree = await get(`${base}/git/trees/${encodeURIComponent(branch.commit.sha)}?recursive=1`) as {
-      tree?: unknown; truncated?: unknown;
-    };
-    if (!Array.isArray(tree.tree) || tree.truncated === true) throw new Error("GitHub tree incomplete");
-    return tree.tree.filter((item: unknown): item is { type: "blob"; path: string; size: number } => {
-      if (!item || typeof item !== "object") return false;
-      const file = item as Record<string, unknown>;
-      return file.type === "blob" && typeof file.path === "string" && file.path.endsWith(".md")
-        && Number.isSafeInteger(file.size) && Number(file.size) >= 0;
-    }).map(item => ({ path: item.path, size: item.size }));
+    return await enumerateTeamMarkdownFiles(source, lease.repositoryId, lease.token);
   } finally {
     await lease.release();
   }
+}
+
+/** List only a repository whose immutable ID was verified by the user's token lease. */
+export async function enumerateTeamMarkdownFiles(
+  source: string, repositoryId: number, token: string, githubFetch: typeof fetch = fetch,
+): Promise<Array<{ path: string; size: number }>> {
+  const headers = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json",
+    "User-Agent": "aisystant-knowledge", "Cache-Control": "no-cache" };
+  const base = `https://api.github.com/repos/${source.split("/").map(encodeURIComponent).join("/")}`;
+  const get = async (url: string, stage: "metadata" | "default_branch" | "branches" | "tree",
+    allowMissing = false): Promise<unknown | null> => {
+    const response = await githubFetch(url, { headers, redirect: "manual", signal: AbortSignal.timeout(15_000) });
+    if (allowMissing && response.status === 404) return null;
+    if (!response.ok) {
+      // Do not log URLs, repository names, response bodies or credentials.
+      console.warn(JSON.stringify({ event: "team_repository_listing_http_error", stage, status: response.status }));
+      throw new Error("GitHub repository listing unavailable");
+    }
+    return response.json();
+  };
+  const metadata = await get(base, "metadata") as { id?: unknown; full_name?: unknown;
+    default_branch?: unknown; size?: unknown; empty?: unknown };
+  if (metadata.id !== repositoryId || typeof metadata.full_name !== "string"
+    || metadata.full_name.toLowerCase() !== source.toLowerCase()) {
+    throw new Error("GitHub repository identity changed");
+  }
+  const maybeEmpty = metadata.size === 0 || metadata.empty === true;
+  const noBranches = async (): Promise<boolean> => {
+    const branches = await get(`${base}/branches?per_page=1`, "branches");
+    return Array.isArray(branches) && branches.length === 0;
+  };
+  if (!metadata.default_branch && maybeEmpty && await noBranches()) return [];
+  if (typeof metadata.default_branch !== "string" || !metadata.default_branch) {
+    throw new Error("GitHub default branch unavailable");
+  }
+  const branch = await get(`${base}/branches/${encodeURIComponent(metadata.default_branch)}`,
+    "default_branch", maybeEmpty) as { commit?: { sha?: unknown } } | null;
+  if (branch === null) {
+    if (maybeEmpty && await noBranches()) return [];
+    throw new Error("GitHub branch unavailable");
+  }
+  if (typeof branch.commit?.sha !== "string") throw new Error("GitHub branch unavailable");
+  const tree = await get(`${base}/git/trees/${encodeURIComponent(branch.commit.sha)}?recursive=1`, "tree") as {
+    tree?: unknown; truncated?: unknown;
+  };
+  if (!Array.isArray(tree.tree) || tree.truncated === true) throw new Error("GitHub tree incomplete");
+  return tree.tree.filter((item: unknown): item is { type: "blob"; path: string; size: number } => {
+    if (!item || typeof item !== "object") return false;
+    const file = item as Record<string, unknown>;
+    return file.type === "blob" && typeof file.path === "string" && file.path.endsWith(".md")
+      && Number.isSafeInteger(file.size) && Number(file.size) >= 0;
+  }).map(item => ({ path: item.path, size: item.size }));
 }
