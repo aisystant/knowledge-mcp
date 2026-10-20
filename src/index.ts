@@ -4499,7 +4499,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
   // Resolve user_id: L2 platform → NULL (visible to all). L4 personal → user_sources.user_id (required).
   // WP-268: user_sources перенесён в новую `knowledge` БД через mvp/016 (DDL+ETL).
   const isL2 = L2_PLATFORM_SOURCES.has(req.source);
-  const userRows = await sql`SELECT user_id FROM user_sources WHERE source = ${req.source} LIMIT 1`;
+  const userRows = await sql`SELECT user_id, github_owner FROM user_sources WHERE source = ${req.source} LIMIT 1`;
 
   if (isL2 && userRows.length > 0) {
     result.errors.push(`Conflict: ${req.source} is L2 platform but registered in user_sources`);
@@ -4511,6 +4511,13 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
   }
 
   const uid = isL2 ? null : (userRows[0].user_id as string);
+  // WP-596 Ф7: classification metadata (not access control — collection_kind/account_id
+  // above still decide that). L2 sources are platform-wide methodology; L4 sources are
+  // owned by whoever registered them in user_sources (github_owner, a human-readable
+  // name — never the UUID, to avoid colliding with account_id downstream, see
+  // migrations/031-source-class-owner.sql).
+  const sourceClass: "methodology" | "personal" = isL2 ? "methodology" : "personal";
+  const sourceOwner = isL2 ? "platform" : (userRows[0].github_owner as string);
 
   const sourceType = resolveSourceType(req.source);
   const sourceConfig = SOURCE_GITHUB_BASE[req.source];
@@ -4586,10 +4593,10 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
         // Insert parent document (no embedding). search_vector — generated stored.
         await sql`
           INSERT INTO ${sql.unsafe(knowledgeChunkTable)}
-            (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind)
+            (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind, source_class, source_owner)
           VALUES
             (${dbFilename + '::p0'}, ${dbFilename}, 0, ${hash}, ${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, NULL,
-             ${accountUuid}::uuid, ${collectionKind})
+             ${accountUuid}::uuid, ${collectionKind}, ${sourceClass}, ${sourceOwner})
           ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
             DO NOTHING
         `;
@@ -4604,13 +4611,13 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
 
           await sql`
             INSERT INTO ${sql.unsafe(knowledgeChunkTable)}
-              (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, parent_chunk_id, account_id, collection_kind)
+              (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, parent_chunk_id, account_id, collection_kind, source_class, source_owner)
             VALUES (
               ${chunk.filename + '::p' + chunkPos}, ${chunk.filename}, ${chunkPos}, ${chunkHash},
               ${chunk.filename}, ${chunk.content}, ${req.source}, ${sourceType}, ${chunkHash},
               ${vec}::vector,
               (SELECT chunk_uuid FROM ${sql.unsafe(knowledgeChunkTable)} WHERE source_uri = ${dbFilename} AND source = ${req.source} LIMIT 1),
-              ${accountUuid}::uuid, ${collectionKind}
+              ${accountUuid}::uuid, ${collectionKind}, ${sourceClass}, ${sourceOwner}
             )
             ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
               DO NOTHING
@@ -4623,10 +4630,10 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
 
         await sql`
           INSERT INTO ${sql.unsafe(knowledgeChunkTable)}
-            (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind)
+            (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind, source_class, source_owner)
           VALUES
             (${dbFilename + '::p0'}, ${dbFilename}, 0, ${hash}, ${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, ${vec}::vector,
-             ${accountUuid}::uuid, ${collectionKind})
+             ${accountUuid}::uuid, ${collectionKind}, ${sourceClass}, ${sourceOwner})
           ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
             DO NOTHING
         `;
@@ -5774,8 +5781,10 @@ async function attemptFullIngestSwap(env: Env, runId: string): Promise<void> {
     `,
     knowledgeSql`
       INSERT INTO ${knowledgeSql.unsafe(knowledgeChunkTable)}
-        (chunk_uuid, chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, parent_chunk_id, account_id, collection_kind)
-      SELECT s.chunk_uuid, s.chunk_id, s.document_path, s.paragraph_pos, s.content_hash, s.source_uri, s.content, s.source, s.source_kind, s.hash, s.embedding, s.parent_chunk_uuid, NULL, s.collection_kind
+        (chunk_uuid, chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, parent_chunk_id, account_id, collection_kind, source_class, source_owner)
+      -- WP-596 Ф7: FULL_INGEST_SOURCES is exclusively platform sources (comment above
+      -- hardcodes account_id IS NULL for the same reason) — literal, not from staging.
+      SELECT s.chunk_uuid, s.chunk_id, s.document_path, s.paragraph_pos, s.content_hash, s.source_uri, s.content, s.source, s.source_kind, s.hash, s.embedding, s.parent_chunk_uuid, NULL, s.collection_kind, 'methodology', 'platform'
       FROM ${knowledgeSql.unsafe(stagingTable)} s
       WHERE s.run_id = ${runId}
         AND EXISTS (SELECT 1 FROM ${knowledgeSql.unsafe(runsTable)} r WHERE r.run_id = s.run_id AND r.status = 'swapping')
