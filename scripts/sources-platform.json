@@ -5,7 +5,9 @@
     "path": "~/IWE/FPF",
     "exclude": [
       ".git/"
-    ]
+    ],
+    "source_class": "methodology",
+    "source_owner": "platform"
   },
   {
     "source": "SPF",
@@ -15,7 +17,9 @@
       "pack-template/",
       "node_modules/",
       ".git/"
-    ]
+    ],
+    "source_class": "methodology",
+    "source_owner": "platform"
   },
   {
     "source": "PACK-digital-platform",
@@ -24,7 +28,9 @@
     "exclude": [
       "images/",
       "assets/"
-    ]
+    ],
+    "source_class": "methodology",
+    "source_owner": "platform"
   },
   {
     "source": "PACK-personal",
@@ -33,7 +39,9 @@
     "exclude": [
       "images/",
       "assets/"
-    ]
+    ],
+    "source_class": "methodology",
+    "source_owner": "platform"
   },
   {
     "source": "PACK-MIM",
@@ -42,7 +50,9 @@
     "exclude": [
       "images/",
       "assets/"
-    ]
+    ],
+    "source_class": "methodology",
+    "source_owner": "platform"
   },
   {
     "source": "PACK-verification",
@@ -51,7 +61,9 @@
     "exclude": [
       "images/",
       "assets/"
-    ]
+    ],
+    "source_class": "methodology",
+    "source_owner": "platform"
   },
   {
     "source": "PACK-autonomous-agents",
@@ -60,7 +72,9 @@
     "exclude": [
       "images/",
       "assets/"
-    ]
+    ],
+    "source_class": "methodology",
+    "source_owner": "platform"
   },
   {
     "source": "PACK-ecosystem",
@@ -69,7 +83,9 @@
     "exclude": [
       "images/",
       "assets/"
-    ]
+    ],
+    "source_class": "methodology",
+    "source_owner": "platform"
   },
   {
     "source": "DS-autonomous-agents",
@@ -79,7 +95,9 @@
       "node_modules/",
       ".git/",
       "images/"
-    ]
+    ],
+    "source_class": "methodology",
+    "source_owner": "platform"
   },
   {
     "source": "DS-principles-curriculum",
@@ -90,7 +108,9 @@
       ".git/",
       "images/",
       "assets/"
-    ]
+    ],
+    "source_class": "methodology",
+    "source_owner": "platform"
   },
   {
     "source": "docs-courses",
@@ -99,13 +119,17 @@
     "exclude": [
       "node_modules/",
       "public/"
-    ]
+    ],
+    "source_class": "methodology",
+    "source_owner": "platform"
   },
   {
     "source": "exocortex-template-docs",
     "source_type": "guides",
     "path": "~/IWE/FMT-exocortex-template/docs",
-    "exclude": []
+    "exclude": [],
+    "source_class": "methodology",
+    "source_owner": "platform"
   },
   {
     "source": "FMT-exocortex-template",
@@ -117,7 +141,9 @@
       "docs/",
       "images/",
       "assets/"
-    ]
+    ],
+    "source_class": "methodology",
+    "source_owner": "platform"
   },
   {
     "source": "FMT-s2r",
@@ -128,7 +154,9 @@
       ".git/",
       "images/",
       "assets/"
-    ]
+    ],
+    "source_class": "methodology",
+    "source_owner": "platform"
   },
   {
     "source": "aist-bot-docs",
@@ -136,6 +164,8 @@
     "path": "~/IWE/DS-IT-systems/aist_bot_newarchitecture/docs",
     "exclude": [
       "plans-and-reports/"
-    ]
+    ],
+    "source_class": "methodology",
+    "source_owner": "platform"
   }
 ]

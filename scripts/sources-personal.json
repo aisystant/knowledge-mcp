@@ -15,7 +15,9 @@
       "docs/2023/",
       "docs/2024/",
       "docs/FPF/"
-    ]
+    ],
+    "source_class": "personal",
+    "source_owner": "tseren"
   },
   {
     "source": "DS-my-strategy",
@@ -28,7 +30,9 @@
       ".obsidian/",
       "images/",
       "assets/"
-    ]
+    ],
+    "source_class": "personal",
+    "source_owner": "tseren"
   },
   {
     "source": "DS-creator-development",
@@ -40,7 +44,9 @@
       ".git/",
       "images/",
       "assets/"
-    ]
+    ],
+    "source_class": "personal",
+    "source_owner": "tseren"
   },
   {
     "source": "DS-marathon-v2-tseren",
@@ -52,7 +58,9 @@
       ".git/",
       "images/",
       "assets/"
-    ]
+    ],
+    "source_class": "personal",
+    "source_owner": "tseren"
   },
   {
     "source": "DS-agent-workspace",
@@ -66,7 +74,9 @@
       "__pycache__/",
       "images/",
       "assets/"
-    ]
+    ],
+    "source_class": "personal",
+    "source_owner": "tseren"
   },
   {
     "source": "DS-ai-systems",
@@ -80,6 +90,8 @@
       "__pycache__/",
       "images/",
       "assets/"
-    ]
+    ],
+    "source_class": "personal",
+    "source_owner": "tseren"
   }
 ]

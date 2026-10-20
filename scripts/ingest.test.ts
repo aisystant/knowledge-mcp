@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { ingestSource, contentHash, chunkLargeFile, type SourceConfig } from "./ingest.js";
+import { ingestSource, contentHash, chunkLargeFile, validateSourceConfigs, type SourceConfig } from "./ingest.js";
 
 type MockQuery = { text: string; type: "select" | "delete" | "insert" | "lock" };
 
@@ -64,6 +64,8 @@ describe("ingestSource — transactional DELETE+INSERT (WP-443)", () => {
     source: "wp443-test",
     source_type: "ds",
     path: dir,
+    source_class: "personal",
+    source_owner: "tseren",
     ...overrides,
   });
 
@@ -134,5 +136,56 @@ describe("ingestSource — transactional DELETE+INSERT (WP-443)", () => {
 
     expect(transactionCalls).toHaveLength(2); // both units attempted
     expect(indexed).toBe(1); // only the surviving unit counted
+  });
+
+  it("writes source_class/source_owner into the standalone INSERT (WP-596 Ф7)", async () => {
+    writeFileSync(join(dir, "small.md"), "# Small\n\nSome standalone content.\n");
+    const { sql, transactionCalls } = makeMockSql([]);
+
+    await ingestSource(config({ source_class: "methodology", source_owner: "platform" }), sql, "fake-api-key");
+
+    const [, , ins] = transactionCalls[0];
+    expect(ins.text).toContain("methodology");
+    expect(ins.text).toContain("platform");
+  });
+});
+
+describe("validateSourceConfigs — class/owner required at indexing time (WP-596 Ф7)", () => {
+  const baseConfig = (overrides: Partial<SourceConfig> = {}): SourceConfig => ({
+    source: "valid-source",
+    source_type: "ds",
+    path: "/tmp/does-not-matter",
+    source_class: "methodology",
+    source_owner: "platform",
+    ...overrides,
+  });
+
+  it("passes silently when every config has a valid class and a non-empty owner", () => {
+    expect(() => validateSourceConfigs([baseConfig(), baseConfig({ source: "second" })])).not.toThrow();
+  });
+
+  it("throws when source_class is missing", () => {
+    expect(() =>
+      validateSourceConfigs([{ ...baseConfig(), source_class: undefined as unknown as SourceConfig["source_class"] }])
+    ).toThrow(/source_class/);
+  });
+
+  it("throws when source_class is not one of the four allowed values", () => {
+    expect(() =>
+      validateSourceConfigs([{ ...baseConfig(), source_class: "bogus" as unknown as SourceConfig["source_class"] }])
+    ).toThrow(/source_class/);
+  });
+
+  it("throws when source_owner is missing or empty", () => {
+    expect(() => validateSourceConfigs([baseConfig({ source_owner: "" })])).toThrow(/source_owner/);
+  });
+
+  it("collects every invalid source in one error instead of stopping at the first", () => {
+    expect(() =>
+      validateSourceConfigs([
+        { ...baseConfig({ source: "bad-one" }), source_owner: "" },
+        { ...baseConfig({ source: "bad-two" }), source_class: undefined as unknown as SourceConfig["source_class"] },
+      ])
+    ).toThrow(/bad-one[\s\S]*bad-two/);
   });
 });
