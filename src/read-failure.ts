@@ -36,6 +36,10 @@ export class ReadFailure extends Error {
       stage: this.stage,
       message: this.message,
       retryable: ["source_context_unavailable", "dependency_rate_limited", "dependency_unavailable", "dependency_timeout"].includes(this.code),
+      // WP-596 Ф4: every ReadFailure is a dependency problem, not a caller mistake — except
+      // dependency_access_denied, which means the caller's own credentials/permissions are the
+      // actual blocker (an auth problem, not an upstream outage).
+      error_code: (this.code === "dependency_access_denied" ? "auth" : "upstream") as "auth" | "upstream",
       ...(this.status === undefined ? {} : { status: this.status }),
       ...(this.retryAfterSeconds === undefined ? {} : { retry_after_seconds: this.retryAfterSeconds }),
     };

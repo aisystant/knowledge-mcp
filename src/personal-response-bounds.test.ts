@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { buildPrivateDocumentResponse, buildPrivateSearchResponse, enforcePrivateReadBudget, privateReadIdError, privateResponseBytes, PRIVATE_READ_RESPONSE_BUDGET_BYTES, validateDocumentPageRequest } from "./personal-response-bounds.js";
 
 type Response = ReturnType<typeof buildPrivateSearchResponse>;
-const result = (response: Response) => response.result as { content: { text: string }[]; isError?: boolean };
+const result = (response: Response) => response.result as { content: { text: string }[]; isError?: boolean; error_code?: string };
 const data = (response: Response) => JSON.parse(result(response).content[0].text);
 const doc = { filename: "notes/synthetic.md", source: "synthetic-source", content: "small text" };
 const indexed = { userId: "synthetic-user", live: false };
@@ -136,6 +136,7 @@ describe("private document continuation", () => {
     const cursor = data(await buildPrivateDocumentResponse(1, original, { ...indexed, cursor: "start" })).next_cursor;
     const changed = await buildPrivateDocumentResponse(1, { ...original, content: original.content + "changed" }, { ...indexed, cursor });
     expect(data(changed).error).toBe("document_changed");
+    expect(result(changed).error_code).toBe("validation");
     for (const [target, read] of [
       [{ ...original, filename: "other.md" }, indexed],
       [{ ...original, source: "other-source" }, indexed],
@@ -147,6 +148,7 @@ describe("private document continuation", () => {
       assertBounded(response);
       expect(result(response).isError).toBe(true);
       expect(data(response).error).toBe("invalid_cursor");
+      expect(result(response).error_code).toBe("validation");
     }
     const fields = JSON.parse(Buffer.from(cursor.slice(3), "base64url").toString());
     expect(Object.keys(fields).sort()).toEqual(["binding", "offset", "revision"]);
@@ -169,6 +171,16 @@ describe("private document continuation", () => {
     assertBounded(response);
     expect(data(response).error).toBe("response_too_large");
     expect(result(response).isError).toBe(true);
+    // response_too_large is this server's own response not fitting the budget — a dependency-
+    // shaped failure, not a caller mistake (WP-596 Ф4).
+    expect(result(response).error_code).toBe("upstream");
+  });
+
+  it("rejects a headings request combined with a page selector as a caller argument error (WP-596 Ф4: validation)", async () => {
+    const response = await buildPrivateDocumentResponse(1, doc, { ...indexed, cursor: "start", headings: [{ level: 1, title: "x" }] });
+    expect(result(response).isError).toBe(true);
+    expect(result(response).error_code).toBe("validation");
+    expect(data(response).error).toBe("invalid_arguments");
   });
 
   it("keeps an empty document valid and refuses partial headings", async () => {

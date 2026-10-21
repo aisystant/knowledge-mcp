@@ -6,7 +6,7 @@ const CURSOR_MAX_LENGTH = 512;
 
 type RequestId = string | number;
 type ResponseEnvelope = { jsonrpc: "2.0"; id: RequestId | null; result?: unknown; error?: { code: number; message: string } };
-type Problem = { code: string; message: string };
+type Problem = { code: PrivateReadErrorCode; message: string };
 type DocumentCursor = { offset: number; binding: string; revision: string; end?: number };
 
 export function privateResponseBytes(response: ResponseEnvelope): number {
@@ -27,10 +27,25 @@ export function privateReadIdError(id: RequestId): ResponseEnvelope | null {
     ? invalidRequestId() : null;
 }
 
-export function privateReadError(id: RequestId, code: string, message: string): ResponseEnvelope {
+/** WP-596 Ф4: the four buckets an isError:true tool result can carry. */
+export type ToolErrorCode = "not_found" | "validation" | "auth" | "upstream";
+
+export type PrivateReadErrorCode = "invalid_arguments" | "invalid_cursor" | "document_changed" | "response_too_large";
+
+/** Every code privateReadError is called with is a caller-argument problem (bad cursor,
+ * incompatible options, stale revision) except response_too_large, which is this server's own
+ * response not fitting the budget — a dependency-shaped failure, not the caller's mistake. */
+const PRIVATE_READ_ERROR_CODES: Record<PrivateReadErrorCode, ToolErrorCode> = {
+  invalid_arguments: "validation",
+  invalid_cursor: "validation",
+  document_changed: "validation",
+  response_too_large: "upstream",
+};
+
+export function privateReadError(id: RequestId, code: PrivateReadErrorCode, message: string): ResponseEnvelope {
   const response: ResponseEnvelope = {
     jsonrpc: "2.0", id,
-    result: { content: [{ type: "text", text: JSON.stringify({ error: code, message }) }], isError: true },
+    result: { content: [{ type: "text", text: JSON.stringify({ error: code, message }) }], isError: true, error_code: PRIVATE_READ_ERROR_CODES[code] },
   };
   return privateResponseBytes(response) <= PRIVATE_READ_RESPONSE_BUDGET_BYTES ? response : invalidRequestId();
 }
