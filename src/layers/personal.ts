@@ -305,8 +305,8 @@ export async function resolveUserContext(
         FROM ${sql.unsafe(userSourcesTable)}
         WHERE user_id = ${userId} AND active = true
           AND (index_state = 'ready' OR ${includeReindexing} = true
-            OR (${includeInitialTeamWrite} = true AND index_generation = 1
-              AND github_repository_id IS NOT NULL AND source LIKE '%/%'))
+            OR (${includeInitialTeamWrite} = true AND index_state = 'reindexing' AND index_generation = 1
+              AND github_user_binding_id = github_repository_id AND source LIKE '%/%'))
         ORDER BY source
       `, 5_000);
       if (rows.length > 0) {
