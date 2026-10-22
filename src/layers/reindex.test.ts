@@ -102,6 +102,17 @@ function latestSqlCallContaining(fragment: string): unknown[] {
   return call;
 }
 
+function sourceIndexStateUpdates(): unknown[][] {
+  return sqlCalls.filter(([template]) =>
+    (template as TemplateStringsArray).join(" ").includes("SET index_state = "));
+}
+
+function latestSourceIndexStateUpdate(): unknown[] {
+  const call = sourceIndexStateUpdates().at(-1);
+  if (!call) throw new Error("Source index state update not found");
+  return call;
+}
+
 /** Like latestSqlCallContaining, but disambiguates between the two DELETE
  * statements a `removed` action now issues (WP-7 Ф97.2): documents and
  * file_index_status share the "DELETE" fragment, so this also matches on
@@ -535,7 +546,7 @@ describe("reindex enumeration failures", () => {
     expect(result.status).toBe("failed");
     expect(sendBatch).not.toHaveBeenCalled();
     expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("status = 'succeeded'"))).toBe(false);
-    const sourceState = latestSqlCallContaining("index_state = 'reindexing' AND index_generation =");
+    const sourceState = latestSourceIndexStateUpdate();
     expect(sourceState[2]).toBe("failed");
     expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("DELETE FROM"))).toBe(false);
   });
@@ -560,7 +571,7 @@ describe("reindex enumeration failures", () => {
     expect(result.message).toContain("No files");
     expect(sendBatch).not.toHaveBeenCalled();
     expect(latestSqlCallContaining("status = 'succeeded'")).toBeDefined();
-    expect(latestSqlCallContaining("index_state = 'reindexing' AND index_generation =")[2]).toBe("ready");
+    expect(latestSourceIndexStateUpdate()[2]).toBe("ready");
   });
 
   it("accepts a new repository whose default branch has not been created yet", async () => {
@@ -579,7 +590,7 @@ describe("reindex enumeration failures", () => {
     expect(fetchMock.mock.calls[2][0]).toContain("/branches?per_page=1");
     expect(sendBatch).not.toHaveBeenCalled();
     expect(latestSqlCallContaining("status = 'succeeded'")).toBeDefined();
-    expect(latestSqlCallContaining("index_state = 'reindexing' AND index_generation =")[2]).toBe("ready");
+    expect(latestSourceIndexStateUpdate()[2]).toBe("ready");
   });
 });
 
@@ -673,7 +684,7 @@ describe("generation fencing (WP-560 Ф3)", () => {
     const msg = { body: { job_id: "job-3", user_id: USER_ID, source: "DS-my-strategy", files: [{ path: "a.md", action: "removed" as const }] }, ack: vi.fn(), retry: vi.fn(), attempts: 1 };
     await handleQueue({ messages: [msg], queue: "reindex", ackAll: vi.fn(), retryAll: vi.fn() } as unknown as MessageBatch<ReindexBatchMessage>, ENV);
     expect(msg.ack).toHaveBeenCalledOnce();
-    const ready = latestSqlCallContaining("index_state = 'reindexing' AND index_generation =") as unknown[];
+    const ready = latestSourceIndexStateUpdate();
     expect(ready[2]).toBe("ready"); // params: [table, state, userId, source, generation]
     expect(ready[5]).toBe(3);
     expect(ready).toContain("job-3");
@@ -699,7 +710,7 @@ describe("generation fencing (WP-560 Ф3)", () => {
     expect(result.status).toBe("running");
     expect(result.job_id).toBe("job-rebind");
     expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("INTERVAL '1 second'"))).toBe(false); // no cooldown query
-    const ready = latestSqlCallContaining("index_state = 'reindexing' AND index_generation =") as unknown[];
+    const ready = latestSourceIndexStateUpdate();
     expect(ready[5]).toBe(2);
     globalThis.fetch = originalFetch;
   });
@@ -761,7 +772,7 @@ describe("generation fencing (WP-560 Ф3)", () => {
     await handleWatchdog(ENV);
     const abandoned = latestSqlCallContaining("watchdog_pending_never_started") as unknown[];
     expect((abandoned[0] as TemplateStringsArray).join(" ")).toContain("status = 'pending'");
-    const failed = latestSqlCallContaining("index_state = 'reindexing' AND index_generation =") as unknown[];
+    const failed = latestSourceIndexStateUpdate();
     expect(failed[2]).toBe("failed");
     expect(failed[5]).toBe(4);
   });
@@ -847,7 +858,7 @@ describe("handleQueue", () => {
     expect(completion).toContain("failed");
     expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("DELETE FROM"))).toBe(false);
     expect(latestSqlCallContaining("completed_batch_indexes = array_append")).toContain(JSON.stringify(errors));
-    const sourceUpdates = sqlCalls.filter(([t]) => (t as TemplateStringsArray).join(" ").includes("index_state = 'reindexing' AND index_generation ="));
+    const sourceUpdates = sourceIndexStateUpdates();
     if (kind === "full") expect(sourceUpdates[0][2]).toBe("failed");
     else expect(sourceUpdates).toHaveLength(0);
   });
@@ -868,7 +879,7 @@ describe("handleQueue", () => {
     expect(msg.ack).toHaveBeenCalledOnce();
     expect(msg.retry).not.toHaveBeenCalled();
     expect(latestSqlCallContaining("finished_at = NOW()")).toContain("failed");
-    expect(latestSqlCallContaining("index_state = 'reindexing' AND index_generation =")[2]).toBe("failed");
+    expect(latestSourceIndexStateUpdate()[2]).toBe("failed");
     expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("DELETE FROM"))).toBe(false);
     // The final batch itself succeeded; job completion must use accumulated errors.
     expect(latestSqlCallContaining("completed_batch_indexes = array_append")).toContain("[]");
@@ -970,7 +981,7 @@ describe("handleQueue", () => {
     await handleQueue(makeBatch([msg]), ENV);
     expect(msg.ack).toHaveBeenCalledOnce();
     expect(msg.retry).not.toHaveBeenCalled();
-    expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("index_state = 'reindexing' AND index_generation ="))).toBe(false);
+    expect(sourceIndexStateUpdates()).toHaveLength(0);
   });
 
   it("watchdog never touches index_state for a stale or abandoned kind='incremental' job", async () => {
@@ -980,7 +991,7 @@ describe("handleQueue", () => {
     queryQueue.push([{ id: "job-stale-inc", user_id: USER_ID, source: "DS-my-strategy", kind: "incremental", generation: 1, completed_batches: 1, expected_batches: 3 }]); // stale running
     queryQueue.push([{ id: "job-pending-inc", user_id: USER_ID, source: "DS-my-strategy", kind: "incremental", generation: 1 }]); // abandoned pending
     await handleWatchdog(ENV);
-    expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("index_state = 'reindexing' AND index_generation ="))).toBe(false);
+    expect(sourceIndexStateUpdates()).toHaveLength(0);
   });
 });
 
