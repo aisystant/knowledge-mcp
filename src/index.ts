@@ -3377,7 +3377,9 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
             }, "auth");
           }
 
-          const ctx = await resolveUserContext(env, principal.userId);
+          const ctx = await resolveUserContext(env, principal.userId, {
+            includeInitialTeamWrite: toolName === "write",
+          });
           const meta = (params as { _meta?: Record<string, unknown> })._meta;
           const requestId = typeof meta?.request_id === "string" ? meta.request_id : undefined;
 

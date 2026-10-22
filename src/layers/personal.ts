@@ -280,6 +280,12 @@ export interface ResolveUserContextOptions {
    * mid-purge-and-reindex, so neither stale nor partial documents are ever served (WP-560 Ф3).
    */
   includeReindexing?: boolean;
+  /**
+   * A newly connected team repository can accept its first direct GitHub write
+   * while its initial, possibly empty index is still building. This never
+   * enables indexed reads or a source rebound to another repository.
+   */
+  includeInitialTeamWrite?: boolean;
 }
 
 export async function resolveUserContext(
@@ -293,11 +299,14 @@ export async function resolveUserContext(
       const schema = getKnowledgeSchema(env);
       const userSourcesTable = KNOWLEDGE_TABLES.user_sources(schema);
       const includeReindexing = options.includeReindexing === true;
+      const includeInitialTeamWrite = options.includeInitialTeamWrite === true;
       const rows = await withReadDeadline("context", async () => sql`
         SELECT source, github_owner, github_repo, path_prefix, source_type
         FROM ${sql.unsafe(userSourcesTable)}
         WHERE user_id = ${userId} AND active = true
-          AND (index_state = 'ready' OR ${includeReindexing} = true)
+          AND (index_state = 'ready' OR ${includeReindexing} = true
+            OR (${includeInitialTeamWrite} = true AND index_state = 'reindexing' AND index_generation = 1
+              AND github_user_binding_id = github_repository_id AND source LIKE '%/%'))
         ORDER BY source
       `, 5_000);
       if (rows.length > 0) {

@@ -2405,6 +2405,40 @@ describe("resolveUserContext read gate (WP-560 Ф3)", () => {
     await resolveUserContext(ENV, "user-1", { includeReindexing: true });
     expect(sqlCalls[0][3]).toBe(true);
   });
+
+  it("admits a newly bound team source for its first write during indexing", async () => {
+    const source = "MimEcoSys/editorial-lpf";
+    queryQueue.push(
+      [{ source, github_owner: "MimEcoSys", github_repo: "editorial-lpf", source_type: "ds" }],
+      [],
+      [{ repository_id: 42, installation_id: 7,
+        github_owner: "MimEcoSys", github_repo: "editorial-lpf", generation: 1 }],
+    );
+    const result = await resolveUserContext(
+      { ...ENV, GITHUB_TEAM_REPOS_ENABLED: true }, "user-1", { includeInitialTeamWrite: true },
+    );
+
+    expect(result.sourceNames).toEqual([source]);
+    expect(sqlCalls[0][4]).toBe(true);
+    const query = (sqlCalls[0][0] as TemplateStringsArray).join(" ");
+    expect(query).toContain("index_state = 'reindexing'");
+    expect(query).toContain("index_generation = 1");
+    expect(query).toContain("github_user_binding_id = github_repository_id");
+  });
+
+  it("does not admit a team source without an active binding", async () => {
+    const source = "MimEcoSys/editorial-lpf";
+    queryQueue.push(
+      [{ source, github_owner: "MimEcoSys", github_repo: "editorial-lpf", source_type: "ds" }],
+      [],
+      [],
+    );
+    const result = await resolveUserContext(
+      { ...ENV, GITHUB_TEAM_REPOS_ENABLED: true }, "user-1", { includeInitialTeamWrite: true },
+    );
+
+    expect(result.sourceNames).toEqual([]);
+  });
 });
 
 // Деплой-2 группа А (peer-session 2026-07-01-29): faithful port from
