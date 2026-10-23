@@ -79,6 +79,15 @@ fi
 
 bash "$IWE/DS-MCP/knowledge-mcp/scripts/pack-lint.sh" || EXIT_CODE=1
 
+# Самоограничивающийся шаг (РП-595 Ф16 заимствование 3, 2026-10-23): запускается
+# только если именно ЭТОТ пак-репозиторий несёт свой scripts/enforcement-check.sh —
+# сегодня только PACK-agent-rules. Для остальных 8 паков — безусловный no-op,
+# поведение не меняется.
+ENFORCEMENT_CHECK="$(git rev-parse --show-toplevel)/scripts/enforcement-check.sh"
+if [ -x "$ENFORCEMENT_CHECK" ]; then
+  bash "$ENFORCEMENT_CHECK" || EXIT_CODE=1
+fi
+
 exit $EXIT_CODE
 HOOK_EOF
   chmod +x "$hook_dir/pre-commit"
