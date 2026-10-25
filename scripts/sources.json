@@ -24,7 +24,7 @@
   {
     "source": "PACK-personal",
     "source_type": "pack",
-    "path": "~/IWE/PACK-personal/pack",
+    "path": "~/IWE/PACK-personal-index/pack",
     "exclude": [
       "images/",
       "assets/"
@@ -125,10 +125,11 @@
   {
     "source": "docs-courses",
     "source_type": "guides",
-    "path": "~/IWE/mim-docs/docs/ru",
+    "path": "~/IWE/mim-docs",
     "exclude": [
       "node_modules/",
-      "public/"
+      "public/",
+      ".git/"
     ],
     "source_class": "methodology",
     "source_owner": "platform"
@@ -165,7 +166,7 @@
   {
     "source": "exocortex-template-docs",
     "source_type": "guides",
-    "path": "~/IWE/FMT-exocortex-template/docs",
+    "path": "~/IWE/FMT-exocortex-template-index/docs",
     "exclude": [],
     "source_class": "methodology",
     "source_owner": "platform"

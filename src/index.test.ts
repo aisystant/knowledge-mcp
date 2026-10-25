@@ -1493,7 +1493,7 @@ describe("searchDocuments embedding resilience", () => {
 
     const keywordRow = {
       id: 17,
-      filename: "about-systems.md",
+      filename: "personal/1-1-self-development/00-intro/01-about-the-study-guide.md",
       content: "Система не совпадает со своим описанием.",
       source: "docs-courses",
       source_type: "course",
@@ -1519,7 +1519,7 @@ describe("searchDocuments embedding resilience", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(results).toEqual([{
       ...keywordRow,
-      github_url: "https://github.com/MimEcoSys/docs/blob/main/docs/ru/about-systems.md",
+      github_url: "https://github.com/MimEcoSys/docs/blob/main/personal/1-1-self-development/00-intro/01-about-the-study-guide.md",
     }]);
     expect(mockPoolEnd).toHaveBeenCalledTimes(1);
 

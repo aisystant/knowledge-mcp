@@ -304,7 +304,7 @@ const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> =
   "FPF": { base: "https://github.com/ailev/FPF/blob/main", pathPrefix: "" },
   "DS-ecosystem-development": { base: "https://github.com/aisystant/DS-ecosystem-development/blob/main", pathPrefix: "" },
   "aist-bot-docs": { base: "https://github.com/aisystant/aist_bot/blob/new-architecture", pathPrefix: "docs/" },
-  "docs-courses": { base: "https://github.com/MimEcoSys/docs/blob/main", pathPrefix: "docs/ru/" },
+  "docs-courses": { base: "https://github.com/MimEcoSys/docs/blob/main", pathPrefix: "" },
   "exocortex-template-docs": { base: "https://github.com/TserenTserenov/FMT-exocortex-template/blob/main", pathPrefix: "docs/" },
   "DS-principles-curriculum": { base: "https://github.com/aisystant/DS-principles-curriculum/blob/main", pathPrefix: "" },
   "FMT-exocortex-template": { base: "https://github.com/TserenTserenov/FMT-exocortex-template/blob/main", pathPrefix: "" },
