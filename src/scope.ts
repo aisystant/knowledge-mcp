@@ -481,6 +481,24 @@ export async function provisionBridgeScopes(
       allowed_operations = EXCLUDED.allowed_operations,
       revoked_at = NULL
   `;
+  // WP-7 (found 2026-10-28, Plimrg@gmail.com incident): bridge connect never
+  // granted server-scope for run_strategist/run_extractor (agent-runner,
+  // scope_kind='server') — only the separate GitHub App install webhook did.
+  // A user who never connected the GitHub App got scope_not_found on every
+  // Strategist run forever. Paths/taint mirror DEFAULT_AGENT_SCOPES in
+  // agent-runner (src/db.py) — keep the two in sync when editing either.
+  await indicatorsSql`
+    INSERT INTO agent_scopes_mvp
+      (scope_kind, agent_id, user_id, allowed_repos, allowed_paths, taint_level, granted_by)
+    VALUES
+      ('server', 'run_strategist',
+       ${userId}::uuid, ${allowedRepos}::text[], ARRAY['docs/**','inbox/**','Strategy.md','**/*.md'], 0, 'bridge_install'),
+      ('server', 'run_extractor',
+       ${userId}::uuid, ${allowedRepos}::text[], ARRAY['inbox/**','docs/**'], 0, 'bridge_install')
+    ON CONFLICT (agent_id, user_id) DO UPDATE SET
+      allowed_repos = ARRAY(SELECT DISTINCT unnest(agent_scopes_mvp.allowed_repos || EXCLUDED.allowed_repos)),
+      revoked_at = NULL
+  `;
   console.log(JSON.stringify({
     phase: "bridge_scopes_provisioned",
     user_id: userId,

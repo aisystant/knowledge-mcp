@@ -419,8 +419,11 @@ describe("provisionBridgeScopes (WP-410 срез-2b, explicit connect_source)", 
 
     await provisionBridgeScopes(recordingSql, "user-1", "DS-my-strategy");
 
-    expect(calls).toHaveLength(1);
-    const [{ strings, values }] = calls;
+    // WP-7 (2026-10-28, Plimrg@gmail.com incident): the second call grants
+    // server-scope for run_strategist/run_extractor — without it a bridge user
+    // who never connected the GitHub App got scope_not_found forever.
+    expect(calls).toHaveLength(2);
+    const [{ strings, values }, serverScopeCall] = calls;
     expect(strings).toContain("INSERT INTO agent_scopes_mvp");
     expect(strings).toContain("ON CONFLICT (agent_id, user_id) DO UPDATE SET");
     expect(strings).toContain("iwe_bridge:personal_write");
@@ -429,5 +432,10 @@ describe("provisionBridgeScopes (WP-410 срез-2b, explicit connect_source)", 
     expect(values).toContain("pilot-helper-in-environment");
     expect(values).toContain("user-1");
     expect(values).toContainEqual(["DS-my-strategy"]);
+
+    expect(serverScopeCall.strings).toContain("run_strategist");
+    expect(serverScopeCall.strings).toContain("run_extractor");
+    expect(serverScopeCall.values).toContain("user-1");
+    expect(serverScopeCall.values).toContainEqual(["DS-my-strategy"]);
   });
 });
