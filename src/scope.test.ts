@@ -409,21 +409,22 @@ describe("shouldBlockOnScope: enforce fail-open classification (WP-410, peer-ses
 });
 
 describe("provisionBridgeScopes (WP-410 срез-2b, explicit connect_source)", () => {
-  it("retains broad explicit provisioning of all three bridge identities", async () => {
+  function recordingSql(): { sql: any; calls: { strings: string; values: unknown[] }[] } {
     const calls: { strings: string; values: unknown[] }[] = [];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const recordingSql: any = (strings: TemplateStringsArray, ...values: unknown[]) => {
+    const sql: any = (strings: TemplateStringsArray, ...values: unknown[]) => {
       calls.push({ strings: strings.join("?"), values });
       return Promise.resolve([]);
     };
+    return { sql, calls };
+  }
 
-    await provisionBridgeScopes(recordingSql, "user-1", "DS-my-strategy");
+  it("retains broad explicit provisioning of all three bridge identities", async () => {
+    const { sql, calls } = recordingSql();
 
-    // WP-7 (2026-10-28, Plimrg@gmail.com incident): the second call grants
-    // server-scope for run_strategist/run_extractor — without it a bridge user
-    // who never connected the GitHub App got scope_not_found forever.
-    expect(calls).toHaveLength(2);
-    const [{ strings, values }, serverScopeCall] = calls;
+    await provisionBridgeScopes(sql, "user-1", "DS-my-strategy");
+
+    const [{ strings, values }] = calls;
     expect(strings).toContain("INSERT INTO agent_scopes_mvp");
     expect(strings).toContain("ON CONFLICT (agent_id, user_id) DO UPDATE SET");
     expect(strings).toContain("iwe_bridge:personal_write");
@@ -432,10 +433,41 @@ describe("provisionBridgeScopes (WP-410 срез-2b, explicit connect_source)", 
     expect(values).toContain("pilot-helper-in-environment");
     expect(values).toContain("user-1");
     expect(values).toContainEqual(["DS-my-strategy"]);
+  });
 
+  // WP-7 (2026-10-28, Plimrg@gmail.com incident, follow-up found by code review same day):
+  // `source` is a short display name for personal (non-team) sources — agent-runner's
+  // enforce_scope matches allowed_repos against the real GitHub 'owner/repo' exactly, so
+  // writing [source] there would never match. The caller must supply `fullRepo` once it
+  // knows the GitHub owner.
+  it("skips the server-scope grant when source is not owner/repo and no fullRepo is given", async () => {
+    const { sql, calls } = recordingSql();
+
+    await provisionBridgeScopes(sql, "user-1", "DS-my-strategy");
+
+    expect(calls.every(({ strings }) => !strings.includes("'server'"))).toBe(true);
+  });
+
+  it("grants run_strategist/run_extractor server-scope for the explicit fullRepo", async () => {
+    const { sql, calls } = recordingSql();
+
+    await provisionBridgeScopes(sql, "user-1", "DS-my-strategy", "plimr/DS-my-strategy");
+
+    expect(calls).toHaveLength(2);
+    const [, serverScopeCall] = calls;
     expect(serverScopeCall.strings).toContain("run_strategist");
     expect(serverScopeCall.strings).toContain("run_extractor");
     expect(serverScopeCall.values).toContain("user-1");
-    expect(serverScopeCall.values).toContainEqual(["DS-my-strategy"]);
+    expect(serverScopeCall.values).toContainEqual(["plimr/DS-my-strategy"]);
+  });
+
+  it("self-heals the server-scope grant from source alone when it is already owner/repo", async () => {
+    const { sql, calls } = recordingSql();
+
+    await provisionBridgeScopes(sql, "user-1", "MimEcoSys/editorial-lpf");
+
+    expect(calls).toHaveLength(2);
+    const [, serverScopeCall] = calls;
+    expect(serverScopeCall.values).toContainEqual(["MimEcoSys/editorial-lpf"]);
   });
 });

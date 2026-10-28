@@ -459,12 +459,27 @@ async function tryInsertViolation(opts: InsertViolationOpts): Promise<void> {
  * finding, not a security hole — the ownership gate still re-runs correctly each time, this was a
  * "silently never converges" bug, not a privilege issue).
  */
+// Server-side enforcement (agent-runner mcp_tools.py enforce_scope) matches allowed_repos by
+// exact 'owner/repo' string — no short-name fallback. `source` here is the bridge/personal-space
+// logical name (e.g. 'DS-my-strategy'), which is NOT that format for personal (non-team) sources.
+const OWNER_REPO_RE = /^[^/\s]+\/[^/\s]+$/;
+
+/**
+ * `fullRepo` is the GitHub 'owner/repo' name to grant for run_strategist/run_extractor
+ * (scope_kind='server'). Pass it explicitly when the caller knows the owner (personal sources —
+ * see connectSource below) — `source` alone is a short display name there and cannot be used.
+ * If omitted, `source` is used only when it already matches owner/repo (team sources, which are
+ * always of that shape); otherwise the server-scope grant is skipped rather than writing a repo
+ * name enforce_scope will never match.
+ */
 export async function provisionBridgeScopes(
   indicatorsSql: NeonSql,
   userId: string,
   source: string,
+  fullRepo?: string,
 ): Promise<void> {
   const allowedRepos = [source];
+  const serverRepo = fullRepo ?? (OWNER_REPO_RE.test(source) ? source : null);
   await indicatorsSql`
     INSERT INTO agent_scopes_mvp
       (scope_kind, agent_id, user_id, allowed_repos, allowed_paths, allowed_operations, granted_by)
@@ -487,21 +502,32 @@ export async function provisionBridgeScopes(
   // A user who never connected the GitHub App got scope_not_found on every
   // Strategist run forever. Paths/taint mirror DEFAULT_AGENT_SCOPES in
   // agent-runner (src/db.py) — keep the two in sync when editing either.
-  await indicatorsSql`
-    INSERT INTO agent_scopes_mvp
-      (scope_kind, agent_id, user_id, allowed_repos, allowed_paths, taint_level, granted_by)
-    VALUES
-      ('server', 'run_strategist',
-       ${userId}::uuid, ${allowedRepos}::text[], ARRAY['docs/**','inbox/**','Strategy.md','**/*.md'], 0, 'bridge_install'),
-      ('server', 'run_extractor',
-       ${userId}::uuid, ${allowedRepos}::text[], ARRAY['inbox/**','docs/**'], 0, 'bridge_install')
-    ON CONFLICT (agent_id, user_id) DO UPDATE SET
-      allowed_repos = ARRAY(SELECT DISTINCT unnest(agent_scopes_mvp.allowed_repos || EXCLUDED.allowed_repos)),
-      revoked_at = NULL
-  `;
+  if (serverRepo) {
+    const serverRepos = [serverRepo];
+    await indicatorsSql`
+      INSERT INTO agent_scopes_mvp
+        (scope_kind, agent_id, user_id, allowed_repos, allowed_paths, taint_level, granted_by)
+      VALUES
+        ('server', 'run_strategist',
+         ${userId}::uuid, ${serverRepos}::text[], ARRAY['docs/**','inbox/**','Strategy.md','**/*.md'], 0, 'bridge_install'),
+        ('server', 'run_extractor',
+         ${userId}::uuid, ${serverRepos}::text[], ARRAY['inbox/**','docs/**'], 0, 'bridge_install')
+      ON CONFLICT (agent_id, user_id) DO UPDATE SET
+        allowed_repos = ARRAY(SELECT DISTINCT unnest(agent_scopes_mvp.allowed_repos || EXCLUDED.allowed_repos)),
+        revoked_at = NULL
+    `;
+  } else {
+    console.warn(JSON.stringify({
+      phase: "bridge_server_scope_skipped",
+      reason: "no owner/repo available for source",
+      user_id: userId,
+      source,
+    }));
+  }
   console.log(JSON.stringify({
     phase: "bridge_scopes_provisioned",
     user_id: userId,
     source,
+    server_repo: serverRepo,
   }));
 }

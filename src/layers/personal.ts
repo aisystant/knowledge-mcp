@@ -2332,7 +2332,9 @@ export interface ConnectSourceDependencies {
 async function provisionTeamSourceScope(env: PersonalEnv, userId: string, source: string): Promise<ConnectSourceResult["scope_provisioning"]> {
   if (!env.INDICATORS_DATABASE_URL) return "skipped";
   try {
-    await provisionBridgeScopes(neon(env.INDICATORS_DATABASE_URL), userId, source);
+    // Team sources are already 'owner/repo' (connectSource routes here only when
+    // source.includes("/")) — pass it through as the server-scope fullRepo too.
+    await provisionBridgeScopes(neon(env.INDICATORS_DATABASE_URL), userId, source, source);
     return "ok";
   } catch {
     return "failed";
@@ -2703,7 +2705,12 @@ export async function connectSource(
   let scopeProvisioning: "ok" | "failed" | "skipped" = "skipped";
   if (env.INDICATORS_DATABASE_URL) {
     try {
-      await provisionBridgeScopes(neon(env.INDICATORS_DATABASE_URL), userId, source);
+      // WP-7 (2026-10-28): `source` is the short repo name for personal sources (the owner
+      // lives separately in githubUsername) — pass the full 'owner/repo' explicitly so the
+      // run_strategist/run_extractor server-scope grant matches what enforce_scope checks.
+      await provisionBridgeScopes(
+        neon(env.INDICATORS_DATABASE_URL), userId, source, `${githubUsername}/${source}`,
+      );
       scopeProvisioning = "ok";
     } catch (err) {
       scopeProvisioning = "failed";
