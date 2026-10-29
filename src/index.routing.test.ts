@@ -817,6 +817,47 @@ describe("/reindex-full and /provision-bridge-scopes (WP-545 Ф5, ported from pe
     expect(body.user_id).toBe("user-1");
   });
 
+  // Records the bound values of every tagged-template query, so a test can see which
+  // repo names provisionBridgeScopes actually wrote.
+  function capturingSql(seen: unknown[][]): ReturnType<typeof neon> {
+    const tagged = (_strings: unknown, ...values: unknown[]) => {
+      seen.push(values);
+      return Promise.resolve([]);
+    };
+    return tagged as unknown as ReturnType<typeof neon>;
+  }
+
+  it("/provision-bridge-scopes grants server-scope on owner/repo from the owned source row", async () => {
+    const writes: unknown[][] = [];
+    vi.mocked(neon)
+      .mockImplementationOnce(() => fakeSql([{ github_owner: "alice", github_repo: "DS-my-strategy" }]))
+      .mockImplementationOnce(() => capturingSql(writes));
+
+    const res = await worker.fetch(
+      postJson("/provision-bridge-scopes", "service-secret", { source: "DS-my-strategy", user_id: "user-1" }),
+      serviceEnv
+    );
+    expect(res.status).toBe(200);
+    // Second query is the run_strategist/run_extractor server-scope INSERT.
+    expect(writes).toHaveLength(2);
+    expect(writes[1]).toContainEqual(["alice/DS-my-strategy"]);
+  });
+
+  it("/provision-bridge-scopes skips server-scope when the source row has no owner", async () => {
+    const writes: unknown[][] = [];
+    vi.mocked(neon)
+      .mockImplementationOnce(() => fakeSql([{ github_owner: null, github_repo: "DS-my-strategy" }]))
+      .mockImplementationOnce(() => capturingSql(writes));
+
+    const res = await worker.fetch(
+      postJson("/provision-bridge-scopes", "service-secret", { source: "DS-my-strategy", user_id: "user-1" }),
+      serviceEnv
+    );
+    expect(res.status).toBe(200);
+    // Only the bridge-scope INSERT ran; no server row with a name enforce_scope can't match.
+    expect(writes).toHaveLength(1);
+  });
+
   it("/provision-bridge-scopes never leaks the raw provisioning error to the client", async () => {
     vi.mocked(neon)
       .mockImplementationOnce(() => fakeSql([{ "?column?": 1 }])) // ownership SELECT — owned
