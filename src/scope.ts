@@ -513,8 +513,9 @@ export async function provisionBridgeScopes(
         ('server', 'run_extractor',
          ${userId}::uuid, ${serverRepos}::text[], ARRAY['inbox/**','docs/**'], 0, 'bridge_install')
       ON CONFLICT (agent_id, user_id) DO UPDATE SET
-        allowed_repos = ARRAY(SELECT DISTINCT unnest(agent_scopes_mvp.allowed_repos || EXCLUDED.allowed_repos)),
-        revoked_at = NULL
+        allowed_repos = ARRAY(SELECT DISTINCT unnest(agent_scopes_mvp.allowed_repos || EXCLUDED.allowed_repos))
+      -- WP-5 F66: a revoked server row stays revoked; /provision-bridge-scopes is user-callable.
+      WHERE agent_scopes_mvp.revoked_at IS NULL
     `;
   } else {
     console.warn(JSON.stringify({
