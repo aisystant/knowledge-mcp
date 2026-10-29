@@ -496,7 +496,7 @@ export async function provisionBridgeScopes(
       allowed_operations = EXCLUDED.allowed_operations,
       revoked_at = NULL
   `;
-  // WP-7 (found 2026-10-28, Plimrg@gmail.com incident): bridge connect never
+  // WP-7 (found 2026-10-28, single-user incident): bridge connect never
   // granted server-scope for run_strategist/run_extractor (agent-runner,
   // scope_kind='server') — only the separate GitHub App install webhook did.
   // A user who never connected the GitHub App got scope_not_found on every
