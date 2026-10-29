@@ -4937,7 +4937,7 @@ export default {
       const sql = personalDb(env);
       const userSourcesTable = KNOWLEDGE_TABLES.user_sources(getKnowledgeSchema(env));
       const ownedSourceRows = await sql`
-        SELECT 1 FROM ${sql.unsafe(userSourcesTable)}
+        SELECT github_owner, github_repo FROM ${sql.unsafe(userSourcesTable)}
         WHERE user_id = ${effectiveUserId} AND source = ${body.source} AND active = true
         LIMIT 1
       `;
@@ -4946,11 +4946,18 @@ export default {
           status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" },
         });
       }
+      // WP-5 Ф66 (2026-10-29): the webhook sends only the short source name, so without the
+      // owner provisionBridgeScopes skipped the run_strategist/run_extractor server-scope for
+      // every personal source. The owner/repo comes from the same row that proved ownership.
+      const { github_owner: owner, github_repo: repo } = ownedSourceRows[0] as {
+        github_owner: string | null; github_repo: string | null;
+      };
+      const fullRepo = owner && repo ? `${owner}/${repo}` : undefined;
 
       let scopeProvisioning: "ok" | "failed" | "skipped" = "skipped";
       if (env.INDICATORS_DATABASE_URL) {
         try {
-          await provisionBridgeScopes(neon(env.INDICATORS_DATABASE_URL), effectiveUserId, body.source);
+          await provisionBridgeScopes(neon(env.INDICATORS_DATABASE_URL), effectiveUserId, body.source, fullRepo);
           scopeProvisioning = "ok";
         } catch (err) {
           scopeProvisioning = "failed";
