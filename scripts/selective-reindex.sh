@@ -55,10 +55,9 @@ log "Sources requested: ${REQUESTED[*]}"
 # peer-session with Codex, Ф27-2: personal sources carry user_id in
 # sources-personal.json, which caller sets $SOURCES_CONFIG to point at; platform
 # sources in the default sources.json have no such key). The 4th field is
-# printed unconditionally (empty string, not omitted) so `read` below always
-# sees 4 tab-separated fields — an omitted trailing field on an L2 (platform)
-# row would silently shift nothing here since it's already last, but making the
-# arity explicit avoids relying on that fact.
+# printed unconditionally, and "-" stands for "no user_id": an empty field would
+# collapse under IFS=tab (tab counts as whitespace for `read`) and shift every
+# later field one place left (WP-596 Ф10 п.5 fixed this).
 # WP-596 Ф7: source_class/source_owner обязательны для ingest.ts (--class/--owner) —
 # резолвим их из того же sources.json, тем же образом, что уже резолвится user_id.
 RESOLVED=$(python3 - "${REQUESTED[@]}" << PYEOF
@@ -70,7 +69,11 @@ for name in requested:
     if name in source_map:
         s = source_map[name]
         path = s["path"].replace("~", "$HOME")
-        print(f"{s['source']}\t{s['source_type']}\t{path}\t{s.get('user_id', '')}\t{s['source_class']}\t{s['source_owner']}")
+        # WP-596 Ф10 п.5: the draft/prune switches travel with the source, or the nightly path
+        # would index drafts back. "1"/"0" keeps the field non-empty (read splits on tabs).
+        drafts = "1" if s.get("exclude_drafts") else "0"
+        prune = "1" if s.get("prune_missing") else "0"
+        print(f"{s['source']}\t{s['source_type']}\t{path}\t{s.get('user_id') or '-'}\t{s['source_class']}\t{s['source_owner']}\t{drafts}\t{prune}")
     else:
         print(f"ERROR\t{name}\tnot found in sources.json", file=sys.stderr)
         sys.exit(1)
@@ -84,11 +87,18 @@ PYEOF
 cd "$MCP_DIR"
 
 FAILED_SOURCES=()
-while IFS=$'\t' read -r SOURCE SOURCE_TYPE SOURCE_PATH USER_ID SOURCE_CLASS SOURCE_OWNER; do
+while IFS=$'\t' read -r SOURCE SOURCE_TYPE SOURCE_PATH USER_ID SOURCE_CLASS SOURCE_OWNER EXCLUDE_DRAFTS PRUNE_MISSING; do
     log "→ Indexing: $SOURCE ($SOURCE_TYPE) from $SOURCE_PATH"
 
+    # An empty field would collapse under IFS=tab (tab is whitespace for `read`) and shift every
+    # later field one place left; the resolver prints "-" for "no user_id" instead.
+    [ "$USER_ID" = "-" ] && USER_ID=""
     UID_ARGS=()
     [ -n "$USER_ID" ] && UID_ARGS=(--user-id "$USER_ID")
+
+    SWITCH_ARGS=()
+    [ "$EXCLUDE_DRAFTS" = "1" ] && SWITCH_ARGS+=(--exclude-drafts)
+    [ "$PRUNE_MISSING" = "1" ] && SWITCH_ARGS+=(--prune-missing)
 
     # `set -u` (line 12) makes a bare "${UID_ARGS[@]}" on a genuinely empty
     # array an unbound-variable error in bash — the L2 (platform) case, which
@@ -97,7 +107,7 @@ while IFS=$'\t' read -r SOURCE SOURCE_TYPE SOURCE_PATH USER_ID SOURCE_CLASS SOUR
     # source, before Ф27-2's own FAILED_SOURCES logic ever ran). The
     # `${arr[@]+"${arr[@]}"}` form is the standard nounset-safe empty-array
     # expansion — expands to nothing when UID_ARGS is empty instead of erroring.
-    OUTPUT=$(npx tsx scripts/ingest.ts --source "$SOURCE" --type "$SOURCE_TYPE" --path "$SOURCE_PATH" --class "$SOURCE_CLASS" --owner "$SOURCE_OWNER" ${UID_ARGS[@]+"${UID_ARGS[@]}"} 2>&1) || {
+    OUTPUT=$(npx tsx scripts/ingest.ts --source "$SOURCE" --type "$SOURCE_TYPE" --path "$SOURCE_PATH" --class "$SOURCE_CLASS" --owner "$SOURCE_OWNER" ${UID_ARGS[@]+"${UID_ARGS[@]}"} ${SWITCH_ARGS[@]+"${SWITCH_ARGS[@]}"} 2>&1) || {
         log "ERROR: ingest failed for $SOURCE"
         log "$OUTPUT"
         FAILED_SOURCES+=("$SOURCE")

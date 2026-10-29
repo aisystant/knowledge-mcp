@@ -151,7 +151,9 @@
       "docs/FPF/"
     ],
     "source_class": "methodology",
-    "source_owner": "platform"
+    "source_owner": "platform",
+    "exclude_drafts": true,
+    "prune_missing": true
   },
   {
     "source": "aist-bot-docs",
