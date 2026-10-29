@@ -22,7 +22,7 @@
  * Usage:
  *   npx tsx scripts/ingest.ts --source PACK-digital-platform --type pack --path ~/IWE/PACK-digital-platform/pack
  *   npx tsx scripts/ingest.ts --config scripts/sources.json   # bulk ingest from config
- *   (exclude_drafts and --dry-run draft preview work only in --config mode; single-source flags do not carry exclude_drafts)
+ *   (single-source mode takes the same switches as flags: --exclude-drafts --prune-missing --prune-max-ratio 0.2 --dry-run)
  *
  * Environment variables (or .dev.vars file):
  *   DATABASE_URL — Neon PostgreSQL connection string (knowledge DB)
@@ -76,13 +76,17 @@ export interface SourceConfig {
   // на уровне источника, потому что в других репозиториях `status: draft` — рабочая спецификация,
   // которую искать нужно. Только для платформенного слоя: личный слой тех же файлов не трогаем.
   exclude_drafts?: boolean;
+  // WP-596 Ф10 п.5: удалять строки файлов, которых уже нет на диске (перенесены, удалены автором).
+  // Без этого переиндексация их не трогает, и удалённые черновики остаются в общей выдаче.
+  // Только для платформенного слоя; включается явно на источнике.
+  prune_missing?: boolean;
 }
 
 const VALID_SOURCE_CLASSES: readonly SourceClass[] = ["methodology", "personal", "team", "public_user"];
 
-// Два независимых признака черновика в репозитории автора (непересекающиеся множества на 29.10:
-// 474 файла с категорией, 127 со `status`): фронтматтер `status` и строка `**Категория:**` с
-// названием раздела клуба. Ни один не запасной для другого.
+// Два независимых признака черновика в репозитории автора (непересекающиеся множества на 29.10,
+// в индексируемом наборе из 1226 файлов: 139 с категорией, 133 со `status`): фронтматтер `status`
+// и строка `**Категория:**` с названием раздела клуба. Ни один не запасной для другого.
 const DRAFT_STATUSES: readonly string[] = ["draft", "draft-internal"];
 const DRAFT_CATEGORY_PREFIX = "черновики";
 const CATEGORY_SCAN_LINES = 30;
@@ -126,6 +130,12 @@ export function validateSourceConfigs(configs: SourceConfig[]): void {
     }
     if (config.exclude_drafts && config.user_id) {
       errors.push(`"${config.source}": exclude_drafts применим только к платформенному слою (user_id задан — личный слой держит черновики)`);
+    }
+    if (config.prune_missing !== undefined && typeof config.prune_missing !== "boolean") {
+      errors.push(`"${config.source}": prune_missing должен быть true/false, получено: ${JSON.stringify(config.prune_missing)}`);
+    }
+    if (config.prune_missing && config.user_id) {
+      errors.push(`"${config.source}": prune_missing применим только к платформенному слою (user_id задан)`);
     }
   }
   if (errors.length > 0) {
@@ -310,7 +320,13 @@ export function chunkLargeFile(
 export interface IngestOptions {
   // Only report what the draft purge would delete; nothing is deleted, nothing is indexed.
   dryRun?: boolean;
+  // prune_missing refuses to run when more than this share of the already indexed files is missing
+  // from the scan (a wrong path or a half-mounted directory looks exactly like that). Default 0.2.
+  pruneMaxRatio?: number;
 }
+
+const DEFAULT_PRUNE_MAX_RATIO = 0.2;
+const PRUNE_PREVIEW_NAMES = 20;
 
 interface DraftSplit {
   kept: { filepath: string; relative: string }[];
@@ -327,9 +343,23 @@ function splitDrafts(files: { filepath: string; relative: string }[]): DraftSpli
   return split;
 }
 
-// Rows of files classified as drafts: the file itself and its "::section" chunks. The list comes from
-// the scan, never from "everything missing from the scan" - an empty or mistyped path must not wipe a source.
-async function purgeDraftRows(
+// Names of the files whose rows are already in the database for this source and owner.
+async function listIndexedFiles(
+  sql: NeonQueryFunction<false, false>,
+  source: string,
+  accountId: string | null
+): Promise<string[]> {
+  const rows = (await sql`
+    SELECT DISTINCT split_part(source_uri, '::', 1) AS filename
+    FROM public.knowledge_chunk
+    WHERE source = ${source}
+      AND account_id IS NOT DISTINCT FROM ${accountId}::uuid`) as { filename: string }[];
+  return rows.map((r) => r.filename);
+}
+
+// Rows of the named files: the file itself and its "::section" chunks. Callers pass an explicit list
+// (drafts found by the scan, or files proven missing by prune_missing), never an open-ended condition.
+async function deleteFileRows(
   sql: NeonQueryFunction<false, false>,
   source: string,
   accountId: string | null,
@@ -369,20 +399,40 @@ export async function ingestSource(
     return 0;
   }
 
+  // Read before the scan: a file another run indexes after this point can never count as "missing".
+  const indexedBefore = config.prune_missing ? await listIndexedFiles(sql, source, accountId) : [];
+
   console.log(`\n  Scanning ${resolvedPath}...`);
   let files = scanMarkdownFiles(resolvedPath, config.exclude);
   console.log(`  Found ${files.length} markdown files`);
+  const scannedNames = new Set(files.map((f) => f.relative));
+  const dryRun = options.dryRun === true;
 
   if (config.exclude_drafts) {
     const { kept, drafts } = splitDrafts(files);
     const byStatus = drafts.filter((d) => d.reason === "status").length;
     console.log(`  Drafts excluded: ${drafts.length} (status: ${byStatus}, category: ${drafts.length - byStatus})`);
-    const purged = await purgeDraftRows(sql, source, accountId, drafts.map((d) => d.relative), options.dryRun === true);
-    console.log(`  ${options.dryRun ? "Would delete" : "Deleted"} ${purged} already-indexed draft rows`);
+    const purged = await deleteFileRows(sql, source, accountId, drafts.map((d) => d.relative), dryRun);
+    console.log(`  ${dryRun ? "Would delete" : "Deleted"} ${purged} already-indexed draft rows`);
     files = kept;
   }
 
-  if (options.dryRun) return 0;
+  if (config.prune_missing) {
+    const missing = indexedBefore.filter((name) => !scannedNames.has(name));
+    const maxRatio = options.pruneMaxRatio ?? DEFAULT_PRUNE_MAX_RATIO;
+    if (indexedBefore.length > 0 && missing.length / indexedBefore.length > maxRatio) {
+      console.error(
+        `  ⛔ prune_missing skipped for [${source}]: ${missing.length} of ${indexedBefore.length} indexed files are missing ` +
+        `from the scan (limit ${Math.round(maxRatio * 100)}%). Check the path and exclude list, then re-run with --prune-max-ratio.`
+      );
+    } else {
+      const deleted = await deleteFileRows(sql, source, accountId, missing, dryRun);
+      console.log(`  ${dryRun ? "Would delete" : "Deleted"} ${deleted} rows of ${missing.length} files that are no longer on disk`);
+      if (dryRun && missing.length > 0) console.log(`  Missing (first ${PRUNE_PREVIEW_NAMES}): ${missing.slice(0, PRUNE_PREVIEW_NAMES).join(", ")}`);
+    }
+  }
+
+  if (dryRun) return 0;
   if (files.length === 0) return 0;
 
   // Read files and compute hashes (chunk large files)
@@ -606,8 +656,20 @@ export async function ingestSource(
 
 // --- CLI ---
 
+function parsePruneMaxRatio(args: string[]): number | undefined {
+  const idx = args.indexOf("--prune-max-ratio");
+  if (idx === -1) return undefined;
+  const ratio = Number(args[idx + 1]);
+  if (!Number.isFinite(ratio) || ratio < 0 || ratio > 1) {
+    console.error(`--prune-max-ratio expects a number from 0 to 1, got: ${args[idx + 1]}`);
+    process.exit(1);
+  }
+  return ratio;
+}
+
 async function main() {
   const args = process.argv.slice(2);
+  const pruneMaxRatio = parsePruneMaxRatio(args);
 
   const env: Record<string, string> = {
     DATABASE_URL: process.env.DATABASE_URL || "",
@@ -644,7 +706,7 @@ async function main() {
     for (const config of configs) {
       console.log(`\n[${config.source}] (${config.source_type})`);
       try {
-        total += await ingestSource(config, sql, env.OPENAI_API_KEY, { dryRun: args.includes("--dry-run") });
+        total += await ingestSource(config, sql, env.OPENAI_API_KEY, { dryRun: args.includes("--dry-run"), pruneMaxRatio });
       } catch (err) {
         console.error(`  [ingest] source "${config.source}" failed, skipping: ${(err as Error).message}`);
         failedSources.push(config.source);
@@ -678,6 +740,8 @@ async function main() {
       user_id: userId,
       source_class: args[classIdx + 1] as SourceClass,
       source_owner: args[ownerIdx + 1],
+      ...(args.includes("--exclude-drafts") ? { exclude_drafts: true } : {}),
+      ...(args.includes("--prune-missing") ? { prune_missing: true } : {}),
     };
     validateSourceConfigs([config]);
 
@@ -718,7 +782,7 @@ async function main() {
     }
 
     console.log(`Ingesting [${config.source}] (${config.source_type}) from ${config.path}`);
-    const count = await ingestSource(config, sql, env.OPENAI_API_KEY, { dryRun });
+    const count = await ingestSource(config, sql, env.OPENAI_API_KEY, { dryRun, pruneMaxRatio });
     console.log(`\nDone. Indexed: ${count}`);
   }
 }

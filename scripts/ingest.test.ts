@@ -16,14 +16,15 @@ function classify(text: string): MockQuery["type"] {
 // Minimal stand-in for @neondatabase/serverless's tagged-template `sql` function:
 // each call returns a thenable carrying its own query text/type, and `.transaction()`
 // records the array it received (order + membership) before resolving each entry.
-function makeMockSql(existingRows: { source_uri: string; content_hash: string }[]) {
+function makeMockSql(existingRows: { source_uri: string; content_hash: string }[], indexedFiles: string[] = []) {
   const transactionCalls: MockQuery[][] = [];
   const allQueries: MockQuery[] = [];
 
   function tag(strings: TemplateStringsArray, ...values: unknown[]) {
     const text = strings.reduce((acc, s, i) => acc + s + (i < values.length ? String(values[i]) : ""), "");
     const type = classify(text);
-    const result = type === "select" ? existingRows : [];
+    // The prune_missing lookup selects file names; every other select reads (source_uri, content_hash).
+    const result = type !== "select" ? [] : /DISTINCT split_part/.test(text) ? indexedFiles.map((filename) => ({ filename })) : existingRows;
     const query: MockQuery = { text, type };
     allQueries.push(query);
     const promise = Promise.resolve(result) as Promise<unknown> & { __query: MockQuery };
@@ -312,5 +313,114 @@ describe("ingestSource — exclude_drafts purge (WP-596 Ф10 п.5)", () => {
     await ingestSource(config({ exclude_drafts: true }), sql, "fake-api-key");
 
     expect(purgeQueries(allQueries)).toHaveLength(0);
+  });
+});
+
+describe("validateSourceConfigs — prune_missing (WP-596 Ф10 п.5)", () => {
+  const platform = (overrides: Partial<SourceConfig> = {}): SourceConfig => ({
+    source: "kb", source_type: "content", path: "/x", source_class: "methodology", source_owner: "platform", ...overrides,
+  });
+
+  it("accepts prune_missing on a platform source", () => {
+    expect(() => validateSourceConfigs([platform({ prune_missing: true })])).not.toThrow();
+  });
+
+  it("rejects prune_missing on a personal source (user_id set)", () => {
+    expect(() => validateSourceConfigs([platform({ prune_missing: true, user_id: "u-1" })])).toThrow(/prune_missing применим только/);
+  });
+
+  it("rejects a non-boolean prune_missing", () => {
+    expect(() => validateSourceConfigs([platform({ prune_missing: "yes" as unknown as boolean })])).toThrow(/prune_missing должен быть true\/false/);
+  });
+});
+
+describe("ingestSource — prune_missing (WP-596 Ф10 п.5)", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "wp596-prune-test-"));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, opts: { body: string }) => {
+        const { input } = JSON.parse(opts.body) as { input: string[] };
+        return { ok: true, status: 200, json: async () => ({ data: input.map(() => ({ embedding: [0.1, 0.2, 0.3] })) }) };
+      })
+    );
+    writeFileSync(join(dir, "normal.md"), "# Published\n\nPublished content long enough.\n");
+    writeFileSync(join(dir, "draft-status.md"), "---\nstatus: draft\n---\n\n# Draft\n\nContent of a draft.\n");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const config = (overrides: Partial<SourceConfig> = {}): SourceConfig => ({
+    source: "kb", source_type: "content", path: dir, source_class: "methodology", source_owner: "platform",
+    exclude_drafts: true, prune_missing: true, ...overrides,
+  });
+  const returningDeletes = (queries: MockQuery[]) => queries.filter((q) => q.type === "delete" && q.text.includes("RETURNING"));
+  const pruneDelete = (queries: MockQuery[], name: string) => returningDeletes(queries).filter((q) => q.text.includes(name));
+
+  it("deletes the rows of files that are on neither side of the scan, and only those", async () => {
+    // normal.md and draft-status.md are scanned; gone.md was indexed earlier and no longer exists.
+    const { sql, allQueries } = makeMockSql([], ["normal.md", "draft-status.md", "gone.md"]);
+
+    await ingestSource(config(), sql, "fake-api-key", { pruneMaxRatio: 0.5 });
+
+    const prune = pruneDelete(allQueries, "gone.md");
+    expect(prune).toHaveLength(1);
+    expect(prune[0].text).not.toContain("normal.md");
+    expect(prune[0].text).not.toContain("draft-status.md");
+  });
+
+  it("refuses to prune when too much of the indexed set is missing from the scan (wrong path, half-mounted dir)", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { sql, allQueries } = makeMockSql([], ["normal.md", "gone-1.md", "gone-2.md"]); // 2 of 3 missing, default limit 20 %
+
+    await ingestSource(config(), sql, "fake-api-key");
+
+    expect(pruneDelete(allQueries, "gone-1.md")).toHaveLength(0);
+    expect(errors.mock.calls.flat().join("\n")).toContain("prune_missing skipped");
+  });
+
+  it("still indexes the scanned files when the prune is refused", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { sql, transactionCalls } = makeMockSql([], ["normal.md", "gone-1.md", "gone-2.md"]);
+
+    const indexed = await ingestSource(config(), sql, "fake-api-key");
+
+    expect(indexed).toBe(1);
+    expect(transactionCalls).toHaveLength(1);
+  });
+
+  it("does not even read the indexed file names without the flag", async () => {
+    const { sql, allQueries } = makeMockSql([], ["normal.md", "gone.md"]);
+
+    await ingestSource(config({ prune_missing: false }), sql, "fake-api-key");
+
+    expect(allQueries.some((q) => /DISTINCT split_part/.test(q.text))).toBe(false);
+    expect(pruneDelete(allQueries, "gone.md")).toHaveLength(0);
+  });
+
+  it("dry run lists the missing files but deletes nothing", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { sql, allQueries } = makeMockSql([], ["normal.md", "draft-status.md", "gone.md"]);
+
+    await ingestSource(config(), sql, "fake-api-key", { dryRun: true, pruneMaxRatio: 0.5 });
+
+    expect(allQueries.filter((q) => q.type === "delete")).toHaveLength(0);
+    expect(log.mock.calls.flat().join("\n")).toContain("Missing (first 20): gone.md");
+  });
+
+  it("deletes nothing when every indexed file is still on disk", async () => {
+    const { sql, allQueries } = makeMockSql([], ["normal.md", "draft-status.md"]);
+
+    await ingestSource(config(), sql, "fake-api-key");
+
+    expect(pruneDelete(allQueries, "normal.md")).toHaveLength(0);
+    // the only RETURNING delete is the draft purge of draft-status.md
+    expect(returningDeletes(allQueries)).toHaveLength(1);
   });
 });
