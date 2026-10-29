@@ -55,10 +55,9 @@ log "Sources requested: ${REQUESTED[*]}"
 # peer-session with Codex, Ф27-2: personal sources carry user_id in
 # sources-personal.json, which caller sets $SOURCES_CONFIG to point at; platform
 # sources in the default sources.json have no such key). The 4th field is
-# printed unconditionally (empty string, not omitted) so `read` below always
-# sees 4 tab-separated fields — an omitted trailing field on an L2 (platform)
-# row would silently shift nothing here since it's already last, but making the
-# arity explicit avoids relying on that fact.
+# printed unconditionally, and "-" stands for "no user_id": an empty field would
+# collapse under IFS=tab (tab counts as whitespace for `read`) and shift every
+# later field one place left (WP-596 Ф10 п.5 fixed this).
 # WP-596 Ф7: source_class/source_owner обязательны для ingest.ts (--class/--owner) —
 # резолвим их из того же sources.json, тем же образом, что уже резолвится user_id.
 RESOLVED=$(python3 - "${REQUESTED[@]}" << PYEOF
