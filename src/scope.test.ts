@@ -461,6 +461,16 @@ describe("provisionBridgeScopes (WP-410 срез-2b, explicit connect_source)", 
     expect(serverScopeCall.values).toContainEqual(["plimr/DS-my-strategy"]);
   });
 
+  it("never lifts a revoked server-scope grant on re-provisioning", async () => {
+    const { sql, calls } = recordingSql();
+
+    await provisionBridgeScopes(sql, "user-1", "DS-my-strategy", "plimr/DS-my-strategy");
+
+    const [, serverScopeCall] = calls;
+    expect(serverScopeCall.strings).not.toContain("revoked_at = NULL");
+    expect(serverScopeCall.strings).toContain("WHERE agent_scopes_mvp.revoked_at IS NULL");
+  });
+
   it("self-heals the server-scope grant from source alone when it is already owner/repo", async () => {
     const { sql, calls } = recordingSql();
 
