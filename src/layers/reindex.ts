@@ -797,19 +797,6 @@ export interface StartIncrementalReindexJobResult {
   rejected_paths?: string[];
 }
 
-/**
- * Webhook-push counterpart to startReindexJob: enqueue exactly the files a single push
- * changed (already known — no GitHub Trees listing), skip the 60s cooldown (a push is a
- * discrete event, not a recency-guarded manual trigger), and never touch user_sources.index_state
- * (kind='incremental', see enqueueReindexBatches). WP-545 Ф13, peer-session
- * 2026-09-18-12-wp545-f13-reindex-impl (design consensus + Kimi/Codex implementation review).
- *
- * Active-source gating is the INSERT...SELECT...WHERE below (atomic with job creation — no
- * TOCTOU window between "is this source connected and enabled" and "create the job row", same
- * pattern startReindexJob already uses). The probe SELECT above it is informational only, for a
- * precise skip `reason` — if the source's state changes in the gap between the two queries, the
- * atomic INSERT's outcome is authoritative and the reason falls back to "state_changed_during_check".
- */
 /** Runs one database stage and reports its duration; a stage that fails still leaves a timed log
  * line (a slow-then-rejected query is exactly the case a success-only log would hide) and rethrows. */
 async function timedStage<T>(
@@ -830,6 +817,19 @@ async function timedStage<T>(
   }
 }
 
+/**
+ * Webhook-push counterpart to startReindexJob: enqueue exactly the files a single push
+ * changed (already known — no GitHub Trees listing), skip the 60s cooldown (a push is a
+ * discrete event, not a recency-guarded manual trigger), and never touch user_sources.index_state
+ * (kind='incremental', see enqueueReindexBatches). WP-545 Ф13, peer-session
+ * 2026-09-18-12-wp545-f13-reindex-impl (design consensus + Kimi/Codex implementation review).
+ *
+ * Active-source gating is the INSERT...SELECT...WHERE below (atomic with job creation — no
+ * TOCTOU window between "is this source connected and enabled" and "create the job row", same
+ * pattern startReindexJob already uses). The probe SELECT above it is informational only, for a
+ * precise skip `reason` — if the source's state changes in the gap between the two queries, the
+ * atomic INSERT's outcome is authoritative and the reason falls back to "state_changed_during_check".
+ */
 export async function startIncrementalReindexJob(
   env: ReindexEnv,
   userId: string,
