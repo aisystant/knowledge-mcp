@@ -435,7 +435,7 @@ describe("provisionBridgeScopes (WP-410 срез-2b, explicit connect_source)", 
     expect(values).toContainEqual(["DS-my-strategy"]);
   });
 
-  // WP-7 (2026-10-28, Plimrg@gmail.com incident, follow-up found by code review same day):
+  // WP-7 (2026-10-28, single-user incident, follow-up found by code review same day):
   // `source` is a short display name for personal (non-team) sources — agent-runner's
   // enforce_scope matches allowed_repos against the real GitHub 'owner/repo' exactly, so
   // writing [source] there would never match. The caller must supply `fullRepo` once it
