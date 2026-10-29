@@ -22,6 +22,7 @@
  * Usage:
  *   npx tsx scripts/ingest.ts --source PACK-digital-platform --type pack --path ~/IWE/PACK-digital-platform/pack
  *   npx tsx scripts/ingest.ts --config scripts/sources.json   # bulk ingest from config
+ *   (exclude_drafts and --dry-run draft preview work only in --config mode; single-source flags do not carry exclude_drafts)
  *
  * Environment variables (or .dev.vars file):
  *   DATABASE_URL — Neon PostgreSQL connection string (knowledge DB)
@@ -33,6 +34,7 @@ import { join, relative, extname, dirname } from "path";
 import { createHash, randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
+import { parseDocument } from "yaml";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -70,9 +72,39 @@ export interface SourceConfig {
   user_id?: string; // если задан → personal collection (account_id, collection_kind='personal')
   source_class: SourceClass;
   source_owner: string; // "platform" для методологии, иначе имя пилота/команды — не account_id
+  // WP-596 Ф10 п.5: не индексировать черновики автора в общий (платформенный) слой. Включается
+  // на уровне источника, потому что в других репозиториях `status: draft` — рабочая спецификация,
+  // которую искать нужно. Только для платформенного слоя: личный слой тех же файлов не трогаем.
+  exclude_drafts?: boolean;
 }
 
 const VALID_SOURCE_CLASSES: readonly SourceClass[] = ["methodology", "personal", "team", "public_user"];
+
+// Два независимых признака черновика в репозитории автора (непересекающиеся множества на 29.10:
+// 474 файла с категорией, 127 со `status`): фронтматтер `status` и строка `**Категория:**` с
+// названием раздела клуба. Ни один не запасной для другого.
+const DRAFT_STATUSES: readonly string[] = ["draft", "draft-internal"];
+const DRAFT_CATEGORY_PREFIX = "черновики";
+const CATEGORY_SCAN_LINES = 30;
+
+export type DraftReason = "status" | "category";
+
+export function draftReason(rawContent: string): DraftReason | null {
+  const content = rawContent.replace(/^\uFEFF/, ""); // a BOM would hide the frontmatter from the `^---` match
+  const frontmatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (frontmatter) {
+    // parseDocument does not throw on malformed YAML: errors are collected and the file is
+    // judged by the category line only (it stays indexed rather than silently vanishing).
+    const doc = parseDocument(frontmatter[1]);
+    const status = doc.errors.length === 0 ? doc.get("status") : undefined;
+    if (typeof status === "string" && DRAFT_STATUSES.includes(status.trim().toLowerCase())) return "status";
+  }
+  for (const line of content.split(/\r?\n/, CATEGORY_SCAN_LINES)) {
+    const category = line.match(/^\*\*Категория:\*\*\s*(.+)$/);
+    if (category) return category[1].trim().toLowerCase().startsWith(DRAFT_CATEGORY_PREFIX) ? "category" : null;
+  }
+  return null;
+}
 
 /**
  * Проверяет весь набор конфигов сразу и собирает ВСЕ ошибки, а не падает на первой —
@@ -88,6 +120,12 @@ export function validateSourceConfigs(configs: SourceConfig[]): void {
     }
     if (!config.source_owner || config.source_owner.trim() === "") {
       errors.push(`"${config.source}": source_owner отсутствует или пуст`);
+    }
+    if (config.exclude_drafts !== undefined && typeof config.exclude_drafts !== "boolean") {
+      errors.push(`"${config.source}": exclude_drafts должен быть true/false, получено: ${JSON.stringify(config.exclude_drafts)}`);
+    }
+    if (config.exclude_drafts && config.user_id) {
+      errors.push(`"${config.source}": exclude_drafts применим только к платформенному слою (user_id задан — личный слой держит черновики)`);
     }
   }
   if (errors.length > 0) {
@@ -269,10 +307,56 @@ export function chunkLargeFile(
 
 // --- Main ingestion (REFACTORED to public.knowledge_chunk) ---
 
+export interface IngestOptions {
+  // Only report what the draft purge would delete; nothing is deleted, nothing is indexed.
+  dryRun?: boolean;
+}
+
+interface DraftSplit {
+  kept: { filepath: string; relative: string }[];
+  drafts: { relative: string; reason: DraftReason }[];
+}
+
+function splitDrafts(files: { filepath: string; relative: string }[]): DraftSplit {
+  const split: DraftSplit = { kept: [], drafts: [] };
+  for (const file of files) {
+    const reason = draftReason(readFileSync(file.filepath, "utf-8"));
+    if (reason) split.drafts.push({ relative: file.relative, reason });
+    else split.kept.push(file);
+  }
+  return split;
+}
+
+// Rows of files classified as drafts: the file itself and its "::section" chunks. The list comes from
+// the scan, never from "everything missing from the scan" - an empty or mistyped path must not wipe a source.
+async function purgeDraftRows(
+  sql: NeonQueryFunction<false, false>,
+  source: string,
+  accountId: string | null,
+  draftFilenames: string[],
+  dryRun: boolean
+): Promise<number> {
+  if (draftFilenames.length === 0) return 0;
+  const rows = (dryRun
+    ? await sql`
+        SELECT source_uri FROM public.knowledge_chunk
+        WHERE source = ${source}
+          AND account_id IS NOT DISTINCT FROM ${accountId}::uuid
+          AND split_part(source_uri, '::', 1) = ANY(${draftFilenames}::text[])`
+    : await sql`
+        DELETE FROM public.knowledge_chunk
+        WHERE source = ${source}
+          AND account_id IS NOT DISTINCT FROM ${accountId}::uuid
+          AND split_part(source_uri, '::', 1) = ANY(${draftFilenames}::text[])
+        RETURNING source_uri`) as unknown[];
+  return rows.length;
+}
+
 export async function ingestSource(
   config: SourceConfig,
   sql: NeonQueryFunction<false, false>,
-  apiKey: string
+  apiKey: string,
+  options: IngestOptions = {}
 ): Promise<number> {
   const { source, source_type, path: basePath, source_class, source_owner } = config;
   // Personal vs platform: use user_id from config if present
@@ -286,9 +370,19 @@ export async function ingestSource(
   }
 
   console.log(`\n  Scanning ${resolvedPath}...`);
-  const files = scanMarkdownFiles(resolvedPath, config.exclude);
+  let files = scanMarkdownFiles(resolvedPath, config.exclude);
   console.log(`  Found ${files.length} markdown files`);
 
+  if (config.exclude_drafts) {
+    const { kept, drafts } = splitDrafts(files);
+    const byStatus = drafts.filter((d) => d.reason === "status").length;
+    console.log(`  Drafts excluded: ${drafts.length} (status: ${byStatus}, category: ${drafts.length - byStatus})`);
+    const purged = await purgeDraftRows(sql, source, accountId, drafts.map((d) => d.relative), options.dryRun === true);
+    console.log(`  ${options.dryRun ? "Would delete" : "Deleted"} ${purged} already-indexed draft rows`);
+    files = kept;
+  }
+
+  if (options.dryRun) return 0;
   if (files.length === 0) return 0;
 
   // Read files and compute hashes (chunk large files)
@@ -550,7 +644,7 @@ async function main() {
     for (const config of configs) {
       console.log(`\n[${config.source}] (${config.source_type})`);
       try {
-        total += await ingestSource(config, sql, env.OPENAI_API_KEY);
+        total += await ingestSource(config, sql, env.OPENAI_API_KEY, { dryRun: args.includes("--dry-run") });
       } catch (err) {
         console.error(`  [ingest] source "${config.source}" failed, skipping: ${(err as Error).message}`);
         failedSources.push(config.source);
@@ -610,7 +704,10 @@ async function main() {
       }
     }
 
-    if (args.includes("--clean")) {
+    const dryRun = args.includes("--dry-run");
+    if (args.includes("--clean") && dryRun) {
+      console.log("--dry-run: --clean skipped, nothing is deleted");
+    } else if (args.includes("--clean")) {
       const cleanAccountId: string | null = userId ?? null;
       const deleted = await sql`
         DELETE FROM public.knowledge_chunk
@@ -621,7 +718,7 @@ async function main() {
     }
 
     console.log(`Ingesting [${config.source}] (${config.source_type}) from ${config.path}`);
-    const count = await ingestSource(config, sql, env.OPENAI_API_KEY);
+    const count = await ingestSource(config, sql, env.OPENAI_API_KEY, { dryRun });
     console.log(`\nDone. Indexed: ${count}`);
   }
 }

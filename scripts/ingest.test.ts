@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { ingestSource, contentHash, chunkLargeFile, validateSourceConfigs, type SourceConfig } from "./ingest.js";
+import { ingestSource, contentHash, chunkLargeFile, validateSourceConfigs, draftReason, type SourceConfig } from "./ingest.js";
 
 type MockQuery = { text: string; type: "select" | "delete" | "insert" | "lock" };
 
@@ -18,12 +18,14 @@ function classify(text: string): MockQuery["type"] {
 // records the array it received (order + membership) before resolving each entry.
 function makeMockSql(existingRows: { source_uri: string; content_hash: string }[]) {
   const transactionCalls: MockQuery[][] = [];
+  const allQueries: MockQuery[] = [];
 
   function tag(strings: TemplateStringsArray, ...values: unknown[]) {
     const text = strings.reduce((acc, s, i) => acc + s + (i < values.length ? String(values[i]) : ""), "");
     const type = classify(text);
     const result = type === "select" ? existingRows : [];
     const query: MockQuery = { text, type };
+    allQueries.push(query);
     const promise = Promise.resolve(result) as Promise<unknown> & { __query: MockQuery };
     promise.__query = query;
     return promise;
@@ -34,7 +36,7 @@ function makeMockSql(existingRows: { source_uri: string; content_hash: string }[
     return Promise.all(queries);
   });
 
-  return { sql: tag as unknown as Parameters<typeof ingestSource>[1], transactionCalls };
+  return { sql: tag as unknown as Parameters<typeof ingestSource>[1], transactionCalls, allQueries };
 }
 
 describe("ingestSource — transactional DELETE+INSERT (WP-443)", () => {
@@ -187,5 +189,128 @@ describe("validateSourceConfigs — class/owner required at indexing time (WP-59
         { ...baseConfig({ source: "bad-two" }), source_class: undefined as unknown as SourceConfig["source_class"] },
       ])
     ).toThrow(/bad-one[\s\S]*bad-two/);
+  });
+});
+
+describe("draftReason — two independent draft markers (WP-596 Ф10 п.5)", () => {
+  it.each([
+    ["status: draft", "---\nstatus: draft\n---\n\n# Post\n", "status"],
+    ["status behind a BOM", "\uFEFF---\nstatus: draft\n---\n\n# Post\n", "status"],
+    ["quoted status", '---\nstatus: "draft"\n---\n\n# Post\n', "status"],
+    ["status in other case", "---\nstatus: Draft\n---\n\n# Post\n", "status"],
+    ["draft-internal status", "---\nstatus: draft-internal\n---\n\n# Post\n", "status"],
+    ["club category line", "# Мышление письмом\n\n**Категория:** Черновики|Церен Церенов (черновики)\n\n**Дата:** 2023-06-14\n", "category"],
+    ["category line in other case", "# Post\n\n**Категория:** черновики\n", "category"],
+  ] as const)("flags %s", (_name, content, reason) => {
+    expect(draftReason(content)).toBe(reason);
+  });
+
+  it.each([
+    ["published status", "---\nstatus: published\n---\n\n# Post\n"],
+    ["ready status", "---\nstatus: ready\n---\n\n# Post\n"],
+    ["other category", "# Post\n\n**Категория:** Статьи\n"],
+    ["word 'draft' only in the body", "---\nstatus: published\n---\n\nThis is not a draft any more.\n"],
+    ["category line deep in the body", "# Post\n" + "text\n".repeat(40) + "**Категория:** Черновики\n"],
+    ["no frontmatter and no category", "# Plain document\n\nSome text.\n"],
+  ])("does not flag %s", (_name, content) => {
+    expect(draftReason(content)).toBeNull();
+  });
+
+  it("falls back to the category line when the frontmatter is malformed YAML", () => {
+    expect(draftReason("---\nstatus: [draft\n---\n\n**Категория:** Черновики\n")).toBe("category");
+    expect(draftReason("---\nstatus: [draft\n---\n\n# Post\n")).toBeNull();
+  });
+});
+
+describe("validateSourceConfigs — exclude_drafts (WP-596 Ф10 п.5)", () => {
+  const platform = (overrides: Partial<SourceConfig> = {}): SourceConfig => ({
+    source: "kb", source_type: "content", path: "/x", source_class: "methodology", source_owner: "platform", ...overrides,
+  });
+
+  it("accepts exclude_drafts on a platform source", () => {
+    expect(() => validateSourceConfigs([platform({ exclude_drafts: true })])).not.toThrow();
+  });
+
+  it("rejects exclude_drafts on a personal source (user_id set): the personal layer keeps drafts", () => {
+    expect(() => validateSourceConfigs([platform({ exclude_drafts: true, user_id: "u-1" })])).toThrow(/только к платформенному слою/);
+  });
+
+  it("rejects a non-boolean exclude_drafts so a typo cannot silently disable the filter", () => {
+    expect(() => validateSourceConfigs([platform({ exclude_drafts: "true" as unknown as boolean })])).toThrow(/true\/false/);
+  });
+});
+
+describe("ingestSource — exclude_drafts purge (WP-596 Ф10 п.5)", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "wp596-drafts-test-"));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, opts: { body: string }) => {
+        const { input } = JSON.parse(opts.body) as { input: string[] };
+        return { ok: true, status: 200, json: async () => ({ data: input.map(() => ({ embedding: [0.1, 0.2, 0.3] })) }) };
+      })
+    );
+    writeFileSync(join(dir, "normal.md"), "# Published\n\n---\n\nPublished content long enough.\n");
+    writeFileSync(join(dir, "draft-status.md"), "---\nstatus: draft\n---\n\n# Draft by status\n\nContent of a draft.\n");
+    writeFileSync(join(dir, "club-post.md"), "# Club post\n\n**Категория:** Черновики|Автор (черновики)\n\nContent of a club post.\n");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+    vi.unstubAllGlobals();
+  });
+
+  const config = (overrides: Partial<SourceConfig> = {}): SourceConfig => ({
+    source: "kb", source_type: "content", path: dir, source_class: "methodology", source_owner: "platform", ...overrides,
+  });
+  const purgeQueries = (queries: MockQuery[]) => queries.filter((q) => q.type === "delete" && q.text.includes("RETURNING"));
+
+  it("indexes only the non-draft file and deletes the rows of both drafts by explicit filename", async () => {
+    const { sql, transactionCalls, allQueries } = makeMockSql([]);
+
+    const indexed = await ingestSource(config({ exclude_drafts: true }), sql, "fake-api-key");
+
+    expect(indexed).toBe(1);
+    expect(transactionCalls).toHaveLength(1);
+    expect(transactionCalls[0].some((q) => q.type === "insert" && q.text.includes("normal.md"))).toBe(true);
+    const purge = purgeQueries(allQueries);
+    expect(purge).toHaveLength(1);
+    expect(purge[0].text).toContain("draft-status.md");
+    expect(purge[0].text).toContain("club-post.md");
+    expect(purge[0].text).not.toContain("normal.md");
+    expect(purge[0].text).toContain("split_part(source_uri, '::', 1)"); // also removes the '::section' chunks
+  });
+
+  it("dry run counts the draft rows but deletes and indexes nothing", async () => {
+    const { sql, transactionCalls, allQueries } = makeMockSql([]);
+
+    const indexed = await ingestSource(config({ exclude_drafts: true }), sql, "fake-api-key", { dryRun: true });
+
+    expect(indexed).toBe(0);
+    expect(transactionCalls).toHaveLength(0);
+    expect(allQueries.filter((q) => q.type === "delete")).toHaveLength(0);
+    expect(allQueries.some((q) => q.type === "select" && q.text.includes("draft-status.md"))).toBe(true);
+  });
+
+  it("keeps drafts when the source has no exclude_drafts flag (personal layer, other repositories)", async () => {
+    const { sql, transactionCalls, allQueries } = makeMockSql([]);
+
+    const indexed = await ingestSource(config(), sql, "fake-api-key");
+
+    expect(indexed).toBe(3);
+    expect(transactionCalls).toHaveLength(3);
+    expect(purgeQueries(allQueries)).toHaveLength(0);
+  });
+
+  it("deletes nothing when no file is a draft", async () => {
+    rmSync(join(dir, "draft-status.md"));
+    rmSync(join(dir, "club-post.md"));
+    const { sql, allQueries } = makeMockSql([]);
+
+    await ingestSource(config({ exclude_drafts: true }), sql, "fake-api-key");
+
+    expect(purgeQueries(allQueries)).toHaveLength(0);
   });
 });
