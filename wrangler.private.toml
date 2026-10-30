@@ -1,4 +1,6 @@
 name = "personal-knowledge-mcp"
+# WP-545 Ф20: config is the source of truth; a deploy without this key switches Workers Observability off.
+observability.enabled = true
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
