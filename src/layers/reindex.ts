@@ -408,6 +408,18 @@ export async function personalReindexFiles(
         continue;
       }
 
+      // A blank file has nothing to embed (the embeddings service rejects an empty input and the whole
+      // job used to fail). Drop any previously indexed chunks and record the file as indexed-empty.
+      if (content.trim() === "") {
+        const emptyHash = await contentHash(content);
+        await sql.transaction(fenced(() => [
+          buildDeleteDocumentQuery(sql, documentsTable, req.source, userId, normalizedPath),
+          buildIndexStatusSuccessQuery(sql, statusTable, req.source, userId, normalizedPath, emptyHash),
+        ]));
+        result.skipped++;
+        continue;
+      }
+
       // Check hash — skip only if unchanged AND already on v2. A hash match on
       // a still-legacy row must NOT skip — it would never get backfilled to v2
       // otherwise, since a reindex re-run is the only backfill path and most

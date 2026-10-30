@@ -287,6 +287,30 @@ describe("personalReindexFiles", () => {
     globalThis.fetch = originalFetch;
   });
 
+  it.each(["", " \n\t"])("treats a blank file (%j) as indexed-empty: no embedding call, no error, old chunks dropped", async blank => {
+    const path = "sessions/01-peer-codex.md";
+    queryQueue.push([sourceRow()]); // resolveUserContext
+    queryQueue.push([{ index_generation: 3 }]); // generation pre-check
+
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: true, text: async () => blank }); // file content
+    globalThis.fetch = fetchMock;
+
+    const result = await personalReindexFiles(ENV, {
+      job_id: "job-test", generation: 3,
+      source: "DS-my-strategy", files: [{ path, action: "modified" }], user_id: USER_ID,
+    });
+    expect(result.errors).toEqual([]);
+    expect(result.skipped).toBe(1);
+    expect(result.processed).toBe(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // GitHub only, no embeddings request
+    const [, ...docValues] = latestSqlCallContainingForTable("DELETE", "knowledge.documents") as [TemplateStringsArray, ...unknown[]];
+    expect(docValues).toContain(path);
+    const [, ...statusValues] = latestSqlCallContainingForTable("INSERT", "knowledge.file_index_status") as [TemplateStringsArray, ...unknown[]];
+    expect(statusValues).toContain(path);
+    globalThis.fetch = originalFetch;
+  });
+
   it.each(["vault", "vault/"])("reads an exact encoded URL with pathPrefix %s", async pathPrefix => {
     const hash = await contentHash("unchanged content");
     const path = "docs/cafe\u0301_%#? file.md";
