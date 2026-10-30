@@ -1089,4 +1089,97 @@ describe("startIncrementalReindexJob (WP-545 Ф13)", () => {
     // (kind='incremental' never gates that call in the first place).
     expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("index_state = 'failed'"))).toBe(false);
   });
+
+  // Incident 29.10 (WP-545 Ф20): clients timed out at 20s while the code after the 202 looked cheap;
+  // the stage timings are what tells a slow database from a slow queue send next time.
+  function loggedPhases(spy: { mock: { calls: unknown[][] } }): Record<string, unknown>[] {
+    return spy.mock.calls.map(([line]) => JSON.parse(String(line)) as Record<string, unknown>);
+  }
+
+  it("logs how long the probe, the insert, the status update and the queue send each took", async () => {
+    queryQueue.push([{ active: true, auto_reindex_enabled: true }]); // probe
+    queryQueue.push([{ id: "job-inc-4", generation: 5 }]); // INSERT ... RETURNING
+    queryQueue.push([]); // UPDATE running
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await startIncrementalReindexJob(queueEnv(), USER_ID, "DS-my-strategy", [{ path: "note.md", action: "modified" }]);
+      const phases = loggedPhases(logSpy);
+      const created = phases.find((p) => p.phase === "incremental_job_created");
+      const enqueued = phases.find((p) => p.phase === "enqueue");
+      expect(created).toMatchObject({ job_id: "job-inc-4", source: "DS-my-strategy", files: 1 });
+      expect(created?.probe_ms).toEqual(expect.any(Number));
+      expect(created?.insert_ms).toEqual(expect.any(Number));
+      expect(enqueued).toMatchObject({ job_id: "job-inc-4", batches: 1 });
+      expect(enqueued?.update_running_ms).toEqual(expect.any(Number));
+      expect(enqueued?.send_batch_ms).toEqual(expect.any(Number));
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("logs the duration of a probe that fails, then rethrows the original error", async () => {
+    queryQueue.push(new Error("probe timed out"));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(
+        startIncrementalReindexJob(queueEnv(), USER_ID, "DS-my-strategy", [{ path: "note.md", action: "modified" }]),
+      ).rejects.toThrow("probe timed out");
+      expect(loggedPhases(errorSpy)).toContainEqual(
+        expect.objectContaining({ phase: "reindex_stage_error", stage: "probe", error: "probe timed out", elapsed_ms: expect.any(Number) }),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("logs the duration of an insert that fails and still answers with a failed result", async () => {
+    queryQueue.push([{ active: true, auto_reindex_enabled: true }]); // probe
+    queryQueue.push(new Error("insert deadlock")); // INSERT throws
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await startIncrementalReindexJob(queueEnv(), USER_ID, "DS-my-strategy", [{ path: "note.md", action: "modified" }]);
+      expect(result).toMatchObject({ status: "failed" });
+      expect(loggedPhases(errorSpy)).toContainEqual(
+        expect.objectContaining({ phase: "reindex_stage_error", stage: "insert", error: "insert deadlock" }),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("logs the duration of a status update that fails before the job is enqueued", async () => {
+    queryQueue.push([{ active: true, auto_reindex_enabled: true }]); // probe
+    queryQueue.push([{ id: "job-inc-6", generation: 5 }]); // INSERT ... RETURNING
+    queryQueue.push(new Error("connection reset")); // UPDATE running throws
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const env = queueEnv();
+      const result = await startIncrementalReindexJob(env, USER_ID, "DS-my-strategy", [{ path: "note.md", action: "modified" }]);
+      expect(result).toMatchObject({ status: "failed", job_id: "job-inc-6" });
+      expect(env.REINDEX_QUEUE!.sendBatch).not.toHaveBeenCalled();
+      expect(loggedPhases(errorSpy)).toContainEqual(
+        expect.objectContaining({ phase: "reindex_stage_error", stage: "update_running", job_id: "job-inc-6" }),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("logs the queue send duration and fails the job when sendBatch rejects", async () => {
+    queryQueue.push([{ active: true, auto_reindex_enabled: true }]); // probe
+    queryQueue.push([{ id: "job-inc-5", generation: 5 }]); // INSERT ... RETURNING
+    queryQueue.push([]); // UPDATE running
+    const env = queueEnv();
+    vi.mocked(env.REINDEX_QUEUE!.sendBatch).mockRejectedValue(new Error("queue unavailable"));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await startIncrementalReindexJob(env, USER_ID, "DS-my-strategy", [{ path: "note.md", action: "modified" }]);
+      expect(result).toMatchObject({ status: "failed", job_id: "job-inc-5" });
+      const failure = loggedPhases(errorSpy).find((p) => p.phase === "enqueue_error");
+      expect(failure).toMatchObject({ job_id: "job-inc-5", error: "queue unavailable" });
+      expect(failure?.send_batch_ms).toEqual(expect.any(Number));
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
 });

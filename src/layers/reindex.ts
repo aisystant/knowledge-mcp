@@ -577,10 +577,12 @@ async function enqueueReindexBatches(
   const { jobId, userId, source, files, kind, generation } = params;
   const expectedBatches = Math.ceil(files.length / REINDEX_BATCH_SIZE);
 
-  await sql`UPDATE ${sql.unsafe(reindexJobsTable)}
+  // Incident 29.10: callers hit their 20s deadline although the work after the 202 is cheap. Per-stage
+  // timings (WP-545 Ф20) show whether the time goes to the database update or to the queue send.
+  const { ms: updateRunningMs } = await timedStage("update_running", { job_id: jobId, source }, () => sql`UPDATE ${sql.unsafe(reindexJobsTable)}
     SET status = 'running', total = ${files.length}, expected_batches = ${expectedBatches},
         last_heartbeat_at = NOW()
-    WHERE id = ${jobId}::uuid`;
+    WHERE id = ${jobId}::uuid`);
 
   if (files.length === 0) {
     await sql`UPDATE ${sql.unsafe(reindexJobsTable)}
@@ -606,12 +608,25 @@ async function enqueueReindexBatches(
 
   // CF Queues sendBatch limit is ~256KB total payload — send in chunks of 20 to stay within it.
   const SEND_CHUNK_SIZE = 20;
-  for (let i = 0; i < batches.length; i += SEND_CHUNK_SIZE) {
-    const chunk = batches.slice(i, i + SEND_CHUNK_SIZE);
-    await env.REINDEX_QUEUE!.sendBatch(chunk.map((b) => ({ body: b })));
+  const sendStartedAt = Date.now();
+  try {
+    for (let i = 0; i < batches.length; i += SEND_CHUNK_SIZE) {
+      const chunk = batches.slice(i, i + SEND_CHUNK_SIZE);
+      await env.REINDEX_QUEUE!.sendBatch(chunk.map((b) => ({ body: b })));
+    }
+  } catch (err) {
+    console.error(JSON.stringify({
+      phase: "enqueue_error", job_id: jobId, source, kind, batches: batches.length,
+      update_running_ms: updateRunningMs, send_batch_ms: Date.now() - sendStartedAt,
+      error: err instanceof Error ? err.message : String(err),
+    }));
+    throw err;
   }
 
-  console.log(JSON.stringify({ phase: "enqueue", job_id: jobId, source, kind, total_files: files.length, batches: batches.length }));
+  console.log(JSON.stringify({
+    phase: "enqueue", job_id: jobId, source, kind, total_files: files.length, batches: batches.length,
+    update_running_ms: updateRunningMs, send_batch_ms: Date.now() - sendStartedAt,
+  }));
 
   return {
     job_id: jobId,
@@ -782,6 +797,26 @@ export interface StartIncrementalReindexJobResult {
   rejected_paths?: string[];
 }
 
+/** Runs one database stage and reports its duration; a stage that fails still leaves a timed log
+ * line (a slow-then-rejected query is exactly the case a success-only log would hide) and rethrows. */
+async function timedStage<T>(
+  stage: string,
+  context: Record<string, unknown>,
+  run: () => PromiseLike<T>,
+): Promise<{ value: T; ms: number }> {
+  const startedAt = Date.now();
+  try {
+    const value = await run();
+    return { value, ms: Date.now() - startedAt };
+  } catch (err) {
+    console.error(JSON.stringify({
+      phase: "reindex_stage_error", stage, ...context,
+      elapsed_ms: Date.now() - startedAt, error: err instanceof Error ? err.message : String(err),
+    }));
+    throw err;
+  }
+}
+
 /**
  * Webhook-push counterpart to startReindexJob: enqueue exactly the files a single push
  * changed (already known — no GitHub Trees listing), skip the 60s cooldown (a push is a
@@ -843,15 +878,16 @@ export async function startIncrementalReindexJob(
     };
   }
 
-  const probe = await sql`
+  const { value: probe, ms: probeMs } = await timedStage("probe", { source }, () => sql`
     SELECT active, auto_reindex_enabled FROM ${sql.unsafe(userSourcesTable)}
     WHERE user_id = ${userId} AND source = ${source}
     LIMIT 1
-  `;
+  `);
 
   let rows: Record<string, unknown>[];
+  let insertMs: number;
   try {
-    rows = await sql`
+    ({ value: rows, ms: insertMs } = await timedStage("insert", { source }, () => sql`
       INSERT INTO ${sql.unsafe(reindexJobsTable)} (user_id, source, status, generation, kind)
       SELECT ${userId}, ${source}, 'pending', index_generation, 'incremental'
       FROM ${sql.unsafe(userSourcesTable)}
@@ -859,7 +895,7 @@ export async function startIncrementalReindexJob(
         AND active = true AND auto_reindex_enabled = true
       FOR UPDATE
       RETURNING id, generation
-    `;
+    `));
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";
     return { status: "failed", message: `Failed to create incremental reindex job: ${msg}` };
@@ -878,6 +914,10 @@ export async function startIncrementalReindexJob(
 
   const jobId = rows[0].id as string;
   const generation = generationColumn(rows[0].generation);
+  console.log(JSON.stringify({
+    phase: "incremental_job_created", job_id: jobId, source, files: indexable.length,
+    probe_ms: probeMs, insert_ms: insertMs,
+  }));
 
   try {
     const result = await enqueueReindexBatches(env, sql, reindexJobsTable, userSourcesTable, {
