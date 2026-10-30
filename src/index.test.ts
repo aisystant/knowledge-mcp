@@ -1606,6 +1606,134 @@ describe("searchDocuments embedding resilience", () => {
     expect(mockPoolEnd).toHaveBeenCalledTimes(1);
   });
 
+  it("sets the iterative scan options before the vector SELECT, inside the same call", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(mockEmbeddingResponse([0.1, 0.2, 0.3]));
+    const statements: string[] = [];
+    mockWithUserContextImpl = (fn) => {
+      const sql = (strings: TemplateStringsArray) => {
+        statements.push(strings.join("?").replace(/\s+/g, " ").trim());
+        return Promise.resolve([]);
+      };
+      (sql as any).unsafe = (value: string) => value;
+      return fn(sql as any);
+    };
+    vi.spyOn(console, "info").mockImplementation(() => undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    await searchDocuments(
+      {
+        KNOWLEDGE_DATABASE_URL: "postgres://knowledge",
+        HEALTH_DATABASE_URL: "postgres://health",
+        OPENROUTER_API_KEY: "api-key",
+        VECTOR_ITERATIVE_SCAN: "relaxed_order",
+      },
+      "как устроены системные уровни"
+    );
+
+    const vectorCall = statements.findIndex((s) => s.includes("embedding <=>"));
+    expect(vectorCall).toBeGreaterThan(0);
+    expect(statements.slice(0, vectorCall).map((s) => s.match(/set_config\('([^']+)'/)?.[1])).toEqual([
+      "hnsw.iterative_scan",
+      "statement_timeout",
+    ]);
+  });
+
+  it("puts the best hit first when relaxed_order returns rows out of distance order", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(mockEmbeddingResponse([0.1, 0.2, 0.3]));
+    const row = (id: number, score: number) => ({
+      id, filename: `doc-${id}.md`, content: `Фрагмент ${id}`, source: "docs-courses", source_type: "course", score,
+    });
+    mockWithUserContextImpl = (fn) => fn(makeMockSql([row(1, 0.71), row(2, 0.93), row(3, 0.82)]));
+    vi.spyOn(console, "info").mockImplementation(() => undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const results = await searchDocuments(
+      {
+        KNOWLEDGE_DATABASE_URL: "postgres://knowledge",
+        HEALTH_DATABASE_URL: "postgres://health",
+        OPENROUTER_API_KEY: "api-key",
+        VECTOR_ITERATIVE_SCAN: "relaxed_order",
+      },
+      "как устроены системные уровни"
+    );
+
+    expect(results.map((r) => r.score)).toEqual([0.93, 0.82, 0.71]);
+  });
+
+  it("issues no scan settings while the flag is off", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(mockEmbeddingResponse([0.1, 0.2, 0.3]));
+    const statements: string[] = [];
+    mockWithUserContextImpl = (fn) => {
+      const sql = (strings: TemplateStringsArray) => {
+        statements.push(strings.join("?"));
+        return Promise.resolve([]);
+      };
+      (sql as any).unsafe = (value: string) => value;
+      return fn(sql as any);
+    };
+
+    await searchDocuments(
+      { KNOWLEDGE_DATABASE_URL: "postgres://knowledge", HEALTH_DATABASE_URL: "postgres://health", OPENROUTER_API_KEY: "api-key" },
+      "как устроены системные уровни"
+    );
+
+    expect(statements.some((s) => s.includes("set_config"))).toBe(false);
+    expect(statements.some((s) => s.includes("embedding <=>"))).toBe(true);
+  });
+
+  it("degrades to keyword search when the iterative scan exceeds its time budget", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(mockEmbeddingResponse([0.1, 0.2, 0.3]));
+    const keywordRow = {
+      id: 31,
+      filename: "keyword-result.md",
+      content: "Результат ключевого поиска.",
+      source: "docs-courses",
+      source_type: "course",
+      score: 0.7,
+    };
+    let dbCall = 0;
+    mockWithUserContextImpl = async (fn) => {
+      dbCall += 1;
+      if (dbCall === 1) throw Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
+      return fn(makeMockSql(dbCall === 2 ? [keywordRow] : []));
+    };
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const results = await searchDocuments(
+      {
+        KNOWLEDGE_DATABASE_URL: "postgres://knowledge",
+        HEALTH_DATABASE_URL: "postgres://health",
+        OPENROUTER_API_KEY: "api-key",
+        VECTOR_ITERATIVE_SCAN: "relaxed_order",
+      },
+      "как устроены системные уровни"
+    );
+
+    expect(results.map((r) => r.filename)).toEqual(["keyword-result.md"]);
+    expect(JSON.parse(warnSpy.mock.calls[0][0] as string)).toEqual({
+      event: "knowledge_search_vector_scan_timeout",
+      mode: "relaxed_order",
+      timeout_ms: 3000,
+      fallback: "keyword",
+      source_filter_present: false,
+      source_type_filter_present: false,
+    });
+  });
+
+  it("does not turn a statement timeout into a fallback while the flag is off", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(mockEmbeddingResponse([0.1, 0.2, 0.3]));
+    mockWithUserContextImpl = async () => {
+      throw Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
+    };
+
+    await expect(
+      searchDocuments(
+        { KNOWLEDGE_DATABASE_URL: "postgres://knowledge", HEALTH_DATABASE_URL: "postgres://health", OPENROUTER_API_KEY: "api-key" },
+        "как устроены системные уровни"
+      )
+    ).rejects.toMatchObject({ code: "57014" });
+  });
+
   it("does not mask database failures as embedding fallback", async () => {
     const fetchMock = vi.fn().mockResolvedValue(mockEmbeddingResponse([0.1, 0.2, 0.3]));
     globalThis.fetch = fetchMock;
