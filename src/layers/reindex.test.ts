@@ -585,6 +585,22 @@ describe("reindex enumeration failures", () => {
     expect(latestSourceIndexStateUpdate()[2]).toBe("ready");
   });
 
+  it("notifies the operator once when the empty full rebuild is the job that finished", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    const github = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ default_branch: "main" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ commit: { sha: "a".repeat(40) } }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ tree: [], truncated: false }) });
+    const env = { ...ENV, REINDEX_NOTIFY_TELEGRAM_TOKEN: "tok", REINDEX_NOTIFY_CHAT_ID: "42", REINDEX_QUEUE: { sendBatch: vi.fn() } as unknown as Queue<ReindexBatchMessage> };
+
+    queryQueue.push([], [{ id: "job-won", generation: 3 }], [sourceRow()], [], [{ source: "DS-my-strategy", kind: "full", errors: null }]);
+    vi.stubGlobal("fetch", vi.fn((url: string, init?: RequestInit) =>
+      String(url).startsWith("https://api.telegram.org/") ? fetchMock(url, init) : github(url)));
+    await startReindexJob(env, USER_ID, "DS-my-strategy");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).text).toBe("Полная переиндексация источника DS-my-strategy завершена.");
+  });
+
   it("accepts a new repository whose default branch has not been created yet", async () => {
     queryQueue.push([], [{ id: "job-uninitialized", generation: 3 }], [sourceRow()]);
     const fetchMock = vi.fn()

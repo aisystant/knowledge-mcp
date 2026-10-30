@@ -28,6 +28,7 @@ import {
   type UserContext,
 } from "./personal.js";
 import { repositoryToken } from "./team-github.js";
+import { firstErrorText, notifyJobFinished, type ReindexNotifyEnv } from "./reindex-notify.js";
 import {
   githubBranchApiUrl,
   githubContentsApiUrl,
@@ -35,7 +36,7 @@ import {
   resolveSourcePath,
 } from "../repository-path.js";
 
-export interface ReindexEnv extends PersonalEnv {
+export interface ReindexEnv extends PersonalEnv, ReindexNotifyEnv {
   /** Cloudflare Queue binding for the "reindex" queue. Required to enqueue/consume batches. */
   REINDEX_QUEUE?: Queue<ReindexBatchMessage>;
 }
@@ -138,19 +139,27 @@ async function finishJob(
   sql: ReturnType<typeof personalDb>,
   jobsTable: string,
   jobId: string,
-  status: "succeeded" | "failed" | "cancelled",
-  errors?: string[],
+  status: "succeeded" | "failed",
+  ctx: { env: ReindexNotifyEnv; errors?: string[] },
 ): Promise<boolean> {
-  const rows = errors
+  const rows = ctx.errors
     ? await sql`UPDATE ${sql.unsafe(jobsTable)}
-        SET status = ${status}, finished_at = NOW(), errors = ${JSON.stringify(errors)}::jsonb
+        SET status = ${status}, finished_at = NOW(), errors = ${JSON.stringify(ctx.errors)}::jsonb
         WHERE id = ${jobId}::uuid AND status IN ('pending', 'running')
-        RETURNING id`
+        RETURNING source, kind, errors`
     : await sql`UPDATE ${sql.unsafe(jobsTable)}
         SET status = ${status}, finished_at = NOW()
         WHERE id = ${jobId}::uuid AND status IN ('pending', 'running')
-        RETURNING id`;
-  return rows.length > 0;
+        RETURNING source, kind, errors`;
+  if (rows.length === 0) return false;
+  const row = rows[0] as { source: string; kind: string; errors: unknown };
+  await notifyJobFinished(ctx.env, {
+    status,
+    kind: row.kind === "full" ? "full" : "incremental",
+    source: row.source,
+    reason: firstErrorText(row.errors),
+  });
+  return true;
 }
 
 function generationColumn(value: unknown): number | null {
@@ -611,7 +620,7 @@ async function enqueueReindexBatches(
     WHERE id = ${jobId}::uuid`);
 
   if (files.length === 0) {
-    await finishJob(sql, reindexJobsTable, jobId, "succeeded");
+    await finishJob(sql, reindexJobsTable, jobId, "succeeded", { env });
     if (kind === "full") {
       await setSourceIndexState(sql, userSourcesTable, reindexJobsTable, userId, source, generation, "ready", jobId);
     }
@@ -784,7 +793,7 @@ export async function startReindexJob(
   try {
     const ctx = await resolveUserContext(env, userId, { includeReindexing: true });
     if (!ctx.sourceNames.includes(source)) {
-      await finishJob(sql, reindexJobsTable, jobId, "failed", [`Unknown source: ${source}`]);
+      await finishJob(sql, reindexJobsTable, jobId, "failed", { env, errors: [`Unknown source: ${source}`] });
       return { job_id: jobId, status: "failed", message: `Unknown source: ${source}`, source };
     }
 
@@ -800,7 +809,7 @@ export async function startReindexJob(
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";
-    await finishJob(sql, reindexJobsTable, jobId, "failed", [msg]);
+    await finishJob(sql, reindexJobsTable, jobId, "failed", { env, errors: [msg] });
     // Fail-closed stays visible as 'failed', never silently 'ready' (WP-560 Ф3).
     await setSourceIndexState(sql, userSourcesTable, reindexJobsTable, userId, source, generation, "failed", jobId);
     return { job_id: jobId, status: "failed", message: `Failed to start reindex: ${msg}`, source };
@@ -949,7 +958,7 @@ export async function startIncrementalReindexJob(
     return { status: "queued", job_id: jobId, message: result.message };
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";
-    await finishJob(sql, reindexJobsTable, jobId, "failed", [msg]);
+    await finishJob(sql, reindexJobsTable, jobId, "failed", { env, errors: [msg] });
     return { status: "failed", job_id: jobId, message: `Failed to enqueue incremental reindex: ${msg}` };
   }
 }
@@ -1114,7 +1123,7 @@ export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env:
         // Use errors accumulated by the atomic UPDATE, not just this batch's result: the
         // final batch can succeed after an earlier one failed. Keep the existing status enum.
         const completionStatus = errors?.length ? "failed" : "succeeded";
-        await finishJob(sql, KNOWLEDGE_TABLES.reindex_jobs(schema), job_id, completionStatus);
+        await finishJob(sql, KNOWLEDGE_TABLES.reindex_jobs(schema), job_id, completionStatus, { env });
         // Only a full-tree rebuild may declare the source's index 'ready' — an incremental
         // (webhook push) job completing must never flip index_state, or a fast push-triggered
         // job could mark 'ready' while an unrelated full rebuild is still mid-flight (WP-545 Ф13).
@@ -1202,6 +1211,26 @@ export async function handleWatchdog(env: ReindexEnv): Promise<void> {
     // the queue consumer's completion path (WP-545 Ф13): only a full-tree rebuild's failure
     // may mark the source 'failed', or a stuck push-triggered job would wrongly fail a source
     // whose full index is actually fine.
+    // One notice per row this UPDATE just moved to 'failed' (the RETURNING rows are the winners).
+    // Complete batches without a recorded final status is a write problem, not a hung worker.
+    const watchdogReason = (r: Record<string, unknown>, never_started: boolean): string => {
+      if (never_started) return "задача так и не стартовала";
+      const done = Number(r.completed_batches);
+      const expected = Number(r.expected_batches);
+      return expected > 0 && done >= expected
+        ? "все пакеты обработаны, но итог не записан"
+        : "задача зависла, пакеты перестали обрабатываться";
+    };
+    for (const [rows, neverStarted] of [[stale, false], [abandoned, true]] as const) {
+      for (const r of rows) {
+        await notifyJobFinished(env, {
+          status: "failed",
+          kind: (r.kind as string) === "full" ? "full" : "incremental",
+          source: r.source as string,
+          reason: watchdogReason(r, neverStarted),
+        });
+      }
+    }
     for (const r of [...stale, ...abandoned]) {
       if ((r.kind as string) !== "full") continue;
       await setSourceIndexState(sql, KNOWLEDGE_TABLES.user_sources(schema), KNOWLEDGE_TABLES.reindex_jobs(schema), r.user_id as string, r.source as string, generationColumn(r.generation), "failed", r.id as string);
