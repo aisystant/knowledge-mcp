@@ -94,6 +94,16 @@ function emptyRepositoryFetch() {
     .mockResolvedValueOnce({ ok: true, json: async () => ({ tree: [], truncated: false }) });
 }
 
+/** The guarded terminal-status write (WP-545 Ф23): never overwrites an already-finished job. */
+function latestGuardedFinish(status: string): unknown[] {
+  const call = [...sqlCalls].reverse().find(([template, ...values]) => {
+    const text = (template as TemplateStringsArray).join(" ");
+    return text.includes("SET status =") && text.includes("status IN ('pending', 'running')") && values.includes(status);
+  });
+  if (!call) throw new Error(`guarded finish to ${status} not found`);
+  return call;
+}
+
 function latestSqlCallContaining(fragment: string): unknown[] {
   const call = [...sqlCalls].reverse().find(([template]) =>
     (template as TemplateStringsArray).join(" ").includes(fragment)
@@ -545,7 +555,8 @@ describe("reindex enumeration failures", () => {
 
     expect(result.status).toBe("failed");
     expect(sendBatch).not.toHaveBeenCalled();
-    expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("status = 'succeeded'"))).toBe(false);
+    expect(() => latestGuardedFinish("succeeded")).toThrow();
+    expect(latestGuardedFinish("failed")).toBeDefined();
     const sourceState = latestSourceIndexStateUpdate();
     expect(sourceState[2]).toBe("failed");
     expect(sqlCalls.some(([t]) => (t as TemplateStringsArray).join(" ").includes("DELETE FROM"))).toBe(false);
@@ -570,7 +581,7 @@ describe("reindex enumeration failures", () => {
     const result = await startReindexJob({ ...ENV, REINDEX_QUEUE: { sendBatch } as unknown as Queue<ReindexBatchMessage> }, USER_ID, "DS-my-strategy");
     expect(result.message).toContain("No files");
     expect(sendBatch).not.toHaveBeenCalled();
-    expect(latestSqlCallContaining("status = 'succeeded'")).toBeDefined();
+    expect(latestGuardedFinish("succeeded")).toBeDefined();
     expect(latestSourceIndexStateUpdate()[2]).toBe("ready");
   });
 
@@ -589,7 +600,7 @@ describe("reindex enumeration failures", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(fetchMock.mock.calls[2][0]).toContain("/branches?per_page=1");
     expect(sendBatch).not.toHaveBeenCalled();
-    expect(latestSqlCallContaining("status = 'succeeded'")).toBeDefined();
+    expect(latestGuardedFinish("succeeded")).toBeDefined();
     expect(latestSourceIndexStateUpdate()[2]).toBe("ready");
   });
 });
