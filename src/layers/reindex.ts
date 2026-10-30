@@ -127,6 +127,32 @@ async function setSourceIndexState(
   ]);
 }
 
+/**
+ * Single writer of a job's terminal status (WP-545 Ф23). The status guard makes the transition
+ * happen at most once: a job already cancelled/failed/succeeded is never overwritten, and the
+ * caller learns whether it was the one that changed the row (the future notifier fires only then).
+ * Under READ COMMITTED a concurrent second UPDATE waits for the first, re-checks the guard and
+ * returns no rows.
+ */
+async function finishJob(
+  sql: ReturnType<typeof personalDb>,
+  jobsTable: string,
+  jobId: string,
+  status: "succeeded" | "failed" | "cancelled",
+  errors?: string[],
+): Promise<boolean> {
+  const rows = errors
+    ? await sql`UPDATE ${sql.unsafe(jobsTable)}
+        SET status = ${status}, finished_at = NOW(), errors = ${JSON.stringify(errors)}::jsonb
+        WHERE id = ${jobId}::uuid AND status IN ('pending', 'running')
+        RETURNING id`
+    : await sql`UPDATE ${sql.unsafe(jobsTable)}
+        SET status = ${status}, finished_at = NOW()
+        WHERE id = ${jobId}::uuid AND status IN ('pending', 'running')
+        RETURNING id`;
+  return rows.length > 0;
+}
+
 function generationColumn(value: unknown): number | null {
   return value === null || value === undefined ? null : Number(value);
 }
@@ -585,9 +611,7 @@ async function enqueueReindexBatches(
     WHERE id = ${jobId}::uuid`);
 
   if (files.length === 0) {
-    await sql`UPDATE ${sql.unsafe(reindexJobsTable)}
-      SET status = 'succeeded', finished_at = NOW()
-      WHERE id = ${jobId}::uuid`;
+    await finishJob(sql, reindexJobsTable, jobId, "succeeded");
     if (kind === "full") {
       await setSourceIndexState(sql, userSourcesTable, reindexJobsTable, userId, source, generation, "ready", jobId);
     }
@@ -760,10 +784,7 @@ export async function startReindexJob(
   try {
     const ctx = await resolveUserContext(env, userId, { includeReindexing: true });
     if (!ctx.sourceNames.includes(source)) {
-      await sql`UPDATE ${sql.unsafe(reindexJobsTable)}
-        SET status = 'failed', finished_at = NOW(),
-            errors = ${JSON.stringify([`Unknown source: ${source}`])}::jsonb
-        WHERE id = ${jobId}::uuid`;
+      await finishJob(sql, reindexJobsTable, jobId, "failed", [`Unknown source: ${source}`]);
       return { job_id: jobId, status: "failed", message: `Unknown source: ${source}`, source };
     }
 
@@ -779,10 +800,7 @@ export async function startReindexJob(
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";
-    await sql`UPDATE ${sql.unsafe(reindexJobsTable)}
-      SET status = 'failed', finished_at = NOW(),
-          errors = ${JSON.stringify([msg])}::jsonb
-      WHERE id = ${jobId}::uuid`;
+    await finishJob(sql, reindexJobsTable, jobId, "failed", [msg]);
     // Fail-closed stays visible as 'failed', never silently 'ready' (WP-560 Ф3).
     await setSourceIndexState(sql, userSourcesTable, reindexJobsTable, userId, source, generation, "failed", jobId);
     return { job_id: jobId, status: "failed", message: `Failed to start reindex: ${msg}`, source };
@@ -931,9 +949,7 @@ export async function startIncrementalReindexJob(
     return { status: "queued", job_id: jobId, message: result.message };
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";
-    await sql`UPDATE ${sql.unsafe(reindexJobsTable)}
-      SET status = 'failed', finished_at = NOW(), errors = ${JSON.stringify([msg])}::jsonb
-      WHERE id = ${jobId}::uuid`;
+    await finishJob(sql, reindexJobsTable, jobId, "failed", [msg]);
     return { status: "failed", job_id: jobId, message: `Failed to enqueue incremental reindex: ${msg}` };
   }
 }
@@ -1098,11 +1114,7 @@ export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env:
         // Use errors accumulated by the atomic UPDATE, not just this batch's result: the
         // final batch can succeed after an earlier one failed. Keep the existing status enum.
         const completionStatus = errors?.length ? "failed" : "succeeded";
-        await sql`
-          UPDATE ${sql.unsafe(KNOWLEDGE_TABLES.reindex_jobs(schema))}
-            SET status = ${completionStatus}, finished_at = NOW()
-            WHERE id = ${job_id}::uuid AND status = 'running'
-        `;
+        await finishJob(sql, KNOWLEDGE_TABLES.reindex_jobs(schema), job_id, completionStatus);
         // Only a full-tree rebuild may declare the source's index 'ready' — an incremental
         // (webhook push) job completing must never flip index_state, or a fast push-triggered
         // job could mark 'ready' while an unrelated full rebuild is still mid-flight (WP-545 Ф13).
