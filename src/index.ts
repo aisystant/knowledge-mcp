@@ -18,6 +18,7 @@ export { normalizeSearchResultLimit } from "./search-limits.js";
 
 import { neon, type NeonQueryFunction, type Pool } from "@neondatabase/serverless";
 import { withUserContext, createRequestPool } from "./rls.js";
+import { resolveVectorScanConfig, applyVectorScanSettings, isStatementTimeout, VectorScanTimeoutError, type VectorScanEnv } from "./vector-scan.js";
 import { beginObservation, enqueueObservation, recordObservationFeedback, expireObservations,
   type ObservationEnv, type ObservationRuntime } from "./retrieval-observations.js";
 import {
@@ -59,7 +60,7 @@ import { handleQueue, handleWatchdog, startReindexJob, startIncrementalReindexJo
 
 // --- Types ---
 
-export interface Env extends ObservationEnv {
+export interface Env extends ObservationEnv, VectorScanEnv {
   /** Cloudflare runtime version id/tag; exposed on /health for deploy provenance checks. */
   CF_VERSION_METADATA?: WorkerVersionMetadata;
   /** Neon `knowledge` БД connection string (knowledge_chunk + concept_graph). Required. */
@@ -1019,7 +1020,14 @@ async function vectorSearch(
 
   // WP-268: knowledge_chunk schema with id/filename/source_type aliases.
   // WP-7 Ф-L2-PRIVACY: explicit account_id filter — defense-in-depth alongside RLS (mvp/015).
-  const rows = await withUserContext(activeDsn(env), userId, (sql) => sql`
+  // WP-596 Ф10 п.12: with VECTOR_ITERATIVE_SCAN on, the HNSW scan continues until enough rows pass the filters.
+  const scan = resolveVectorScanConfig(env);
+  const scanStarted = Date.now();
+  let rows;
+  try {
+    rows = await withUserContext(activeDsn(env), userId, async (sql) => {
+      await applyVectorScanSettings(sql, scan);
+      return sql`
     SELECT legacy_id AS id, source_uri AS filename,
            CASE WHEN ${["hash", "platform-text"].includes(env.RETRIEVAL_OBSERVATION_MODE ?? "")}
                 THEN encode(sha256(convert_to(content, 'UTF8')), 'hex') END AS indexed_content_hash,
@@ -1036,7 +1044,27 @@ async function vectorSearch(
       AND NOT (source = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[]))
     ORDER BY embedding <=> ${vec}::vector
     LIMIT ${limit}
-  `, pool, trace);
+  `;
+    }, pool, trace);
+  } catch (error) {
+    if (scan.mode !== "off" && isStatementTimeout(error)) {
+      throw new VectorScanTimeoutError(scan.mode, scan.statementTimeoutMs, error);
+    }
+    throw error;
+  }
+  // relaxed_order may return rows slightly out of distance order, while callers read rows[0] as the best hit
+  // (confidence threshold below); ORDER BY cannot repair this because it is satisfied by the index scan.
+  if (scan.mode === "relaxed_order") rows.sort((a, b) => (b.score as number) - (a.score as number));
+  if (scan.mode !== "off") {
+    console.info(JSON.stringify({
+      event: "knowledge_search_vector_scan",
+      mode: scan.mode,
+      max_scan_tuples: scan.maxScanTuples ?? null,
+      duration_ms: Date.now() - scanStarted,
+      rows: rows.length,
+      source_filter_present: src !== null,
+    }));
+  }
 
   return rows.map((r) => {
     const source = (r.source as string) || "";
@@ -1246,6 +1274,17 @@ export async function searchDocuments(
       try {
         vectorResults = await trace.run("vector", () => vectorSearch(env, query, source, sourceType, fetchLimit, userId, pool, trace));
       } catch (error) {
+        if (error instanceof VectorScanTimeoutError) {
+          console.warn(JSON.stringify({
+            event: "knowledge_search_vector_scan_timeout",
+            mode: error.mode,
+            timeout_ms: error.timeoutMs,
+            fallback: "keyword",
+            source_filter_present: source !== undefined,
+            source_type_filter_present: sourceType !== undefined,
+          }));
+          return await enrich(await keyword());
+        }
         if (!(error instanceof EmbeddingUnavailableError)) throw error;
 
         console.warn(JSON.stringify({
