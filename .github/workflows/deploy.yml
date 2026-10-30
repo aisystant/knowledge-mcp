@@ -33,6 +33,9 @@ jobs:
         run: bash scripts/verified-deploy.sh
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # ВНИМАНИЕ: репозиторий aisystant/personal-knowledge-mcp АРХИВИРОВАН (31.08.2026), а ВОРКЕР
+      # Cloudflare personal-knowledge-mcp ЖИВОЙ и обслуживает личные источники (/reindex, очередь,
+      # сторожевой процесс). Имя воркера — историческое. Не отключать воркер по статусу репозитория.
       # WP-545 Ф5: единый канонический путь деплоя воркера personal-knowledge-mcp
       # из unified-дерева (завершение cut-over WP-410, АрхГейт WP-7 Ф100 accepted).
       # По умолчанию ВЫКЛЮЧЕНО: включается repo variable PERSONAL_WORKER_DEPLOY_ENABLED=true.
