@@ -7,7 +7,7 @@ const CURSOR_MAX_LENGTH = 512;
 type RequestId = string | number;
 type ResponseEnvelope = { jsonrpc: "2.0"; id: RequestId | null; result?: unknown; error?: { code: number; message: string } };
 type Problem = { code: PrivateReadErrorCode; message: string };
-type DocumentCursor = { offset: number; binding: string; revision: string; end?: number };
+type DocumentCursor = { offset: number; binding: string; revision: string; end?: number; sel?: "section" };
 
 export function privateResponseBytes(response: ResponseEnvelope): number {
   return new TextEncoder().encode(JSON.stringify(response)).length;
@@ -120,13 +120,16 @@ function decodeCursor(value: unknown): DocumentCursor | null {
   const keys = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? Object.keys(parsed).sort().join(",") : "";
   // "end" is optional: absent means "to the end of the whole document" (plain forward paging,
   // unchanged shape of every cursor issued before the section selector existed, WP-7 Ф204).
-  if (keys !== "binding,offset,revision" && keys !== "binding,end,offset,revision") {
+  // "sel" is optional too (WP-613): a section window that reaches the end of the document has no
+  // "end", so only this marker tells a later page that it is still a selection, not the whole file.
+  if (!["binding,offset,revision", "binding,end,offset,revision", "binding,offset,revision,sel", "binding,end,offset,revision,sel"].includes(keys)) {
     throw new Error("Invalid document cursor");
   }
   if (!Number.isSafeInteger(parsed.offset) || parsed.offset < 0
     || typeof parsed.binding !== "string" || typeof parsed.revision !== "string"
     || !/^[a-f0-9]{64}$/.test(parsed.binding) || !/^[a-f0-9]{64}$/.test(parsed.revision)
-    || (parsed.end !== undefined && (!Number.isSafeInteger(parsed.end) || parsed.end < parsed.offset))) {
+    || (parsed.end !== undefined && (!Number.isSafeInteger(parsed.end) || parsed.end < parsed.offset))
+    || (parsed.sel !== undefined && parsed.sel !== "section")) {
     throw new Error("Invalid document cursor");
   }
   return parsed as DocumentCursor;
@@ -191,16 +194,30 @@ function contentKey(read: DocumentRead): ContentField {
   return read.contentField ?? "content";
 }
 
+/** WP-613: a read that returns only part of the document by request (the end of it, or one section
+ * window). `content_scope` keeps meaning where the text was read from; this field says the body is
+ * not the whole file, so a caller does not rewrite the file from it. */
+type Selection = { kind: "tail_lines" | "section" };
+
+function selectionInstruction(live: boolean): string {
+  return live
+    ? "This is only a selection of the document, not the whole file (the end of it, or one section window); sha belongs to the complete file. To edit, use mode:'append' or 'str_replace' with expected_sha; do not rewrite the file from this text."
+    : "This is only a selection of the indexed representation, which may be a legacy fragment, not the whole file; use include_sha:true to read the exact file before editing.";
+}
+
 /** Shared document metadata envelope — identical for every read shape (plain, paged, tail). */
-function documentEnvelope(doc: PersonalDocument, read: DocumentRead, readMode: "live" | "indexed") {
+function documentEnvelope(doc: PersonalDocument, read: DocumentRead, readMode: "live" | "indexed", selection?: Selection) {
   return {
     filename: doc.filename, source: doc.source,
     ...(read.live ? { sha: doc.sha, ...(read.ref !== undefined ? { ref: read.ref } : {}) } : {}),
     read_mode: readMode,
     content_scope: read.live ? "full_file" : "indexed_representation",
-    instruction: read.live
-      ? "Collect all pages before editing; sha belongs to the complete file."
-      : "complete covers this indexed representation, which may be a legacy fragment; use include_sha:true for the exact file.",
+    ...(selection ? { selection } : {}),
+    instruction: selection
+      ? selectionInstruction(read.live)
+      : read.live
+        ? "Collect all pages before editing; sha belongs to the complete file."
+        : "complete covers this indexed representation, which may be a legacy fragment; use include_sha:true for the exact file.",
   };
 }
 
@@ -231,13 +248,14 @@ async function pagedDocumentResponse(id: RequestId, doc: PersonalDocument, read:
   // Hoisted out of render(): both are O(document size) and render() runs once per bisection step.
   const totalLines = countLines(doc.content);
   const totalBytes = new TextEncoder().encode(doc.content).length;
+  const isSection = read.section !== undefined || cursor?.sel === "section";
   const render = (end: number): ResponseEnvelope => textResponse(id, JSON.stringify({
-    ...documentEnvelope(doc, read, readMode),
+    ...documentEnvelope(doc, read, readMode, isSection ? { kind: "section" } : undefined),
     [contentKey(read)]: doc.content.slice(start, end),
     total_lines: totalLines, total_bytes: totalBytes,
     revision: `v1:${revision}`,
     complete: end === boundEnd,
-    next_cursor: end === boundEnd ? null : encodeCursor({ offset: end, binding, revision, ...(boundEnd !== doc.content.length ? { end: boundEnd } : {}) }),
+    next_cursor: end === boundEnd ? null : encodeCursor({ offset: end, binding, revision, ...(boundEnd !== doc.content.length ? { end: boundEnd } : {}), ...(isSection ? { sel: "section" as const } : {}) }),
   }, null, 2));
 
   const remainder = render(boundEnd);
@@ -291,7 +309,7 @@ async function tailLinesDocumentResponse(id: RequestId, doc: PersonalDocument, r
   const requested = read.tailLines!;
 
   const render = (start: number, linesReturned: number, partialLine: boolean): ResponseEnvelope => textResponse(id, JSON.stringify({
-    ...documentEnvelope(doc, read, readMode),
+    ...documentEnvelope(doc, read, readMode, { kind: "tail_lines" }),
     [contentKey(read)]: doc.content.slice(start),
     lines_returned: linesReturned, total_lines: totalLines, total_bytes: totalBytes,
     truncated: linesReturned < Math.min(requested, totalLines) || partialLine,
