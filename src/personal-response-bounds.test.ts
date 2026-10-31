@@ -390,3 +390,70 @@ describe("document cursor backward compatibility (WP-7 Ф204)", () => {
     expect(data(response).error).toBe("invalid_cursor");
   });
 });
+
+describe("content_field opt-in (WP-613: ChatGPT shows {} for a JSON result with a top-level content key)", () => {
+  const live = { ...doc, sha: "a".repeat(40), content: "line one\nline two\nline three\n" };
+
+  it("keeps `content` by default in every JSON read shape", async () => {
+    expect(data(await buildPrivateDocumentResponse(1, live, { ...indexed, live: true })).content).toBe(live.content);
+    expect(data(await buildPrivateDocumentResponse(1, live, { ...indexed, live: true, cursor: "start" })).content).toBe(live.content);
+    expect(data(await buildPrivateDocumentResponse(1, live, { ...indexed, live: true, tailLines: 2 })).content).toBe("line two\nline three\n");
+  });
+
+  it.each([
+    ["include_sha", { live: true } as const, live.content],
+    ["cursor", { live: true, cursor: "start" } as const, live.content],
+    ["tail_lines", { live: true, tailLines: 2 } as const, "line two\nline three\n"],
+    ["indexed cursor", { live: false, cursor: "start" } as const, live.content],
+  ])("moves the text to `body` and drops `content` for %s", async (_name, read, expected) => {
+    const page = data(await buildPrivateDocumentResponse(1, live, { ...indexed, ...read, contentField: "body" }));
+    expect(page.body).toBe(expected);
+    expect(page).not.toHaveProperty("content");
+    expect(page.filename).toBe(live.filename);
+  });
+
+  it("pages a document larger than the budget in `body` mode and rebuilds the exact text", async () => {
+    const big = { ...live, content: "строка 😀 line\n".repeat(6_000) };
+    let cursor: string | null = "start";
+    let combined = "";
+    let pages = 0;
+    do {
+      const response = await buildPrivateDocumentResponse(1, big, { ...indexed, live: true, cursor, contentField: "body" });
+      assertBounded(response);
+      const page = data(response);
+      expect(page).not.toHaveProperty("content");
+      expect(page.body.length).toBeGreaterThan(0);
+      combined += page.body;
+      cursor = page.next_cursor;
+      pages += 1;
+    } while (cursor !== null && pages < 50);
+    expect(pages).toBeGreaterThan(1);
+    expect(combined).toBe(big.content);
+  });
+
+  it("a cursor made in `body` mode is accepted without the flag and answers under `content`", async () => {
+    const big = { ...live, content: "x".repeat(60_000) };
+    const first = data(await buildPrivateDocumentResponse(1, big, { ...indexed, live: true, cursor: "start", contentField: "body" }));
+    const second = data(await buildPrivateDocumentResponse(1, big, { ...indexed, live: true, cursor: first.next_cursor }));
+    expect(second.content.length).toBeGreaterThan(0);
+    expect(second).not.toHaveProperty("body");
+  });
+
+  it("applies `body` to a section read", async () => {
+    const withHeadings = { ...live, content: "# A\nalpha\n# B\nbeta\n" };
+    const section = { start: 4, end: 10 };
+    const page = data(await buildPrivateDocumentResponse(1, withHeadings, { ...indexed, live: true, section, contentField: "body" }));
+    expect(page.body).toBe(withHeadings.content.slice(4, 10));
+    expect(page).not.toHaveProperty("content");
+  });
+
+  it.each([null, 1, [], "", "BODY"])("rejects content_field=%j", value => {
+    expect(validateDocumentPageRequest({ content_field: value })).toMatchObject({ code: "invalid_arguments" });
+  });
+
+  it("rejects an unknown content_field name, accepts both known ones", () => {
+    expect(validateDocumentPageRequest({ content_field: "text" })).toMatchObject({ code: "invalid_arguments" });
+    expect(validateDocumentPageRequest({ content_field: "body" })).toBeNull();
+    expect(validateDocumentPageRequest({ content_field: "content", tail_lines: 2 })).toBeNull();
+  });
+});

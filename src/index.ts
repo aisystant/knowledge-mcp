@@ -1,6 +1,6 @@
 import { ReadFailure, withReadDeadline, readJson, createReadTrace, type ReadTrace } from "./read-failure.js";
 import { normalizeSearchResultLimit, SEARCH_RESULT_LIMIT_MAX } from "./search-limits.js";
-import { buildPrivateDocumentResponse, buildPrivateSearchResponse, enforcePrivateReadBudget, privateReadError, privateReadIdError, validateDocumentPageRequest } from "./personal-response-bounds.js";
+import { buildPrivateDocumentResponse, buildPrivateSearchResponse, enforcePrivateReadBudget, privateReadError, privateReadIdError, validateDocumentPageRequest, type ContentField } from "./personal-response-bounds.js";
 export { normalizeSearchResultLimit } from "./search-limits.js";
 /**
  * Knowledge MCP Server v4.1 — L2 Platform — Hybrid Search + Parent Retrieval + LLM Reranking + Feedback Loop
@@ -3261,7 +3261,8 @@ function privateToolDefinition(tool: (typeof TOOLS)[number]) {
       ...tool.inputSchema,
       properties: {
         ...tool.inputSchema.properties,
-        cursor: { type: "string", maxLength: 512, description: "Private full reads only: 'start' opts into JSON pages; copy next_cursor with the same filename/source/include_sha/ref. On document_changed, discard pages and restart. Each page rechecks access. Not combinable with headings, tail_lines or section." },
+        cursor: { type: "string", maxLength: 512, description: "Private full reads only: 'start' opts into JSON pages; copy next_cursor with the same filename/source/include_sha/ref/content_field (the key name is not stored in the cursor: omit content_field on a later page and that page uses `content`). On document_changed, discard pages and restart. Each page rechecks access. Not combinable with headings, tail_lines or section." },
+        content_field: { type: "string", enum: ["content", "body"], description: "Name of the JSON key that carries the document text in include_sha, ref, cursor, tail_lines and section responses. Default 'content'. Pass 'body' if a client shows an empty {} for those responses: the value is identical, only the key name differs. Has no effect on plain reads and format:'headings'." },
         tail_lines: { type: "integer", minimum: 1, description: "Private full reads only: the last N whole lines of the document, cheaper than paging from the start when you only need the end (e.g. before appending). If the budget cannot fit N lines, returns as many as fit with truncated:true; if even one line cannot fit, returns its tail with partial_line:true rather than nothing. Not combinable with cursor or section." },
         section: { type: "string", description: "Private full reads only: the content under one heading (its title, exact match — copy it from format:'headings' rather than retyping, leading/trailing whitespace is not trimmed), up to the next heading of the same or higher level or the end of the document. Headings inside fenced code blocks or YAML frontmatter do not count. No match returns the document's heading outline (error section_not_found); more than one match returns their line numbers (error section_ambiguous) — call get_document(format:'headings') or disambiguate and retry. A section larger than the budget pages the same way as cursor, via next_cursor. Not combinable with cursor or tail_lines." },
       },
@@ -3810,6 +3811,7 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
             const filename = args.filename as string;
             const ref = args.ref as string | undefined;
             const tailLines = args.tail_lines as number | undefined;
+            const contentField = args.content_field as ContentField | undefined;
             const sectionTitle = args.section as string | undefined;
 
             // GitHub's Contents API treats an empty ref value as "no ref" and returns the
@@ -3854,6 +3856,7 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
               }
               return await buildPrivateDocumentResponse(id, liveResult, {
                 userId: principal.userId, live: true, ref, cursor: args.cursor,
+                ...(contentField !== undefined ? { contentField } : {}),
                 ...(tailLines !== undefined ? { tailLines } : {}),
                 ...(liveSection ? { section: liveSection } : {}),
               });
@@ -3879,6 +3882,7 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
             }
             return await buildPrivateDocumentResponse(id, doc, {
               userId: principal.userId, live: false, cursor: args.cursor,
+              ...(contentField !== undefined ? { contentField } : {}),
               ...(args.format === "headings" ? { headings: documentHeadings(doc.content) } : {}),
               ...(tailLines !== undefined ? { tailLines } : {}),
               ...(indexedSection ? { section: indexedSection } : {}),
