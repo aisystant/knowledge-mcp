@@ -137,6 +137,9 @@ function encodeCursor(cursor: DocumentCursor): string {
 }
 
 export function validateDocumentPageRequest(args: Record<string, unknown>): Problem | null {
+  if (args.content_field !== undefined && !CONTENT_FIELDS.includes(args.content_field as ContentField)) {
+    return { code: "invalid_arguments", message: "content_field must be 'content' or 'body'." };
+  }
   const selectors = ["cursor", "tail_lines", "section"].filter(key => args[key] !== undefined);
   if (selectors.length > 1) {
     return { code: "invalid_arguments", message: `Only one of cursor, tail_lines, section may be given at once (got ${selectors.join(", ")}).` };
@@ -174,7 +177,19 @@ type SectionBound = { start: number; end: number };
 type DocumentRead = {
   userId: string; live: boolean; ref?: string; cursor?: unknown; headings?: unknown[];
   tailLines?: number; section?: SectionBound;
+  /** Name of the JSON key that carries the document text; `content` unless the caller opts into `body`. */
+  contentField?: ContentField;
 };
+
+/** WP-613: ChatGPT shows `{}` for a successful JSON result whose text has a top-level `content` key
+ * (include_sha, cursor, tail_lines, section, ref all failed; JSON without that key, errors included, arrived).
+ * `body` carries the same value under another name and is opt-in, so the default contract is unchanged. */
+export type ContentField = "content" | "body";
+export const CONTENT_FIELDS: readonly ContentField[] = ["content", "body"];
+
+function contentKey(read: DocumentRead): ContentField {
+  return read.contentField ?? "content";
+}
 
 /** Shared document metadata envelope — identical for every read shape (plain, paged, tail). */
 function documentEnvelope(doc: PersonalDocument, read: DocumentRead, readMode: "live" | "indexed") {
@@ -218,7 +233,7 @@ async function pagedDocumentResponse(id: RequestId, doc: PersonalDocument, read:
   const totalBytes = new TextEncoder().encode(doc.content).length;
   const render = (end: number): ResponseEnvelope => textResponse(id, JSON.stringify({
     ...documentEnvelope(doc, read, readMode),
-    content: doc.content.slice(start, end),
+    [contentKey(read)]: doc.content.slice(start, end),
     total_lines: totalLines, total_bytes: totalBytes,
     revision: `v1:${revision}`,
     complete: end === boundEnd,
@@ -277,7 +292,7 @@ async function tailLinesDocumentResponse(id: RequestId, doc: PersonalDocument, r
 
   const render = (start: number, linesReturned: number, partialLine: boolean): ResponseEnvelope => textResponse(id, JSON.stringify({
     ...documentEnvelope(doc, read, readMode),
-    content: doc.content.slice(start),
+    [contentKey(read)]: doc.content.slice(start),
     lines_returned: linesReturned, total_lines: totalLines, total_bytes: totalBytes,
     truncated: linesReturned < Math.min(requested, totalLines) || partialLine,
     partial_line: partialLine,
@@ -342,7 +357,7 @@ export async function buildPrivateDocumentResponse(id: RequestId, doc: PersonalD
     return pagedDocumentResponse(id, doc, { ...read, cursor: read.cursor === undefined ? "start" : read.cursor });
   }
   const text = read.live
-    ? JSON.stringify({ filename: doc.filename, source: doc.source, sha: doc.sha, ...(read.ref ? { ref: read.ref } : {}), content: doc.content }, null, 2)
+    ? JSON.stringify({ filename: doc.filename, source: doc.source, sha: doc.sha, ...(read.ref ? { ref: read.ref } : {}), [contentKey(read)]: doc.content }, null, 2)
     : read.headings !== undefined
       ? JSON.stringify({ filename: doc.filename, headings: read.headings }, null, 2)
       : doc.content;

@@ -390,3 +390,31 @@ describe("document cursor backward compatibility (WP-7 Ф204)", () => {
     expect(data(response).error).toBe("invalid_cursor");
   });
 });
+
+describe("content_field opt-in (WP-613: ChatGPT shows {} for a JSON result with a top-level content key)", () => {
+  const live = { ...doc, sha: "a".repeat(40), content: "line one\nline two\nline three\n" };
+
+  it("keeps `content` by default in every JSON read shape", async () => {
+    expect(data(await buildPrivateDocumentResponse(1, live, { ...indexed, live: true })).content).toBe(live.content);
+    expect(data(await buildPrivateDocumentResponse(1, live, { ...indexed, live: true, cursor: "start" })).content).toBe(live.content);
+    expect(data(await buildPrivateDocumentResponse(1, live, { ...indexed, live: true, tailLines: 2 })).content).toBe("line two\nline three\n");
+  });
+
+  it.each([
+    ["include_sha", { live: true } as const, live.content],
+    ["cursor", { live: true, cursor: "start" } as const, live.content],
+    ["tail_lines", { live: true, tailLines: 2 } as const, "line two\nline three\n"],
+    ["indexed cursor", { live: false, cursor: "start" } as const, live.content],
+  ])("moves the text to `body` and drops `content` for %s", async (_name, read, expected) => {
+    const page = data(await buildPrivateDocumentResponse(1, live, { ...indexed, ...read, contentField: "body" }));
+    expect(page.body).toBe(expected);
+    expect(page).not.toHaveProperty("content");
+    expect(page.filename).toBe(live.filename);
+  });
+
+  it("rejects an unknown content_field name, accepts both known ones", () => {
+    expect(validateDocumentPageRequest({ content_field: "text" })).toMatchObject({ code: "invalid_arguments" });
+    expect(validateDocumentPageRequest({ content_field: "body" })).toBeNull();
+    expect(validateDocumentPageRequest({ content_field: "content", tail_lines: 2 })).toBeNull();
+  });
+});
