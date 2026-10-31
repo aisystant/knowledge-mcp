@@ -502,6 +502,29 @@ describe("selection marker for partial reads (WP-613, Maria's LPF report)", () =
     expect(pages).toBeGreaterThan(1);
   });
 
+  it("keeps the marker on pages of a section window that stops before the end, in body mode too", async () => {
+    const big = { ...live, content: "before\n## Keep\n" + "x".repeat(60_000) + "\n## Next\nafter" };
+    const window = { start: big.content.indexOf("## Keep"), end: big.content.indexOf("## Next") };
+    let cursor: string | null = "start";
+    let pages = 0;
+    let combined = "";
+    do {
+      const page = data(await buildPrivateDocumentResponse(1, big, { ...indexed, live: true, cursor, contentField: "body", ...(cursor === "start" ? { section: window } : {}) }));
+      expect(page.selection).toEqual({ kind: "section" });
+      expect(page).not.toHaveProperty("content");
+      combined += page.body;
+      cursor = page.next_cursor;
+      if (cursor !== null) {
+        // the cursor of this shape carries both the upper bound and the marker
+        expect(Object.keys(JSON.parse(atob(cursor.slice(3).replace(/-/g, "+").replace(/_/g, "/")))).sort().join(","))
+          .toBe("binding,end,offset,revision,sel");
+      }
+      expect(++pages).toBeLessThan(20);
+    } while (cursor);
+    expect(pages).toBeGreaterThan(1);
+    expect(combined).toBe(big.content.slice(window.start, window.end));
+  });
+
   it("leaves whole-file reads untouched: no selection field, original instruction", async () => {
     const big = { ...live, content: "y".repeat(60_000) };
     const first = data(await buildPrivateDocumentResponse(1, big, { ...indexed, live: true, cursor: "start" }));
