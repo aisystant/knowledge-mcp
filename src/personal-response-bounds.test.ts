@@ -457,3 +457,71 @@ describe("content_field opt-in (WP-613: ChatGPT shows {} for a JSON result with 
     expect(validateDocumentPageRequest({ content_field: "content", tail_lines: 2 })).toBeNull();
   });
 });
+
+describe("selection marker for partial reads (WP-613, Maria's LPF report)", () => {
+  const live = { ...doc, sha: "a".repeat(40), content: "KEEP head\nline two\nline three\n" };
+
+  it("marks a live tail_lines read as a selection and tells the caller not to rewrite the file", async () => {
+    const page = data(await buildPrivateDocumentResponse(1, live, { ...indexed, live: true, tailLines: 2 }));
+    expect(page.selection).toEqual({ kind: "tail_lines" });
+    expect(page.content).not.toContain("KEEP");
+    expect(page.sha).toBe(live.sha);
+    expect(page.content_scope).toBe("full_file");
+    expect(page.instruction).toContain("only a selection");
+    expect(page.instruction).toContain("do not rewrite the file");
+    expect(page.instruction).not.toContain("Collect all pages");
+  });
+
+  it("keeps the legacy-fragment warning on an indexed tail_lines read", async () => {
+    const page = data(await buildPrivateDocumentResponse(1, live, { ...indexed, tailLines: 2 }));
+    expect(page.selection).toEqual({ kind: "tail_lines" });
+    expect(page.content_scope).toBe("indexed_representation");
+    expect(page.instruction).toContain("legacy fragment");
+    expect(page.instruction).toContain("include_sha:true");
+  });
+
+  it("marks a tail_lines read that did not fit the budget (partial_line) as a selection too", async () => {
+    const huge = { ...live, content: "head\n" + "x".repeat(40_000) };
+    const page = data(await buildPrivateDocumentResponse(1, huge, { ...indexed, live: true, tailLines: 1 }));
+    expect(page.partial_line).toBe(true);
+    expect(page.selection).toEqual({ kind: "tail_lines" });
+  });
+
+  it("marks a section read and every later page of its window, also when the window reaches the end", async () => {
+    const big = { ...live, content: "before\n## Keep\n" + "x".repeat(60_000) };
+    const window = { start: big.content.indexOf("## Keep"), end: big.content.length };
+    let cursor: string | null = "start";
+    let pages = 0;
+    do {
+      const page = data(await buildPrivateDocumentResponse(1, big, { ...indexed, live: true, cursor, ...(cursor === "start" ? { section: window } : {}) }));
+      expect(page.selection).toEqual({ kind: "section" });
+      expect(page.instruction).toContain("only a selection");
+      cursor = page.next_cursor;
+      expect(++pages).toBeLessThan(20);
+    } while (cursor);
+    expect(pages).toBeGreaterThan(1);
+  });
+
+  it("leaves whole-file reads untouched: no selection field, original instruction", async () => {
+    const big = { ...live, content: "y".repeat(60_000) };
+    const first = data(await buildPrivateDocumentResponse(1, big, { ...indexed, live: true, cursor: "start" }));
+    const second = data(await buildPrivateDocumentResponse(1, big, { ...indexed, live: true, cursor: first.next_cursor }));
+    for (const page of [first, second]) {
+      expect(page).not.toHaveProperty("selection");
+      expect(page.instruction).toBe("Collect all pages before editing; sha belongs to the complete file.");
+    }
+    const plain = data(await buildPrivateDocumentResponse(1, live, { ...indexed, live: true }));
+    expect(plain).not.toHaveProperty("selection");
+  });
+
+  it("still accepts a cursor issued before the marker existed, and rejects a bad marker", async () => {
+    const big = { ...live, content: "z".repeat(60_000) };
+    const first = data(await buildPrivateDocumentResponse(1, big, { ...indexed, live: true, cursor: "start" }));
+    const parsed = JSON.parse(atob(first.next_cursor.slice(3).replace(/-/g, "+").replace(/_/g, "/")));
+    expect(parsed).not.toHaveProperty("sel");
+    const forged = "d1." + btoa(JSON.stringify({ ...parsed, sel: "tail" })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const rejected = await buildPrivateDocumentResponse(1, big, { ...indexed, live: true, cursor: forged });
+    expect(result(rejected).isError).toBe(true);
+    expect(data(rejected).error).toBe("invalid_cursor");
+  });
+});
