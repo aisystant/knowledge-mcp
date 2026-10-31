@@ -412,6 +412,45 @@ describe("content_field opt-in (WP-613: ChatGPT shows {} for a JSON result with 
     expect(page.filename).toBe(live.filename);
   });
 
+  it("pages a document larger than the budget in `body` mode and rebuilds the exact text", async () => {
+    const big = { ...live, content: "строка 😀 line\n".repeat(6_000) };
+    let cursor: string | null = "start";
+    let combined = "";
+    let pages = 0;
+    do {
+      const response = await buildPrivateDocumentResponse(1, big, { ...indexed, live: true, cursor, contentField: "body" });
+      assertBounded(response);
+      const page = data(response);
+      expect(page).not.toHaveProperty("content");
+      expect(page.body.length).toBeGreaterThan(0);
+      combined += page.body;
+      cursor = page.next_cursor;
+      pages += 1;
+    } while (cursor !== null && pages < 50);
+    expect(pages).toBeGreaterThan(1);
+    expect(combined).toBe(big.content);
+  });
+
+  it("a cursor made in `body` mode is accepted without the flag and answers under `content`", async () => {
+    const big = { ...live, content: "x".repeat(60_000) };
+    const first = data(await buildPrivateDocumentResponse(1, big, { ...indexed, live: true, cursor: "start", contentField: "body" }));
+    const second = data(await buildPrivateDocumentResponse(1, big, { ...indexed, live: true, cursor: first.next_cursor }));
+    expect(second.content.length).toBeGreaterThan(0);
+    expect(second).not.toHaveProperty("body");
+  });
+
+  it("applies `body` to a section read", async () => {
+    const withHeadings = { ...live, content: "# A\nalpha\n# B\nbeta\n" };
+    const section = { start: 4, end: 10 };
+    const page = data(await buildPrivateDocumentResponse(1, withHeadings, { ...indexed, live: true, section, contentField: "body" }));
+    expect(page.body).toBe(withHeadings.content.slice(4, 10));
+    expect(page).not.toHaveProperty("content");
+  });
+
+  it.each([null, 1, [], "", "BODY"])("rejects content_field=%j", value => {
+    expect(validateDocumentPageRequest({ content_field: value })).toMatchObject({ code: "invalid_arguments" });
+  });
+
   it("rejects an unknown content_field name, accepts both known ones", () => {
     expect(validateDocumentPageRequest({ content_field: "text" })).toMatchObject({ code: "invalid_arguments" });
     expect(validateDocumentPageRequest({ content_field: "body" })).toBeNull();
