@@ -10,6 +10,7 @@ import { ReadFailure } from "./read-failure.js";
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { neon } from "@neondatabase/serverless";
+import { SERVICE_ONLY_TOOL_NAMES } from "./concept-list.js";
 
 // personalDb() (layers/personal.js) is just `neon(env.DATABASE_URL)` in production — the
 // mock below must go through this SAME vi.fn so a single mockImplementationOnce override
@@ -289,7 +290,8 @@ describe("dual-mode routing: private mode reaches the personal layer, never the 
     expect(withoutDescriptions(privateSearch.inputSchema)).toEqual(withoutDescriptions(publicSearch.inputSchema));
     expect(privateSearch.annotations).toEqual(publicSearch.annotations);
     const publicResponse = await handleMcpRequest(request, ENV, undefined, "public");
-    expect(publicResponse.result).toEqual({ tools: publicBefore });
+    // Service-only tools (concept_list) are not advertised to an anonymous caller.
+    expect(publicResponse.result).toEqual({ tools: publicBefore.filter(tool => !SERVICE_ONLY_TOOL_NAMES.has(tool.name)) });
     expect(TOOLS).toEqual(publicBefore);
   });
 
