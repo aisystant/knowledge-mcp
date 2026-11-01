@@ -2546,18 +2546,27 @@ async function getGraphStats(env: Env) {
   return withUserContext(activeDsn(env), null, async (sql) => {
     // Publishable English names among active concepts. The blank-character set is the same
     // string nameEnFields uses, so this count equals the per-concept name_en_publishable flags.
-    // NOW() is the transaction start: as_of describes this query (concepts and the name_en count).
+    // NOW() is the transaction start: as_of describes this query (concepts and the name_en counts).
+    // The "hidden" counts are the concepts the closed-source deny-list keeps out of every concept
+    // tool: a snapshot taken through the gateway has (concepts - hidden) rows, and its publishable
+    // rows equal name_en_publishable_count - name_en_publishable_hidden_count.
     const [conceptCount] = await sql`
+      WITH active AS (
+        SELECT
+          (name_en IS NOT NULL
+            AND btrim(name_en, ${NAME_EN_BLANK_CHARS}) <> ''
+            AND name_en_status = ${NAME_EN_PUBLISHABLE_STATUS}) AS publishable,
+          (source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])) AS hidden
+        FROM ${sql.unsafe(conceptsTable)}
+        WHERE status = 'active'
+      )
       SELECT
         COUNT(*)::int AS cnt,
-        (COUNT(*) FILTER (
-          WHERE name_en IS NOT NULL
-            AND btrim(name_en, ${NAME_EN_BLANK_CHARS}) <> ''
-            AND name_en_status = ${NAME_EN_PUBLISHABLE_STATUS}
-        ))::int AS name_en_publishable_count,
+        (COUNT(*) FILTER (WHERE publishable))::int AS name_en_publishable_count,
+        (COUNT(*) FILTER (WHERE hidden))::int AS hidden_by_closed_sources_count,
+        (COUNT(*) FILTER (WHERE hidden AND publishable))::int AS name_en_publishable_hidden_count,
         NOW() AS as_of
-      FROM ${sql.unsafe(conceptsTable)}
-      WHERE status = 'active'
+      FROM active
     `;
     const [edgeCount] = await sql`SELECT COUNT(*)::int AS cnt FROM ${sql.unsafe(conceptEdgesTable)}`;
     const [miscCount] = await sql`SELECT COUNT(*)::int AS cnt FROM ${sql.unsafe(misconceptionsTable)}`;
@@ -2625,6 +2634,8 @@ async function getGraphStats(env: Env) {
       top_central: topCentral,
       name_en_publishable_count: conceptCount.name_en_publishable_count,
       name_en_publishable_share: nameEnPublishableShare(Number(conceptCount.name_en_publishable_count), Number(conceptCount.cnt)),
+      hidden_by_closed_sources_count: conceptCount.hidden_by_closed_sources_count,
+      name_en_publishable_hidden_count: conceptCount.name_en_publishable_hidden_count,
       as_of: nameEnAsOf(conceptCount.as_of),
     };
   });
@@ -2936,7 +2947,7 @@ export const TOOLS = [
   {
     name: "graph_stats",
     description:
-      "Статистика графа понятий: количество понятий по уровням, связи по типам, orphan-понятия (без связей), подозрительные edges для ревью, топ-10 центральных понятий. Доля английских имён, которые можно публиковать: name_en_publishable_count, name_en_publishable_share (от числа активных понятий) и as_of - время запроса, по которому посчитаны concepts и эти два поля; остальные счётчики читаются отдельными запросами.",
+      "Статистика графа понятий: количество понятий по уровням, связи по типам, orphan-понятия (без связей), подозрительные edges для ревью, топ-10 центральных понятий. Доля английских имён, которые можно публиковать: name_en_publishable_count, name_en_publishable_share (от числа активных понятий) и as_of - время запроса, по которому посчитаны concepts и эти два поля; остальные счётчики читаются отдельными запросами. Сколько активных понятий скрыто закрытым списком источников и ни в одном инструменте понятий не видно: hidden_by_closed_sources_count, из них с публикуемым английским именем: name_en_publishable_hidden_count. Снимок через шлюз содержит concepts - hidden_by_closed_sources_count строк.",
     inputSchema: {
       type: "object",
       properties: {},
