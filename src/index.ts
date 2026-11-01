@@ -10,6 +10,14 @@ import {
   nameEnFields,
   nameEnPublishableShare,
 } from "./name-en-publishable.js";
+import {
+  CONCEPT_LIST_TOOL,
+  SERVICE_ONLY_TOOL_NAMES,
+  buildConceptListPage,
+  parseAfterId,
+  parseLimit,
+  type ConceptListSqlRow,
+} from "./concept-list.js";
 import { buildPrivateDocumentResponse, buildPrivateSearchResponse, enforcePrivateReadBudget, privateReadError, privateReadIdError, validateDocumentPageRequest, type ContentField } from "./personal-response-bounds.js";
 export { normalizeSearchResultLimit } from "./search-limits.js";
 /**
@@ -2542,6 +2550,25 @@ async function expandArtifact(
 
 // --- WP-208: graph_stats ---
 
+/**
+ * One page of active concepts by ascending id (see concept-list.ts). Fetches limit + 1 rows to
+ * learn whether a next page exists. The deny-list condition is the same as in getConceptStatus.
+ */
+async function listConcepts(env: Env, afterId: number, limit: number) {
+  const sql = db(env);
+  const rows = await sql`
+    SELECT c.id, c.code, c.name, c.level, c.domain, c.status, c.name_en, c.name_en_status
+    FROM ${sql.unsafe(conceptsTable)} c
+    WHERE c.status = 'active'
+      AND c.id > ${afterId}
+      AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
+    ORDER BY c.id
+    LIMIT ${limit + 1}
+  ` as ConceptListSqlRow[];
+  const [clock] = await sql`SELECT NOW() AS as_of` as { as_of: unknown }[];
+  return buildConceptListPage(rows, limit, clock?.as_of);
+}
+
 async function getGraphStats(env: Env) {
   return withUserContext(activeDsn(env), null, async (sql) => {
     // Publishable English names among active concepts. The blank-character set is the same
@@ -2964,6 +2991,18 @@ export const TOOLS = [
         domain: { type: "string", description: "Фильтр по домену (MIM, PD, DP и т.д.)" },
       },
       required: ["user_id"],
+    },
+  },
+  {
+    name: CONCEPT_LIST_TOOL,
+    description:
+      "Только для сервисных ключей платформы (X-IWE-Service-Auth). Постраничная выгрузка всех видимых активных понятий графа по возрастанию id: id, code, name, level, domain, status и четыре поля английского имени (name_en, name_en_status_raw, name_en_publishable, name_en_publishable_rules_version). Закрытые источники не отдаются. Ответ: {as_of, rows, next_after_id}; next_after_id передать как after_id в следующем вызове, null - страниц больше нет. Сверка полноты: число строк за весь обход равно concepts минус hidden_by_closed_sources_count из graph_stats на тот же момент.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        after_id: { type: "integer", minimum: 0, description: "Курсор: вернуть понятия с id больше этого. По умолчанию 0." },
+        limit: { type: "integer", minimum: 1, maximum: 500, description: "Размер страницы, по умолчанию 200, максимум 500." },
+      },
     },
   },
   {
@@ -3404,16 +3443,19 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
           },
         };
 
-      case "tools/list":
+      case "tools/list": {
+        const isService = classifyLearnerCaller(env, jwtSubject, rawRequest).kind === "service";
+        const shownTools = isService ? TOOLS : TOOLS.filter(tool => !SERVICE_ONLY_TOOL_NAMES.has(tool.name));
         return {
           jsonrpc: "2.0",
           id,
           result: {
             tools: mode === "private"
-              ? [...TOOLS.filter(tool => !PUBLIC_ONLY_TOOL_NAMES.has(tool.name)).map(privateToolDefinition), ...PRIVATE_TOOLS]
-              : TOOLS,
+              ? [...shownTools.filter(tool => !PUBLIC_ONLY_TOOL_NAMES.has(tool.name)).map(privateToolDefinition), ...PRIVATE_TOOLS]
+              : shownTools,
           },
         };
+      }
 
       case "tools/call": {
         const toolName = (params as { name: string }).name;
@@ -4136,6 +4178,29 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
             jsonrpc: "2.0",
             id,
             result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
+          };
+        }
+
+        if (SERVICE_ONLY_TOOL_NAMES.has(toolName)) {
+          // Always enforced, independent of LEARNER_TOOLS_SERVICE_AUTH: these tools are not
+          // user-facing, so there is no "observe first" mode.
+          const caller = classifyLearnerCaller(env, jwtSubject, rawRequest);
+          if (caller.kind !== "service") {
+            return { jsonrpc: "2.0", id, error: { code: -32001, message: `${toolName} requires a platform service credential` } };
+          }
+        }
+
+        if (toolName === CONCEPT_LIST_TOOL) {
+          const afterId = parseAfterId(args.after_id);
+          const limit = parseLimit(args.limit);
+          if (typeof afterId === "string" || typeof limit === "string") {
+            return { jsonrpc: "2.0", id, error: { code: -32602, message: String(typeof afterId === "string" ? afterId : limit) } };
+          }
+          const page = await listConcepts(env, afterId, limit);
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: { content: [{ type: "text", text: JSON.stringify(page, null, 2) }] },
           };
         }
 
