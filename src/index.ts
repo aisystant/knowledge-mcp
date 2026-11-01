@@ -1,5 +1,14 @@
 import { ReadFailure, withReadDeadline, readJson, createReadTrace, type ReadTrace } from "./read-failure.js";
 import { normalizeSearchResultLimit, SEARCH_RESULT_LIMIT_MAX } from "./search-limits.js";
+import {
+  CONCEPT_NOT_FOUND,
+  NAME_EN_PUBLISHABLE_STATUS,
+  type NameEnFields,
+  attachNameEnFields,
+  nameEnAsOf,
+  nameEnFields,
+  nameEnPublishableShare,
+} from "./name-en-publishable.js";
 import { buildPrivateDocumentResponse, buildPrivateSearchResponse, enforcePrivateReadBudget, privateReadError, privateReadIdError, validateDocumentPageRequest, type ContentField } from "./personal-response-bounds.js";
 export { normalizeSearchResultLimit } from "./search-limits.js";
 /**
@@ -2175,7 +2184,7 @@ async function logGraphUsageEvent(env: Env, ev: GraphUsageEvent): Promise<void> 
   }
 }
 
-type ConceptStatusRow = {
+type ConceptStatusSqlRow = {
   id: number;
   code: string | null;
   name: string;
@@ -2187,14 +2196,18 @@ type ConceptStatusRow = {
   level: string;
   domain: string | null;
   definition: string | null;
+  name_en: string | null;
+  name_en_status: string | null;
 };
+
+type ConceptStatusRow = Omit<ConceptStatusSqlRow, "name_en" | "name_en_status"> & NameEnFields;
 
 async function getConceptStatus(
   env: Env,
   ref: { concept_id?: number; code?: string; name?: string }
 ): Promise<ConceptStatusRow | null> {
   const sql = db(env);
-  let rows: ConceptStatusRow[];
+  let rows: ConceptStatusSqlRow[];
 
   // WP-604 Ф14-б (2026-10-19) — same temporary deny-list as PLATFORM_DENY_SOURCES
   // on knowledge_chunk, applied here to concept_graph.concepts (separate DB/schema,
@@ -2205,31 +2218,31 @@ async function getConceptStatus(
     rows = await sql`
       SELECT c.id, c.code, c.name, c.status, c.misconception, sb.id AS superseded_by,
              sb.code AS superseded_by_code, sb.name AS superseded_by_name,
-             c.level, c.domain, c.definition
+             c.level, c.domain, c.definition, c.name_en, c.name_en_status
       FROM ${sql.unsafe(conceptsTable)} c
       LEFT JOIN ${sql.unsafe(conceptsTable)} sb ON sb.id = c.superseded_by
         AND (sb.source_repo IS NULL OR NOT (sb.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       WHERE c.id = ${ref.concept_id}
         AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       LIMIT 1
-    ` as ConceptStatusRow[];
+    ` as ConceptStatusSqlRow[];
   } else if (ref.code) {
     rows = await sql`
       SELECT c.id, c.code, c.name, c.status, c.misconception, sb.id AS superseded_by,
              sb.code AS superseded_by_code, sb.name AS superseded_by_name,
-             c.level, c.domain, c.definition
+             c.level, c.domain, c.definition, c.name_en, c.name_en_status
       FROM ${sql.unsafe(conceptsTable)} c
       LEFT JOIN ${sql.unsafe(conceptsTable)} sb ON sb.id = c.superseded_by
         AND (sb.source_repo IS NULL OR NOT (sb.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       WHERE c.code = ${ref.code}
         AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       LIMIT 1
-    ` as ConceptStatusRow[];
+    ` as ConceptStatusSqlRow[];
   } else if (ref.name) {
     rows = await sql`
       SELECT c.id, c.code, c.name, c.status, c.misconception, sb.id AS superseded_by,
              sb.code AS superseded_by_code, sb.name AS superseded_by_name,
-             c.level, c.domain, c.definition
+             c.level, c.domain, c.definition, c.name_en, c.name_en_status
       FROM ${sql.unsafe(conceptsTable)} c
       LEFT JOIN ${sql.unsafe(conceptsTable)} sb ON sb.id = c.superseded_by
         AND (sb.source_repo IS NULL OR NOT (sb.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
@@ -2237,15 +2250,16 @@ async function getConceptStatus(
         AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       ORDER BY c.status = 'active' DESC, c.id
       LIMIT 1
-    ` as ConceptStatusRow[];
+    ` as ConceptStatusSqlRow[];
   } else {
     return null;
   }
 
-  return rows[0] ?? null;
+  const row = rows[0];
+  return row ? attachNameEnFields(row) : null;
 }
 
-type ConceptSearchHit = {
+type ConceptSearchSqlRow = {
   id: number;
   code: string | null;
   name: string;
@@ -2254,7 +2268,11 @@ type ConceptSearchHit = {
   status: string;
   misconception: boolean;
   similarity: number;
+  name_en: string | null;
+  name_en_status: string | null;
 };
+
+type ConceptSearchHit = Omit<ConceptSearchSqlRow, "name_en" | "name_en_status"> & NameEnFields;
 
 async function searchConceptByName(
   env: Env,
@@ -2266,16 +2284,17 @@ async function searchConceptByName(
 
   const rows = await sql`
     SELECT c.id, c.code, c.name, c.level, c.domain, c.status, c.misconception,
-           similarity(c.name, ${name}) AS similarity
+           similarity(c.name, ${name}) AS similarity,
+           c.name_en, c.name_en_status
     FROM ${sql.unsafe(conceptsTable)} c
     WHERE c.name % ${name}
       AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
       ${opts.include_inactive ? sql`` : sql`AND c.status = 'active'`}
     ORDER BY similarity DESC, c.id
     LIMIT ${limit}
-  ` as ConceptSearchHit[];
+  ` as ConceptSearchSqlRow[];
 
-  return rows;
+  return rows.map((row) => attachNameEnFields(row));
 }
 
 type ExpandedNeighbor = {
@@ -2290,7 +2309,7 @@ type ExpandedNeighbor = {
   edge_weight: number;
   direction: "out" | "in";
   depth: number;
-};
+} & NameEnFields;
 
 async function expandConcept(
   env: Env,
@@ -2330,9 +2349,11 @@ async function expandConcept(
              fc.id AS fc_id, fc.code AS fc_code, fc.name AS fc_name,
              fc.status AS fc_status, fc.misconception AS fc_misc,
              fc.level AS fc_level, fc.domain AS fc_domain,
+             fc.name_en AS fc_name_en, fc.name_en_status AS fc_name_en_status,
              tc.id AS tc_id, tc.code AS tc_code, tc.name AS tc_name,
              tc.status AS tc_status, tc.misconception AS tc_misc,
-             tc.level AS tc_level, tc.domain AS tc_domain
+             tc.level AS tc_level, tc.domain AS tc_domain,
+             tc.name_en AS tc_name_en, tc.name_en_status AS tc_name_en_status
       FROM ${sql.unsafe(conceptEdgesTable)} e
       JOIN ${sql.unsafe(conceptsTable)} fc ON fc.id = e.from_concept_id
       JOIN ${sql.unsafe(conceptsTable)} tc ON tc.id = e.to_concept_id
@@ -2349,7 +2370,9 @@ async function expandConcept(
       edge_type: string;
       weight: number;
       fc_id: number; fc_code: string | null; fc_name: string; fc_status: string; fc_misc: boolean; fc_level: string; fc_domain: string | null;
+      fc_name_en: string | null; fc_name_en_status: string | null;
       tc_id: number; tc_code: string | null; tc_name: string; tc_status: string; tc_misc: boolean; tc_level: string; tc_domain: string | null;
+      tc_name_en: string | null; tc_name_en_status: string | null;
     }>;
 
     const nextFrontier: number[] = [];
@@ -2371,6 +2394,7 @@ async function expandConcept(
             id: r.tc_id, code: r.tc_code, name: r.tc_name,
             status: r.tc_status, misconception: r.tc_misc,
             level: r.tc_level, domain: r.tc_domain,
+            ...nameEnFields(r.tc_name_en, r.tc_name_en_status),
             edge_type: r.edge_type, edge_weight: r.weight,
             direction: "out", depth: d,
           }
@@ -2378,6 +2402,7 @@ async function expandConcept(
             id: r.fc_id, code: r.fc_code, name: r.fc_name,
             status: r.fc_status, misconception: r.fc_misc,
             level: r.fc_level, domain: r.fc_domain,
+            ...nameEnFields(r.fc_name_en, r.fc_name_en_status),
             edge_type: r.edge_type, edge_weight: r.weight,
             direction: "in", depth: d,
           };
@@ -2534,7 +2559,22 @@ async function expandArtifact(
 
 async function getGraphStats(env: Env) {
   return withUserContext(activeDsn(env), null, async (sql) => {
-    const [conceptCount] = await sql`SELECT COUNT(*)::int AS cnt FROM ${sql.unsafe(conceptsTable)} WHERE status = 'active'`;
+    // Доля английских имён: непустой name_en и статус ok, только среди
+    // активных понятий. btrim снимает пробелы ASCII; nameEnFields.trim()
+    // ещё считает пустой строку из пробельных символов Unicode.
+    // Боевую базу эта сессия не читает.
+    const [conceptCount] = await sql`
+      SELECT
+        COUNT(*)::int AS cnt,
+        (COUNT(*) FILTER (
+          WHERE name_en IS NOT NULL
+            AND btrim(name_en) <> ''
+            AND name_en_status = ${NAME_EN_PUBLISHABLE_STATUS}
+        ))::int AS name_en_publishable_count,
+        NOW() AS as_of
+      FROM ${sql.unsafe(conceptsTable)}
+      WHERE status = 'active'
+    `;
     const [edgeCount] = await sql`SELECT COUNT(*)::int AS cnt FROM ${sql.unsafe(conceptEdgesTable)}`;
     const [miscCount] = await sql`SELECT COUNT(*)::int AS cnt FROM ${sql.unsafe(misconceptionsTable)}`;
 
@@ -2590,6 +2630,7 @@ async function getGraphStats(env: Env) {
       LIMIT 10
     `;
 
+    const nameEnPublishableCount = Number(conceptCount.name_en_publishable_count);
     return {
       concepts: conceptCount.cnt,
       edges: edgeCount.cnt,
@@ -2599,6 +2640,9 @@ async function getGraphStats(env: Env) {
       orphans: orphans.length > 0 ? orphans : "none",
       suspicious_edges: suspiciousEdges.length > 0 ? suspiciousEdges : "none",
       top_central: topCentral,
+      name_en_publishable_count: nameEnPublishableCount,
+      name_en_publishable_share: nameEnPublishableShare(nameEnPublishableCount, Number(conceptCount.cnt)),
+      as_of: nameEnAsOf(conceptCount.as_of),
     };
   });
 }
@@ -2909,7 +2953,7 @@ export const TOOLS = [
   {
     name: "graph_stats",
     description:
-      "Статистика графа понятий: количество понятий по уровням, связи по типам, orphan-понятия (без связей), подозрительные edges для ревью, топ-10 центральных понятий.",
+      "Статистика графа понятий: количество понятий по уровням, связи по типам, orphan-понятия (без связей), подозрительные edges для ревью, топ-10 центральных понятий. Доля английских имён, которые можно публиковать: name_en_publishable_count, name_en_publishable_share (от числа активных понятий) и отметка снимка as_of.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -2931,7 +2975,7 @@ export const TOOLS = [
   {
     name: "concept_status",
     description:
-      "Возвращает статус концепта (active/deprecated/draft/superseded), признак misconception, и ссылку superseded_by, если концепт заменён новым. Используй перед тем как цитировать концепт в ответе, чтобы соответствовать DP.SC.121 mode (a) — не ссылаться на устаревшие/заблуждения.",
+      "Возвращает статус концепта (active/deprecated/draft/superseded), признак misconception, и ссылку superseded_by, если концепт заменён новым. Используй перед тем как цитировать концепт в ответе, чтобы соответствовать DP.SC.121 mode (a) — не ссылаться на устаревшие/заблуждения. На найденном понятии также отдаёт английское имя: name_en, name_en_status_raw, name_en_publishable, name_en_publishable_rules_version. Нет строки в графе — {not_found: true}, без выдуманной строки.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2944,7 +2988,7 @@ export const TOOLS = [
   {
     name: "concept_search_by_name",
     description:
-      "Fuzzy-поиск концепта по имени (trigram). Для сценариев: (1) разрешить естественное имя в id; (2) проверить наличие концепта перед цитированием. Возвращает top-N с similarity, status, misconception. Отличается от 'search' тем, что работает только по полю name графа, а не по embed'ам документов.",
+      "Fuzzy-поиск концепта по имени (trigram). Для сценариев: (1) разрешить естественное имя в id; (2) проверить наличие концепта перед цитированием. Возвращает top-N с similarity, status, misconception. Отличается от 'search' тем, что работает только по полю name графа, а не по embed'ам документов. На каждом найденном понятии также name_en, name_en_status_raw, name_en_publishable, name_en_publishable_rules_version.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2958,7 +3002,7 @@ export const TOOLS = [
   {
     name: "concept_expand",
     description:
-      "BFS-обход графа от seed-концептов: возвращает соседей через рёбра specializes/part_of/related/prerequisite. Используй когда пользователь задал термин и тебе нужны связанные понятия для развёрнутого ответа (DP.METHOD.042 сценарии: определение, Pack-обучение, онтологические ответы). Автоматически фильтрует deprecated/superseded в выдаче. Обновляет last_traversed_at на пройденных рёбрах.",
+      "BFS-обход графа от seed-концептов: возвращает соседей через рёбра specializes/part_of/related/prerequisite. Используй когда пользователь задал термин и тебе нужны связанные понятия для развёрнутого ответа (DP.METHOD.042 сценарии: определение, Pack-обучение, онтологические ответы). Автоматически фильтрует deprecated/superseded в выдаче. Обновляет last_traversed_at на пройденных рёбрах. На каждом соседе также name_en, name_en_status_raw, name_en_publishable, name_en_publishable_rules_version.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4158,7 +4202,7 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
             jsonrpc: "2.0",
             id,
             result: {
-              content: [{ type: "text", text: JSON.stringify(concept ?? { not_found: true }, null, 2) }],
+              content: [{ type: "text", text: JSON.stringify(concept ?? CONCEPT_NOT_FOUND, null, 2) }],
             },
           };
         }
