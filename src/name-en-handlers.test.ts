@@ -209,7 +209,13 @@ describe("graph_stats", () => {
 
   function statsResponder(conceptRowOverride: Record<string, unknown>): Responder {
     return (call) => {
-      if (call.text.includes("name_en_publishable_count")) return [{ cnt: 5788, name_en_publishable_count: 3308, as_of: AS_OF, ...conceptRowOverride }];
+      if (call.text.includes("name_en_publishable_count")) {
+        return [{
+          cnt: 5788, name_en_publishable_count: 3308,
+          hidden_by_closed_sources_count: 120, name_en_publishable_hidden_count: 90,
+          as_of: AS_OF, ...conceptRowOverride,
+        }];
+      }
       return [{ cnt: 1 }];
     };
   }
@@ -223,6 +229,19 @@ describe("graph_stats", () => {
       name_en_publishable_share: 0.571527,
       as_of: "2026-11-01T15:13:06.612Z",
     });
+  });
+
+  it("reports how many concepts the closed-source list hides, so a snapshot can be reconciled", async () => {
+    setResponder(statsResponder({}));
+    const got = (await callTool("graph_stats", {})) as Record<string, number>;
+    expect(got.hidden_by_closed_sources_count).toBe(120);
+    expect(got.name_en_publishable_hidden_count).toBe(90);
+    // rows visible through the gateway = concepts - hidden; publishable among them = count - hidden publishable
+    expect(got.concepts - got.hidden_by_closed_sources_count).toBe(5668);
+    expect(got.name_en_publishable_count - got.name_en_publishable_hidden_count).toBe(3218);
+    const count = calls.find((call) => call.text.includes("name_en_publishable_count"));
+    expect(count?.text).toContain("source_repo = ANY(?::text[])");
+    expect(count?.values.some((v) => Array.isArray(v) && v.includes("PACK-verification") && v.includes("PACK-agent-rules"))).toBe(true);
   });
 
   it("counts with the same blank characters and status that nameEnFields uses", async () => {
