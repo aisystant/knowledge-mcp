@@ -2,6 +2,7 @@ import { ReadFailure, withReadDeadline, readJson, createReadTrace, type ReadTrac
 import { normalizeSearchResultLimit, SEARCH_RESULT_LIMIT_MAX } from "./search-limits.js";
 import {
   CONCEPT_NOT_FOUND,
+  NAME_EN_BLANK_CHARS,
   NAME_EN_PUBLISHABLE_STATUS,
   type NameEnFields,
   attachNameEnFields,
@@ -2207,53 +2208,37 @@ async function getConceptStatus(
   ref: { concept_id?: number; code?: string; name?: string }
 ): Promise<ConceptStatusRow | null> {
   const sql = db(env);
-  let rows: ConceptStatusSqlRow[];
 
   // WP-604 Ф14-б (2026-10-19) — same temporary deny-list as PLATFORM_DENY_SOURCES
   // on knowledge_chunk, applied here to concept_graph.concepts (separate DB/schema,
   // not covered by Ф14's original patch). superseded_by must be re-derived from the
   // filtered `sb` join (not the raw c.superseded_by id) so a denied successor's id
   // isn't exposed even when its code/name are already hidden by the join condition.
+  let lookup;
+  let order = sql``;
   if (ref.concept_id) {
-    rows = await sql`
-      SELECT c.id, c.code, c.name, c.status, c.misconception, sb.id AS superseded_by,
-             sb.code AS superseded_by_code, sb.name AS superseded_by_name,
-             c.level, c.domain, c.definition, c.name_en, c.name_en_status
-      FROM ${sql.unsafe(conceptsTable)} c
-      LEFT JOIN ${sql.unsafe(conceptsTable)} sb ON sb.id = c.superseded_by
-        AND (sb.source_repo IS NULL OR NOT (sb.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
-      WHERE c.id = ${ref.concept_id}
-        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
-      LIMIT 1
-    ` as ConceptStatusSqlRow[];
+    lookup = sql`c.id = ${ref.concept_id}`;
   } else if (ref.code) {
-    rows = await sql`
-      SELECT c.id, c.code, c.name, c.status, c.misconception, sb.id AS superseded_by,
-             sb.code AS superseded_by_code, sb.name AS superseded_by_name,
-             c.level, c.domain, c.definition, c.name_en, c.name_en_status
-      FROM ${sql.unsafe(conceptsTable)} c
-      LEFT JOIN ${sql.unsafe(conceptsTable)} sb ON sb.id = c.superseded_by
-        AND (sb.source_repo IS NULL OR NOT (sb.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
-      WHERE c.code = ${ref.code}
-        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
-      LIMIT 1
-    ` as ConceptStatusSqlRow[];
+    lookup = sql`c.code = ${ref.code}`;
   } else if (ref.name) {
-    rows = await sql`
-      SELECT c.id, c.code, c.name, c.status, c.misconception, sb.id AS superseded_by,
-             sb.code AS superseded_by_code, sb.name AS superseded_by_name,
-             c.level, c.domain, c.definition, c.name_en, c.name_en_status
-      FROM ${sql.unsafe(conceptsTable)} c
-      LEFT JOIN ${sql.unsafe(conceptsTable)} sb ON sb.id = c.superseded_by
-        AND (sb.source_repo IS NULL OR NOT (sb.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
-      WHERE LOWER(c.name) = LOWER(${ref.name})
-        AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
-      ORDER BY c.status = 'active' DESC, c.id
-      LIMIT 1
-    ` as ConceptStatusSqlRow[];
+    lookup = sql`LOWER(c.name) = LOWER(${ref.name})`;
+    order = sql`ORDER BY c.status = 'active' DESC, c.id`;
   } else {
     return null;
   }
+
+  const rows = await sql`
+    SELECT c.id, c.code, c.name, c.status, c.misconception, sb.id AS superseded_by,
+           sb.code AS superseded_by_code, sb.name AS superseded_by_name,
+           c.level, c.domain, c.definition, c.name_en, c.name_en_status
+    FROM ${sql.unsafe(conceptsTable)} c
+    LEFT JOIN ${sql.unsafe(conceptsTable)} sb ON sb.id = c.superseded_by
+      AND (sb.source_repo IS NULL OR NOT (sb.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
+    WHERE ${lookup}
+      AND (c.source_repo IS NULL OR NOT (c.source_repo = ANY(${PLATFORM_DENY_SOURCES_PARAM}::text[])))
+    ${order}
+    LIMIT 1
+  ` as ConceptStatusSqlRow[];
 
   const row = rows[0];
   return row ? attachNameEnFields(row) : null;
@@ -2394,17 +2379,17 @@ async function expandConcept(
             id: r.tc_id, code: r.tc_code, name: r.tc_name,
             status: r.tc_status, misconception: r.tc_misc,
             level: r.tc_level, domain: r.tc_domain,
-            ...nameEnFields(r.tc_name_en, r.tc_name_en_status),
             edge_type: r.edge_type, edge_weight: r.weight,
             direction: "out", depth: d,
+            ...nameEnFields(r.tc_name_en, r.tc_name_en_status),
           }
         : {
             id: r.fc_id, code: r.fc_code, name: r.fc_name,
             status: r.fc_status, misconception: r.fc_misc,
             level: r.fc_level, domain: r.fc_domain,
-            ...nameEnFields(r.fc_name_en, r.fc_name_en_status),
             edge_type: r.edge_type, edge_weight: r.weight,
             direction: "in", depth: d,
+            ...nameEnFields(r.fc_name_en, r.fc_name_en_status),
           };
 
       neighbors.push(n);
@@ -2559,16 +2544,15 @@ async function expandArtifact(
 
 async function getGraphStats(env: Env) {
   return withUserContext(activeDsn(env), null, async (sql) => {
-    // Доля английских имён: непустой name_en и статус ok, только среди
-    // активных понятий. btrim снимает пробелы ASCII; nameEnFields.trim()
-    // ещё считает пустой строку из пробельных символов Unicode.
-    // Боевую базу эта сессия не читает.
+    // Publishable English names among active concepts. The blank-character set is the same
+    // string nameEnFields uses, so this count equals the per-concept name_en_publishable flags.
+    // NOW() is the transaction start: as_of describes this query (concepts and the name_en count).
     const [conceptCount] = await sql`
       SELECT
         COUNT(*)::int AS cnt,
         (COUNT(*) FILTER (
           WHERE name_en IS NOT NULL
-            AND btrim(name_en) <> ''
+            AND btrim(name_en, ${NAME_EN_BLANK_CHARS}) <> ''
             AND name_en_status = ${NAME_EN_PUBLISHABLE_STATUS}
         ))::int AS name_en_publishable_count,
         NOW() AS as_of
@@ -2630,7 +2614,6 @@ async function getGraphStats(env: Env) {
       LIMIT 10
     `;
 
-    const nameEnPublishableCount = Number(conceptCount.name_en_publishable_count);
     return {
       concepts: conceptCount.cnt,
       edges: edgeCount.cnt,
@@ -2640,8 +2623,8 @@ async function getGraphStats(env: Env) {
       orphans: orphans.length > 0 ? orphans : "none",
       suspicious_edges: suspiciousEdges.length > 0 ? suspiciousEdges : "none",
       top_central: topCentral,
-      name_en_publishable_count: nameEnPublishableCount,
-      name_en_publishable_share: nameEnPublishableShare(nameEnPublishableCount, Number(conceptCount.cnt)),
+      name_en_publishable_count: conceptCount.name_en_publishable_count,
+      name_en_publishable_share: nameEnPublishableShare(Number(conceptCount.name_en_publishable_count), Number(conceptCount.cnt)),
       as_of: nameEnAsOf(conceptCount.as_of),
     };
   });
@@ -2953,7 +2936,7 @@ export const TOOLS = [
   {
     name: "graph_stats",
     description:
-      "Статистика графа понятий: количество понятий по уровням, связи по типам, orphan-понятия (без связей), подозрительные edges для ревью, топ-10 центральных понятий. Доля английских имён, которые можно публиковать: name_en_publishable_count, name_en_publishable_share (от числа активных понятий) и отметка снимка as_of.",
+      "Статистика графа понятий: количество понятий по уровням, связи по типам, orphan-понятия (без связей), подозрительные edges для ревью, топ-10 центральных понятий. Доля английских имён, которые можно публиковать: name_en_publishable_count, name_en_publishable_share (от числа активных понятий) и as_of - время запроса, по которому посчитаны concepts и эти два поля; остальные счётчики читаются отдельными запросами.",
     inputSchema: {
       type: "object",
       properties: {},

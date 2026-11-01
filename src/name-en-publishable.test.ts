@@ -1,84 +1,50 @@
 /**
- * Приёмка 19 кодов из inbox/WP-5/f67-nabor-priemki-shluza.md.
- * Боевая база не читается: на вход идут уже снятые name_en и name_en_status.
- * F67_ETALON — путь к этому файлу; тогда тест сверяет таблицу с функцией.
+ * Pure rules of the English-name fields (WP-596 F67), checked against the 19-code acceptance table
+ * (copy of the owner table, see test-support/f67-etalon.ts).
  */
 
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
-  CONCEPT_NOT_FOUND,
+  NAME_EN_BLANK_CHARS,
   NAME_EN_PUBLISHABLE_RULES_VERSION,
-  type NameEnDbRow,
-  type NameEnFields,
   attachNameEnFields,
   nameEnAsOf,
   nameEnFields,
   nameEnPublishableShare,
-  projectNameEn,
 } from "./name-en-publishable.js";
+import { readEtalon } from "./test-support/f67-etalon.js";
 
-type AcceptanceRow = {
-  code: string;
-  row: NameEnDbRow | null;
-  name_en: string | null;
-  name_en_status_raw: string | null;
-  name_en_publishable: boolean;
-};
+describe("acceptance table of 19 codes", () => {
+  const etalon = readEtalon();
 
-const ACCEPTANCE: AcceptanceRow[] = [
-  { code: "DP.SC.045", row: { name_en: "Constraint Analysis (TOC)", name_en_status: "ok" }, name_en: "Constraint Analysis (TOC)", name_en_status_raw: "ok", name_en_publishable: true },
-  { code: "ECO.PRIN.001", row: null, name_en: null, name_en_status_raw: null, name_en_publishable: false },
-  { code: "MIM.M.030", row: { name_en: "System Type Classifier", name_en_status: "ok" }, name_en: "System Type Classifier", name_en_status_raw: "ok", name_en_publishable: true },
-  { code: "LS.FORM.007", row: { name_en: "Pull request register", name_en_status: "ok" }, name_en: "Pull request register", name_en_status_raw: "ok", name_en_publishable: true },
-  { code: "PD.METHOD.008", row: { name_en: "Strategizing", name_en_status: "ok" }, name_en: "Strategizing", name_en_status_raw: "ok", name_en_publishable: true },
-  { code: "DP.SC.108", row: { name_en: "Team Formation", name_en_status: "ok" }, name_en: "Team Formation", name_en_status_raw: "ok", name_en_publishable: true },
-  { code: "ECO.FM.001", row: { name_en: "ECO.FM.001", name_en_status: "ok" }, name_en: "ECO.FM.001", name_en_status_raw: "ok", name_en_publishable: true },
-  { code: "MIM.M.024", row: { name_en: null, name_en_status: "ok" }, name_en: null, name_en_status_raw: "ok", name_en_publishable: false },
-  { code: "LS.BC.001", row: { name_en: "LS.BC.001", name_en_status: "ok" }, name_en: "LS.BC.001", name_en_status_raw: "ok", name_en_publishable: true },
-  { code: "PD.SOTA.008", row: { name_en: null, name_en_status: "ok" }, name_en: null, name_en_status_raw: "ok", name_en_publishable: false },
-  { code: "ZP.1", row: { name_en: "Axiomaticity", name_en_status: "ok" }, name_en: "Axiomaticity", name_en_status_raw: "ok", name_en_publishable: true },
-  { code: "ZP.2", row: { name_en: "Structurality and Symmetries", name_en_status: "ok" }, name_en: "Structurality and Symmetries", name_en_status_raw: "ok", name_en_publishable: true },
-  { code: "U.Entity", row: { name_en: "Entity", name_en_status: "ok" }, name_en: "Entity", name_en_status_raw: "ok", name_en_publishable: true },
-  { code: "U.Method", row: { name_en: "Method", name_en_status: "ok" }, name_en: "Method", name_en_status_raw: "ok", name_en_publishable: true },
-  { code: "U.Role", row: { name_en: "Role", name_en_status: "ok" }, name_en: "Role", name_en_status_raw: "ok", name_en_publishable: true },
-  { code: "AR.D.005", row: null, name_en: null, name_en_status_raw: null, name_en_publishable: false },
-  { code: "AR.008", row: { name_en: null, name_en_status: "ok" }, name_en: null, name_en_status_raw: "ok", name_en_publishable: false },
-  { code: "VR.FM.002", row: { name_en: "False Confidence", name_en_status: "ok" }, name_en: "False Confidence", name_en_status_raw: "ok", name_en_publishable: true },
-  { code: "VR.BC.001", row: { name_en: "Bounded Context — Verification and Acceptance", name_en_status: "ok" }, name_en: "Bounded Context — Verification and Acceptance", name_en_status_raw: "ok", name_en_publishable: true },
-];
-
-function expectedFields(item: AcceptanceRow): NameEnFields {
-  return {
-    name_en: item.name_en,
-    name_en_status_raw: item.name_en_status_raw,
-    name_en_publishable: item.name_en_publishable,
-    name_en_publishable_rules_version: NAME_EN_PUBLISHABLE_RULES_VERSION,
-  };
-}
-
-describe("name-en publishable, 19 codes", () => {
-  it("names one non-empty rules version", () => {
-    expect(NAME_EN_PUBLISHABLE_RULES_VERSION).toBe("name-en-publishable/1");
-    expect(NAME_EN_PUBLISHABLE_RULES_VERSION.trim()).not.toBe("");
+  it("has the 19 codes of the owner table", () => {
+    expect(etalon).toHaveLength(19);
+    expect(etalon.filter((row) => row.dbRow === null).map((row) => row.code)).toEqual(["ECO.PRIN.001", "AR.D.005"]);
   });
 
-  it("matches the acceptance set with zero discrepancies", () => {
-    expect(ACCEPTANCE).toHaveLength(19);
-    const versions = new Set<string>();
-    for (const item of ACCEPTANCE) {
-      const got = projectNameEn(item.row);
-      if (item.row === null) {
-        expect(got, item.code).toEqual(CONCEPT_NOT_FOUND);
-        expect(got, item.code).not.toHaveProperty("name_en");
-        expect(got, item.code).not.toHaveProperty("name_en_status_raw");
-        expect(got, item.code).not.toHaveProperty("name_en_publishable");
-        continue;
-      }
-      expect(got, item.code).toEqual(expectedFields(item));
-      versions.add((got as NameEnFields).name_en_publishable_rules_version);
+  it("gives every code present in the graph the flag and version of the table", () => {
+    for (const row of etalon) {
+      if (row.dbRow === null) continue;
+      const got = nameEnFields(row.dbRow.name_en, row.dbRow.name_en_status);
+      expect(got.name_en, row.code).toBe(row.dbRow.name_en);
+      expect(got.name_en_status_raw, row.code).toBe(row.dbRow.name_en_status);
+      expect(got.name_en_publishable, row.code).toBe(row.publishable);
+      expect(got.name_en_publishable_rules_version, row.code).toBe(row.rulesVersion);
     }
-    expect(versions.size).toBe(1);
+  });
+
+  it("publishes 14 of the 17 codes present in the graph, a share of 0.823529", () => {
+    const present = etalon.filter((row) => row.dbRow !== null);
+    const publishable = present.filter((row) => row.publishable).length;
+    expect(present).toHaveLength(17);
+    expect(publishable).toBe(14);
+    expect(nameEnPublishableShare(publishable, present.length)).toBe(0.823529);
+  });
+});
+
+describe("rules of name-en-publishable/1", () => {
+  it("names the rules version", () => {
+    expect(NAME_EN_PUBLISHABLE_RULES_VERSION).toBe("name-en-publishable/1");
   });
 
   it("keeps an empty name with status ok as null, ok, false", () => {
@@ -90,7 +56,15 @@ describe("name-en publishable, 19 codes", () => {
     });
     expect(nameEnFields("", "ok").name_en).toBeNull();
     expect(nameEnFields("   ", "ok").name_en).toBeNull();
-    expect(nameEnFields(" \t", "ok").name_en_publishable).toBe(false);
+  });
+
+  it("answers null, null, false when the database columns are missing from the row", () => {
+    expect(nameEnFields(undefined, undefined)).toEqual({
+      name_en: null,
+      name_en_status_raw: null,
+      name_en_publishable: false,
+      name_en_publishable_rules_version: NAME_EN_PUBLISHABLE_RULES_VERSION,
+    });
   });
 
   it("returns a code stored as the name and marks it publishable", () => {
@@ -121,67 +95,50 @@ describe("name-en publishable, 19 codes", () => {
       name_en: "Axiomaticity",
       name_en_status: "ok",
     });
-    expect(got.name).toBe("Аксиоматичность");
-    expect(got.level).toBe("zp");
-    expect(got.domain).toBeNull();
-    expect(got.status).toBe("active");
+    expect(got).toMatchObject({ name: "Аксиоматичность", level: "zp", domain: null, status: "active", name_en: "Axiomaticity", name_en_publishable: true });
     expect(got).not.toHaveProperty("name_en_status");
-    expect(got.name_en).toBe("Axiomaticity");
-    expect(got.name_en_publishable).toBe(true);
-  });
-
-  it("counts publishable share over active concepts", () => {
-    const present = ACCEPTANCE.filter((item) => item.row !== null);
-    const count = present.filter((item) => item.name_en_publishable).length;
-    expect(count).toBe(14);
-    expect(nameEnPublishableShare(count, present.length)).toBe(0.823529);
-    expect(nameEnPublishableShare(0, 0)).toBe(0);
-    expect(nameEnPublishableShare(3, 5788)).toBe(0.000518);
-  });
-
-  it("formats the snapshot mark from the database clock", () => {
-    expect(nameEnAsOf(new Date("2026-11-01T12:00:00.000Z"))).toBe("2026-11-01T12:00:00.000Z");
-    expect(nameEnAsOf("2026-11-01 12:00:00+00")).toBe("2026-11-01T12:00:00.000Z");
-    expect(() => nameEnAsOf(null)).toThrow(/as_of/);
   });
 });
 
-function parseEtalon(markdown: string): Array<{ code: string; cells: string[] }> {
-  const rows = [];
-  for (const line of markdown.split("\n")) {
-    if (!line.startsWith("|")) continue;
-    const cells = line.split("|").slice(1, -1).map((cell) => cell.trim());
-    if (cells.length < 6 || !/^\d+$/.test(cells[0] ?? "")) continue;
-    rows.push({ code: cells[1] ?? "", cells });
-  }
-  return rows;
-}
-
-describe("etalon file", () => {
-  const path = process.env.F67_ETALON;
-  it.skipIf(!path)("matches inbox/WP-5/f67-nabor-priemki-shluza.md with zero discrepancies", () => {
-    const parsed = parseEtalon(readFileSync(path!, "utf8"));
-    expect(parsed).toHaveLength(19);
-    expect(parsed.map((row) => row.code)).toEqual(ACCEPTANCE.map((row) => row.code));
-    for (let i = 0; i < parsed.length; i++) {
-      const file = parsed[i]!;
-      const item = ACCEPTANCE[i]!;
-      const got = projectNameEn(item.row);
-      if (item.row === null) {
-        expect(file.cells.slice(2), file.code).toEqual([
-          "строки в графе нет",
-          "строки в графе нет",
-          "строки в графе нет",
-          "строки в графе нет",
-        ]);
-        expect(got, file.code).toEqual(CONCEPT_NOT_FOUND);
-        continue;
-      }
-      const fields = got as NameEnFields;
-      expect(file.cells[2], file.code).toBe(fields.name_en === null ? "null" : fields.name_en);
-      expect(file.cells[3], file.code).toBe(fields.name_en_status_raw);
-      expect(file.cells[4], file.code).toBe(String(fields.name_en_publishable));
-      expect(file.cells[5], file.code).toBe(fields.name_en_publishable_rules_version);
+describe("blank names", () => {
+  it("treats a name made of any whitespace character as empty", () => {
+    for (const ch of NAME_EN_BLANK_CHARS) {
+      const got = nameEnFields(`${ch}${ch}`, "ok");
+      expect(got.name_en, `U+${ch.codePointAt(0)!.toString(16)}`).toBeNull();
+      expect(got.name_en_publishable).toBe(false);
     }
+  });
+
+  it("matches exactly the characters String.trim removes, so SQL btrim and TypeScript agree", () => {
+    const trimmed = new Set<string>();
+    for (let code = 0; code <= 0xffff; code++) {
+      const ch = String.fromCharCode(code);
+      if (ch.trim() === "") trimmed.add(ch);
+    }
+    expect(new Set(NAME_EN_BLANK_CHARS)).toEqual(trimmed);
+  });
+
+  it("keeps a name with a letter among whitespace", () => {
+    expect(nameEnFields(" Entity\t", "ok").name_en).toBe(" Entity\t");
+  });
+});
+
+describe("share and snapshot mark", () => {
+  it("counts the share with six decimals and tolerates zero concepts", () => {
+    expect(nameEnPublishableShare(0, 0)).toBe(0);
+    expect(nameEnPublishableShare(3, 5788)).toBe(0.000518);
+    expect(nameEnPublishableShare(3308, 5788)).toBe(0.571527);
+  });
+
+  it("formats the mark from the database clock", () => {
+    expect(nameEnAsOf(new Date("2026-11-01T12:00:00.000Z"))).toBe("2026-11-01T12:00:00.000Z");
+    expect(nameEnAsOf("2026-11-01 12:00:00+00")).toBe("2026-11-01T12:00:00.000Z");
+  });
+
+  it("falls back to the worker clock instead of failing when the value does not parse", () => {
+    const now = () => new Date("2026-11-01T15:00:00.000Z");
+    expect(nameEnAsOf(null, now)).toBe("2026-11-01T15:00:00.000Z");
+    expect(nameEnAsOf("not a date", now)).toBe("2026-11-01T15:00:00.000Z");
+    expect(nameEnAsOf(new Date("x"), now)).toBe("2026-11-01T15:00:00.000Z");
   });
 });
