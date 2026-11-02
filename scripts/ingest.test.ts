@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync } from "fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { ingestSource, contentHash, chunkLargeFile, validateSourceConfigs, draftReason, type SourceConfig } from "./ingest.js";
@@ -331,6 +331,21 @@ describe("validateSourceConfigs — prune_missing (WP-596 Ф10 п.5)", () => {
 
   it("rejects a non-boolean prune_missing", () => {
     expect(() => validateSourceConfigs([platform({ prune_missing: "yes" as unknown as boolean })])).toThrow(/prune_missing должен быть true\/false/);
+  });
+});
+
+describe("scripts/sources.json — FPF source (WP-596 Ф14)", () => {
+  // The FPF copy moved folders on 2026-10-13; without prune_missing the old paths stayed in the index
+  // and surfaced as stale duplicates of the same sections.
+  const configs = JSON.parse(readFileSync(join(__dirname, "sources.json"), "utf-8")) as SourceConfig[];
+
+  it("prunes rows of files that left the FPF copy", () => {
+    const fpf = configs.find((c) => c.source === "FPF");
+    expect(fpf?.prune_missing).toBe(true);
+  });
+
+  it("is a valid config as a whole", () => {
+    expect(() => validateSourceConfigs(configs)).not.toThrow();
   });
 });
 
