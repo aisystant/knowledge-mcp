@@ -53,6 +53,7 @@ import { isToolAllowedInMode, JwtScopeGuard, ScopeDeniedError, PRIVATE_TOOL_NAME
 import { provisionBridgeScopes } from "./scope.js";
 import { verifyJwtLocally, secretsEqual } from "./auth.js";
 import { fetchGitHubApi } from "./github-api.js";
+import { planPrune, PRUNE_MAX_RATIO } from "./full-ingest-prune.js";
 import {
   resolveUserContext,
   writeToGitHub,
@@ -4723,7 +4724,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
       if (file.action === "removed") {
         // WP-7 Ф-L2-PRIVACY: account_id фильтр чтобы L4-источник не прибил чужие L2 чанки с тем же source_uri
         await sql`DELETE FROM ${sql.unsafe(knowledgeChunkTable)} WHERE source = ${req.source}
-          AND (source_uri = ${dbFilename} OR source_uri LIKE ${dbFilename + '::%'})
+          AND (source_uri = ${dbFilename} OR starts_with(source_uri, ${dbFilename + "::"}))
           AND (account_id IS NOT DISTINCT FROM ${accountUuid}::uuid)`;
         result.deleted++;
         continue;
@@ -4757,7 +4758,7 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
       // Delete old document + chunks
       // WP-7 Ф-L2-PRIVACY: account_id фильтр (не прибить чужие L2 чанки)
       await sql`DELETE FROM ${sql.unsafe(knowledgeChunkTable)} WHERE source = ${req.source}
-        AND (source_uri = ${dbFilename} OR source_uri LIKE ${dbFilename + '::%'})
+        AND (source_uri = ${dbFilename} OR starts_with(source_uri, ${dbFilename + "::"}))
         AND (account_id IS NOT DISTINCT FROM ${accountUuid}::uuid)`;
 
       if (content.length > LARGE_FILE_THRESHOLD) {
@@ -5150,7 +5151,7 @@ export default {
       if (!presented || !secretsEqual(presented, env.REINDEX_SECRET)) {
         return json(401, { error: "Unauthorized" });
       }
-      let body: { source?: string; path?: string; dry_run?: boolean };
+      let body: { source?: string; path?: string; dry_run?: boolean; prune?: boolean; max_ratio?: number };
       try {
         body = ((await request.json()) ?? {}) as typeof body;
       } catch {
@@ -5162,6 +5163,18 @@ export default {
       }
       const dryRun = body.dry_run !== false;
       try {
+        // WP-596 Ф14: one-off cleanup above the daily guard (max_ratio), e.g. after a folder move that
+        // touched more than PRUNE_MAX_RATIO of the files. dry_run defaults to true here as well.
+        if (body.prune === true) {
+          const maxRatio = body.max_ratio;
+          if (maxRatio !== undefined && !(typeof maxRatio === "number" && maxRatio >= 0 && maxRatio <= 1)) {
+            return json(400, { error: "Bad Request", reason: "max_ratio_must_be_between_0_and_1" });
+          }
+          const tree = await listGitHubFilesWithSize(source, env.GITHUB_TOKEN);
+          const prune = await pruneMissingPlatformFiles(env, source, tree.map((f) => f.path), { maxRatio, dryRun });
+          console.log(JSON.stringify({ phase: "full_ingest_manual_prune", source, dry_run: dryRun, blocked: prune.blocked, planned: prune.planned.length, deleted_files: prune.deletedFiles }));
+          return json(200, { source, dry_run: dryRun, prune });
+        }
         const results = await runOversizedFullIngest(env, source, { dryRun, path: body.path });
         console.log(JSON.stringify({ phase: "full_ingest_manual_trigger", source, dry_run: dryRun, results }));
         return json(200, { source, dry_run: dryRun, results });
@@ -6137,9 +6150,78 @@ async function runOversizedFullIngest(env: Env, source: string, opts: { dryRun: 
  * vs-DB drift, and a dashboard filtering `ABS(drift) > 5` across all sources uniformly
  * would get a number that means something different for FPF/SPF than for PACK-*
  * without any way to tell the two apart from the column alone. db_count here is a real
- * `count(DISTINCT source_uri)` against knowledge_chunk, mirroring the concept_graph
- * artifact count PACK-* rows use — genuinely comparable, not reused for convenience.
+ * count of DISTINCT FILES (source_uri before "::", platform layer) in knowledge_chunk — the same
+ * unit as github_count. Counting source_uri as is counts chunks ("file::section"), so drift read
+ * -25 000 every day and could never show a stale file (WP-596 Ф14).
  */
+export interface PruneResult {
+  planned: string[];
+  deletedFiles: number;
+  deletedRows: number;
+  skippedActive: string[];
+  blocked: boolean;
+  missingRatio: number;
+}
+
+/**
+ * Removes platform-layer rows of files that are no longer in the source's GitHub tree (WP-596 Ф14).
+ * Each file goes in its own transaction under the same advisory lock the batched swap takes
+ * (`source::path`), and a file with a full-ingest run in flight is skipped, otherwise the swap
+ * would put its rows back. dryRun plans only.
+ */
+export async function pruneMissingPlatformFiles(
+  env: Env,
+  source: string,
+  treeFiles: string[],
+  opts: { maxRatio?: number; dryRun?: boolean } = {},
+): Promise<PruneResult> {
+  const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
+  const schema = getKnowledgeSchema(env);
+  const chunkTable = KNOWLEDGE_TABLES.knowledge_chunk(schema);
+  const runsTable = KNOWLEDGE_TABLES.full_ingest_runs(schema);
+
+  const rows = await knowledgeSql`
+    SELECT DISTINCT split_part(source_uri, '::', 1) AS path
+    FROM ${knowledgeSql.unsafe(chunkTable)}
+    WHERE source = ${source} AND account_id IS NULL
+  ` as { path: string }[];
+  const plan = planPrune(rows.map((r) => r.path), treeFiles, opts.maxRatio);
+  const result: PruneResult = {
+    planned: plan.toDelete, deletedFiles: 0, deletedRows: 0, skippedActive: [],
+    blocked: plan.blocked, missingRatio: plan.missingRatio,
+  };
+  if (plan.blocked) {
+    console.warn(JSON.stringify({ phase: "full_ingest_prune_blocked", source, missing_ratio: plan.missingRatio, indexed: rows.length, tree: treeFiles.length }));
+    return result;
+  }
+
+  for (const path of opts.dryRun ? [] : plan.toDelete) {
+    const { active } = await readFullIngestState(knowledgeSql, runsTable, source, path);
+    if (active > 0) {
+      result.skippedActive.push(path);
+      continue;
+    }
+    // starts_with, not LIKE: "_" and "%" in a file name must not widen the match.
+    const [, removed] = await knowledgeSql.transaction([
+      knowledgeSql`SELECT pg_advisory_xact_lock(hashtext(${source + "::" + path}))`,
+      knowledgeSql`
+        WITH gone AS (
+          DELETE FROM ${knowledgeSql.unsafe(chunkTable)}
+          WHERE source = ${source} AND account_id IS NULL
+            AND (source_uri = ${path} OR starts_with(source_uri, ${path + "::"}))
+          RETURNING 1
+        ) SELECT count(*)::int AS n FROM gone`,
+    ]) as unknown as [unknown, { n: number }[]];
+    result.deletedFiles++;
+    result.deletedRows += removed[0]?.n ?? 0;
+  }
+  console.log(JSON.stringify({
+    phase: "full_ingest_pruned", source, dry_run: !!opts.dryRun, planned: plan.toDelete.length,
+    deleted_files: result.deletedFiles, deleted_rows: result.deletedRows, skipped_active: result.skippedActive.length,
+  }));
+  return result;
+}
+
 async function syncFullIngestSource(env: Env, source: string): Promise<void> {
   const startedAt = Date.now();
   let foundCount = 0;
@@ -6172,6 +6254,13 @@ async function syncFullIngestSource(env: Env, source: string): Promise<void> {
     // download, thousands of staged rows) must not be able to delay or abort it.
     errors = errors.concat(await startOversizedFullIngests(env, source, excluded));
 
+    // WP-596 Ф14: drop rows of files that left the tree. Compared with ALL tree files, not
+    // `eligible`: oversized files (FPF-Spec.md) are in the tree but take the batched path.
+    const prune = await pruneMissingPlatformFiles(env, source, allFiles.map((f) => f.path));
+    if (prune.blocked) {
+      errors.push(`prune blocked: ${Math.round(prune.missingRatio * 100)}% of indexed files are missing from the tree (limit ${Math.round(PRUNE_MAX_RATIO * 100)}%); check the tree, then POST /full-ingest with prune and max_ratio`);
+    }
+
     console.log(JSON.stringify({
       phase: errors.length > 0 ? "full_ingest_partial" : "full_ingest_ok",
       source,
@@ -6202,9 +6291,9 @@ async function syncFullIngestSource(env: Env, source: string): Promise<void> {
     const knowledgeSql = neon(env.KNOWLEDGE_DATABASE_URL.replace("-pooler", ""));
     const chunkTable = KNOWLEDGE_TABLES.knowledge_chunk(getKnowledgeSchema(env));
     const [row] = await knowledgeSql`
-      SELECT count(DISTINCT source_uri)::int AS cnt
+      SELECT count(DISTINCT split_part(source_uri, '::', 1))::int AS cnt
       FROM ${knowledgeSql.unsafe(chunkTable)}
-      WHERE source = ${source}
+      WHERE source = ${source} AND account_id IS NULL
     `;
     dbCount = row.cnt as number;
   } catch (e) {
