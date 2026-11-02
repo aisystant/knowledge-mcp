@@ -193,6 +193,7 @@
       ".git/"
     ],
     "source_class": "methodology",
-    "source_owner": "platform"
+    "source_owner": "platform",
+    "prune_missing": true
   }
 ]
