@@ -540,6 +540,79 @@ describe.skipIf(!PG_URL)("batched full-ingest on real PostgreSQL (WP-532 Ф9)", 
     expect(await stagingCount()).toBe(0);
   });
 
+  describe("prune of files that left the tree (WP-596 Ф14)", () => {
+    // The stubbed tree holds DOC (oversized, batched path) and README.md.
+    const uris = async () => (await q(`SELECT DISTINCT source_uri FROM knowledge_chunk WHERE source = $1 AND account_id IS NULL ORDER BY 1`, [SOURCE])).map((r) => r.source_uri as string);
+    const addRow = (uri: string, account: string | null = null) =>
+      q(
+        `INSERT INTO knowledge_chunk (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, account_id, collection_kind)
+         VALUES ($1, $2, 0, 'h', $2, 'x', $3, 'pack', 'h', $4::uuid, $5)`,
+        [`${uri}::p0`, uri, SOURCE, account, account ? "personal" : "platform"],
+      );
+
+    it("is blocked above the limit and never deletes by default", async () => {
+      await addRow(DOC);
+      await addRow("Gone.md");
+      stubNetwork({ sha: "sha-p1", text: syntheticDoc(15) });
+      const res = await postFullIngest(makeEnv(), { source: SOURCE, prune: true, dry_run: false });
+      expect(res.json.prune.blocked).toBe(true);
+      expect(await uris()).toEqual([DOC, "Gone.md"]);
+    });
+
+    it("plans without writing on a dry run", async () => {
+      await addRow(DOC);
+      await addRow("Gone.md");
+      stubNetwork({ sha: "sha-p2", text: syntheticDoc(15) });
+      const res = await postFullIngest(makeEnv(), { source: SOURCE, prune: true, max_ratio: 0.6 });
+      expect(res.json.dry_run).toBe(true);
+      expect(res.json.prune.planned).toEqual(["Gone.md"]);
+      expect(await uris()).toEqual([DOC, "Gone.md"]);
+    });
+
+    it("removes the vanished file, keeps the oversized one in the tree and a person's copy", async () => {
+      const person = "11111111-1111-4111-8111-111111111111";
+      await addRow(DOC);
+      await addRow("Gone.md");
+      await addRow("Gone.md", person);
+      await q(`INSERT INTO knowledge_chunk (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, collection_kind)
+               VALUES ('Gone.md::S::p1', 'Gone.md::S', 1, 'h', 'Gone.md::S', 'x', $1, 'pack', 'h', 'platform')`, [SOURCE]);
+      stubNetwork({ sha: "sha-p3", text: syntheticDoc(15) });
+      const res = await postFullIngest(makeEnv(), { source: SOURCE, prune: true, max_ratio: 0.6, dry_run: false });
+      expect(res.json.prune).toMatchObject({ deletedFiles: 1, deletedRows: 2, blocked: false });
+      expect(await uris()).toEqual([DOC]);
+      expect((await q(`SELECT count(*)::int AS n FROM knowledge_chunk WHERE account_id = $1::uuid`, [person]))[0].n).toBe(1);
+    });
+
+    it("does not widen the match through '_' in a file name", async () => {
+      // LIKE 'READ_E.md::%' would also match README.md::..., a file that is still in the tree.
+      await addRow(DOC);
+      await addRow("README.md");
+      await addRow("README.md::Intro");
+      await addRow("READ_E.md");
+      stubNetwork({ sha: "sha-p4", text: syntheticDoc(15) });
+      const res = await postFullIngest(makeEnv(), { source: SOURCE, prune: true, max_ratio: 0.5, dry_run: false });
+      expect(res.json.prune.planned).toEqual(["READ_E.md"]);
+      expect(await uris()).toEqual([DOC, "README.md", "README.md::Intro"]);
+    });
+
+    it("skips a vanished file while a full-ingest run for it is in flight", async () => {
+      await addRow(DOC);
+      await addRow("Gone.md");
+      await q(`INSERT INTO full_ingest_runs (run_id, source, document_path, source_revision, total_chunks, status)
+               VALUES (gen_random_uuid(), $1, 'Gone.md', 'sha', 3, 'running')`, [SOURCE]);
+      stubNetwork({ sha: "sha-p5", text: syntheticDoc(15) });
+      const res = await postFullIngest(makeEnv(), { source: SOURCE, prune: true, max_ratio: 0.6, dry_run: false });
+      expect(res.json.prune.skippedActive).toEqual(["Gone.md"]);
+      expect(await uris()).toEqual([DOC, "Gone.md"]);
+    });
+
+    it("rejects a max_ratio outside 0..1", async () => {
+      stubNetwork({ sha: "sha-p6", text: syntheticDoc(15) });
+      const res = await postFullIngest(makeEnv(), { source: SOURCE, prune: true, max_ratio: 5 });
+      expect(res.status).toBe(400);
+    });
+  });
+
   it("sends env.GITHUB_TOKEN with both GitHub reads of a run: the tree listing and the blob", async () => {
     const env = makeEnv({ FULL_INGEST_QUEUE: makeQueue(), GITHUB_TOKEN: "ghp_test_token" });
     const net = stubNetwork({ sha: "sha-gh-1", text: syntheticDoc(15) });
