@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { ingestSource, contentHash, chunkLargeFile, validateSourceConfigs, draftReason, type SourceConfig } from "./ingest.js";
+import { ingestSource, contentHash, chunkLargeFile, validateSourceConfigs, SERVER_OWNED_SOURCES, draftReason, type SourceConfig } from "./ingest.js";
 
 type MockQuery = { text: string; type: "select" | "delete" | "insert" | "lock" };
 
@@ -334,18 +334,29 @@ describe("validateSourceConfigs — prune_missing (WP-596 Ф10 п.5)", () => {
   });
 });
 
-describe("scripts/sources.json — FPF source (WP-596 Ф14)", () => {
-  // The FPF copy moved folders on 2026-10-13; without prune_missing the old paths stayed in the index
-  // and surfaced as stale duplicates of the same sections.
+describe("scripts/sources.json — server-owned sources (WP-596 Ф14)", () => {
+  // FPF/SPF are indexed daily by the Worker from GitHub. A second writer with different chunking
+  // rewrites its rows, and the Worker then re-downloads FPF-Spec.md every night.
   const configs = JSON.parse(readFileSync(join(__dirname, "sources.json"), "utf-8")) as SourceConfig[];
+  const config = (overrides: Partial<SourceConfig>): SourceConfig => ({
+    source: "X", source_type: "pack", path: "/tmp/x", source_class: "methodology", source_owner: "platform", ...overrides,
+  });
 
-  it("prunes rows of files that left the FPF copy", () => {
-    const fpf = configs.find((c) => c.source === "FPF");
-    expect(fpf?.prune_missing).toBe(true);
+  it("does not list a source that only the Worker may index", () => {
+    const owned = configs.filter((c) => SERVER_OWNED_SOURCES.includes(c.source)).map((c) => c.source);
+    expect(owned).toEqual([]);
   });
 
   it("is a valid config as a whole", () => {
     expect(() => validateSourceConfigs(configs)).not.toThrow();
+  });
+
+  it("rejects a platform config of a server-owned source", () => {
+    expect(() => validateSourceConfigs([config({ source: "FPF" })])).toThrow(/только Worker/);
+  });
+
+  it("allows a personal-layer source with the same name", () => {
+    expect(() => validateSourceConfigs([config({ source: "FPF", user_id: "u1" })])).not.toThrow();
   });
 });
 

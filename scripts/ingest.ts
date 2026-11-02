@@ -113,12 +113,23 @@ export function draftReason(rawContent: string): DraftReason | null {
 }
 
 /**
+ * Источники, которые в платформенном слое ведёт только Worker (ежедневный проход
+ * syncFullIngestSource по GitHub, FULL_INGEST_SOURCES в src/index.ts). Второй автор с другой
+ * нарезкой фрагментов (префикс частей, нумерация повторных заголовков) переписывает строки
+ * Worker'а, а тот каждую ночь заново качает FPF-Spec.md (WP-596 Ф14).
+ */
+export const SERVER_OWNED_SOURCES: readonly string[] = ["FPF", "SPF"];
+
+/**
  * Проверяет весь набор конфигов сразу и собирает ВСЕ ошибки, а не падает на первой —
  * иначе исправление по одной source за прогон индексации (WP-596 Ф7, уточнение Codex).
  */
 export function validateSourceConfigs(configs: SourceConfig[]): void {
   const errors: string[] = [];
   for (const config of configs) {
+    if (!config.user_id && SERVER_OWNED_SOURCES.includes(config.source)) {
+      errors.push(`"${config.source}": платформенный источник ведёт только Worker (ежедневный проход по GitHub); локальная индексация запрещена`);
+    }
     if (!config.source_class || !VALID_SOURCE_CLASSES.includes(config.source_class)) {
       errors.push(
         `"${config.source}": source_class отсутствует или невалиден (ожидается одно из: ${VALID_SOURCE_CLASSES.join(", ")}), получено: ${JSON.stringify(config.source_class)}`

@@ -172,28 +172,5 @@
     "exclude": [],
     "source_class": "methodology",
     "source_owner": "platform"
-  },
-  {
-    "source": "SPF",
-    "source_type": "pack",
-    "path": "~/IWE/SPF",
-    "exclude": [
-      "pack-template/",
-      "node_modules/",
-      ".git/"
-    ],
-    "source_class": "methodology",
-    "source_owner": "platform"
-  },
-  {
-    "source": "FPF",
-    "source_type": "pack",
-    "path": "~/IWE/FPF",
-    "exclude": [
-      ".git/"
-    ],
-    "source_class": "methodology",
-    "source_owner": "platform",
-    "prune_missing": true
   }
 ]
