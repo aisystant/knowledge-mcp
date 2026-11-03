@@ -807,9 +807,11 @@ describe("generation fencing (WP-560 Ф3)", () => {
       files: [{ path: "broken.md", action: "modified" }],
     });
     globalThis.fetch = originalFetch;
-    expect(result.errors).toHaveLength(1);
+    expect(result.errors).toEqual(["Cannot read broken.md from GitHub (github_http_500)"]);
+    expect(result.error_details[0].reason).toBe("cannot read from GitHub: github_http_500");
     const status = latestSqlCallContaining("'error'") as unknown[];
     expect(status).toBeDefined();
+    expect(status).toContain("cannot read from GitHub: github_http_500");
     const fenceIdx = sqlCalls.findIndex(([t]) => (t as TemplateStringsArray).join(" ").includes("AS fence"));
     const statusIdx = sqlCalls.findIndex(([t]) => (t as TemplateStringsArray).join(" ").includes("'error'"));
     expect(fenceIdx).toBeGreaterThan(-1);
@@ -891,7 +893,7 @@ describe("handleQueue", () => {
   }
 
   it.each(["full", "incremental"] as const)("finishes a %s job with a failed file as failed without discarding old chunks or retrying 403", async kind => {
-    const errors = ["Cannot read note.md from GitHub"];
+    const errors = ["Cannot read note.md from GitHub (github_http_403)"];
     queryQueue.push(
       [{ status: "running", generation: 3, kind, completed_batch_indexes: [] }],
       [sourceRow()], [{ index_generation: 3 }], [{ fence: 1 }], [{ job_fence: 1 }], [],
@@ -912,6 +914,26 @@ describe("handleQueue", () => {
     const sourceUpdates = sourceIndexStateUpdates();
     if (kind === "full") expect(sourceUpdates[0][2]).toBe("failed");
     else expect(sourceUpdates).toHaveLength(0);
+  });
+
+  it("the operator notice counts distinct accumulated errors of the job", async () => {
+    const first = "Cannot read note.md from GitHub (github_http_404)";
+    const other = "Cannot read other.md from GitHub (github_http_404)";
+    queryQueue.push(
+      [{ status: "running", generation: 3, kind: "incremental", completed_batch_indexes: [] }],
+      [sourceRow()], [{ index_generation: 3 }], [{ fence: 1 }], [{ job_fence: 1 }], [],
+      [{ completed_batches: 1, expected_batches: 1, errors: [first, other, other] }],
+      [{ source: "DS-my-strategy", kind: "incremental", errors: [first, other, other] }],
+    );
+    const telegram = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    vi.stubGlobal("fetch", vi.fn((url: string, init?: RequestInit) =>
+      String(url).startsWith("https://api.telegram.org/") ? telegram(url, init) : Promise.resolve({ ok: false, status: 404 })));
+    const env = { ...ENV, REINDEX_NOTIFY_TELEGRAM_TOKEN: "tok", REINDEX_NOTIFY_CHAT_ID: "42" };
+    await handleQueue(makeBatch([makeMessage({ kind: "incremental" })]), env);
+
+    expect(telegram).toHaveBeenCalledOnce();
+    const text = JSON.parse(String((telegram.mock.calls[0][1] as RequestInit).body)).text as string;
+    expect(text).toBe(`Инкрементальная переиндексация источника DS-my-strategy не удалась: ${first} (и ещё ошибок: 1)`);
   });
 
   it("does not forget an earlier batch's failure when the final file is successfully retained", async () => {

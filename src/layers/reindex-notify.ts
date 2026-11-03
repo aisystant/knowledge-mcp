@@ -20,6 +20,8 @@ export interface FinishedJob {
   kind: "full" | "incremental";
   source: string;
   reason?: string;
+  /** How many errors the job recorded; the notice names the first and counts the rest (WP-607). */
+  errorCount?: number;
 }
 
 export function shouldNotify(job: Pick<FinishedJob, "status" | "kind">): boolean {
@@ -30,7 +32,8 @@ export function renderNotice(job: FinishedJob): string {
   const kind = job.kind === "full" ? "Полная" : "Инкрементальная";
   if (job.status === "succeeded") return `${kind} переиндексация источника ${job.source} завершена.`;
   const reason = (job.reason ?? "причина не записана").slice(0, MAX_REASON_CHARS);
-  return `${kind} переиндексация источника ${job.source} не удалась: ${reason}`;
+  const more = job.errorCount && job.errorCount > 1 ? ` (и ещё ошибок: ${job.errorCount - 1})` : "";
+  return `${kind} переиндексация источника ${job.source} не удалась: ${reason}${more}`;
 }
 
 /** First recorded error as text; the errors column holds strings or small JSON objects. */
