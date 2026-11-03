@@ -158,6 +158,8 @@ async function finishJob(
     kind: row.kind === "full" ? "full" : "incremental",
     source: row.source,
     reason: firstErrorText(row.errors),
+    // Distinct entries only: a source-level failure repeats once per batch (WP-607 cold review).
+    errorCount: Array.isArray(row.errors) ? new Set(row.errors.map((e) => JSON.stringify(e))).size : undefined,
   });
   return true;
 }
@@ -231,15 +233,22 @@ export async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (i
   return results;
 }
 
+/**
+ * Why a file could not be read (WP-607): the source is not in the user's context, no GitHub
+ * token could be obtained, or GitHub answered with a non-2xx status. Before this the three
+ * cases collapsed into one indistinguishable null and the HTTP status was thrown away.
+ */
+export type GitHubReadFailure = "source_not_connected" | "github_access_unavailable" | `github_http_${number}`;
+
 /** Read file content from GitHub via App Installation Token (GET, distinct from writeToGitHub's PUT). */
 async function readFromGitHub(
   env: ReindexEnv,
   ctx: UserContext,
   source: string,
   path: string
-): Promise<string | null> {
+): Promise<{ content: string } | { failure: GitHubReadFailure }> {
   const userSource = ctx.sources.find((s) => s.source === source);
-  if (!userSource) return null;
+  if (!userSource) return { failure: "source_not_connected" };
 
   const owner = userSource.githubOwner;
   const repo = userSource.githubRepo;
@@ -249,7 +258,7 @@ async function readFromGitHub(
   const fullPath = resolveSourcePath(userSource.pathPrefix, path).fullPath;
 
   const lease = await repositoryToken(env, ctx, source, "read", () => getInstallationToken(env, ctx.userId, repo));
-  if (!lease) return null;
+  if (!lease) return { failure: "github_access_unavailable" };
   const token = lease.token;
   try {
 
@@ -262,8 +271,8 @@ async function readFromGitHub(
     },
   });
 
-  if (!resp.ok) return null;
-  return await resp.text();
+  if (!resp.ok) return { failure: `github_http_${resp.status}` };
+  return { content: await resp.text() };
   } finally {
     await lease.release();
   }
@@ -386,18 +395,18 @@ export async function personalReindexFiles(
 
       assertIndexablePath(normalizedPath);
 
-      // WP-7 Ф97.2 cold review: readFromGitHub returns null on failure but ""
-      // on a genuinely empty (0-byte) file — `!content` treated both the same,
-      // which used to only pollute a throwaway errors[] entry but now would
-      // durably (and wrongly) mark a successfully-read empty file as 'error'
-      // in file_index_status. Only null is a real read failure.
-      const content = await readFromGitHub(env, ctx, req.source, normalizedPath);
-      if (content === null) {
-        result.errors.push(`Cannot read ${normalizedPath} from GitHub`);
-        result.error_details.push({ path: normalizedPath, action: file.action, reason: "cannot read from GitHub" });
-        await sql.transaction(fenced(() => [buildIndexStatusErrorQuery(sql, statusTable, req.source, userId, normalizedPath, "cannot read from GitHub")]));
+      // A genuinely empty (0-byte) file reads as { content: "" }, not as a failure
+      // (WP-7 Ф97.2 cold review) — it must not be marked 'error' in file_index_status.
+      // The failure code keeps the cause visible to the operator notice (WP-607).
+      const read = await readFromGitHub(env, ctx, req.source, normalizedPath);
+      if ("failure" in read) {
+        const reason = `cannot read from GitHub: ${read.failure}`;
+        result.errors.push(`Cannot read ${normalizedPath} from GitHub (${read.failure})`);
+        result.error_details.push({ path: normalizedPath, action: file.action, reason });
+        await sql.transaction(fenced(() => [buildIndexStatusErrorQuery(sql, statusTable, req.source, userId, normalizedPath, reason)]));
         continue;
       }
+      const content = read.content;
 
       if (content.length > MAX_FILE_SIZE) {
         result.skipped++;

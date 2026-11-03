@@ -17,6 +17,10 @@ describe("reindex notice criterion", () => {
     const text = renderNotice({ status: "failed", kind: "full", source: "DS-x", reason: "e".repeat(500) });
     expect(text).toBe(`Полная переиндексация источника DS-x не удалась: ${"e".repeat(200)}`);
     expect(renderNotice({ status: "succeeded", kind: "full", source: "DS-x" })).toBe("Полная переиндексация источника DS-x завершена.");
+    expect(renderNotice({ status: "failed", kind: "incremental", source: "DS-x", reason: "first", errorCount: 3 }))
+      .toBe("Инкрементальная переиндексация источника DS-x не удалась: first (и ещё ошибок: 2)");
+    expect(renderNotice({ status: "failed", kind: "incremental", source: "DS-x", reason: "only", errorCount: 1 }))
+      .toBe("Инкрементальная переиндексация источника DS-x не удалась: only");
   });
 
   it("reads the first error from strings and from objects", () => {
