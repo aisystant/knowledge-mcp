@@ -240,13 +240,23 @@ export async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (i
  */
 export type GitHubReadFailure = "source_not_connected" | "github_access_unavailable" | `github_http_${number}`;
 
-/** Read file content from GitHub via App Installation Token (GET, distinct from writeToGitHub's PUT). */
+/** Pause before re-reading a file GitHub reported missing: a replica can lag right after a push. */
+export const MISSING_RECHECK_DELAY_MS = 1000;
+
+/**
+ * Read file content from GitHub via App Installation Token (GET, distinct from writeToGitHub's PUT).
+ * `missing` (WP-607): the file is not at HEAD on a second read, and the repository itself is
+ * reachable with this token and is the same repository (id) — so a push named the file and a
+ * later push removed or renamed it before this job ran. A bare 404 does not prove that: GitHub
+ * also answers 404 for a repository the token cannot see. With a non-empty path prefix the
+ * webhook's repo-root paths would not resolve at all, so 404 stays a failure there.
+ */
 async function readFromGitHub(
   env: ReindexEnv,
   ctx: UserContext,
   source: string,
   path: string
-): Promise<{ content: string } | { failure: GitHubReadFailure }> {
+): Promise<{ content: string } | { missing: true } | { failure: GitHubReadFailure }> {
   const userSource = ctx.sources.find((s) => s.source === source);
   if (!userSource) return { failure: "source_not_connected" };
 
@@ -262,7 +272,7 @@ async function readFromGitHub(
   const token = lease.token;
   try {
 
-  const resp = await fetch(githubContentsApiUrl(owner, repo, fullPath), {
+  const readContents = () => fetch(githubContentsApiUrl(owner, repo, fullPath), {
     redirect: "manual",
     headers: {
       Authorization: `Bearer ${token}`,
@@ -270,6 +280,22 @@ async function readFromGitHub(
       "User-Agent": "aisystant-knowledge",
     },
   });
+
+  let resp = await readContents();
+  if (resp.status === 404 && !userSource.pathPrefix) {
+    await new Promise((resolve) => setTimeout(resolve, MISSING_RECHECK_DELAY_MS));
+    resp = await readContents();
+    if (resp.status === 404) {
+      const repoResp = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+        redirect: "manual",
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+      });
+      if (repoResp.ok) {
+        const repoJson = (await repoResp.json()) as { id?: number };
+        if (lease.repositoryId === undefined || repoJson.id === lease.repositoryId) return { missing: true };
+      }
+    }
+  }
 
   if (!resp.ok) return { failure: `github_http_${resp.status}` };
   return { content: await resp.text() };
@@ -399,6 +425,14 @@ export async function personalReindexFiles(
       // (WP-7 Ф97.2 cold review) — it must not be marked 'error' in file_index_status.
       // The failure code keeps the cause visible to the operator notice (WP-607).
       const read = await readFromGitHub(env, ctx, req.source, normalizedPath);
+      if ("missing" in read) {
+        // Gone from HEAD after the push that named it. Rows are left as they are: the push that
+        // removed the file carries action=removed and deletes them, and deleting here could wipe
+        // the rows a concurrent job just wrote for a re-added file (WP-607 cold review).
+        console.log(JSON.stringify({ phase: "file_missing_at_head", job_id: req.job_id, source: req.source }));
+        result.skipped++;
+        continue;
+      }
       if ("failure" in read) {
         const reason = `cannot read from GitHub: ${read.failure}`;
         result.errors.push(`Cannot read ${normalizedPath} from GitHub (${read.failure})`);
