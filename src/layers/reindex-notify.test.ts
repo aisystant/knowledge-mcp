@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { firstErrorText, notifyJobFinished, renderNotice, shouldNotify } from "./reindex-notify.js";
+import { firstErrorText, notifyJobFinished, renderCenterEvent, renderNotice, shouldNotify } from "./reindex-notify.js";
 
 const ENV = { REINDEX_NOTIFY_TELEGRAM_TOKEN: "tok", REINDEX_NOTIFY_CHAT_ID: "42" };
+const CENTER = {
+  REINDEX_CENTER_LOKI_URL: "https://logs.example/",
+  REINDEX_CENTER_LOKI_USER: "77",
+  REINDEX_CENTER_LOKI_TOKEN: "lokisecret",
+  REINDEX_OPERATOR_USER_ID: "op-1",
+};
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -56,6 +62,122 @@ describe("notifyJobFinished", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     await expect(notifyJobFinished(ENV, { status: "failed", kind: "full", source: "DS-x" })).resolves.toBeUndefined();
     expect(warn.mock.calls.flat().join(" ")).not.toContain("tok");
+    warn.mockRestore();
+  });
+});
+
+describe("Notification Center event", () => {
+  it("keeps the name of the operator's own source", () => {
+    const ev = renderCenterEvent(
+      { status: "failed", kind: "incremental", source: "DS-mine", userId: "op-1", reason: "Cannot read DS-mine/a.md" },
+      "op-1",
+    );
+    expect(ev).toEqual({
+      title: "Инкрементальная переиндексация не удалась: DS-mine",
+      detail: "Cannot read DS-mine/a.md",
+      correlationId: "knowledge-reindex:incremental:DS-mine",
+    });
+  });
+
+  it("hides another user's source name in title, reason and correlation id", () => {
+    const ev = renderCenterEvent(
+      { status: "failed", kind: "full", source: "DS-health", userId: "u-2", reason: "Cannot read DS-health/x.md from GitHub", errorCount: 3 },
+      "op-1",
+    );
+    expect(ev?.title).toBe("Полная переиндексация не удалась: источник другого пользователя");
+    expect(ev?.detail).toBe("внутренняя ошибка, подробности в журнале сервера (и ещё ошибок: 2)");
+    expect(JSON.stringify(ev)).not.toContain("DS-health");
+  });
+
+  it("passes only a fixed cause category for another user's job, never the free text", () => {
+    const leaky = [
+      ["Cannot read diagnoses/2026.md from GitHub (github_http_404)", "не удалось прочитать файл из GitHub (github_http_404)"],
+      ["Unknown source: DS-x. User sources: DS-health, DS-finance", "источник не найден у пользователя"],
+      ["Invalid user context for user_id=0b1c2d3e-aaaa-bbbb-cccc-111122223333", "неверный контекст пользователя"],
+      ['duplicate key value violates unique constraint, Key (user_id, source)=(0b1c2d3e, DS-x)', "внутренняя ошибка, подробности в журнале сервера"],
+      ['{"reason":"watchdog_stale_heartbeat"}', "задача зависла, пакеты перестали обрабатываться"],
+      ["задача так и не стартовала", "задача так и не стартовала"],
+    ] as const;
+    for (const [reason, expected] of leaky) {
+      const ev = renderCenterEvent({ status: "failed", kind: "incremental", source: "DS-x", userId: "u-2", reason }, "op-1");
+      expect(ev?.detail).toBe(expected);
+      for (const secret of ["DS-health", "DS-finance", "0b1c2d3e", "diagnoses", "DS-x"]) {
+        expect(JSON.stringify(ev)).not.toContain(secret);
+      }
+    }
+  });
+
+  it("does not break on an empty source name", () => {
+    const ev = renderCenterEvent({ status: "failed", kind: "full", source: "", userId: "u-2", reason: "Unknown source: " }, "op-1");
+    expect(ev?.detail).toBe("источник не найден у пользователя");
+  });
+
+  it("matches the operator id even with stray whitespace in the stored value", () => {
+    const ev = renderCenterEvent({ status: "failed", kind: "full", source: "DS-mine", userId: "op-1", reason: "boom" }, " op-1\n");
+    expect(ev?.title).toBe("Полная переиндексация не удалась: DS-mine");
+    expect(ev?.detail).toBe("boom");
+  });
+
+  it("treats every source as foreign while the operator id is not configured", () => {
+    const ev = renderCenterEvent({ status: "failed", kind: "full", source: "DS-mine", userId: "op-1" }, undefined);
+    expect(ev?.title).toBe("Полная переиндексация не удалась: источник другого пользователя");
+  });
+
+  it("does not count successes", () => {
+    expect(renderCenterEvent({ status: "succeeded", kind: "full", source: "DS-x" }, "op-1")).toBeNull();
+  });
+});
+
+describe("dual write to Telegram and the Center", () => {
+  it("sends the Telegram notice and pushes one Loki stream line for a failure", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+    await notifyJobFinished({ ...ENV, ...CENTER }, { status: "failed", kind: "incremental", source: "DS-x", userId: "u-2", reason: "boom" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.map((c) => c[0])).toContain("https://api.telegram.org/bottok/sendMessage");
+    const center = fetchMock.mock.calls.find((c) => c[0] === "https://logs.example/loki/api/v1/push");
+    expect(center).toBeDefined();
+    const init = center![1];
+    expect(init.headers.authorization).toBe(`Basic ${btoa("77:lokisecret")}`);
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+    const body = JSON.parse(init.body);
+    expect(body.streams).toHaveLength(1);
+    expect(body.streams[0].stream).toEqual({ job: "notification-center", source: "knowledge-reindex", severity: "warning", needs_decision: "false" });
+    const [ts, line] = body.streams[0].values[0];
+    expect(ts).toMatch(/^\d{19}$/);
+    expect(JSON.parse(line)).toEqual({
+      schema_version: 1,
+      event: "notification",
+      title: "Инкрементальная переиндексация не удалась: источник другого пользователя",
+      detail: "внутренняя ошибка, подробности в журнале сервера",
+      correlation_id: "knowledge-reindex:incremental:источник другого пользователя",
+    });
+  });
+
+  it("writes nothing to the Center for a full success, but still tells Telegram", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+    await notifyJobFinished({ ...ENV, ...CENTER }, { status: "succeeded", kind: "full", source: "DS-x" });
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual(["https://api.telegram.org/bottok/sendMessage"]);
+  });
+
+  it("writes to the Center alone once Telegram is switched off", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+    await notifyJobFinished(CENTER, { status: "failed", kind: "full", source: "DS-x" });
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual(["https://logs.example/loki/api/v1/push"]);
+  });
+
+  it("keeps Telegram delivery when the Center rejects, and never logs the Loki token", async () => {
+    const fetchMock = vi.fn().mockImplementation((url: string) =>
+      url.includes("/loki/") ? Promise.reject(new Error("lokisecret leaked?")) : Promise.resolve({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(notifyJobFinished({ ...ENV, ...CENTER }, { status: "failed", kind: "full", source: "DS-x" })).resolves.toBeUndefined();
+    expect(fetchMock.mock.calls.map((c) => c[0])).toContain("https://api.telegram.org/bottok/sendMessage");
+    const logged = warn.mock.calls.flat().join(" ");
+    expect(logged).toContain("center_write_failed");
+    expect(logged).not.toContain("lokisecret");
     warn.mockRestore();
   });
 });

@@ -146,17 +146,18 @@ async function finishJob(
     ? await sql`UPDATE ${sql.unsafe(jobsTable)}
         SET status = ${status}, finished_at = NOW(), errors = ${JSON.stringify(ctx.errors)}::jsonb
         WHERE id = ${jobId}::uuid AND status IN ('pending', 'running')
-        RETURNING source, kind, errors`
+        RETURNING source, kind, errors, user_id`
     : await sql`UPDATE ${sql.unsafe(jobsTable)}
         SET status = ${status}, finished_at = NOW()
         WHERE id = ${jobId}::uuid AND status IN ('pending', 'running')
-        RETURNING source, kind, errors`;
+        RETURNING source, kind, errors, user_id`;
   if (rows.length === 0) return false;
-  const row = rows[0] as { source: string; kind: string; errors: unknown };
+  const row = rows[0] as { source: string; kind: string; errors: unknown; user_id: string };
   await notifyJobFinished(ctx.env, {
     status,
     kind: row.kind === "full" ? "full" : "incremental",
     source: row.source,
+    userId: row.user_id,
     reason: firstErrorText(row.errors),
     // Distinct entries only: a source-level failure repeats once per batch (WP-607 cold review).
     errorCount: Array.isArray(row.errors) ? new Set(row.errors.map((e) => JSON.stringify(e))).size : undefined,
@@ -1282,6 +1283,7 @@ export async function handleWatchdog(env: ReindexEnv): Promise<void> {
           status: "failed",
           kind: (r.kind as string) === "full" ? "full" : "incremental",
           source: r.source as string,
+          userId: r.user_id as string,
           reason: watchdogReason(r, neverStarted),
         });
       }
