@@ -63,6 +63,7 @@ import {
   mapWithConcurrency,
   type ReindexEnv,
   type ReindexBatchMessage,
+  MISSING_RECHECK_DELAY_MS,
 } from "./reindex.js";
 import { assertIndexablePath, getInstallationToken } from "./personal.js";
 
@@ -816,6 +817,64 @@ describe("generation fencing (WP-560 Ф3)", () => {
     const statusIdx = sqlCalls.findIndex(([t]) => (t as TemplateStringsArray).join(" ").includes("'error'"));
     expect(fenceIdx).toBeGreaterThan(-1);
     expect(fenceIdx).toBeLessThan(statusIdx);
+  });
+
+  describe("file missing at HEAD (WP-607)", () => {
+    const originalFetch = globalThis.fetch;
+    beforeEach(() => vi.useFakeTimers({ toFake: ["setTimeout"] }));
+    afterEach(() => { vi.useRealTimers(); globalThis.fetch = originalFetch; });
+
+    async function reindexOne(fetchMock: ReturnType<typeof vi.fn>, path = "gone.md") {
+      queryQueue.push([sourceRow()]); // resolveUserContext
+      queryQueue.push([{ index_generation: 3 }]); // pre-check
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+      const pending = personalReindexFiles(ENV, {
+        job_id: "job-test", source: "DS-my-strategy", user_id: USER_ID, generation: 3,
+        files: [{ path, action: "modified" }],
+      });
+      await vi.advanceTimersByTimeAsync(MISSING_RECHECK_DELAY_MS);
+      return pending;
+    }
+    const touchedIndex = () => sqlCalls.some(([t]) => /DELETE FROM|'error'/.test((t as TemplateStringsArray).join(" ")));
+
+    it("is skipped without an error and without touching the index when the repository is readable", async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({ ok: false, status: 404 }) // contents
+        .mockResolvedValueOnce({ ok: false, status: 404 }) // contents, re-read after the pause
+        .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ id: 1 }) }); // repository
+      const result = await reindexOne(fetchMock);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(String(fetchMock.mock.calls[2][0])).toMatch(/\/repos\/[^/]+\/[^/]+$/);
+      expect(result.errors).toEqual([]);
+      expect(result.skipped).toBe(1);
+      expect(touchedIndex()).toBe(false);
+    });
+
+    it("stays an error when the repository itself is not readable", async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({ ok: false, status: 404 })
+        .mockResolvedValueOnce({ ok: false, status: 404 })
+        .mockResolvedValueOnce({ ok: false, status: 404 });
+      const result = await reindexOne(fetchMock);
+      expect(result.errors).toEqual(["Cannot read gone.md from GitHub (github_http_404)"]);
+      expect(latestSqlCallContaining("'error'")).toContain("cannot read from GitHub: github_http_404");
+    });
+
+    it("indexes a file that appears on the re-read (replica lag right after a push)", async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({ ok: false, status: 404 })
+        .mockResolvedValueOnce({ ok: true, status: 200, text: async () => "" }); // blank file: no embedding needed
+      const result = await reindexOne(fetchMock);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.errors).toEqual([]);
+    });
+
+    it("a non-404 failure is neither re-read nor probed", async () => {
+      const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status: 403 });
+      const result = await reindexOne(fetchMock, "locked.md");
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(result.errors).toEqual(["Cannot read locked.md from GitHub (github_http_403)"]);
+    });
   });
 
   it("watchdog also fails 'pending' jobs nobody ever started and marks their sources 'failed'", async () => {
