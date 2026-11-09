@@ -254,6 +254,42 @@ export const MISSING_RECHECK_DELAY_MS = 1000;
  */
 export const TEAM_TOKEN_RETRY_DELAYS_MS: readonly number[] = [1000, 2000];
 
+/**
+ * Neon's HTTP driver reports any non-400 HTTP failure as `Server error (HTTP status N): …`.
+ * On 09.11.2026 three file writes of one full job died on HTTP 520 at the database edge
+ * (WP-5 Ф64). The per-file write deletes the file's rows and inserts the new set in one
+ * transaction, so repeating it after an unknown outcome converges to the same rows.
+ */
+const TRANSIENT_DB_HTTP_ERROR = /^Server error \(HTTP status (?:429|5\d\d)\)/;
+export const DB_WRITE_RETRY_DELAYS_MS: readonly number[] = [1000, 3000];
+
+/** Repeat an idempotent write after a transient database-edge failure; anything else is rethrown. */
+export async function withTransientDbRetry<T>(write: () => Promise<T>): Promise<T> {
+  for (const delay of DB_WRITE_RETRY_DELAYS_MS) {
+    try {
+      return await write();
+    } catch (err) {
+      if (!(err instanceof Error) || !TRANSIENT_DB_HTTP_ERROR.test(err.message)) throw err;
+      console.warn(JSON.stringify({ phase: "db_write_retry", delay_ms: delay }));
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  return write();
+}
+
+/**
+ * Source visibility after a full rebuild (WP-5 Ф64, pilot's decision 09.11.2026). Files that
+ * failed keep their own 'error' status and the job stays 'failed' for the operator, but a few
+ * failed files no longer hide every file that was indexed. A job that indexed nothing still
+ * marks the source failed. Visibility grants no access: every read and search re-checks the
+ * active repository binding. `indexedCount` includes skipped files on purpose: an unchanged
+ * file is skipped by hash and is already searchable; the cost is that a source whose only
+ * success is an oversized/missing skip shows as ready with no searchable chunks.
+ */
+export function sourceStateAfterFullJob(errorCount: number, indexedCount: number): "ready" | "failed" {
+  return errorCount === 0 || indexedCount > 0 ? "ready" : "failed";
+}
+
 type ReadLease = NonNullable<Awaited<ReturnType<typeof repositoryToken>>>;
 
 export async function readLease(env: ReindexEnv, ctx: UserContext, source: string, repo: string): Promise<ReadLease | null> {
@@ -527,7 +563,7 @@ export async function personalReindexFiles(
       // never leave a partial document visible to readers (WP-7 Ф94), and can
       // never leave new chunks committed without a matching status update
       // (WP-7 Ф97.2, this is what closes the split-transaction race).
-      await sql.transaction(fenced(() => [
+      await withTransientDbRetry(() => sql.transaction(fenced(() => [
         buildDeleteDocumentQuery(sql, documentsTable, req.source, userId, normalizedPath),
         ...chunks.map((c, i) => sql`
           INSERT INTO ${sql.unsafe(documentsTable)}
@@ -538,7 +574,7 @@ export async function personalReindexFiles(
           )
         `),
         buildIndexStatusSuccessQuery(sql, statusTable, req.source, userId, normalizedPath, hash),
-      ]));
+      ])));
 
       result.processed++;
     } catch (err) {
@@ -1191,7 +1227,7 @@ export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env:
               last_heartbeat_at = NOW(),
               errors = COALESCE(errors, '[]'::jsonb) || ${errorsJson}::jsonb
           WHERE id = ${job_id}::uuid AND NOT (${batch_index} = ANY(completed_batch_indexes))
-          RETURNING completed_batches, expected_batches, errors
+          RETURNING completed_batches, expected_batches, errors, processed, skipped
       `;
 
       if (updated.length === 0) {
@@ -1200,10 +1236,12 @@ export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env:
         continue;
       }
 
-      const { completed_batches, expected_batches, errors } = updated[0] as {
+      const { completed_batches, expected_batches, errors, processed, skipped } = updated[0] as {
         completed_batches: number;
         expected_batches: number | null;
         errors: string[] | null;
+        processed: number;
+        skipped: number;
       };
       if (expected_batches !== null && completed_batches >= expected_batches) {
         // Use errors accumulated by the atomic UPDATE, not just this batch's result: the
@@ -1215,7 +1253,7 @@ export async function handleQueue(batch: MessageBatch<ReindexBatchMessage>, env:
         // job could mark 'ready' while an unrelated full rebuild is still mid-flight (WP-545 Ф13).
         if (jobKind === "full") {
           await setSourceIndexState(sql, userSourcesTable, KNOWLEDGE_TABLES.reindex_jobs(schema), user_id, source, generation,
-            completionStatus === "succeeded" ? "ready" : "failed", job_id);
+            sourceStateAfterFullJob(errors?.length ?? 0, Number(processed) + Number(skipped)), job_id);
         }
       }
 
