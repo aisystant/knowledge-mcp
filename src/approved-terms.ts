@@ -12,29 +12,35 @@
 /** Bump when the table format or the row → concept mapping changes; part of the file content hash. */
 export const APPROVED_TERMS_FORMAT_VERSION = "approved-terms/1";
 
-const SECTION_HEADING = /^#{2,4}\s+(?:\d+(?:\.\d+)*\.?\s+)?Утверждённые английские термины\s*$/m;
+const SECTION_HEADING = /^#{2,4}\s+(?:\d+(?:\.\d+)*\.?\s+)?Утвержд[её]нные английские термины\s*$/m;
 const APPROVAL = /^пилот,\s*\d{4}-\d{2}-\d{2}$/;
+/** Code infix of approved-term concepts; the loader prunes only codes carrying it. */
+export const APPROVED_TERM_INFIX = ".TERM.";
 
 const COLUMN_RU = "Термин (RU)";
 const COLUMN_EN = "Term (EN)";
 const COLUMN_ALTERNATIVES = "Не использовать / альтернативы";
-const COLUMN_WHERE = "Где употребляется";
 const COLUMN_APPROVED = "Утвердил";
 
 export interface ApprovedTerm {
   code: string;
   nameRu: string;
   nameEn: string;
-  /** Human-readable note stored as the concept definition. */
-  definition: string;
+  /** «Не использовать / альтернативы» cell, or null; the only note kept as the concept definition. */
+  definition: string | null;
   /** true only when the «Утвердил» cell is "пилот, YYYY-MM-DD". */
   approved: boolean;
 }
 
 export interface ApprovedTermsParse {
   terms: ApprovedTerm[];
-  /** Rows dropped with a reason (empty name, duplicate code); reported, never silently ignored. */
+  /** Problems found (empty name, duplicate code, malformed approval, bad header); reported, never silently ignored. */
   rejected: string[];
+  /**
+   * false when the section exists but no readable table follows it. The caller must then keep
+   * the terms already in the graph instead of treating the file as having an empty table.
+   */
+  tableReadable: boolean;
 }
 
 export function hasApprovedTermsSection(body: string): boolean {
@@ -48,7 +54,7 @@ export function approvedTermCode(domain: string, nameRu: string): string {
     .replace(/ё/g, "е")
     .replace(/[^\p{L}\p{N}]+/gu, "-")
     .replace(/^-+|-+$/g, "");
-  return `${domain}.TERM.${slug}`;
+  return `${domain}${APPROVED_TERM_INFIX}${slug}`;
 }
 
 function splitRow(line: string): string[] {
@@ -69,23 +75,26 @@ function isDash(cell: string): boolean {
 }
 
 export function parseApprovedTerms(domain: string, body: string): ApprovedTermsParse {
-  const result: ApprovedTermsParse = { terms: [], rejected: [] };
+  const result: ApprovedTermsParse = { terms: [], rejected: [], tableReadable: false };
   const heading = SECTION_HEADING.exec(body);
-  if (!heading) return result;
+  if (!heading) return { ...result, tableReadable: true };
 
-  const lines = body.slice(heading.index + heading[0].length).split("\n");
+  const lines = body.slice(heading.index + heading[0].length).split(/\r?\n/);
   const tableStart = lines.findIndex((line) => line.trim().startsWith("|"));
-  if (tableStart < 0) return result;
   // A table must follow its heading before the next heading.
-  if (lines.slice(0, tableStart).some((line) => /^#{1,6}\s/.test(line))) return result;
+  if (tableStart < 0 || lines.slice(0, tableStart).some((line) => /^#{1,6}\s/.test(line))) {
+    result.rejected.push("section has no table before the next heading");
+    return result;
+  }
 
   const header = splitRow(lines[tableStart]);
   const col = (name: string) => header.indexOf(name);
-  const [iRu, iEn, iAlt, iWhere, iApproved] = [COLUMN_RU, COLUMN_EN, COLUMN_ALTERNATIVES, COLUMN_WHERE, COLUMN_APPROVED].map(col);
+  const [iRu, iEn, iAlt, iApproved] = [COLUMN_RU, COLUMN_EN, COLUMN_ALTERNATIVES, COLUMN_APPROVED].map(col);
   if (iRu < 0 || iEn < 0 || iApproved < 0) {
     result.rejected.push(`table header lacks «${COLUMN_RU}», «${COLUMN_EN}» or «${COLUMN_APPROVED}»`);
     return result;
   }
+  result.tableReadable = true;
 
   const seen = new Set<string>();
   // tableStart + 1 is the |---| separator row.
@@ -106,20 +115,18 @@ export function parseApprovedTerms(domain: string, body: string): ApprovedTermsP
     seen.add(code);
 
     const approvedBy = plain(cells[iApproved]);
+    const approved = APPROVAL.test(approvedBy);
+    if (!approved && !isDash(approvedBy)) {
+      result.rejected.push(`«${nameRu}»: approval «${approvedBy}» is not "пилот, YYYY-MM-DD", kept as not approved`);
+    }
     const alternatives = iAlt >= 0 ? plain(cells[iAlt]) : "";
-    const where = iWhere >= 0 ? plain(cells[iWhere]) : "";
-    const notes = [
-      isDash(alternatives) ? null : `Не использовать / альтернативы: ${alternatives}`,
-      isDash(where) ? null : `Где: ${where}`,
-      `Утвердил: ${isDash(approvedBy) ? "не утверждено" : approvedBy}`,
-    ].filter((note): note is string => note !== null);
 
     result.terms.push({
       code,
       nameRu,
       nameEn,
-      definition: notes.join(". "),
-      approved: APPROVAL.test(approvedBy),
+      definition: isDash(alternatives) ? null : `Не использовать / альтернативы: ${alternatives}`,
+      approved,
     });
   }
   return result;
