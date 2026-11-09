@@ -11,6 +11,12 @@
 import { neon } from "@neondatabase/serverless";
 import { getConceptGraphSchema, CONCEPT_GRAPH_TABLES } from "./utils/db.js";
 import { glossaryLookup, translateWithLlm } from "./translation.js";
+import {
+  APPROVED_TERMS_FORMAT_VERSION,
+  type ApprovedTerm,
+  hasApprovedTermsSection,
+  parseApprovedTerms,
+} from "./approved-terms.js";
 
 // --- Types ---
 
@@ -256,6 +262,10 @@ interface ExtractedFile {
   edges: ConceptEdge[];
   misconceptions: Misconception[];
   contentHash: string;
+  /** Rows of the «Утверждённые английские термины» table (WP-620 Ф3); also present in `concepts`. */
+  approvedTerms: ApprovedTerm[];
+  /** Domain prefix under which approved-term codes are minted (null when the file has no `id`). */
+  approvedTermsDomain: string | null;
 }
 
 async function contentHash(content: string): Promise<string> {
@@ -359,7 +369,64 @@ function extractPackFile(sourceRepo: string, filePath: string, content: string):
 
   // 5. Misconceptions (if file is in CAT.001 — not Pack, skip here)
 
-  return { concepts, edges, misconceptions, contentHash: "" };
+  // 6. Approved English terms table (WP-620 Ф3): one concept node per row.
+  const approvedTermsDomain = meta.id ? String(meta.id).split(".")[0] : null;
+  const approvedTerms: ApprovedTerm[] = [];
+  if (approvedTermsDomain && hasApprovedTermsSection(body)) {
+    const parsed = parseApprovedTerms(approvedTermsDomain, body);
+    for (const reason of parsed.rejected) {
+      console.warn(`[approved-terms] ${sourceRepo}/${filePath}: ${reason}`);
+    }
+    for (const term of parsed.terms) {
+      approvedTerms.push(term);
+      concepts.push({
+        code: term.code,
+        name: term.nameRu,
+        name_ru: term.nameRu,
+        name_en: term.nameEn,
+        definition: term.definition,
+        level: "pack",
+        node_type: "concept",
+        domain: approvedTermsDomain,
+        source_doc: filePath,
+        source_repo: sourceRepo,
+      });
+    }
+  }
+
+  return { concepts, edges, misconceptions, contentHash: "", approvedTerms, approvedTermsDomain };
+}
+
+/**
+ * The general upsert keeps an existing name_en (COALESCE) and does not touch provenance, so the
+ * table is applied on top: it is the source of truth for these codes. Rows that vanished from
+ * the table are removed, the same way a removed file removes its nodes.
+ */
+async function applyApprovedTerms(
+  sql: SqlClient,
+  ct: string,
+  source: string,
+  filePath: string,
+  domain: string,
+  terms: ApprovedTerm[],
+): Promise<void> {
+  for (const term of terms) {
+    await sql`
+      UPDATE ${sql.unsafe(ct)}
+      SET name_en = ${term.nameEn},
+          name_en_source = 'manual',
+          name_en_status = ${term.approved ? "ok" : "pending"},
+          updated_at = NOW()
+      WHERE code = ${term.code}
+    `;
+  }
+  await sql`
+    DELETE FROM ${sql.unsafe(ct)}
+    WHERE source_repo = ${source}
+      AND source_doc = ${filePath}
+      AND code LIKE ${`${domain}.TERM.%`}
+      AND NOT (code = ANY(${terms.map((t) => t.code)}))
+  `;
 }
 
 // Resolve markdown links in a file body using conceptToArtifact map
@@ -506,8 +573,11 @@ export async function reindexConceptsForFiles(
         continue;
       }
 
-      // Content-hash skip
-      const hash = await contentHash(content);
+      // Content-hash skip. The format version joins the hash of files with an approved-terms
+      // table, so a parser change reprocesses them even when the file itself did not change.
+      const hash = await contentHash(
+        hasApprovedTermsSection(content) ? `${content}\n${APPROVED_TERMS_FORMAT_VERSION}` : content
+      );
       const existing = await sql`
         SELECT content_hash FROM ${sql.unsafe(ct)}
         WHERE source_repo = ${source} AND source_doc = ${file.path}
@@ -588,6 +658,11 @@ export async function reindexConceptsForFiles(
             content_hash = EXCLUDED.content_hash,
             updated_at = NOW()
         `;
+      }
+
+      // Runs for every Pack file with an id, so deleting the whole table also removes its terms.
+      if (extracted.approvedTermsDomain) {
+        await applyApprovedTerms(sql, ct, source, file.path, extracted.approvedTermsDomain, extracted.approvedTerms);
       }
 
       // Attempt best-effort translation for concepts without a name_en.
