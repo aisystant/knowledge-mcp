@@ -442,12 +442,16 @@ def review_manual(conn: "psycopg2.extensions.connection", dry_run: bool) -> None
 
     FPF sections (A.N) and U.* concepts → source='fpf', status='ok'
     All others (AS.*, _T.*, etc.)       → source='manual', status='ok'
+
+    Approved-term rows (<DOMAIN>.TERM.*, WP-620) are excluded: their pending status means
+    «not approved by the pilot in the Pack table», and only the Pack table may change it.
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("""
             SELECT id, code, COALESCE(name_ru, name) AS name_ru, name_en
             FROM concept_graph.concepts
             WHERE name_en_source = 'manual' AND name_en_status = 'pending'
+              AND code NOT LIKE '%.TERM.%'
             ORDER BY code
         """)
         rows = cur.fetchall()

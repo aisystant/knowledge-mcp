@@ -11,6 +11,13 @@
 import { neon } from "@neondatabase/serverless";
 import { getConceptGraphSchema, CONCEPT_GRAPH_TABLES } from "./utils/db.js";
 import { glossaryLookup, translateWithLlm } from "./translation.js";
+import {
+  APPROVED_TERM_INFIX,
+  APPROVED_TERMS_FORMAT_VERSION,
+  type ApprovedTerm,
+  hasApprovedTermsSection,
+  parseApprovedTerms,
+} from "./approved-terms.js";
 
 // --- Types ---
 
@@ -39,6 +46,12 @@ interface ConceptNode {
   domain: string | null;
   source_doc: string | null;
   source_repo: string;
+  /**
+   * Set only for rows of an approved-terms table: the Pack is then the authority for name_en,
+   * written with name_en_source='manual' in the same INSERT (never a later UPDATE, so an
+   * unapproved row is not publishable even for a moment).
+   */
+  approved_term_status?: "ok" | "pending";
 }
 
 interface ConceptEdge {
@@ -256,6 +269,11 @@ interface ExtractedFile {
   edges: ConceptEdge[];
   misconceptions: Misconception[];
   contentHash: string;
+  /** Code of the file's own concept (`id` in frontmatter); approved terms are minted under its domain. */
+  fileConceptCode: string | null;
+  /** false when an approved-terms section exists but its table is unreadable: keep the graph as is. */
+  approvedTermsReadable: boolean;
+  approvedTermsRejected: string[];
 }
 
 async function contentHash(content: string): Promise<string> {
@@ -359,7 +377,91 @@ function extractPackFile(sourceRepo: string, filePath: string, content: string):
 
   // 5. Misconceptions (if file is in CAT.001 — not Pack, skip here)
 
-  return { concepts, edges, misconceptions, contentHash: "" };
+  // 6. Approved English terms table (WP-620 Ф3): one concept node per row, defined by this file.
+  const fileConceptCode = meta.id ? String(meta.id) : null;
+  let approvedTermsReadable = true;
+  let approvedTermsRejected: string[] = [];
+  if (fileConceptCode) {
+    const domain = fileConceptCode.split(".")[0];
+    const parsed = parseApprovedTerms(domain, body);
+    approvedTermsReadable = parsed.tableReadable;
+    approvedTermsRejected = parsed.rejected;
+    for (const term of parsed.terms) {
+      concepts.push(approvedTermNode(term, domain, sourceRepo, filePath));
+      edges.push({
+        from_code: artifactCode,
+        to_code: term.code,
+        edge_type: "artifact_defines_concept",
+        weight: 0.95,
+        weight_source: "manual",
+      });
+    }
+  }
+
+  return {
+    concepts, edges, misconceptions, contentHash: "",
+    fileConceptCode, approvedTermsReadable, approvedTermsRejected,
+  };
+}
+
+function approvedTermNode(term: ApprovedTerm, domain: string, sourceRepo: string, filePath: string): ConceptNode {
+  return {
+    code: term.code,
+    name: term.nameRu,
+    name_ru: term.nameRu,
+    name_en: term.nameEn,
+    definition: term.definition,
+    level: "pack",
+    node_type: "concept",
+    domain,
+    source_doc: filePath,
+    source_repo: sourceRepo,
+    approved_term_status: term.approved ? "ok" : "pending",
+  };
+}
+
+/**
+ * A term code is owned by the first file that defined it. A second file with the same term
+ * would silently take the row over (and later prune it), so its row is refused loudly instead.
+ */
+async function dropTermsOwnedElsewhere(
+  sql: SqlClient,
+  ct: string,
+  source: string,
+  filePath: string,
+  extracted: ExtractedFile,
+): Promise<string[]> {
+  const termCodes = extracted.concepts.filter((c) => c.approved_term_status).map((c) => c.code!);
+  if (termCodes.length === 0) return [];
+  const owned = await sql`
+    SELECT code, source_repo, source_doc FROM ${sql.unsafe(ct)}
+    WHERE code = ANY(${termCodes})
+      AND NOT (source_repo = ${source} AND source_doc = ${filePath})
+  `;
+  const foreign = new Set(owned.map((r) => r.code as string));
+  extracted.concepts = extracted.concepts.filter((c) => !c.code || !foreign.has(c.code));
+  extracted.edges = extracted.edges.filter((e) => !foreign.has(e.to_code));
+  return owned.map((r) => `approved term ${r.code} is already defined in ${r.source_repo}/${r.source_doc}; row skipped`);
+}
+
+/** Rows that vanished from the table are removed, the same way a removed file removes its nodes. */
+async function pruneApprovedTerms(
+  sql: SqlClient,
+  ct: string,
+  source: string,
+  filePath: string,
+  fileConceptCode: string,
+  keepCodes: string[],
+): Promise<void> {
+  const domain = fileConceptCode.split(".")[0];
+  await sql`
+    DELETE FROM ${sql.unsafe(ct)}
+    WHERE source_repo = ${source}
+      AND source_doc = ${filePath}
+      AND code LIKE ${`${domain}${APPROVED_TERM_INFIX}%`}
+      AND code <> ${fileConceptCode}
+      AND NOT (code = ANY(${keepCodes}))
+  `;
 }
 
 // Resolve markdown links in a file body using conceptToArtifact map
@@ -506,8 +608,11 @@ export async function reindexConceptsForFiles(
         continue;
       }
 
-      // Content-hash skip
-      const hash = await contentHash(content);
+      // Content-hash skip. The format version joins the hash of files with an approved-terms
+      // table, so a parser change reprocesses them even when the file itself did not change.
+      const hash = await contentHash(
+        hasApprovedTermsSection(content) ? `${content}\n${APPROVED_TERMS_FORMAT_VERSION}` : content
+      );
       const existing = await sql`
         SELECT content_hash FROM ${sql.unsafe(ct)}
         WHERE source_repo = ${source} AND source_doc = ${file.path}
@@ -522,6 +627,14 @@ export async function reindexConceptsForFiles(
       // Extract concepts/edges from file
       const extracted = extractPackFile(source, file.path, content);
       extracted.contentHash = hash;
+      const termProblems = [
+        ...extracted.approvedTermsRejected,
+        ...(await dropTermsOwnedElsewhere(sql, ct, source, file.path, extracted)),
+      ];
+      for (const problem of termProblems) {
+        console.warn(`[approved-terms] ${source}/${file.path}: ${problem}`);
+        result.errors.push(`${file.path}: ${problem}`);
+      }
 
       // Resolve markdown link edges using updated map
       const { body } = parseFrontmatter(content);
@@ -568,16 +681,24 @@ export async function reindexConceptsForFiles(
       });
       const embeddings = await getEmbeddings(env, embeddingTexts);
 
+      // content_hash is written only after every step below succeeded (end of this block), so a
+      // file that failed midway is reprocessed on the next pass instead of skipped as unchanged.
       for (let i = 0; i < extracted.concepts.length; i++) {
         const c = extracted.concepts[i];
         const emb = embeddings[i];
+        const authoritative = c.approved_term_status !== undefined;
         await sql`
-          INSERT INTO ${sql.unsafe(ct)} (code, name, name_ru, name_en, definition, level, node_type, domain, source_doc, source_repo, embedding, content_hash)
-          VALUES (${c.code}, ${c.name}, ${c.name_ru ?? null}, ${c.name_en ?? null}, ${c.definition}, ${c.level}, ${c.node_type}, ${c.domain}, ${c.source_doc}, ${c.source_repo}, ${vectorToSql(emb)}::vector, ${hash})
+          INSERT INTO ${sql.unsafe(ct)} (code, name, name_ru, name_en, name_en_source, name_en_status, definition, level, node_type, domain, source_doc, source_repo, embedding, content_hash)
+          VALUES (${c.code}, ${c.name}, ${c.name_ru ?? null}, ${c.name_en ?? null}, ${authoritative ? "manual" : null}, ${c.approved_term_status ?? "ok"}, ${c.definition}, ${c.level}, ${c.node_type}, ${c.domain}, ${c.source_doc}, ${c.source_repo}, ${vectorToSql(emb)}::vector, NULL)
           ON CONFLICT (code) DO UPDATE SET
             name = EXCLUDED.name,
             name_ru = COALESCE(EXCLUDED.name_ru, ${sql.unsafe(ct)}.name_ru),
-            name_en = COALESCE(EXCLUDED.name_en, ${sql.unsafe(ct)}.name_en),
+            name_en = CASE WHEN ${authoritative}::boolean THEN EXCLUDED.name_en
+                           ELSE COALESCE(EXCLUDED.name_en, ${sql.unsafe(ct)}.name_en) END,
+            name_en_source = CASE WHEN ${authoritative}::boolean THEN EXCLUDED.name_en_source
+                                  ELSE ${sql.unsafe(ct)}.name_en_source END,
+            name_en_status = CASE WHEN ${authoritative}::boolean THEN EXCLUDED.name_en_status
+                                  ELSE ${sql.unsafe(ct)}.name_en_status END,
             definition = EXCLUDED.definition,
             level = EXCLUDED.level,
             node_type = EXCLUDED.node_type,
@@ -585,9 +706,16 @@ export async function reindexConceptsForFiles(
             source_doc = EXCLUDED.source_doc,
             source_repo = EXCLUDED.source_repo,
             embedding = EXCLUDED.embedding,
-            content_hash = EXCLUDED.content_hash,
+            content_hash = NULL,
             updated_at = NOW()
         `;
+      }
+
+      // Runs for every Pack file with an id, so deleting the whole table also removes its terms;
+      // an unreadable table keeps them (a header typo must not wipe approved names).
+      if (extracted.fileConceptCode && extracted.approvedTermsReadable) {
+        const keepCodes = extracted.concepts.filter((c) => c.approved_term_status).map((c) => c.code!);
+        await pruneApprovedTerms(sql, ct, source, file.path, extracted.fileConceptCode, keepCodes);
       }
 
       // Attempt best-effort translation for concepts without a name_en.
@@ -614,6 +742,11 @@ export async function reindexConceptsForFiles(
           // Skip edges where target concept doesn't exist yet
         }
       }
+
+      await sql`
+        UPDATE ${sql.unsafe(ct)} SET content_hash = ${hash}
+        WHERE source_repo = ${source} AND source_doc = ${file.path}
+      `;
 
       result.processed++;
       result.details.push({
