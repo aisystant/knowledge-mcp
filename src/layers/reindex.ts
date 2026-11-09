@@ -27,7 +27,7 @@ import {
   type PersonalEnv,
   type UserContext,
 } from "./personal.js";
-import { repositoryToken } from "./team-github.js";
+import { activeTeamBinding, repositoryToken, teamRepositoryName } from "./team-github.js";
 import { firstErrorText, notifyJobFinished, type ReindexNotifyEnv } from "./reindex-notify.js";
 import {
   githubBranchApiUrl,
@@ -171,7 +171,7 @@ function generationColumn(value: unknown): number | null {
 
 const MAX_FILE_SIZE = 100_000; // 100KB — skip large files
 const CHUNK_SIZE = 8_000; // ~8K chars per chunk (fits embedding context)
-const REINDEX_BATCH_SIZE = 10; // files per queue message, each consumer invocation ≤30s
+const REINDEX_BATCH_SIZE = 10; // files per queue message, each consumer invocation ≤30s CPU; team token retries add up to 3s of wall-clock wait per refused file
 const REINDEX_COOLDOWN_SECONDS = 60;
 
 // --- File content processing (faithful port of personal-knowledge-mcp/src/index.ts:2246-2332) ---
@@ -245,6 +245,36 @@ export type GitHubReadFailure = "source_not_connected" | "github_access_unavaila
 export const MISSING_RECHECK_DELAY_MS = 1000;
 
 /**
+ * Pauses before asking the broker again for a team-repository read token. The broker mints a
+ * fresh token per file and occasionally refuses one for a user who still has access (WP-5 Ф64,
+ * 09.11.2026: 22 refusals in ~1200 reads over three jobs, never the same file twice), and a full
+ * job with any failed file leaves the whole source invisible. Two retries turn a ~1.8% per-file
+ * refusal into ~0.0006%. A revoked user is refused on every attempt, so revocation still holds;
+ * a binding already deactivated locally is not retried at all.
+ */
+export const TEAM_TOKEN_RETRY_DELAYS_MS: readonly number[] = [1000, 2000];
+
+type ReadLease = NonNullable<Awaited<ReturnType<typeof repositoryToken>>>;
+
+export async function readLease(env: ReindexEnv, ctx: UserContext, source: string, repo: string): Promise<ReadLease | null> {
+  const attempt = () => repositoryToken(env, ctx, source, "read", () => getInstallationToken(env, ctx.userId, repo));
+  // Personal sources use the App installation token, which has no per-read broker step to retry.
+  if (!teamRepositoryName(source)) return attempt();
+  for (const delay of TEAM_TOKEN_RETRY_DELAYS_MS) {
+    try {
+      const lease = await attempt();
+      if (lease) return lease;
+    } catch (err) {
+      console.warn(JSON.stringify({ phase: "team_token_issue_error", error: err instanceof Error ? err.name : "unknown" }));
+    }
+    if (!ctx.userId || !await activeTeamBinding(env, ctx.userId, source)) return null;
+    console.log(JSON.stringify({ phase: "team_token_retry", delay_ms: delay }));
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+  return attempt();
+}
+
+/**
  * Read file content from GitHub via App Installation Token (GET, distinct from writeToGitHub's PUT).
  * `missing` (WP-607): the file is not at HEAD on a second read, and the repository itself is
  * reachable with this token and is the same repository (id) — so a push named the file and a
@@ -268,7 +298,7 @@ async function readFromGitHub(
   // source configuration must never reach the installation-token or Contents endpoints.
   const fullPath = resolveSourcePath(userSource.pathPrefix, path).fullPath;
 
-  const lease = await repositoryToken(env, ctx, source, "read", () => getInstallationToken(env, ctx.userId, repo));
+  const lease = await readLease(env, ctx, source, repo);
   if (!lease) return { failure: "github_access_unavailable" };
   const token = lease.token;
   try {
