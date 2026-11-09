@@ -25,7 +25,7 @@ for (const line of vars.split("\n")) {
 
 const env = {
   KNOWLEDGE_DATABASE_URL: process.env.DATABASE_URL!.replace("-pooler", ""),
-  OPENAI_API_KEY: process.env.OPENAI_API_KEY!,
+  OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY!,
 };
 
 const source = "PACK-digital-platform";

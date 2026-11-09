@@ -23,9 +23,7 @@ import {
 
 export interface Env {
   KNOWLEDGE_DATABASE_URL: string;
-  /** OpenAI key for embeddings. Optional — concept graph indexing skipped if absent. */
-  OPENAI_API_KEY?: string;
-  /** OpenRouter key for concept name translation. Optional — translation skipped if absent. */
+  /** OpenRouter key: embeddings (required for indexing) and concept name translation. */
   OPENROUTER_API_KEY?: string;
   CONCEPT_GRAPH_DB_SCHEMA?: string;
 }
@@ -108,16 +106,21 @@ function misconceptionsTable(env: Env) {
   return CONCEPT_GRAPH_TABLES.concept_misconceptions(getConceptGraphSchema(env));
 }
 
-// --- OpenAI Embeddings ---
+// --- Embeddings (OpenRouter, same provider and model as chunk search in index.ts) ---
+
+// Was a direct OpenAI call with its own key; that key is absent since the worker moved to
+// OpenRouter (19.06), so every Pack graph write failed silently from 04.09 (WP-620 Ф3).
+const EMBEDDING_ENDPOINT = "https://openrouter.ai/api/v1/embeddings";
+const EMBEDDING_MODEL = "openai/text-embedding-3-small";
 
 async function getEmbeddings(env: Env, texts: string[]): Promise<number[][]> {
-  const apiKey = env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error("OPENAI_API_KEY required");
+  const apiKey = env.OPENROUTER_API_KEY;
+  if (!apiKey) throw new Error("OPENROUTER_API_KEY required for concept graph embeddings");
 
   const results: number[][] = [];
   for (let i = 0; i < texts.length; i += BATCH_SIZE) {
     const batch = texts.slice(i, i + BATCH_SIZE);
-    const response = await fetch("https://api.openai.com/v1/embeddings", {
+    const response = await fetch(EMBEDDING_ENDPOINT, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -125,14 +128,15 @@ async function getEmbeddings(env: Env, texts: string[]): Promise<number[][]> {
       },
       body: JSON.stringify({
         input: batch,
-        model: "text-embedding-3-small",
+        model: EMBEDDING_MODEL,
         dimensions: 1024,
       }),
     });
 
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`OpenAI error: ${response.status} ${text}`);
+      // Only status and body size: the provider controls the body text (same rule as index.ts, WP-7 F183).
+      const bodyLength = (await response.text()).length;
+      throw new Error(`OpenRouter embeddings error: ${response.status} (body ${bodyLength} chars)`);
     }
 
     const data = (await response.json()) as {

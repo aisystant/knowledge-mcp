@@ -87,8 +87,6 @@ export interface Env extends ObservationEnv, VectorScanEnv {
   /** Neon `health` БД (DB #8) для observability writes (graph_usage_events). Required. */
   HEALTH_DATABASE_URL: string;
   OPENROUTER_API_KEY: string;
-  /** OpenAI key for concept-indexer (WP-339). Optional — concept graph indexing skipped if absent. */
-  OPENAI_API_KEY?: string;
   ORY_URL?: string; // e.g. https://auth.system-school.ru/hydra — optional, JWT verification disabled if absent
   REINDEX_SECRET?: string; // Shared secret for /reindex endpoint (set via wrangler secret)
   // WP-7 Ф95: secret github-integration-service sends on every push for the personal
@@ -4997,6 +4995,11 @@ export default {
           body.files,
           (path: string) => readFromGitHubPublic(body.source, path)
         );
+        if (graphResult.errors.length > 0) {
+          console.error(
+            `[reindex] ${body.source}: concept graph ${graphResult.errors.length} file error(s), first: ${graphResult.errors[0]}`
+          );
+        }
       }
 
       return new Response(JSON.stringify({ chunks: chunkResult, graph: graphResult }), {
@@ -6526,6 +6529,12 @@ async function runHeartbeatForSource(
       reindexed = true;
       reindexProcessed = result.processed;
       reindexSkipped = result.skipped;
+      // Per-file failures do not throw; without this the freshness log showed a "successful"
+      // reindex that wrote nothing for two months (WP-620 Ф3).
+      if (result.errors.length > 0) {
+        error = `graph: ${result.errors.length} file error(s), first: ${result.errors[0]}`;
+        console.error(`[heartbeat] ${source} ${error}`);
+      }
     } else {
       console.log(
         `[heartbeat] ${source}: drift=${githubCount - dbCount}, p99=${p99Hours?.toFixed(1)}h — OK`
