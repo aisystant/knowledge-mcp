@@ -104,15 +104,26 @@ export function reasonCategory(reason: string | undefined): string {
   return "внутренняя ошибка, подробности в журнале сервера";
 }
 
+/** Identity must not depend on the display name or the operator configuration.
+ * Hash the owner/source tuple, not the (guessable) source name alone. Missing
+ * ownership cannot be grouped safely: retain that event under a unique key.
+ */
+async function sourceIdentity(job: FinishedJob): Promise<string> {
+  if (!job.userId?.trim()) return `unattributed:${crypto.randomUUID()}`;
+  const encoded = new TextEncoder().encode(JSON.stringify([job.userId, job.source]));
+  const digest = await crypto.subtle.digest("SHA-256", encoded);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 /** Center event for a failed job, or null: successes are not faults and are not counted. */
-export function renderCenterEvent(job: FinishedJob, operatorUserId?: string): CenterEvent | null {
+export async function renderCenterEvent(job: FinishedJob, operatorUserId?: string): Promise<CenterEvent | null> {
   if (!shouldNotify(job)) return null;
   const { kind, name, reason } = failureParts(job, operatorUserId);
   return {
     title: `${kind} переиндексация не удалась: ${name}`,
     detail: reason,
     // Same failure of the same source within the alert window is one Center item, not many.
-    correlationId: `${CENTER_SOURCE}:${job.kind}:${name}`,
+    correlationId: `${CENTER_SOURCE}:v2:${job.kind}:${await sourceIdentity(job)}`,
   };
 }
 
@@ -158,7 +169,7 @@ async function writeCenter(env: ReindexNotifyEnv, job: FinishedJob): Promise<voi
   if (!url || !user || !token) return;
   // Everything inside the try: the caller has already committed the job status and must not fail here.
   try {
-    const event = renderCenterEvent(job, env.REINDEX_OPERATOR_USER_ID);
+    const event = await renderCenterEvent(job, env.REINDEX_OPERATOR_USER_ID);
     if (!event) return;
     const line = JSON.stringify({
       schema_version: 1,
