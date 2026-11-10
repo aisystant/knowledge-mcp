@@ -12,14 +12,14 @@ const CENTER = {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("reindex notice criterion", () => {
-  it("is loud for every failure and silent for every success, full rebuild included", () => {
+  it("is loud for every failure and silent for every success, full rebuild included", async () => {
     expect(shouldNotify({ status: "succeeded" })).toBe(false);
     expect(shouldNotify({ status: "failed" })).toBe(true);
     expect(renderNotice({ status: "succeeded", kind: "incremental", source: "DS-x", userId: "op-1" }, "op-1")).toBeNull();
     expect(renderNotice({ status: "succeeded", kind: "full", source: "DS-x", userId: "op-1" }, "op-1")).toBeNull();
   });
 
-  it("renders the operator's own source with its reason, trimming long reasons", () => {
+  it("renders the operator's own source with its reason, trimming long reasons", async () => {
     const own = { source: "DS-x", userId: "op-1" };
     expect(renderNotice({ ...own, status: "failed", kind: "full", reason: "e".repeat(500) }, "op-1"))
       .toBe(`Полная переиндексация источника DS-x не удалась: ${"e".repeat(200)}`);
@@ -29,7 +29,7 @@ describe("reindex notice criterion", () => {
       .toBe("Инкрементальная переиндексация источника DS-x не удалась: only");
   });
 
-  it("hides another user's source name and free error text in the chat notice", () => {
+  it("hides another user's source name and free error text in the chat notice", async () => {
     const text = renderNotice({
       status: "failed", kind: "full", source: "SomeLogin/moi-rp", userId: "u-2",
       reason: "Cannot read notes/a.md from GitHub (github_http_403)",
@@ -39,7 +39,7 @@ describe("reindex notice criterion", () => {
     expect(text).not.toContain("notes/a.md");
   });
 
-  it("reads the first error from strings and from objects", () => {
+  it("reads the first error from strings and from objects", async () => {
     expect(firstErrorText(["boom"])).toBe("boom");
     expect(firstErrorText([{ reason: "watchdog_stale_heartbeat" }])).toBe('{"reason":"watchdog_stale_heartbeat"}');
     expect(firstErrorText([])).toBeUndefined();
@@ -71,7 +71,7 @@ describe("notifyJobFinished", () => {
 
   it("logs a failed delivery under the masked name of another user's source", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500 }));
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(async () => {});
     await notifyJobFinished({ ...ENV, REINDEX_OPERATOR_USER_ID: "op-1" },
       { status: "failed", kind: "full", source: "SomeLogin/x", userId: "u-2", reason: "boom" });
     const logged = warn.mock.calls.flat().join(" ");
@@ -82,7 +82,7 @@ describe("notifyJobFinished", () => {
 
   it("swallows a network failure and never logs the token", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("https://api.telegram.org/bottok/sendMessage down")));
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(async () => {});
     await expect(notifyJobFinished(ENV, { status: "failed", kind: "full", source: "DS-x" })).resolves.toBeUndefined();
     expect(warn.mock.calls.flat().join(" ")).not.toContain("tok");
     warn.mockRestore();
@@ -90,20 +90,20 @@ describe("notifyJobFinished", () => {
 });
 
 describe("Notification Center event", () => {
-  it("keeps the name of the operator's own source", () => {
-    const ev = renderCenterEvent(
+  it("keeps the name of the operator's own source", async () => {
+    const ev = await renderCenterEvent(
       { status: "failed", kind: "incremental", source: "DS-mine", userId: "op-1", reason: "Cannot read DS-mine/a.md" },
       "op-1",
     );
     expect(ev).toEqual({
       title: "Инкрементальная переиндексация не удалась: DS-mine",
       detail: "Cannot read DS-mine/a.md",
-      correlationId: "knowledge-reindex:incremental:DS-mine",
+      correlationId: expect.stringMatching(/^knowledge-reindex:v2:incremental:[a-f0-9]{64}$/),
     });
   });
 
-  it("hides another user's source name in title, reason and correlation id", () => {
-    const ev = renderCenterEvent(
+  it("hides another user's source name in title, reason and correlation id", async () => {
+    const ev = await renderCenterEvent(
       { status: "failed", kind: "full", source: "DS-health", userId: "u-2", reason: "Cannot read DS-health/x.md from GitHub", errorCount: 3 },
       "op-1",
     );
@@ -112,7 +112,7 @@ describe("Notification Center event", () => {
     expect(JSON.stringify(ev)).not.toContain("DS-health");
   });
 
-  it("passes only a fixed cause category for another user's job, never the free text", () => {
+  it("passes only a fixed cause category for another user's job, never the free text", async () => {
     const leaky = [
       ["Cannot read diagnoses/2026.md from GitHub (github_http_404)", "не удалось прочитать файл из GitHub (github_http_404)"],
       ["Unknown source: DS-x. User sources: DS-health, DS-finance", "источник не найден у пользователя"],
@@ -122,7 +122,7 @@ describe("Notification Center event", () => {
       ["задача так и не стартовала", "задача так и не стартовала"],
     ] as const;
     for (const [reason, expected] of leaky) {
-      const ev = renderCenterEvent({ status: "failed", kind: "incremental", source: "DS-x", userId: "u-2", reason }, "op-1");
+      const ev = await renderCenterEvent({ status: "failed", kind: "incremental", source: "DS-x", userId: "u-2", reason }, "op-1");
       expect(ev?.detail).toBe(expected);
       for (const secret of ["DS-health", "DS-finance", "0b1c2d3e", "diagnoses", "DS-x"]) {
         expect(JSON.stringify(ev)).not.toContain(secret);
@@ -130,24 +130,24 @@ describe("Notification Center event", () => {
     }
   });
 
-  it("does not break on an empty source name", () => {
-    const ev = renderCenterEvent({ status: "failed", kind: "full", source: "", userId: "u-2", reason: "Unknown source: " }, "op-1");
+  it("does not break on an empty source name", async () => {
+    const ev = await renderCenterEvent({ status: "failed", kind: "full", source: "", userId: "u-2", reason: "Unknown source: " }, "op-1");
     expect(ev?.detail).toBe("источник не найден у пользователя");
   });
 
-  it("matches the operator id even with stray whitespace in the stored value", () => {
-    const ev = renderCenterEvent({ status: "failed", kind: "full", source: "DS-mine", userId: "op-1", reason: "boom" }, " op-1\n");
+  it("matches the operator id even with stray whitespace in the stored value", async () => {
+    const ev = await renderCenterEvent({ status: "failed", kind: "full", source: "DS-mine", userId: "op-1", reason: "boom" }, " op-1\n");
     expect(ev?.title).toBe("Полная переиндексация не удалась: DS-mine");
     expect(ev?.detail).toBe("boom");
   });
 
-  it("treats every source as foreign while the operator id is not configured", () => {
-    const ev = renderCenterEvent({ status: "failed", kind: "full", source: "DS-mine", userId: "op-1" }, undefined);
+  it("treats every source as foreign while the operator id is not configured", async () => {
+    const ev = await renderCenterEvent({ status: "failed", kind: "full", source: "DS-mine", userId: "op-1" }, undefined);
     expect(ev?.title).toBe("Полная переиндексация не удалась: источник другого пользователя");
   });
 
-  it("does not count successes", () => {
-    expect(renderCenterEvent({ status: "succeeded", kind: "full", source: "DS-x" }, "op-1")).toBeNull();
+  it("does not count successes", async () => {
+    expect(await renderCenterEvent({ status: "succeeded", kind: "full", source: "DS-x" }, "op-1")).toBeNull();
   });
 });
 
@@ -173,7 +173,7 @@ describe("dual write to Telegram and the Center", () => {
       event: "notification",
       title: "Инкрементальная переиндексация не удалась: источник другого пользователя",
       detail: "внутренняя ошибка, подробности в журнале сервера",
-      correlation_id: "knowledge-reindex:incremental:источник другого пользователя",
+      correlation_id: expect.stringMatching(/^knowledge-reindex:v2:incremental:[a-f0-9]{64}$/),
     });
   });
 
@@ -210,12 +210,49 @@ describe("dual write to Telegram and the Center", () => {
     const fetchMock = vi.fn().mockImplementation((url: string) =>
       url.includes("/loki/") ? Promise.reject(new Error("lokisecret leaked?")) : Promise.resolve({ ok: true }));
     vi.stubGlobal("fetch", fetchMock);
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(async () => {});
     await expect(notifyJobFinished({ ...ENV, ...CENTER }, { status: "failed", kind: "full", source: "DS-x" })).resolves.toBeUndefined();
     expect(fetchMock.mock.calls.map((c) => c[0])).toContain("https://api.telegram.org/bottok/sendMessage");
     const logged = warn.mock.calls.flat().join(" ");
     expect(logged).toContain("center_write_failed");
     expect(logged).not.toContain("lokisecret");
     warn.mockRestore();
+  });
+});
+
+
+describe("source identity independent of display", () => {
+  const job = { status: "failed", kind: "full", source: "private-source", userId: "owner-a" } as const;
+
+  it("keeps the same identity through retries, changed wording and operator configuration", async () => {
+    const a = await renderCenterEvent(job, "owner-a");
+    const b = await renderCenterEvent({ ...job, reason: "changed error" }, "different-operator");
+    const c = await renderCenterEvent(job);
+    expect(a?.correlationId).toBe(b?.correlationId);
+    expect(a?.correlationId).toBe(c?.correlationId);
+    expect(a?.title).not.toBe(b?.title);
+    expect(b?.correlationId).not.toContain(job.source);
+    expect(b?.correlationId).not.toContain(job.userId);
+  });
+
+  it("separates sources, owners, kinds and ambiguous delimiter tuples", async () => {
+    const events = await Promise.all([
+      job,
+      { ...job, source: "different-source" },
+      { ...job, userId: "owner-b" },
+      { ...job, kind: "incremental" as const },
+      { ...job, userId: "a:b", source: "c" },
+      { ...job, userId: "a", source: "b:c" },
+    ].map((entry) => renderCenterEvent(entry)));
+    expect(new Set(events.map((event) => event?.correlationId)).size).toBe(events.length);
+  });
+
+  it("never merges events without trustworthy ownership or exposes the source", async () => {
+    const missing = { ...job, userId: undefined };
+    const a = await renderCenterEvent(missing);
+    const b = await renderCenterEvent(missing);
+    expect(a?.correlationId).toMatch(/^knowledge-reindex:v2:full:unattributed:/);
+    expect(a?.correlationId).not.toBe(b?.correlationId);
+    expect(JSON.stringify(a)).not.toContain(job.source);
   });
 });
