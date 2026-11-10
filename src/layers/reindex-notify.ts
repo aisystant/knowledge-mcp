@@ -1,15 +1,15 @@
 /**
  * Operator notice about a finished reindex job (WP-545 Ф23). One best-effort Telegram message,
  * one attempt with a short timeout; a lost message is accepted until the reliable-delivery
- * phase (Ф24). Silent by design for routine outcomes: an incremental (push-triggered) job that
- * succeeded is not reported, every failure and every full-rebuild success is.
- * The text carries the source name only, never a user identity.
+ * phase (Ф24). Only failures are reported: a success needs no action from the operator
+ * (WP-568 Ф10, 10.11 — full-rebuild successes no longer reach the chat).
  *
  * Notification Center (WP-568 Ф10): every failure is also written to the operator's
- * Notification Center (Grafana Cloud Loki, same stream shape as notification-center-send.sh),
- * which counts it instead of interrupting the chat. Telegram and the Center run side by side
- * until the dual-write check passes; then the Telegram variables are removed. A source that
- * does not belong to the operator is shown in the Center without its name.
+ * Notification Center (Grafana Cloud Loki, same stream shape as notification-center-send.sh).
+ * Telegram and the Center run side by side until the operator actually reads the Center; then
+ * the Telegram variables are removed. Both channels render the same failure text: a source that
+ * does not belong to the operator is shown without its name (it often carries a GitHub login)
+ * and with a fixed cause category instead of the free error text.
  */
 
 const NOTIFY_TIMEOUT_MS = 4000;
@@ -47,16 +47,36 @@ export interface CenterEvent {
   correlationId: string;
 }
 
-export function shouldNotify(job: Pick<FinishedJob, "status" | "kind">): boolean {
-  return job.status === "failed" || job.kind === "full";
+export function shouldNotify(job: Pick<FinishedJob, "status">): boolean {
+  return job.status === "failed";
 }
 
-export function renderNotice(job: FinishedJob): string {
-  const kind = job.kind === "full" ? "Полная" : "Инкрементальная";
-  if (job.status === "succeeded") return `${kind} переиндексация источника ${job.source} завершена.`;
-  const reason = (job.reason ?? "причина не записана").slice(0, MAX_REASON_CHARS);
+interface FailureParts {
+  kind: string;
+  own: boolean;
+  name: string;
+  reason: string;
+}
+
+/** Failure wording shared by Telegram and the Center; another user's source loses its name and free text. */
+function failureParts(job: FinishedJob, operatorUserId?: string): FailureParts {
+  const operator = operatorUserId?.trim();
+  const own = Boolean(operator) && job.userId === operator;
   const more = job.errorCount && job.errorCount > 1 ? ` (и ещё ошибок: ${job.errorCount - 1})` : "";
-  return `${kind} переиндексация источника ${job.source} не удалась: ${reason}${more}`;
+  return {
+    kind: job.kind === "full" ? "Полная" : "Инкрементальная",
+    own,
+    name: own ? job.source : FOREIGN_SOURCE,
+    reason: (own ? (job.reason ?? "причина не записана").slice(0, MAX_REASON_CHARS) : reasonCategory(job.reason)) + more,
+  };
+}
+
+/** Telegram text for a failed job, or null: successes are not reported. */
+export function renderNotice(job: FinishedJob, operatorUserId?: string): string | null {
+  if (!shouldNotify(job)) return null;
+  const { kind, own, name, reason } = failureParts(job, operatorUserId);
+  const subject = own ? `источника ${name}` : "источника другого пользователя";
+  return `${kind} переиндексация ${subject} не удалась: ${reason}`;
 }
 
 const WATCHDOG_REASONS = new Set([
@@ -86,16 +106,11 @@ export function reasonCategory(reason: string | undefined): string {
 
 /** Center event for a failed job, or null: successes are not faults and are not counted. */
 export function renderCenterEvent(job: FinishedJob, operatorUserId?: string): CenterEvent | null {
-  if (job.status !== "failed") return null;
-  const operator = operatorUserId?.trim();
-  const own = Boolean(operator) && job.userId === operator;
-  const name = own ? job.source : FOREIGN_SOURCE;
-  const reason = own ? (job.reason ?? "причина не записана").slice(0, MAX_REASON_CHARS) : reasonCategory(job.reason);
-  const kind = job.kind === "full" ? "Полная" : "Инкрементальная";
-  const more = job.errorCount && job.errorCount > 1 ? ` (и ещё ошибок: ${job.errorCount - 1})` : "";
+  if (!shouldNotify(job)) return null;
+  const { kind, name, reason } = failureParts(job, operatorUserId);
   return {
     title: `${kind} переиндексация не удалась: ${name}`,
-    detail: `${reason}${more}`,
+    detail: reason,
     // Same failure of the same source within the alert window is one Center item, not many.
     correlationId: `${CENTER_SOURCE}:${job.kind}:${name}`,
   };
@@ -109,20 +124,23 @@ export function firstErrorText(errors: unknown): string | undefined {
 }
 
 async function sendTelegram(env: ReindexNotifyEnv, job: FinishedJob): Promise<void> {
-  if (!shouldNotify(job)) return;
+  const text = renderNotice(job, env.REINDEX_OPERATOR_USER_ID);
+  if (text === null) return;
+  // The worker log gets the same masked name as the chat: a foreign source name often carries a GitHub login.
+  const source = failureParts(job, env.REINDEX_OPERATOR_USER_ID).name;
   const { REINDEX_NOTIFY_TELEGRAM_TOKEN: token, REINDEX_NOTIFY_CHAT_ID: chatId } = env;
   if (!token || !chatId) return;
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text: renderNotice(job) }),
+      body: JSON.stringify({ chat_id: chatId, text }),
       signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
     });
-    if (!res.ok) console.warn(JSON.stringify({ phase: "notify_failed", http_status: res.status, source: job.source }));
+    if (!res.ok) console.warn(JSON.stringify({ phase: "notify_failed", http_status: res.status, source }));
   } catch (err) {
     // Never the token: the URL carries it, so only the error class and message of the abort/network failure.
-    console.warn(JSON.stringify({ phase: "notify_failed", source: job.source, error: err instanceof Error ? err.name : "unknown" }));
+    console.warn(JSON.stringify({ phase: "notify_failed", source, error: err instanceof Error ? err.name : "unknown" }));
   }
 }
 

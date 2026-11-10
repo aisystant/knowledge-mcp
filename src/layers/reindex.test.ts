@@ -610,7 +610,7 @@ describe("reindex enumeration failures", () => {
     expect(latestSourceIndexStateUpdate()[2]).toBe("ready");
   });
 
-  it("notifies the operator once when the empty full rebuild is the job that finished", async () => {
+  it("stays silent when the empty full rebuild is the job that finished (successes are not reported)", async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true });
     const github = vi.fn()
       .mockResolvedValueOnce({ ok: true, json: async () => ({ default_branch: "main" }) })
@@ -622,8 +622,8 @@ describe("reindex enumeration failures", () => {
     vi.stubGlobal("fetch", vi.fn((url: string, init?: RequestInit) =>
       String(url).startsWith("https://api.telegram.org/") ? fetchMock(url, init) : github(url)));
     await startReindexJob(env, USER_ID, "DS-my-strategy");
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(fetchMock.mock.calls[0][1].body).text).toBe("Полная переиндексация источника DS-my-strategy завершена.");
+    expect(latestGuardedFinish("succeeded")).toBeDefined();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("accepts a new repository whose default branch has not been created yet", async () => {
@@ -982,12 +982,12 @@ describe("handleQueue", () => {
       [{ status: "running", generation: 3, kind: "incremental", completed_batch_indexes: [] }],
       [sourceRow()], [{ index_generation: 3 }], [{ fence: 1 }], [{ job_fence: 1 }], [],
       [{ completed_batches: 1, expected_batches: 1, errors: [first, other, other] }],
-      [{ source: "DS-my-strategy", kind: "incremental", errors: [first, other, other] }],
+      [{ source: "DS-my-strategy", kind: "incremental", user_id: USER_ID, errors: [first, other, other] }],
     );
     const telegram = vi.fn().mockResolvedValue({ ok: true, status: 200 });
     vi.stubGlobal("fetch", vi.fn((url: string, init?: RequestInit) =>
       String(url).startsWith("https://api.telegram.org/") ? telegram(url, init) : Promise.resolve({ ok: false, status: 404 })));
-    const env = { ...ENV, REINDEX_NOTIFY_TELEGRAM_TOKEN: "tok", REINDEX_NOTIFY_CHAT_ID: "42" };
+    const env = { ...ENV, REINDEX_NOTIFY_TELEGRAM_TOKEN: "tok", REINDEX_NOTIFY_CHAT_ID: "42", REINDEX_OPERATOR_USER_ID: USER_ID };
     await handleQueue(makeBatch([makeMessage({ kind: "incremental" })]), env);
 
     expect(telegram).toHaveBeenCalledOnce();
