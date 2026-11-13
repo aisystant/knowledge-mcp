@@ -1,6 +1,6 @@
 import { ReadFailure, createReadTrace, fetchReadResponse, readHttpFailure, readJson, withReadDeadline, type ReadTrace } from "../read-failure.js";
 import { normalizeSearchResultLimit } from "../search-limits.js";
-import { activeTeamBinding, issueTeamToken, repositoryToken, teamMarkdownFiles, teamRepositoryName, teamReposEnabled } from "./team-github.js";
+import { activeTeamBinding, issueTeamToken, repositoryToken, type TeamBinding, teamMarkdownFiles, teamRepositoryName, teamReposEnabled } from "./team-github.js";
 // Personal-corpus data layer for the private MCP mode (WP-410 срез-2b).
 // Ported from personal-knowledge-mcp/src/index.ts, then hardened in this private-mode layer:
 // resolveUserContext, GitHub App JWT signing, writeToGitHub, getInstallationToken.
@@ -2312,7 +2312,7 @@ export interface ConnectSourceResult {
    * documents). The old index is purged and a reindex job is created in the same transaction;
    * the caller (../index.ts) must start that job. Until it finishes the source is fail-closed.
    */
-  status: "newly_connected" | "reactivated" | "already_connected" | "rebound" | "error";
+  status: "newly_connected" | "reactivated" | "already_connected" | "rebound" | "connected_without_index" | "error";
   scope_provisioning: "ok" | "failed" | "skipped";
   reindex_triggered: boolean;
   /** Set by the caller alongside reindex_triggered; poll with personal_reindex_status.
@@ -2322,6 +2322,11 @@ export interface ConnectSourceResult {
   index_generation?: number;
   message?: string;
   error?: string;
+}
+
+/** WP-560 Ф18: the gateway sets skipIndex on a free (no subscription) team connection. */
+export interface ConnectSourceOptions {
+  skipIndex?: boolean;
 }
 
 export interface ConnectSourceDependencies {
@@ -2341,7 +2346,7 @@ async function provisionTeamSourceScope(env: PersonalEnv, userId: string, source
   }
 }
 
-async function connectTeamSource(env: PersonalEnv, userId: string, source: string): Promise<ConnectSourceResult> {
+async function connectTeamSource(env: PersonalEnv, userId: string, source: string, skipIndex: boolean): Promise<ConnectSourceResult> {
   const name = teamRepositoryName(source);
   if (!name || !teamReposEnabled(env)) {
     return { source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
@@ -2374,11 +2379,16 @@ async function connectTeamSource(env: PersonalEnv, userId: string, source: strin
   const scopeProvisioning = await provisionTeamSourceScope(env, userId, source);
   const [, connected] = await sql.transaction([
     sql`SELECT set_config('app.user_id', ${userId}, true)`,
-    sql`SELECT github_repository_id, github_user_binding_id, active, index_state
+    sql`SELECT github_repository_id, github_user_binding_id, active, index_state,
+          EXISTS (SELECT 1 FROM knowledge.github_team_reindex_subscriptions s
+                  WHERE s.user_id = ${userId} AND s.source = ${source} AND s.active = true) AS indexed
         FROM ${sql.unsafe(userSources)} WHERE user_id = ${userId} AND source = ${source}`,
   ]);
   const existing = connected[0];
-  if (existing && existing.active === true && existing.index_state === "ready"
+  if (skipIndex) return connectTeamSourceWithoutIndex(sql, userId, source, binding, existing, scopeProvisioning, { userSources, documents, fileStatus, jobs });
+  // A source connected for free has no index (indexed=false): a paid reconnect falls through
+  // to the full path below and starts indexing instead of answering "already connected".
+  if (existing && existing.active === true && existing.index_state === "ready" && existing.indexed === true
     && Number(existing.github_repository_id) === binding.repositoryId
     && Number(existing.github_user_binding_id) === binding.repositoryId) {
     return { source, status: "already_connected", scope_provisioning: scopeProvisioning,
@@ -2446,6 +2456,78 @@ async function connectTeamSource(env: PersonalEnv, userId: string, source: strin
     message: scopeProvisioning === "failed"
       ? "Репозиторий подключён для чтения, но право записи через IWE не настроено. Повторите подключение после восстановления службы прав."
       : "Репозиторий подключён. Поиск станет доступен после завершения индексации.",
+  };
+}
+
+/**
+ * WP-560 Ф18: connect a team source for reading and writing without building a search index.
+ * Search is a subscription feature, so a free connection creates no reindex job and no
+ * push-webhook reindex subscription (both cost embeddings). Reads and writes of a team source
+ * go live to GitHub and do not need the index; the source only has to be active and 'ready'
+ * to appear in the caller's context. Leftover documents of an earlier binding are removed.
+ */
+async function connectTeamSourceWithoutIndex(
+  sql: ReturnType<typeof personalDb>,
+  userId: string,
+  source: string,
+  binding: TeamBinding,
+  existing: Record<string, unknown> | undefined,
+  scopeProvisioning: ConnectSourceResult["scope_provisioning"],
+  tables: { userSources: string; documents: string; fileStatus: string; jobs: string },
+): Promise<ConnectSourceResult> {
+  const sameRepository = existing?.active === true && Number(existing.github_repository_id) === binding.repositoryId;
+  if (sameRepository && existing?.index_state === "ready") {
+    return { source, status: "already_connected", scope_provisioning: scopeProvisioning, reindex_triggered: false,
+      message: "Репозиторий уже подключён." };
+  }
+  if (sameRepository && existing?.index_state === "reindexing") {
+    // Only a live job keeps the source hidden while it indexes; without one (a lapsed
+    // subscriber's reindex died) the free path resets it to 'ready' below instead of
+    // leaving it stuck — a non-subscriber cannot call personal_reindex.
+    const live = await sql`
+      SELECT id FROM ${sql.unsafe(tables.jobs)} WHERE user_id = ${userId} AND source = ${source}
+        AND status IN ('pending', 'running') LIMIT 1
+    `;
+    if (live.length) {
+      return { source, status: "already_connected", scope_provisioning: scopeProvisioning, reindex_triggered: false,
+        message: "Индекс репозитория уже строится." };
+    }
+  }
+  try {
+    await sql.transaction([
+      sql`SELECT set_config('app.user_id', ${userId}, true)`,
+      sql`
+        INSERT INTO ${sql.unsafe(tables.userSources)}
+          (user_id, source, github_owner, github_repo, source_type, active,
+           github_repository_id, github_user_binding_id, index_state)
+        VALUES (${userId}, ${source}, ${binding.owner}, ${binding.repository},
+                ${inferSourceType(binding.repository)}, true, ${binding.repositoryId},
+                ${binding.repositoryId}, 'ready')
+        ON CONFLICT (user_id, source) DO UPDATE SET
+          github_owner = EXCLUDED.github_owner, github_repo = EXCLUDED.github_repo,
+          github_repository_id = EXCLUDED.github_repository_id,
+          github_user_binding_id = EXCLUDED.github_user_binding_id,
+          active = true, index_state = 'ready',
+          index_generation = ${sql.unsafe(tables.userSources)}.index_generation + 1
+      `,
+      sql`DELETE FROM ${sql.unsafe(tables.documents)} WHERE user_id = ${userId} AND source = ${source}`,
+      sql`DELETE FROM ${sql.unsafe(tables.fileStatus)} WHERE user_id = ${userId} AND source = ${source}`,
+      sql`UPDATE ${sql.unsafe(tables.jobs)} SET status = 'cancelled'
+          WHERE user_id = ${userId} AND source = ${source} AND status IN ('pending', 'running')`,
+      sql`UPDATE knowledge.github_team_reindex_subscriptions SET active = false
+          WHERE user_id = ${userId} AND source = ${source}`,
+    ]);
+  } catch (err) {
+    console.error(JSON.stringify({ phase: "connect_team_source_without_index_failed", user_id_prefix: userId.slice(0, 8),
+      error: err instanceof Error ? err.name : "unknown" }));
+    return { source, status: "error", scope_provisioning: "skipped", reindex_triggered: false,
+      error: "Не удалось подключить репозиторий. Повторите позже." };
+  }
+  return {
+    source, status: "connected_without_index", scope_provisioning: scopeProvisioning, reindex_triggered: false,
+    message: scopeProvisioning === "failed"
+      ? "Репозиторий подключён для чтения; право записи через IWE пока не настроено. Поиск по смыслу по нему доступен с подпиской."
+      : "Репозиторий подключён для чтения и записи. Поиск по смыслу по нему доступен с подпиской: после её оформления повторите подключение, и индекс построится.",
   };
 }
 
@@ -2519,8 +2601,10 @@ export async function connectSource(
   userId: string,
   source: string,
   dependencies: ConnectSourceDependencies = {},
+  options: ConnectSourceOptions = {},
 ): Promise<ConnectSourceResult> {
-  if (source.includes("/")) return connectTeamSource(env, userId, source);
+  // skipIndex applies to team sources only; a personal source ignores it (Kimi, peer session 2026-11-13-19).
+  if (source.includes("/")) return connectTeamSource(env, userId, source, options.skipIndex === true);
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
   const githubInstallationsTable = KNOWLEDGE_TABLES.github_installations(schema);
