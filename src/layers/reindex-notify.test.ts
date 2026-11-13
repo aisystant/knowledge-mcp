@@ -29,11 +29,18 @@ describe("reindex notice criterion", () => {
       .toBe("Инкрементальная переиндексация источника DS-x не удалась: only");
   });
 
-  it("hides another user's source name and free error text in the chat notice", () => {
+  it("keeps another user's failure out of the chat once the operator is configured", () => {
+    const foreign = { status: "failed", kind: "full", source: "SomeLogin/moi-rp", userId: "u-2", reason: "boom" } as const;
+    expect(renderNotice(foreign, "op-1")).toBeNull();
+    expect(renderNotice(foreign, " op-1\n")).toBeNull();
+  });
+
+  it("without a configured operator masks every source but still reaches the chat", () => {
     const text = renderNotice({
       status: "failed", kind: "full", source: "SomeLogin/moi-rp", userId: "u-2",
       reason: "Cannot read notes/a.md from GitHub (github_http_403)",
-    }, "op-1");
+    }, undefined);
+    expect(renderNotice({ status: "failed", kind: "full", source: "DS-mine", userId: "op-1", reason: "x" }, "  ")).not.toBeNull();
     expect(text).toBe("Полная переиндексация источника другого пользователя не удалась: не удалось прочитать файл из GitHub (github_http_403)");
     expect(text).not.toContain("SomeLogin");
     expect(text).not.toContain("notes/a.md");
@@ -72,8 +79,7 @@ describe("notifyJobFinished", () => {
   it("logs a failed delivery under the masked name of another user's source", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500 }));
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    await notifyJobFinished({ ...ENV, REINDEX_OPERATOR_USER_ID: "op-1" },
-      { status: "failed", kind: "full", source: "SomeLogin/x", userId: "u-2", reason: "boom" });
+    await notifyJobFinished(ENV, { status: "failed", kind: "full", source: "SomeLogin/x", userId: "u-2", reason: "boom" });
     const logged = warn.mock.calls.flat().join(" ");
     expect(logged).toContain("notify_failed");
     expect(logged).not.toContain("SomeLogin");
@@ -174,12 +180,11 @@ describe("Notification Center event", () => {
 });
 
 describe("dual write to Telegram and the Center", () => {
-  it("sends the Telegram notice and pushes one Loki stream line for a failure", async () => {
+  it("writes another user's failure to the Center only, one Loki stream line", async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true });
     vi.stubGlobal("fetch", fetchMock);
     await notifyJobFinished({ ...ENV, ...CENTER }, { status: "failed", kind: "incremental", source: "DS-x", userId: "u-2", reason: "boom" });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls.map((c) => c[0])).toContain("https://api.telegram.org/bottok/sendMessage");
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual(["https://logs.example/loki/api/v1/push"]);
     const center = fetchMock.mock.calls.find((c) => c[0] === "https://logs.example/loki/api/v1/push");
     expect(center).toBeDefined();
     const init = center![1];
@@ -199,10 +204,11 @@ describe("dual write to Telegram and the Center", () => {
     });
   });
 
-  it("sends the same masked failure text to Telegram and the Center", async () => {
+  it("without a configured operator sends the same masked failure text to Telegram and the Center", async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true });
     vi.stubGlobal("fetch", fetchMock);
-    await notifyJobFinished({ ...ENV, ...CENTER }, { status: "failed", kind: "incremental", source: "SomeLogin/x", userId: "u-2", reason: "boom" });
+    await notifyJobFinished({ ...ENV, ...CENTER, REINDEX_OPERATOR_USER_ID: undefined },
+      { status: "failed", kind: "incremental", source: "SomeLogin/x", userId: "u-2", reason: "boom" });
     const tg = fetchMock.mock.calls.find((c) => c[0] === "https://api.telegram.org/bottok/sendMessage");
     const center = fetchMock.mock.calls.find((c) => c[0] === "https://logs.example/loki/api/v1/push");
     const cause = "внутренняя ошибка, подробности в журнале сервера";
@@ -233,11 +239,26 @@ describe("dual write to Telegram and the Center", () => {
       url.includes("/loki/") ? Promise.reject(new Error("lokisecret leaked?")) : Promise.resolve({ ok: true }));
     vi.stubGlobal("fetch", fetchMock);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    await expect(notifyJobFinished({ ...ENV, ...CENTER }, { status: "failed", kind: "full", source: "DS-x" })).resolves.toBeUndefined();
+    await expect(notifyJobFinished({ ...ENV, ...CENTER }, { status: "failed", kind: "full", source: "DS-x", userId: "op-1" })).resolves.toBeUndefined();
     expect(fetchMock.mock.calls.map((c) => c[0])).toContain("https://api.telegram.org/bottok/sendMessage");
     const logged = warn.mock.calls.flat().join(" ");
     expect(logged).toContain("center_write_failed");
     expect(logged).not.toContain("lokisecret");
+    warn.mockRestore();
+  });
+
+  it("retries a failed Center write once with the identical body, and not a rejected one", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const job = { status: "failed", kind: "full", source: "DS-x", userId: "u-2" } as const;
+    const flaky = vi.fn().mockResolvedValueOnce({ ok: false, status: 503 }).mockResolvedValueOnce({ ok: true });
+    vi.stubGlobal("fetch", flaky);
+    await notifyJobFinished(CENTER, job);
+    expect(flaky).toHaveBeenCalledTimes(2);
+    expect(flaky.mock.calls[1][1].body).toBe(flaky.mock.calls[0][1].body);
+    const rejected = vi.fn().mockResolvedValue({ ok: false, status: 401 });
+    vi.stubGlobal("fetch", rejected);
+    await notifyJobFinished(CENTER, job);
+    expect(rejected).toHaveBeenCalledTimes(1);
     warn.mockRestore();
   });
 });
