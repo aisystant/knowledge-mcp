@@ -98,6 +98,8 @@ export function reasonCategory(reason: string | undefined): string {
   if (reason.startsWith("Unknown source")) return "источник не найден у пользователя";
   if (reason.startsWith("Invalid user context") || reason.startsWith("Missing user_id")) return "неверный контекст пользователя";
   if (reason.startsWith("Missing job identity")) return "у задачи нет идентификатора, нужен новый запуск";
+  // GitHub read timeout carries the file path in front; only the fact of the timeout is kept (WP-568 Ф10, 13.11).
+  if (reason.includes("Сервис не завершил чтение вовремя")) return "чтение файлов из GitHub не уложилось во время";
   if (WATCHDOG_REASONS.has(reason)) return reason;
   if (reason.includes("watchdog_stale_heartbeat")) return "задача зависла, пакеты перестали обрабатываться";
   if (reason.includes("watchdog_pending_never_started")) return "задача так и не стартовала";

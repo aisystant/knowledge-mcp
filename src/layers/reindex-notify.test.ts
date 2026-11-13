@@ -120,6 +120,10 @@ describe("Notification Center event", () => {
       ['duplicate key value violates unique constraint, Key (user_id, source)=(0b1c2d3e, DS-x)', "внутренняя ошибка, подробности в журнале сервера"],
       ['{"reason":"watchdog_stale_heartbeat"}', "задача зависла, пакеты перестали обрабатываться"],
       ["задача так и не стартовала", "задача так и не стартовала"],
+      [
+        "DS-health/diagnoses/2026.md: Сервис не завершил чтение вовремя. Повтори запрос позже; файл не объявлен отсутствующим.",
+        "чтение файлов из GitHub не уложилось во время",
+      ],
     ] as const;
     for (const [reason, expected] of leaky) {
       const ev = renderCenterEvent({ status: "failed", kind: "incremental", source: "DS-x", userId: "u-2", reason }, "op-1");
