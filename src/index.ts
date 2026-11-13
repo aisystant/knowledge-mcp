@@ -3261,6 +3261,7 @@ export const PRIVATE_TOOLS = [
       type: "object",
       properties: {
         source: { type: "string", description: "Repo name, as it appears in the GitHub App installation" },
+        skip_index: { type: "boolean", description: "Team source (owner/repo) only: connect for reading and writing without building a search index. The gateway sets it for users without a subscription; personal sources ignore it." },
       },
       required: ["source"],
     },
@@ -3742,7 +3743,7 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
           }
 
           if (toolName === "connect_source") {
-            const connectResult = await connectSource(env, principal.userId, args.source as string);
+            const connectResult = await connectSource(env, principal.userId, args.source as string, {}, { skipIndex: args.skip_index === true });
             // WP-410 Деплой-2 группа В: trigger reindex only for a source that actually just
             // changed state (newly_connected/reactivated) AND has write access. "already_connected"
             // is a no-op repeat call (e.g. a retry-happy client) — reindexing it every time would
