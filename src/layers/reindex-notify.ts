@@ -98,6 +98,8 @@ export function reasonCategory(reason: string | undefined): string {
   if (reason.startsWith("Unknown source")) return "источник не найден у пользователя";
   if (reason.startsWith("Invalid user context") || reason.startsWith("Missing user_id")) return "неверный контекст пользователя";
   if (reason.startsWith("Missing job identity")) return "у задачи нет идентификатора, нужен новый запуск";
+  // GitHub read timeout carries the file path in front; only the fact of the timeout is kept (WP-568 Ф10, 13.11).
+  if (reason.includes("Сервис не завершил чтение вовремя")) return "чтение файлов из GitHub не уложилось во время";
   if (WATCHDOG_REASONS.has(reason)) return reason;
   if (reason.includes("watchdog_stale_heartbeat")) return "задача зависла, пакеты перестали обрабатываться";
   if (reason.includes("watchdog_pending_never_started")) return "задача так и не стартовала";
@@ -105,15 +107,28 @@ export function reasonCategory(reason: string | undefined): string {
 }
 
 /** Center event for a failed job, or null: successes are not faults and are not counted. */
-export function renderCenterEvent(job: FinishedJob, operatorUserId?: string): CenterEvent | null {
+export function renderCenterEvent(job: FinishedJob, operatorUserId?: string, foreignKey?: string): CenterEvent | null {
   if (!shouldNotify(job)) return null;
-  const { kind, name, reason } = failureParts(job, operatorUserId);
+  const { kind, own, name, reason } = failureParts(job, operatorUserId);
+  // Foreign sources share one masked name; the pseudonymous key keeps them apart, so the Center
+  // and the digest can count distinct sources and repeated failures of one source (WP-568 Ф10, 13.11).
+  const key = !own && foreignKey ? `:${foreignKey}` : "";
   return {
     title: `${kind} переиндексация не удалась: ${name}`,
     detail: reason,
     // Same failure of the same source within the alert window is one Center item, not many.
-    correlationId: `${CENTER_SOURCE}:${job.kind}:${name}`,
+    correlationId: `${CENTER_SOURCE}:${job.kind}:${name}${key}`,
   };
+}
+
+/**
+ * Stable pseudonym of another user's source: 8 hex of SHA-256 over user id and source name.
+ * The user id is a random UUID, so the key cannot be reversed to a name by guessing logins.
+ */
+export async function foreignSourceKey(job: Pick<FinishedJob, "userId" | "source">): Promise<string> {
+  const data = new TextEncoder().encode(`${job.userId ?? ""}\u0000${job.source}`);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+  return Array.from(digest.slice(0, 4), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 /** First recorded error as text; the errors column holds strings or small JSON objects. */
@@ -158,7 +173,7 @@ async function writeCenter(env: ReindexNotifyEnv, job: FinishedJob): Promise<voi
   if (!url || !user || !token) return;
   // Everything inside the try: the caller has already committed the job status and must not fail here.
   try {
-    const event = renderCenterEvent(job, env.REINDEX_OPERATOR_USER_ID);
+    const event = renderCenterEvent(job, env.REINDEX_OPERATOR_USER_ID, await foreignSourceKey(job));
     if (!event) return;
     const line = JSON.stringify({
       schema_version: 1,

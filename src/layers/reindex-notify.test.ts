@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { firstErrorText, notifyJobFinished, renderCenterEvent, renderNotice, shouldNotify } from "./reindex-notify.js";
+import { firstErrorText, foreignSourceKey, notifyJobFinished, renderCenterEvent, renderNotice, shouldNotify } from "./reindex-notify.js";
 
 const ENV = { REINDEX_NOTIFY_TELEGRAM_TOKEN: "tok", REINDEX_NOTIFY_CHAT_ID: "42" };
 const CENTER = {
@@ -120,6 +120,10 @@ describe("Notification Center event", () => {
       ['duplicate key value violates unique constraint, Key (user_id, source)=(0b1c2d3e, DS-x)', "внутренняя ошибка, подробности в журнале сервера"],
       ['{"reason":"watchdog_stale_heartbeat"}', "задача зависла, пакеты перестали обрабатываться"],
       ["задача так и не стартовала", "задача так и не стартовала"],
+      [
+        "DS-health/diagnoses/2026.md: Сервис не завершил чтение вовремя. Повтори запрос позже; файл не объявлен отсутствующим.",
+        "чтение файлов из GitHub не уложилось во время",
+      ],
     ] as const;
     for (const [reason, expected] of leaky) {
       const ev = renderCenterEvent({ status: "failed", kind: "incremental", source: "DS-x", userId: "u-2", reason }, "op-1");
@@ -149,6 +153,24 @@ describe("Notification Center event", () => {
   it("does not count successes", () => {
     expect(renderCenterEvent({ status: "succeeded", kind: "full", source: "DS-x" }, "op-1")).toBeNull();
   });
+
+  it("tells foreign sources apart by a pseudonymous key, never by name", async () => {
+    const a = { status: "failed", kind: "incremental", source: "Login/DS-a", userId: "u-2" } as const;
+    const b = { ...a, source: "Login/DS-b" };
+    const keyA = await foreignSourceKey(a);
+    expect(keyA).toMatch(/^[0-9a-f]{8}$/);
+    expect(await foreignSourceKey(a)).toBe(keyA);
+    expect(await foreignSourceKey(b)).not.toBe(keyA);
+    expect(await foreignSourceKey({ ...a, userId: "u-3" })).not.toBe(keyA);
+    const ev = renderCenterEvent(a, "op-1", keyA);
+    expect(ev?.correlationId).toBe(`knowledge-reindex:incremental:источник другого пользователя:${keyA}`);
+    expect(JSON.stringify(ev)).not.toContain("Login");
+  });
+
+  it("keeps the operator's own source keyed by its name only", async () => {
+    const own = { status: "failed", kind: "incremental", source: "DS-mine", userId: "op-1" } as const;
+    expect(renderCenterEvent(own, "op-1", await foreignSourceKey(own))?.correlationId).toBe("knowledge-reindex:incremental:DS-mine");
+  });
 });
 
 describe("dual write to Telegram and the Center", () => {
@@ -173,7 +195,7 @@ describe("dual write to Telegram and the Center", () => {
       event: "notification",
       title: "Инкрементальная переиндексация не удалась: источник другого пользователя",
       detail: "внутренняя ошибка, подробности в журнале сервера",
-      correlation_id: "knowledge-reindex:incremental:источник другого пользователя",
+      correlation_id: `knowledge-reindex:incremental:источник другого пользователя:${await foreignSourceKey({ userId: "u-2", source: "DS-x" })}`,
     });
   });
 
