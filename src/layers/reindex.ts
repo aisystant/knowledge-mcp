@@ -28,7 +28,8 @@ import {
   type UserContext,
 } from "./personal.js";
 import { activeTeamBinding, repositoryToken, teamRepositoryName } from "./team-github.js";
-import { firstErrorText, notifyJobFinished, type ReindexNotifyEnv } from "./reindex-notify.js";
+import { firstErrorText, notifyJobFinished, tagDependencyFailure, withoutDependencyTag, type ReindexNotifyEnv } from "./reindex-notify.js";
+import { ReadFailure } from "../read-failure.js";
 import {
   githubBranchApiUrl,
   githubContentsApiUrl,
@@ -584,7 +585,8 @@ export async function personalReindexFiles(
         break;
       }
       const reason = err instanceof Error ? err.message : "unknown error";
-      result.errors.push(`${file.path}: ${reason}`);
+      // The tag keeps the dependency stage and code for the operator notice (WP-568 Ф10, 14.11).
+      result.errors.push(`${file.path}: ${err instanceof ReadFailure ? tagDependencyFailure(reason, err) : reason}`);
       result.error_details.push({ path: file.path, action: file.action, reason });
       await sql.transaction(fenced(() => [buildIndexStatusErrorQuery(sql, statusTable, req.source, userId, normalizedPath, reason)])).catch((statusErr: unknown) => {
         if (isFenceViolation(statusErr)) result.stale = true;
@@ -1120,7 +1122,8 @@ export async function getReindexJobStatus(env: ReindexEnv, userId: string, jobId
     skipped: r.skipped as number,
     deleted: r.deleted as number,
     total: (r.total as number | null) ?? null,
-    errors: (r.errors as string[]) || [],
+    // The dependency tag is for the operator notice, not for the user reading the status.
+    errors: ((r.errors as unknown[]) || []).map((e) => (typeof e === "string" ? withoutDependencyTag(e) : e)) as string[],
     started_at: (r.started_at as Date).toISOString(),
     finished_at: r.finished_at ? (r.finished_at as Date).toISOString() : null,
   };

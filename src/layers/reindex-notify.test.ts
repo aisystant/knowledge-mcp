@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { firstErrorText, foreignSourceKey, notifyJobFinished, renderCenterEvent, renderNotice, shouldNotify } from "./reindex-notify.js";
+import { dependencyFailure, embeddingsOutage, firstErrorText, foreignSourceKey, notifyJobFinished, renderCenterEvent, renderNotice, shouldNotify, tagDependencyFailure, withoutDependencyTag } from "./reindex-notify.js";
 
 const ENV = { REINDEX_NOTIFY_TELEGRAM_TOKEN: "tok", REINDEX_NOTIFY_CHAT_ID: "42" };
 const CENTER = {
@@ -260,5 +260,76 @@ describe("dual write to Telegram and the Center", () => {
     await notifyJobFinished(CENTER, job);
     expect(rejected).toHaveBeenCalledTimes(1);
     warn.mockRestore();
+  });
+});
+
+describe("embeddings outage (WP-568 Ф10, 14.11)", () => {
+  const DENIED = tagDependencyFailure("guide/2026-11-14.md: Сервис отклонил доступ. Проверь подключение; повтор того же запроса не восстановит права.",
+    { stage: "embeddings", code: "dependency_access_denied" });
+  const TELEGRAM = "https://api.telegram.org/bottok/sendMessage";
+  const LOKI = "https://logs.example/loki/api/v1/push";
+
+  it("reads the stage and code back from the tag, and nothing from an untagged reason", () => {
+    expect(dependencyFailure(DENIED)).toEqual({ stage: "embeddings", code: "dependency_access_denied" });
+    expect(dependencyFailure("guide/x.md: Сервис отклонил доступ.")).toBeUndefined();
+    expect(embeddingsOutage(DENIED)).toBe("dependency_access_denied");
+    expect(embeddingsOutage(tagDependencyFailure("x", { stage: "embeddings", code: "dependency_timeout" }))).toBeUndefined();
+    expect(embeddingsOutage(tagDependencyFailure("x", { stage: "github_token", code: "dependency_access_denied" }))).toBeUndefined();
+  });
+
+  it("names a dependency failure of another user's job instead of an internal error", () => {
+    const foreign = { status: "failed", kind: "incremental", source: "DS-x", userId: "u-2" } as const;
+    expect(renderCenterEvent({ ...foreign, reason: DENIED }, "op-1")?.detail).toBe("сервис векторов отклонил доступ");
+    expect(renderCenterEvent({ ...foreign, reason: tagDependencyFailure("x", { stage: "nowhere", code: "made_up" }) }, "op-1")?.detail)
+      .toBe("внешний сервис отказал");
+  });
+
+  it("shows the operator's own reason without the machine tag", () => {
+    expect(renderNotice({ status: "failed", kind: "incremental", source: "DS-x", userId: "op-1", reason: DENIED }, "op-1"))
+      .toBe("Инкрементальная переиндексация источника DS-x не удалась: guide/2026-11-14.md: Сервис отклонил доступ. Проверь подключение; повтор того же запроса не восстановит права.");
+  });
+
+  it("sends no per-job chat message and writes one decision item next to the job line", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    await notifyJobFinished({ ...ENV, ...CENTER }, { status: "failed", kind: "incremental", source: "DS-x", userId: "op-1", reason: DENIED });
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual([LOKI]);
+    const streams = JSON.parse(fetchMock.mock.calls[0][1].body).streams;
+    expect(streams.map((s: { stream: Record<string, string> }) => [s.stream.severity, s.stream.needs_decision]))
+      .toEqual([["warning", "false"], ["critical", "true"]]);
+    const decision = JSON.parse(streams[1].values[0][1]);
+    expect(decision.correlation_id).toBe("knowledge-reindex:embeddings:dependency_access_denied");
+    expect(decision.detail).toContain("Что делать:");
+    expect(decision.title).not.toContain("DS-x");
+    log.mockRestore();
+  });
+
+  it("labels an embeddings timeout by its tag, not as a GitHub read timeout", () => {
+    const reason = tagDependencyFailure("a.md: Сервис не завершил чтение вовремя.", { stage: "embeddings", code: "dependency_timeout" });
+    expect(renderCenterEvent({ status: "failed", kind: "incremental", source: "DS-x", userId: "u-2", reason }, "op-1")?.detail)
+      .toBe("сервис векторов не ответил вовремя");
+  });
+
+  it("falls back to the per-job chat message when the Center rejects the decision item", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => (url === LOKI ? { ok: false, status: 401 } : { ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    await notifyJobFinished({ ...ENV, ...CENTER }, { status: "failed", kind: "incremental", source: "DS-x", userId: "op-1", reason: DENIED });
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual([LOKI, TELEGRAM]);
+    warn.mockRestore();
+  });
+
+  it("strips the tag for any reader of the job errors", () => {
+    expect(withoutDependencyTag(DENIED)).toBe("guide/2026-11-14.md: Сервис отклонил доступ. Проверь подключение; повтор того же запроса не восстановит права.");
+    expect(withoutDependencyTag("plain reason")).toBe("plain reason");
+  });
+
+  it("keeps the per-job chat message while the Center is not configured", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+    await notifyJobFinished({ ...ENV, REINDEX_OPERATOR_USER_ID: "op-1" },
+      { status: "failed", kind: "incremental", source: "DS-x", userId: "op-1", reason: DENIED });
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual([TELEGRAM]);
   });
 });
