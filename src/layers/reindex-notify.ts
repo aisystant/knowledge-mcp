@@ -18,6 +18,57 @@ const CENTER_SOURCE = "knowledge-reindex";
 const FOREIGN_SOURCE = "источник другого пользователя";
 const CENTER_ATTEMPTS = 2;
 
+/**
+ * Machine tag a dependency failure carries at the end of its job error string (WP-568 Ф10, 14.11).
+ * The errors column holds plain strings, so the stage and code of a ReadFailure ride along as a
+ * tag the notice parses back, instead of guessing the cause from the human message text.
+ */
+const DEPENDENCY_TAG = /\s\[dependency:([a-z_]+):([a-z_]+)\]$/;
+
+export interface DependencyFailure {
+  stage: string;
+  code: string;
+}
+
+export function tagDependencyFailure(reason: string, failure: DependencyFailure): string {
+  return `${reason} [dependency:${failure.stage}:${failure.code}]`;
+}
+
+export function dependencyFailure(reason: string | undefined): DependencyFailure | undefined {
+  const match = reason === undefined ? null : DEPENDENCY_TAG.exec(reason);
+  return match ? { stage: match[1], code: match[2] } : undefined;
+}
+
+export function withoutDependencyTag(reason: string): string {
+  return reason.replace(DEPENDENCY_TAG, "");
+}
+
+/**
+ * The embeddings service refusing the worker's key stops every reindex with changed files and
+ * semantic search for all users at once (14.11: weekly spend limit of the OpenRouter key, ~115
+ * chat messages in one night). Such a failure is one operator decision, not one per job.
+ */
+const OUTAGE_DETAILS: Record<string, string> = {
+  dependency_access_denied:
+    "Сервис векторов (OpenRouter) отклонил ключ сервера знаний, чаще всего из-за исчерпанного лимита трат ключа. Что делать: проверить лимит ключа сервера знаний в панели OpenRouter.",
+  dependency_rate_limited:
+    "Сервис векторов (OpenRouter) ограничивает частоту запросов сервера знаний. Что делать: если это длится больше часа, проверить лимит ключа сервера знаний в панели OpenRouter.",
+};
+
+export function embeddingsOutage(reason: string | undefined): string | undefined {
+  const failure = dependencyFailure(reason);
+  return failure?.stage === "embeddings" && failure.code in OUTAGE_DETAILS ? failure.code : undefined;
+}
+
+export function renderOutageEvent(code: string): CenterEvent {
+  return {
+    title: "Сервис векторов отказывает: переиндексация и смысловой поиск стоят у всех пользователей",
+    detail: OUTAGE_DETAILS[code],
+    // No source in the key: every affected job collapses into one decision item.
+    correlationId: `${CENTER_SOURCE}:embeddings:${code}`,
+  };
+}
+
 export interface ReindexNotifyEnv {
   /** Telegram bot token of the operator channel. Notices are off while this or the chat id is unset. */
   REINDEX_NOTIFY_TELEGRAM_TOKEN?: string;
@@ -68,7 +119,7 @@ function failureParts(job: FinishedJob, operatorUserId?: string): FailureParts {
     kind: job.kind === "full" ? "Полная" : "Инкрементальная",
     own,
     name: own ? job.source : FOREIGN_SOURCE,
-    reason: (own ? (job.reason ?? "причина не записана").slice(0, MAX_REASON_CHARS) : reasonCategory(job.reason)) + more,
+    reason: (own ? withoutDependencyTag(job.reason ?? "причина не записана").slice(0, MAX_REASON_CHARS) : reasonCategory(job.reason)) + more,
   };
 }
 
@@ -97,6 +148,10 @@ const WATCHDOG_REASONS = new Set([
  */
 export function reasonCategory(reason: string | undefined): string {
   if (reason === undefined) return "причина не записана";
+  // The tag is exact; the text checks below only cover untagged reasons (an embeddings timeout
+  // shares its message with the GitHub read timeout).
+  const dependency = dependencyFailure(reason);
+  if (dependency) return dependencyCategory(dependency);
   const read = /^Cannot read .* from GitHub \(([a-z0-9_]+)\)$/.exec(reason);
   if (read) return `не удалось прочитать файл из GitHub (${read[1]})`;
   if (reason.startsWith("Cannot enumerate repository")) return "не удалось получить список файлов репозитория";
@@ -109,6 +164,24 @@ export function reasonCategory(reason: string | undefined): string {
   if (reason.includes("watchdog_stale_heartbeat")) return "задача зависла, пакеты перестали обрабатываться";
   if (reason.includes("watchdog_pending_never_started")) return "задача так и не стартовала";
   return "внутренняя ошибка, подробности в журнале сервера";
+}
+
+const DEPENDENCY_STAGES: Record<string, string> = {
+  embeddings: "сервис векторов",
+  github_token: "выдача ключа GitHub",
+};
+
+const DEPENDENCY_CODES: Record<string, string> = {
+  dependency_access_denied: "отклонил доступ",
+  dependency_rate_limited: "ограничил частоту запросов",
+  dependency_unavailable: "недоступен",
+  dependency_timeout: "не ответил вовремя",
+  dependency_invalid_response: "вернул неверный ответ",
+};
+
+/** Fixed wording from the closed sets of stages and codes; an unknown value never reaches the text. */
+function dependencyCategory({ stage, code }: DependencyFailure): string {
+  return `${DEPENDENCY_STAGES[stage] ?? "внешний сервис"} ${DEPENDENCY_CODES[code] ?? "отказал"}`;
 }
 
 /** Center event for a failed job, or null: successes are not faults and are not counted. */
@@ -173,26 +246,33 @@ function lokiTimestamp(): string {
   return `${Date.now()}${String(centerSeq).padStart(6, "0")}`;
 }
 
-async function writeCenter(env: ReindexNotifyEnv, job: FinishedJob): Promise<void> {
+function centerStream(event: CenterEvent, severity: "warning" | "critical", needsDecision: boolean) {
+  const line = JSON.stringify({
+    schema_version: 1,
+    event: "notification",
+    title: event.title,
+    detail: event.detail,
+    correlation_id: event.correlationId,
+  });
+  return {
+    stream: { job: "notification-center", source: CENTER_SOURCE, severity, needs_decision: String(needsDecision) },
+    values: [[lokiTimestamp(), line]],
+  };
+}
+
+/** True only when Loki accepted the push. */
+async function writeCenter(env: ReindexNotifyEnv, job: FinishedJob): Promise<boolean> {
   const { REINDEX_CENTER_LOKI_URL: url, REINDEX_CENTER_LOKI_USER: user, REINDEX_CENTER_LOKI_TOKEN: token } = env;
-  if (!url || !user || !token) return;
+  if (!url || !user || !token) return false;
   // Everything inside the try: the caller has already committed the job status and must not fail here.
   try {
     const event = renderCenterEvent(job, env.REINDEX_OPERATOR_USER_ID, await foreignSourceKey(job));
-    if (!event) return;
-    const line = JSON.stringify({
-      schema_version: 1,
-      event: "notification",
-      title: event.title,
-      detail: event.detail,
-      correlation_id: event.correlationId,
-    });
-    const body = JSON.stringify({
-      streams: [{
-        stream: { job: "notification-center", source: CENTER_SOURCE, severity: "warning", needs_decision: "false" },
-        values: [[lokiTimestamp(), line]],
-      }],
-    });
+    if (!event) return false;
+    // The per-job line stays even during an outage: the morning digest counts affected sources from it.
+    const streams = [centerStream(event, "warning", false)];
+    const outage = embeddingsOutage(job.reason);
+    if (outage) streams.push(centerStream(renderOutageEvent(outage), "critical", true));
+    const body = JSON.stringify({ streams });
     const base = url.replace(/\/+$/, "").replace(/\/loki\/api\/v1\/push$/, "");
     const push = () => fetch(`${base}/loki/api/v1/push`, {
       method: "POST",
@@ -206,9 +286,9 @@ async function writeCenter(env: ReindexNotifyEnv, job: FinishedJob): Promise<voi
     for (let attempt = 1; attempt <= CENTER_ATTEMPTS; attempt++) {
       try {
         const res = await push();
-        if (res.ok) return;
+        if (res.ok) return true;
         console.warn(JSON.stringify({ phase: "center_write_failed", http_status: res.status, attempt }));
-        if (res.status < 500 && res.status !== 429) return;
+        if (res.status < 500 && res.status !== 429) return false;
       } catch (err) {
         // The authorization header carries the token; log only the error class.
         console.warn(JSON.stringify({ phase: "center_write_failed", error: err instanceof Error ? err.name : "unknown", attempt }));
@@ -217,9 +297,20 @@ async function writeCenter(env: ReindexNotifyEnv, job: FinishedJob): Promise<voi
   } catch (err) {
     console.warn(JSON.stringify({ phase: "center_write_failed", error: err instanceof Error ? err.name : "unknown" }));
   }
+  return false;
 }
 
 export async function notifyJobFinished(env: ReindexNotifyEnv, job: FinishedJob): Promise<void> {
   // Independent channels: a slow or failing one must not cost the other its single attempt or reject the caller.
+  if (embeddingsOutage(job.reason)) {
+    // One decision item through the Center instead of a chat message per job; the per-job notice
+    // goes out only when the Center did not take the item (not configured or rejected).
+    if (await writeCenter(env, job)) {
+      console.log(JSON.stringify({ phase: "notify_skipped_outage", source: failureParts(job, env.REINDEX_OPERATOR_USER_ID).name }));
+      return;
+    }
+    await sendTelegram(env, job);
+    return;
+  }
   await Promise.allSettled([sendTelegram(env, job), writeCenter(env, job)]);
 }
