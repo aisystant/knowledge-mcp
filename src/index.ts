@@ -4655,7 +4655,7 @@ function chunkLargeFile(content: string, filename: string): { filename: string; 
  * Called by Gateway webhook after push to PACK, SPF, FPF repos.
  * Reads files from GitHub public API, chunks, embeds, upserts to Neon.
  */
-async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed: number; deleted: number; skipped: number; errors: string[]; status?: string; reason?: string }> {
+export async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed: number; deleted: number; skipped: number; errors: string[]; status?: string; reason?: string }> {
   const sql = db(env);
   const result = { processed: 0, deleted: 0, skipped: 0, errors: [] as string[] };
 
@@ -4754,63 +4754,67 @@ async function reindexFiles(env: Env, req: ReindexRequest): Promise<{ processed:
         continue;
       }
 
-      // Delete old document + chunks
-      // WP-7 Ф-L2-PRIVACY: account_id фильтр (не прибить чужие L2 чанки)
-      await sql`DELETE FROM ${sql.unsafe(knowledgeChunkTable)} WHERE source = ${req.source}
+      // Build the replacement before touching the visible document. A failed
+      // embedding or write leaves the previous version searchable.
+      const deleteOldDocument = sql`DELETE FROM ${sql.unsafe(knowledgeChunkTable)} WHERE source = ${req.source}
         AND (source_uri = ${dbFilename} OR starts_with(source_uri, ${dbFilename + "::"}))
         AND (account_id IS NOT DISTINCT FROM ${accountUuid}::uuid)`;
 
       if (content.length > LARGE_FILE_THRESHOLD) {
-        // Large file: parent document (no embedding) + chunks with parent_chunk_id
         const chunks = chunkLargeFile(content, dbFilename);
-
-        // Insert parent document (no embedding). search_vector — generated stored.
-        await sql`
-          INSERT INTO ${sql.unsafe(knowledgeChunkTable)}
-            (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind, source_class, source_owner)
-          VALUES
-            (${dbFilename + '::p0'}, ${dbFilename}, 0, ${hash}, ${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, NULL,
-             ${accountUuid}::uuid, ${collectionKind}, ${sourceClass}, ${sourceOwner})
-          ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
-            DO NOTHING
-        `;
-
-        // Insert chunks with embeddings, link via parent_chunk_id (UUID self-FK)
-        let chunkPos = 0;
+        const embeddings: number[][] = [];
+        const chunkHashes: string[] = [];
         for (const chunk of chunks) {
-          chunkPos++;
-          const embedding = await getEmbedding(env.OPENROUTER_API_KEY, chunk.content.slice(0, CHUNK_CHAR_LIMIT));
-          const vec = `[${embedding.join(",")}]`;
-          const chunkHash = await contentHash(chunk.content);
+          embeddings.push(await getEmbedding(env.OPENROUTER_API_KEY, chunk.content.slice(0, CHUNK_CHAR_LIMIT)));
+          chunkHashes.push(await contentHash(chunk.content));
+        }
 
-          await sql`
+        await sql.transaction([
+          deleteOldDocument,
+          sql`
             INSERT INTO ${sql.unsafe(knowledgeChunkTable)}
-              (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, parent_chunk_id, account_id, collection_kind, source_class, source_owner)
-            VALUES (
-              ${chunk.filename + '::p' + chunkPos}, ${chunk.filename}, ${chunkPos}, ${chunkHash},
-              ${chunk.filename}, ${chunk.content}, ${req.source}, ${sourceType}, ${chunkHash},
-              ${vec}::vector,
-              (SELECT chunk_uuid FROM ${sql.unsafe(knowledgeChunkTable)} WHERE source_uri = ${dbFilename} AND source = ${req.source} LIMIT 1),
-              ${accountUuid}::uuid, ${collectionKind}, ${sourceClass}, ${sourceOwner}
-            )
+              (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind, source_class, source_owner)
+            VALUES
+              (${dbFilename + '::p0'}, ${dbFilename}, 0, ${hash}, ${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, NULL,
+               ${accountUuid}::uuid, ${collectionKind}, ${sourceClass}, ${sourceOwner})
             ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
               DO NOTHING
-          `;
-        }
+          `,
+          ...chunks.map((chunk, index) => {
+            const chunkPos = index + 1;
+            const vec = `[${embeddings[index].join(",")}]`;
+            const chunkHash = chunkHashes[index];
+            return sql`
+              INSERT INTO ${sql.unsafe(knowledgeChunkTable)}
+                (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, parent_chunk_id, account_id, collection_kind, source_class, source_owner)
+              VALUES (
+                ${chunk.filename + '::p' + chunkPos}, ${chunk.filename}, ${chunkPos}, ${chunkHash},
+                ${chunk.filename}, ${chunk.content}, ${req.source}, ${sourceType}, ${chunkHash},
+                ${vec}::vector,
+                (SELECT chunk_uuid FROM ${sql.unsafe(knowledgeChunkTable)} WHERE source_uri = ${dbFilename} AND source = ${req.source} LIMIT 1),
+                ${accountUuid}::uuid, ${collectionKind}, ${sourceClass}, ${sourceOwner}
+              )
+              ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
+                DO NOTHING
+            `;
+          }),
+        ]);
       } else {
-        // Small file: single document with embedding
         const embedding = await getEmbedding(env.OPENROUTER_API_KEY, content.slice(0, CHUNK_CHAR_LIMIT));
         const vec = `[${embedding.join(",")}]`;
 
-        await sql`
-          INSERT INTO ${sql.unsafe(knowledgeChunkTable)}
-            (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind, source_class, source_owner)
-          VALUES
-            (${dbFilename + '::p0'}, ${dbFilename}, 0, ${hash}, ${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, ${vec}::vector,
-             ${accountUuid}::uuid, ${collectionKind}, ${sourceClass}, ${sourceOwner})
-          ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
-            DO NOTHING
-        `;
+        await sql.transaction([
+          deleteOldDocument,
+          sql`
+            INSERT INTO ${sql.unsafe(knowledgeChunkTable)}
+              (chunk_id, document_path, paragraph_pos, content_hash, source_uri, content, source, source_kind, hash, embedding, account_id, collection_kind, source_class, source_owner)
+            VALUES
+              (${dbFilename + '::p0'}, ${dbFilename}, 0, ${hash}, ${dbFilename}, ${content}, ${req.source}, ${sourceType}, ${hash}, ${vec}::vector,
+               ${accountUuid}::uuid, ${collectionKind}, ${sourceClass}, ${sourceOwner})
+            ON CONFLICT (source_uri, source, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
+              DO NOTHING
+          `,
+        ]);
       }
 
       result.processed++;

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, PRIVATE_TOOLS, PUBLIC_ONLY_TOOL_NAMES, WITHDRAWN_TOOL_MESSAGES, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob, FULL_INGEST_SOURCES, HEARTBEAT_PACK_SOURCES, heartbeatSourceOrder, buildFullIngestBatchRanges, fullIngestDisabled, splitForSendBatch, groupStagingRows, fullIngestRetryDelaySeconds, dedupeChunkFilenames, PLATFORM_DENY_SOURCES, isPlatformDeniedSource } from "./index.js";
+import { detectQueryType, resolveGithubUrl, hashQuery, rerankWithLLM, enrichWithParentContent, getEmbedding, reindexFiles, searchDocuments, compactSearchResultsForResponse, buildSearchToolResponse, SEARCH_TOOL_RESPONSE_BUDGET_BYTES, normalizeSearchResultLimit, resolveDocument, normalizeDocumentLookupQuery, classifyDocumentResolution, handleMcpRequest, TOOLS, PRIVATE_TOOLS, PUBLIC_ONLY_TOOL_NAMES, WITHDRAWN_TOOL_MESSAGES, extractTitle, buildPathTree, checkFileSizeAdmission, partitionFilesBySize, SKILL_FILE_PATTERN, resolveScheduledJob, FULL_INGEST_SOURCES, HEARTBEAT_PACK_SOURCES, heartbeatSourceOrder, buildFullIngestBatchRanges, fullIngestDisabled, splitForSendBatch, groupStagingRows, fullIngestRetryDelaySeconds, dedupeChunkFilenames, PLATFORM_DENY_SOURCES, isPlatformDeniedSource } from "./index.js";
 import type { SearchResult, Env } from "./index.js";
 import worker from "./index.js";
 import { PRIVATE_TOOL_NAMES } from "./layers/private.js";
@@ -1467,6 +1467,135 @@ describe("getEmbedding", () => {
     expect(input.includes(value)).toBe(false);
     const logged = await logFailedEmbedding({ input, headers: { "x-openrouter-request-id": value } });
     expect(logged.requestId).toBeNull();
+  });
+});
+
+describe("reindexFiles replacement safety", () => {
+  const originalFetch = globalThis.fetch;
+  const largeContent = `${"x".repeat(6000)}\n\n${"y".repeat(6000)}`;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.mocked(neon).mockReset();
+  });
+
+  function mockReindexSql(transactionError?: Error) {
+    const transaction = vi.fn(async (queries: { then: Function }[]) => {
+      for (const query of queries) await query;
+      if (transactionError) throw transactionError;
+      return [];
+    });
+    const calls: string[] = [];
+    const sql = ((strings: TemplateStringsArray, ...values: unknown[]) => {
+      const text = strings.reduce((out, part, index) => out + part + (index < values.length ? String(values[index]) : ""), "");
+      const rows = text.includes("SELECT hash FROM") ? [{ hash: "previous-version" }] : [];
+      return {
+        then(onFulfilled?: ((rows: unknown[]) => unknown) | null, onRejected?: ((reason: unknown) => unknown) | null) {
+          calls.push(text);
+          return Promise.resolve(rows).then(onFulfilled, onRejected);
+        },
+      };
+    }) as ((strings: TemplateStringsArray, ...values: unknown[]) => Promise<unknown[]>) & {
+      unsafe: (value: string) => string;
+      transaction: typeof transaction;
+    };
+    sql.unsafe = (value) => value;
+    sql.transaction = transaction;
+    vi.mocked(neon).mockReturnValue(sql as never);
+    return { calls, transaction };
+  }
+
+  function mockReindexFetch(content: string, embeddingStatus: number, failAfter = 0) {
+    let embeddings = 0;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("https://raw.githubusercontent.com/")) return new Response(content);
+      if (url === "https://openrouter.ai/api/v1/embeddings") {
+        embeddings++;
+        if (embeddingStatus !== 200 && embeddings > failAfter) return new Response("provider refused", { status: embeddingStatus });
+        return Response.json({ data: [{ embedding: [0.1, 0.2] }] });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+  }
+
+  it.each([
+    ["small document", "replacement text"],
+    ["large document", largeContent],
+  ])("does not delete the previous %s when embeddings fail", async (_name, content) => {
+    const { calls, transaction } = mockReindexSql();
+    mockReindexFetch(content, 401);
+
+    const result = await reindexFiles(
+      { KNOWLEDGE_DATABASE_URL: "postgres://example", OPENROUTER_API_KEY: "test-key" } as Env,
+      { source: "PACK-digital-platform", files: [{ path: "pack/digital-platform/test.md", action: "modified" }] },
+    );
+
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain("http_4xx");
+    expect(transaction).not.toHaveBeenCalled();
+    expect(calls.some((text) => text.includes("DELETE FROM"))).toBe(false);
+  });
+
+  it("does not delete a large document when a later embedding fails", async () => {
+    const { calls, transaction } = mockReindexSql();
+    mockReindexFetch(largeContent, 401, 1);
+
+    const result = await reindexFiles(
+      { KNOWLEDGE_DATABASE_URL: "postgres://example", OPENROUTER_API_KEY: "test-key" } as Env,
+      { source: "PACK-digital-platform", files: [{ path: "pack/digital-platform/test.md", action: "modified" }] },
+    );
+
+    expect(result.errors[0]).toContain("http_4xx");
+    expect(transaction).not.toHaveBeenCalled();
+    expect(calls.some((text) => text.includes("DELETE FROM"))).toBe(false);
+  });
+
+  it("replaces a small document in one transaction after successful embedding", async () => {
+    const { transaction } = mockReindexSql();
+    mockReindexFetch("replacement text", 200);
+
+    const result = await reindexFiles(
+      { KNOWLEDGE_DATABASE_URL: "postgres://example", OPENROUTER_API_KEY: "test-key" } as Env,
+      { source: "PACK-digital-platform", files: [{ path: "pack/digital-platform/test.md", action: "modified" }] },
+    );
+
+    expect(result).toMatchObject({ processed: 1, errors: [] });
+    expect(transaction).toHaveBeenCalledTimes(1);
+    expect(transaction.mock.calls[0][0]).toHaveLength(2);
+  });
+
+  it("replaces a large document in delete-parent-chunks order", async () => {
+    const { calls, transaction } = mockReindexSql();
+    mockReindexFetch(largeContent, 200);
+
+    const result = await reindexFiles(
+      { KNOWLEDGE_DATABASE_URL: "postgres://example", OPENROUTER_API_KEY: "test-key" } as Env,
+      { source: "PACK-digital-platform", files: [{ path: "pack/digital-platform/test.md", action: "modified" }] },
+    );
+
+    expect(result).toMatchObject({ processed: 1, errors: [] });
+    expect(transaction).toHaveBeenCalledTimes(1);
+    const writes = calls.filter((text) => text.includes("DELETE FROM") || text.includes("INSERT INTO"));
+    expect(writes).toHaveLength(transaction.mock.calls[0][0].length);
+    expect(writes[0]).toContain("DELETE FROM");
+    expect(writes[1]).toContain("INSERT INTO");
+    expect(writes[2]).toContain("parent_chunk_id");
+    expect(writes.slice(2).every((text) => text.includes("[0.1,0.2]"))).toBe(true);
+  });
+
+  it("does not count a document when the replacement transaction fails", async () => {
+    const { transaction } = mockReindexSql(new Error("insert failed"));
+    mockReindexFetch("replacement text", 200);
+
+    const result = await reindexFiles(
+      { KNOWLEDGE_DATABASE_URL: "postgres://example", OPENROUTER_API_KEY: "test-key" } as Env,
+      { source: "PACK-digital-platform", files: [{ path: "pack/digital-platform/test.md", action: "modified" }] },
+    );
+
+    expect(result).toMatchObject({ processed: 0 });
+    expect(result.errors[0]).toContain("insert failed");
+    expect(transaction).toHaveBeenCalledTimes(1);
   });
 });
 
