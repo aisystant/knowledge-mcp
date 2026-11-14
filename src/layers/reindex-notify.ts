@@ -16,6 +16,7 @@ const NOTIFY_TIMEOUT_MS = 4000;
 const MAX_REASON_CHARS = 200;
 const CENTER_SOURCE = "knowledge-reindex";
 const FOREIGN_SOURCE = "источник другого пользователя";
+const CENTER_ATTEMPTS = 2;
 
 export interface ReindexNotifyEnv {
   /** Telegram bot token of the operator channel. Notices are off while this or the chat id is unset. */
@@ -75,6 +76,10 @@ function failureParts(job: FinishedJob, operatorUserId?: string): FailureParts {
 export function renderNotice(job: FinishedJob, operatorUserId?: string): string | null {
   if (!shouldNotify(job)) return null;
   const { kind, own, name, reason } = failureParts(job, operatorUserId);
+  // Another user's failure goes to the Center and the morning digest only (WP-568 Ф10, 13.11).
+  // Without a configured operator id every source looks foreign, the pilot's own included,
+  // so the chat keeps the masked notice rather than going silent.
+  if (!own && operatorUserId?.trim()) return null;
   const subject = own ? `источника ${name}` : "источника другого пользователя";
   return `${kind} переиндексация ${subject} не удалась: ${reason}`;
 }
@@ -189,15 +194,27 @@ async function writeCenter(env: ReindexNotifyEnv, job: FinishedJob): Promise<voi
       }],
     });
     const base = url.replace(/\/+$/, "").replace(/\/loki\/api\/v1\/push$/, "");
-    const res = await fetch(`${base}/loki/api/v1/push`, {
+    const push = () => fetch(`${base}/loki/api/v1/push`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Basic ${btoa(`${user}:${token}`)}` },
       body,
       signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
     });
-    if (!res.ok) console.warn(JSON.stringify({ phase: "center_write_failed", http_status: res.status }));
+    // A foreign failure reaches no chat once the Center is its only channel, so one retry
+    // (WP-568 Ф10, 13.11). The body is identical, timestamp included: Loki drops the second
+    // copy if the first one had landed after all.
+    for (let attempt = 1; attempt <= CENTER_ATTEMPTS; attempt++) {
+      try {
+        const res = await push();
+        if (res.ok) return;
+        console.warn(JSON.stringify({ phase: "center_write_failed", http_status: res.status, attempt }));
+        if (res.status < 500 && res.status !== 429) return;
+      } catch (err) {
+        // The authorization header carries the token; log only the error class.
+        console.warn(JSON.stringify({ phase: "center_write_failed", error: err instanceof Error ? err.name : "unknown", attempt }));
+      }
+    }
   } catch (err) {
-    // The authorization header carries the token; log only the error class.
     console.warn(JSON.stringify({ phase: "center_write_failed", error: err instanceof Error ? err.name : "unknown" }));
   }
 }
