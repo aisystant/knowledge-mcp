@@ -76,6 +76,7 @@ import {
   personalDb,
 } from "./layers/personal.js";
 import { handleQueue, handleWatchdog, startReindexJob, startIncrementalReindexJob, getReindexJobStatus, type ReindexBatchMessage } from "./layers/reindex.js";
+import { buildIngressEvent, PARSE_FAILED } from "./ingress-observation.js";
 
 // --- Types ---
 
@@ -4840,12 +4841,26 @@ export function resolveScheduledJob(mode: McpMode, cron: string): "watchdog" | "
 
 // --- HTTP server ---
 
+// WP-560 Ф19: tool names this worker serves, so the ingress log names a known tool and
+// collapses anything else to "other".
+const KNOWN_TOOL_NAMES = new Set<string>([...TOOLS, ...PRIVATE_TOOLS].map(tool => tool.name).concat([...WITHDRAWN_TOOL_MESSAGES.keys()]));
+
+function logIngress(request: Request, env: Env, details: { jwtSubject?: string; jwtChecked?: boolean; body?: unknown } = {}): void {
+  console.log(JSON.stringify(buildIngressEvent(request, env.MCP_MODE === "private" ? "private" : "public", {
+    ...details,
+    isKnownTool: name => KNOWN_TOOL_NAMES.has(name),
+    serviceHeaderName: SERVICE_AUTH_HEADER,
+  })));
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     // WP-268 Phase 3: Schema parameterization for database migrations
     initTables(env);
 
     const url = new URL(request.url);
+    // /mcp POST is logged after its body is parsed, so the line can name the RPC method and tool.
+    if (!(url.pathname === "/mcp" && request.method === "POST")) logIngress(request, env);
 
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
@@ -4865,6 +4880,7 @@ export default {
       try {
         mode = resolveMode(env.MCP_MODE);
       } catch (err) {
+        logIngress(request, env);
         console.error("[mcp] MCP_MODE misconfigured:", err instanceof Error ? err.message : err);
         return new Response(JSON.stringify({ error: "Server misconfigured: invalid MCP_MODE" }), {
           status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -4881,7 +4897,14 @@ export default {
       const authHeader = request.headers.get("Authorization");
       if (authHeader?.startsWith("Bearer ") && env.ORY_URL) {
         const token = authHeader.slice(7);
-        const sub = await verifyJwtLocally(env.ORY_URL, token);
+        let sub: string | null;
+        try {
+          sub = await verifyJwtLocally(env.ORY_URL, token);
+        } catch (err) {
+          // A failing token check still leaves its ingress line; the error propagates as before.
+          logIngress(request, env, { jwtChecked: true });
+          throw err;
+        }
         userId = sub ?? undefined;
         jwtSubject = userId;
         // Note: opaque tokens (from Gateway /userinfo flow) return null sub → userId=undefined,
@@ -4890,7 +4913,17 @@ export default {
         userId = request.headers.get("x-user-id") || undefined;
       }
 
-      const body = (await request.json()) as McpRequest;
+      const jwtChecked = !!(authHeader?.startsWith("Bearer ") && env.ORY_URL);
+      let body: McpRequest;
+      try {
+        body = (await request.json()) as McpRequest;
+      } catch (err) {
+        // Malformed bodies still leave a line (probing direct callers matter here); the
+        // error propagates exactly as before.
+        logIngress(request, env, { jwtSubject, jwtChecked, body: PARSE_FAILED });
+        throw err;
+      }
+      logIngress(request, env, { jwtSubject, jwtChecked, body });
       const response = await handleMcpRequest(body, env, userId, mode, request, jwtSubject,
         ctx ? { verifiedAccountId: jwtSubject, waitUntil: task => ctx.waitUntil(task) } : undefined);
       const responseHeaders: Record<string, string> = {
