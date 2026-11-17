@@ -317,7 +317,7 @@ const RERANK_LLM_WEIGHT = 0.7;
 // Enables clickable source links in search results.
 const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> = {
   "PACK-digital-platform": { base: "https://github.com/MimEcoSys/PACK-digital-platform/blob/main", pathPrefix: "pack/" },
-  "PACK-personal": { base: "https://github.com/aisystant/PACK-personal/blob/main", pathPrefix: "pack/" },
+  "PACK-personal": { base: "https://github.com/MimEcoSys/PACK-personal/blob/main", pathPrefix: "pack/" },
   "PACK-MIM": { base: "https://github.com/MimEcoSys/PACK-MIM/blob/main", pathPrefix: "pack/" },
   "SPF": { base: "https://github.com/TserenTserenov/SPF/blob/main", pathPrefix: "" },
   "FPF": { base: "https://github.com/ailev/FPF/blob/main", pathPrefix: "" },
@@ -325,7 +325,7 @@ const SOURCE_GITHUB_BASE: Record<string, { base: string; pathPrefix: string }> =
   "aist-bot-docs": { base: "https://github.com/aisystant/aist_bot/blob/new-architecture", pathPrefix: "docs/" },
   "docs-courses": { base: "https://github.com/MimEcoSys/docs/blob/main", pathPrefix: "" },
   "exocortex-template-docs": { base: "https://github.com/TserenTserenov/FMT-exocortex-template/blob/main", pathPrefix: "docs/" },
-  "DS-principles-curriculum": { base: "https://github.com/aisystant/DS-principles-curriculum/blob/main", pathPrefix: "" },
+  "DS-principles-curriculum": { base: "https://github.com/MimEcoSys/DS-principles-curriculum/blob/main", pathPrefix: "" },
   "FMT-exocortex-template": { base: "https://github.com/TserenTserenov/FMT-exocortex-template/blob/main", pathPrefix: "" },
   "FMT-s2r": { base: "https://github.com/TserenTserenov/FMT-s2r/blob/main", pathPrefix: "" },
   "DS-autonomous-agents": { base: "https://github.com/TserenTserenov/DS-autonomous-agents/blob/main", pathPrefix: "" },
