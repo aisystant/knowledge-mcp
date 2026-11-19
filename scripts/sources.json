@@ -158,7 +158,7 @@
   {
     "source": "aist-bot-docs",
     "source_type": "ds",
-    "path": "~/IWE/DS-IT-systems/aist_bot_newarchitecture/docs",
+    "path": "~/IWE/DS-IT-systems/aist_bot_newarchitecture-index/docs",
     "exclude": [
       "plans-and-reports/"
     ],
