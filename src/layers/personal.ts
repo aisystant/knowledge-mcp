@@ -2055,6 +2055,50 @@ export async function personalGetDocumentLive(
   }
 }
 
+/**
+ * WP-560 Ф22: names of the entries in one directory of a connected source, read live from GitHub
+ * (the index keeps files that were moved away, e.g. day plans archived by day-close). null when
+ * the directory does not exist; read failures are thrown like personalGetDocumentLive's.
+ */
+export async function personalListDirectoryLive(
+  env: PersonalEnv,
+  ctx: UserContext,
+  directory: string,
+  source: string,
+): Promise<Array<{ name: string; type: string }> | null> {
+  const userSource = ctx.sources.find(s => s.source === source);
+  if (!userSource) return null;
+  let encodedPath: string;
+  try {
+    encodedPath = canonicalContentsPath(userSource.pathPrefix, directory);
+  } catch {
+    return null;
+  }
+  try {
+    return await withReadDeadline("github_content", async signal => {
+      const lease = await repositoryToken(env, ctx, source, "read", () => getInstallationToken(env, ctx.userId, userSource.githubRepo,
+        (input, init) => fetchReadResponse(input, init ?? {}, "github_token", signal)));
+      if (!lease) throw new ReadFailure("github_not_connected", "github_token");
+      try {
+        const response = await fetchReadResponse(`https://api.github.com/repos/${userSource.githubOwner}/${userSource.githubRepo}/contents/${encodedPath}`, {
+          redirect: "manual",
+          headers: { Authorization: `Bearer ${lease.token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+        }, "github_content", signal);
+        const body = await readJson(response, "github_content");
+        // A file path answers with an object, a directory with an array.
+        if (!Array.isArray(body)) throw new ReadFailure("dependency_invalid_response", "github_content");
+        return body.flatMap(entry => entry && typeof entry.name === "string" && typeof entry.type === "string"
+          ? [{ name: entry.name as string, type: entry.type as string }] : []);
+      } finally {
+        await lease.release();
+      }
+    });
+  } catch (error) {
+    if (error instanceof ReadFailure && error.stage === "github_content" && error.status === 404) return null;
+    throw error;
+  }
+}
+
 /** include_sha=true handler: live-first read with the index only as a source
  * hint — an index miss must NOT fail the call, bypassing a stale index is
  * what include_sha is FOR (peer-review finding, verify session 30.08;

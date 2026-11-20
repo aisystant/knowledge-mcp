@@ -75,12 +75,16 @@ import {
   purgeSource,
   personalDb,
   personalGetDocumentLive,
+  personalListDirectoryLive,
   type UserContext,
 } from "./layers/personal.js";
 import {
   REGISTRY_PATH,
   WP_LIST_STATUS_FILTERS,
+  DAY_PLAN_DIRECTORIES,
   cardPhase,
+  chooseDayPlan,
+  fitText,
   normalizePhase,
   normalizeWpNumber,
   parseRegistry,
@@ -239,8 +243,27 @@ async function findLiveFile(env: Env, ctx: UserContext, paths: string[], source?
   return null;
 }
 
+/**
+ * The source whose docs/ holds the WP registry — the same marker select_governance_repository
+ * checks. Listing docs/ is cheap; reading the 160 KB registry only to find the repository is not.
+ */
+async function findGovernanceSource(env: Env, ctx: UserContext): Promise<string | { ambiguous: string[] } | null> {
+  const registryName = REGISTRY_PATH.split("/").pop();
+  const rounds = [ctx.sourceNames.filter(name => GOVERNANCE_NAME_HINT.test(name)), ctx.sourceNames.filter(name => !GOVERNANCE_NAME_HINT.test(name))];
+  for (const round of rounds) {
+    const settled = await Promise.allSettled(round.map(async source =>
+      (await personalListDirectoryLive(env, ctx, "docs", source))?.some(entry => entry.name === registryName) ? source : null));
+    const failure = settled.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+    if (failure) throw failure.reason;
+    const hits = settled.flatMap(outcome => outcome.status === "fulfilled" && outcome.value ? [outcome.value] : []);
+    if (hits.length > 1) return { ambiguous: hits };
+    if (hits.length === 1) return hits[0];
+  }
+  return null;
+}
+
 async function handleWorkProductRead(
-  env: Env, ctx: UserContext, id: string | number, toolName: "wp_list" | "wp_card", args: Record<string, unknown>,
+  env: Env, ctx: UserContext, id: string | number, toolName: "wp_list" | "wp_card" | "day_plan", args: Record<string, unknown>,
 ): Promise<McpResponse> {
   const startedAt = Date.now();
   const source = typeof args.source === "string" && args.source.trim() ? args.source.trim() : undefined;
@@ -259,6 +282,34 @@ async function handleWorkProductRead(
     log("not_found");
     return toolError(id, { error: "not_found", message: `${what} не найден в подключённых источниках.`, sources: ctx.sourceNames }, "not_found");
   };
+
+  if (toolName === "day_plan") {
+    const date = typeof args.date === "string" && args.date.trim() ? args.date.trim() : undefined;
+    if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) return toolError(id, "Error: date must be YYYY-MM-DD", "validation");
+    const governance = source ?? await findGovernanceSource(env, ctx);
+    if (typeof governance !== "string") return unresolved(governance, "Репозиторий управления (docs/WP-REGISTRY.md)");
+    const [current, archive] = await Promise.all([
+      personalListDirectoryLive(env, ctx, DAY_PLAN_DIRECTORIES.current, governance),
+      personalListDirectoryLive(env, ctx, DAY_PLAN_DIRECTORIES.archive, governance),
+    ]);
+    const names = (entries: Array<{ name: string; type: string }> | null) => (entries ?? []).filter(entry => entry.type === "file").map(entry => entry.name);
+    const choice = chooseDayPlan(names(current), names(archive), date);
+    const today = new Date().toISOString().slice(0, 10);
+    if (!choice) {
+      log("not_found", { date: date ?? null });
+      return toolError(id, { error: "not_found", message: date ? `Плана дня на ${date} нет.` : "Планов дня в репозитории нет.", today_utc: today }, "not_found");
+    }
+    const file = await personalGetDocumentLive(env, ctx, choice.path, governance);
+    if (!file) {
+      log("not_found", { date: choice.date });
+      return toolError(id, { error: "not_found", message: `План ${choice.path} исчез между чтением списка и файла; повтори запрос.` }, "not_found");
+    }
+    const envelope = { source: governance, file: choice.path, ...choice, today_utc: today };
+    const fitted = fitText(file.content, envelope);
+    log("ok", { date: choice.date, day_closed: choice.day_closed, truncated: fitted.truncated });
+    return reply({ ...envelope, ...fitted,
+      ...(fitted.truncated ? { next_action: `personal_get_document(source="${governance}", filename="${choice.path}", include_sha:true, cursor:"start") for the whole plan` } : {}) });
+  }
 
   if (toolName === "wp_list") {
     const status = (args.status ?? "active") as WpListStatusFilter;
@@ -3320,6 +3371,20 @@ export const PRIVATE_TOOLS = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
+    // Day plans move from current/ to archive/day-plans/ when the day is closed, and the search
+    // index keeps the moved files: only a live listing tells which plan is the latest.
+    name: "day_plan",
+    description: "«План на сегодня»: the latest day plan read live (current/ or archive/day-plans/), with its date and day_closed. date=YYYY-MM-DD for a given day. No search, no date guessing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        date: { type: "string", description: "Optional day, YYYY-MM-DD. Omit for the latest plan." },
+        source: { type: "string", description: "Governance repository (source name). Omit to find the connected source that has docs/WP-REGISTRY.md." },
+      },
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
     name: "propose_capture",
     description: "Propose capturing knowledge to a personal repo. Returns a preview of what would be written. Call 'write' to confirm.",
     inputSchema: {
@@ -3560,7 +3625,7 @@ export function gateLearnerCall(env: Env, tool: string, caller: LearnerCaller, a
 
 export async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public", rawRequest?: Request, jwtSubject?: string, observationRuntime?: ObservationRuntime): Promise<McpResponse> {
   const boundedRead = mode === "private" && request.method === "tools/call"
-    && ["search", "get_document", "wp_list", "wp_card"].includes(request.params?.name as string);
+    && ["search", "get_document", "wp_list", "wp_card", "day_plan"].includes(request.params?.name as string);
   if (boundedRead) {
     const idError = privateReadIdError(request.id);
     if (idError) return idError;
@@ -3784,7 +3849,7 @@ async function handleMcpRequestImpl(request: McpRequest, env: Env, userId: strin
               ...(historyResult.success ? {} : { isError: true, error_code: gitOperationErrorCode(historyResult) }) } };
           }
 
-          if (toolName === "wp_list" || toolName === "wp_card") {
+          if (toolName === "wp_list" || toolName === "wp_card" || toolName === "day_plan") {
             return await handleWorkProductRead(env, ctx, id, toolName, args);
           }
 

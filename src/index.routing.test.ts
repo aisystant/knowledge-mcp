@@ -97,6 +97,7 @@ vi.mock("./layers/personal.js", () => ({
   }),
   // WP-560 Ф22: wp_list / wp_card read the governance repository live.
   personalGetDocumentLive: vi.fn().mockResolvedValue(null),
+  personalListDirectoryLive: vi.fn().mockResolvedValue(null),
   connectSource: vi.fn(),
   disconnectSource: vi.fn(),
   purgeSource: vi.fn(),
@@ -128,7 +129,7 @@ vi.mock("./layers/private.js", async (importOriginal) => {
 });
 
 const { handleMcpRequest, TOOLS, default: worker } = await import("./index.js");
-const { AmbiguousSourceError, resolveUserContext, personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalGetDocumentLive, personalListSources, personalListDocuments, personalListPath, writeToGitHub, appendToGitHub, strReplaceInGitHub, deleteFromGitHub, disconnectSource, purgeSource } = await import("./layers/personal.js");
+const { AmbiguousSourceError, resolveUserContext, personalSearchDocuments, personalGetDocument, personalGetDocumentWithSha, personalGetDocumentHistory, personalGetDocumentLive, personalListDirectoryLive, personalListSources, personalListDocuments, personalListPath, writeToGitHub, appendToGitHub, strReplaceInGitHub, deleteFromGitHub, disconnectSource, purgeSource } = await import("./layers/personal.js");
 
 const ENV = {
   KNOWLEDGE_DATABASE_URL: "postgres://fake-public",
@@ -714,8 +715,27 @@ describe("WP-560 Ф22: wp_list / wp_card read the live governance repository", (
     });
   });
 
+  it("day_plan reads the latest plan live; an archived plan reports the day as closed", async () => {
+    vi.mocked(personalListDirectoryLive).mockImplementation(async (_env, _ctx, directory) => ({
+      docs: [{ name: "WP-REGISTRY.md", type: "file" }],
+      current: [{ name: "WeekPlan W47.md", type: "file" }],
+      "archive/day-plans": [{ name: "DayPlan 2026-11-19.md", type: "file" }, { name: "DayPlan 2026-11-20.md", type: "file" }],
+    } as Record<string, Array<{ name: string; type: string }>>)[directory] ?? null);
+    live({ "archive/day-plans/DayPlan 2026-11-20.md": "# Day Plan: 20 ноября" });
+    const { isError, body } = parse(await callTool("day_plan", {}, "private"));
+    expect(isError).toBe(false);
+    expect(body).toMatchObject({ source: "DS-my-strategy", file: "archive/day-plans/DayPlan 2026-11-20.md", date: "2026-11-20", day_closed: true, content: "# Day Plan: 20 ноября", truncated: false });
+    expect(body.today_utc).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
+
+  it("day_plan answers not_found when the governance repository is not connected", async () => {
+    vi.mocked(personalListDirectoryLive).mockResolvedValue(null);
+    expect(parse(await callTool("day_plan", {}, "private"))).toMatchObject({ isError: true, body: { error: "not_found" } });
+    expect(personalGetDocumentLive).not.toHaveBeenCalled();
+  });
+
   it("validates arguments before reading GitHub", async () => {
-    for (const [name, args] of [["wp_card", { wp: "abc" }], ["wp_card", { wp: 5, phase: "фаза" }], ["wp_list", { status: "nope" }], ["wp_list", { source: "чужой" }]] as const) {
+    for (const [name, args] of [["day_plan", { date: "20.11.2026" }], ["wp_card", { wp: "abc" }], ["wp_card", { wp: 5, phase: "фаза" }], ["wp_list", { status: "nope" }], ["wp_list", { source: "чужой" }]] as const) {
       const response = await callTool(name, args, "private");
       expect((response.result as { error_code?: string }).error_code).toBe("validation");
     }
@@ -727,7 +747,7 @@ describe("WP-560 Ф22: wp_list / wp_card read the live governance repository", (
     expect(refused.error?.message).toContain("not available in public mode");
     const listed = await handleMcpRequest({ jsonrpc: "2.0", id: 2, method: "tools/list" } as never, ENV, undefined, "private");
     const tools = (listed.result as { tools: Array<{ name: string; annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean } }> }).tools;
-    for (const name of ["wp_list", "wp_card"]) {
+    for (const name of ["wp_list", "wp_card", "day_plan"]) {
       expect(tools.find(tool => tool.name === name)?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
     }
   });

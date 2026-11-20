@@ -70,6 +70,8 @@ export const PRIVATE_TOOL_NAMES: ReadonlySet<string> = new Set([
   // (personal_wp_list) and one WP card (personal_wp_card). Read-only.
   "wp_list",
   "wp_card",
+  // WP-560 Ф22: the latest day plan, read live (personal_day_plan). Read-only.
+  "day_plan",
 ]);
 
 /**
