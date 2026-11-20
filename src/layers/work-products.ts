@@ -31,10 +31,11 @@ export const ACTIVE_STATUSES: ReadonlySet<string> = new Set(["in_progress", "pen
 export const WP_LIST_STATUS_FILTERS = ["active", "all", "in_progress", "pending", "blocked", "testing", "done"] as const;
 export type WpListStatusFilter = (typeof WP_LIST_STATUS_FILTERS)[number];
 
-/** Phase statuses that mean "nothing left to do here" — such phases are not shown by wp_card. */
-const FINISHED_PHASE_STATUSES: ReadonlySet<string> = new Set([
-  "done", "closed", "defer", "deferred", "cancelled", "canceled", "merged", "archived", "dropped", "superseded",
-]);
+/**
+ * Phase statuses that mean "nothing left to do here" — such phases are not shown by wp_card.
+ * Matched by the leading word: cards write "completed", "moved-to-wp-498", "done (16.10)".
+ */
+const FINISHED_PHASE_STATUS = /^(?:done|closed|complete|completed|defer|deferred|cancell?ed|canceled|merged|archived|dropped|superseded|moved|transferred)(?![a-z])/i;
 
 const PROGRESS_CAP = 200;
 const TITLE_CAP = 160;
@@ -329,7 +330,7 @@ function phaseOfHeading(text: string): string | null {
 
 function isFinished(card: ParsedCard, phase: string): boolean {
   const status = card.phases?.[phase];
-  return status !== undefined && FINISHED_PHASE_STATUSES.has(status.toLowerCase());
+  return status !== undefined && FINISHED_PHASE_STATUS.test(status.trim());
 }
 
 /** First heading of each phase, in card order (a phase may be mentioned again further down). */

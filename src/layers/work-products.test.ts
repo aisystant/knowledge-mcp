@@ -216,6 +216,11 @@ phases:
     expect(card.frontmatter_warnings).toBeUndefined();
   });
 
+  it("treats completed, moved-to and annotated done statuses as closed", () => {
+    const card = summarizeCard("---\nphases:\n  Ф1: completed\n  Ф2: moved-to-wp-498\n  Ф3: done (16.10)\n  Ф4: in_progress\n  Ф5: pending-review\n---\n");
+    expect(card.open_phases).toEqual(["Ф4", "Ф5"]);
+  });
+
   it("matches phase ids written in upper case", () => {
     const card = summarizeCard("---\nphases:\n  Ф3А: done\n  Ф4: pending\n---\n### Ф3а закрыта\nа\n### Ф4 ждёт\nб\n");
     expect(card.sections.map(section => section.phase)).toEqual(["Ф4"]);
