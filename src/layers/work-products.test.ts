@@ -161,7 +161,87 @@ describe("summarizeCard", () => {
   it("survives a card with broken frontmatter", () => {
     const card = summarizeCard("---\nphases: [unclosed\n---\n### Ф1 фаза\nтекст\n");
     expect(card.fields).toEqual({});
+    expect(card.frontmatter_warnings?.length).toBeGreaterThan(0);
     expect(card.sections.map(section => section.phase)).toEqual(["Ф1"]);
+  });
+});
+
+describe("summarizeCard: real-world card shapes (review of knowledge-mcp#112)", () => {
+  const LIST_CARD = `---
+wp: 262
+phases:
+  - id: Ф1
+    title: "Концепция"
+    status: done
+  - id: Ф2
+    title: "Инструкции из одного источника"
+    status: in_progress
+    note: "блок Memory слит; дальше тег слоя"
+  - id: Ф3а
+    title: "Бот без доменной логики"
+    status: in_progress
+---
+# WP-262
+
+## Фазы
+текст без заголовков фаз
+`;
+
+  it("reads a phase list of objects and takes the phase text from title and note", () => {
+    const card = summarizeCard(LIST_CARD);
+    expect(card.phases).toEqual({ Ф1: "done", Ф2: "in_progress", Ф3а: "in_progress" });
+    expect(card.phases_unknown).toBe(false);
+    expect(card.sections).toEqual([
+      { phase: "Ф2", status: "in_progress", heading: "Ф2 — Инструкции из одного источника", excerpt: "блок Memory слит; дальше тег слоя", chars: 33 },
+      { phase: "Ф3а", status: "in_progress", heading: "Ф3а — Бот без доменной логики", excerpt: "", chars: 0 },
+    ]);
+    expect(cardPhase(LIST_CARD, "Ф2")?.content).toBe("блок Memory слит; дальше тег слоя");
+  });
+
+  it("does not show closed phases as open when the map lists them, even if headings exist", () => {
+    const card = summarizeCard("---\nphases:\n  Ф1: done\n  Ф2: pending\n---\n### Ф1 закрыта\nа\n### Ф2 ждёт\nб\n### Ф9 без записи в карте\nв\n");
+    expect(card.sections.map(section => section.phase)).toEqual(["Ф2"]);
+  });
+
+  it("marks phases as unknown, not open, when the card has no phase map", () => {
+    const card = summarizeCard("### Ф1 первая\nа\n### Ф2 вторая\nб\n");
+    expect(card).toMatchObject({ phases: null, phases_unknown: true, open_phases: [] });
+    expect(card.sections.map(section => [section.phase, section.status])).toEqual([["Ф1", null], ["Ф2", null]]);
+  });
+
+  it("keeps the header when a key is repeated (the last value wins)", () => {
+    const card = summarizeCard("---\nwp: 406\nstatus: in_progress\nstatus: in_progress\nphases:\n  Ф1: done\n  Ф2: pending\n---\n### Ф2 ждёт\nб\n");
+    expect(card.fields).toMatchObject({ wp: 406, status: "in_progress" });
+    expect(card.open_phases).toEqual(["Ф2"]);
+    expect(card.frontmatter_warnings).toBeUndefined();
+  });
+
+  it("matches phase ids written in upper case", () => {
+    const card = summarizeCard("---\nphases:\n  Ф3А: done\n  Ф4: pending\n---\n### Ф3а закрыта\nа\n### Ф4 ждёт\nб\n");
+    expect(card.sections.map(section => section.phase)).toEqual(["Ф4"]);
+  });
+});
+
+describe("response budget counts the double JSON encoding of the tool text", () => {
+  const responseSize = (payload: unknown) =>
+    new TextEncoder().encode(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify(payload) }] } })).length;
+
+  it("a phase made of quotes and line breaks still fits", () => {
+    const body = Array.from({ length: 4_000 }, () => '"x"').join("\n");
+    const phase = cardPhase(`### Ф1 кавычки\n${body}\n`, "Ф1");
+    expect(phase?.truncated).toBe(true);
+    expect(responseSize(phase)).toBeLessThanOrEqual(PRIVATE_READ_RESPONSE_BUDGET_BYTES);
+  });
+
+  it("an overview of many quoted phases still fits", () => {
+    const phases = Array.from({ length: 60 }, (_, index) => `  Ф${index + 1}: in_progress`).join("\n");
+    const sections = Array.from({ length: 60 }, (_, index) => `### Ф${index + 1} "фаза"\n${'"q"\n'.repeat(400)}`).join("\n");
+    expect(responseSize(summarizeCard(`---\nphases:\n${phases}\n---\n${sections}\n`))).toBeLessThanOrEqual(PRIVATE_READ_RESPONSE_BUDGET_BYTES);
+  });
+
+  it("a long registry with quoted titles still fits", () => {
+    const rows = Array.from({ length: 500 }, (_, index) => ({ wp: index, status: "done", priority: "P1", title: '"т"'.repeat(50), progress: '"п"\n'.repeat(50) }));
+    expect(responseSize(selectRegistryRows(rows, { status: "all", limit: 500 }))).toBeLessThanOrEqual(PRIVATE_READ_RESPONSE_BUDGET_BYTES);
   });
 });
 

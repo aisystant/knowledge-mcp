@@ -212,8 +212,8 @@ const GOVERNANCE_NAME_HINT = /strateg|governance/i;
 /**
  * First of `paths` that exists in a connected source. With an explicit source only that source is
  * read; otherwise sources are probed in two rounds (likely governance names first). Two sources
- * with the file in the same round is ambiguous: the caller must name the source. A read failure
- * is rethrown when nothing was found, so an outage is never reported as "no such file".
+ * with the file in the same round is ambiguous: the caller must name the source. Any read failure
+ * stops the search, so an outage is never reported as "no such file" or answered from another repo.
  */
 async function findLiveFile(env: Env, ctx: UserContext, paths: string[], source?: string): Promise<LiveFile | { ambiguous: string[] } | null> {
   const readFirstPath = async (candidate: string): Promise<LiveFile | null> => {
@@ -226,15 +226,16 @@ async function findLiveFile(env: Env, ctx: UserContext, paths: string[], source?
   const rounds = source
     ? [[source]]
     : [ctx.sourceNames.filter(name => GOVERNANCE_NAME_HINT.test(name)), ctx.sourceNames.filter(name => !GOVERNANCE_NAME_HINT.test(name))];
-  let failure: unknown = null;
   for (const round of rounds) {
     const settled = await Promise.allSettled(round.map(readFirstPath));
     const hits = settled.flatMap(outcome => outcome.status === "fulfilled" && outcome.value ? [outcome.value] : []);
+    const failure = settled.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+    // A source that could not be read may hold the file too: a single hit next to a failure, or a
+    // hit only in a later round, could be someone else's registry — report the outage instead.
+    if (failure) throw failure.reason;
     if (hits.length > 1) return { ambiguous: hits.map(hit => hit.source) };
     if (hits.length === 1) return hits[0];
-    failure ??= settled.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected")?.reason ?? null;
   }
-  if (failure) throw failure;
   return null;
 }
 
@@ -247,12 +248,12 @@ async function handleWorkProductRead(
     return toolError(id, `Error: source must be one of: ${ctx.sourceNames.join(", ")}`, "validation");
   }
   const log = (outcome: string, extra: Record<string, unknown> = {}) =>
-    console.log(JSON.stringify({ event: "wp_read", tool: toolName, outcome, source: source ?? null, ms: Date.now() - startedAt, ...extra }));
+    console.log(JSON.stringify({ event: "wp_read", tool: toolName, outcome, explicit_source: source !== undefined, ms: Date.now() - startedAt, ...extra }));
   const reply = (payload: unknown): McpResponse =>
     ({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(payload) }] } });
   const unresolved = (found: { ambiguous: string[] } | null, what: string): McpResponse => {
     if (found) {
-      log("ambiguous", { sources: found.ambiguous });
+      log("ambiguous", { candidates: found.ambiguous.length });
       return toolError(id, { error: "source_ambiguous", message: `${what} есть в нескольких источниках — повтори с source.`, sources: found.ambiguous }, "validation");
     }
     log("not_found");
@@ -271,7 +272,7 @@ async function handleWorkProductRead(
       priority: typeof args.priority === "string" ? args.priority : undefined,
       limit: typeof args.limit === "number" ? args.limit : undefined,
     });
-    log("ok", { source: found.source, rows: result.returned, truncated: result.truncated });
+    log("ok", { rows: result.returned, truncated: result.truncated });
     return reply({ source: found.source, file: found.path, ...result });
   }
 
@@ -286,15 +287,15 @@ async function handleWorkProductRead(
   if (phase) {
     const section = cardPhase(found.content, phase);
     if (!section) {
-      log("phase_not_found", { source: found.source, wp, phase });
+      log("phase_not_found", { wp, phase });
       return toolError(id, { error: "phase_not_found", message: `В карточке РП-${wp} нет раздела ${phase}; вызови wp_card без phase, чтобы увидеть открытые фазы.` }, "not_found");
     }
-    log("ok", { source: found.source, wp, phase, truncated: section.truncated });
+    log("ok", { wp, phase, truncated: section.truncated });
     return reply({ source: found.source, file: found.path, wp, ...section,
-      ...(section.truncated ? { next_action: `get_document(source, filename="${found.path}", section="${section.heading}", include_sha:true, cursor:"start")` } : {}) });
+      ...(section.truncated ? { next_action: `personal_get_document(source="${found.source}", filename="${found.path}", section="${section.heading}", include_sha:true), then next_cursor until complete` } : {}) });
   }
   const overview = summarizeCard(found.content);
-  log("ok", { source: found.source, wp, sections: overview.sections.length });
+  log("ok", { wp, sections: overview.sections.length, phases_unknown: overview.phases_unknown });
   return reply({ source: found.source, file: found.path, wp, ...overview });
 }
 
@@ -3292,7 +3293,7 @@ export const PRIVATE_TOOLS = [
     // WP-560 Ф22: the registry is ~160 KB, over the 32 KB response budget, and search serves
     // stale snapshots of it — this reads the live file and returns parsed rows.
     name: "wp_list",
-    description: "List the person's work products (WP) from the live WP registry (docs/WP-REGISTRY.md) of their governance repository — compact rows {wp, status, priority, title, progress}, newest first. Default: active ones (in_progress, pending, blocked). Use this for «мои РП», «что у меня в работе» instead of searching or paging the registry. Then wp_card for one WP.",
+    description: "«Мои РП»: active work products from the live WP registry (docs/WP-REGISTRY.md), no search needed. Rows {wp, status, priority, title, progress}, newest first; default in_progress+pending+blocked. Then wp_card for one WP.",
     inputSchema: {
       type: "object",
       properties: {
@@ -3306,11 +3307,11 @@ export const PRIVATE_TOOLS = [
   },
   {
     name: "wp_card",
-    description: "Read one work product card (inbox/WP-N/WP-N.md) live from the governance repository. Without phase: key fields, the phase map and an overview of every OPEN phase (heading + beginning of its text); closed phases are skipped. With phase (e.g. «Ф22»): the full text of that phase section. Use for «что с РП-N», «где я остановился по РП-N».",
+    description: "«Что с РП-N»: one WP card read live; open phases only. No phase: key fields + overview of every open phase. phase=«Ф22»: that phase in full. Card file inbox/WP-N/WP-N.md of the governance repository.",
     inputSchema: {
       type: "object",
       properties: {
-        wp: { type: "string", description: "WP number: 560, «WP-560» or «РП-560»." },
+        wp: { type: ["string", "integer"], description: "WP number: 560, «WP-560» or «РП-560»." },
         phase: { type: "string", description: "Optional phase, e.g. «Ф22»: return that section in full." },
         source: { type: "string", description: "Governance repository (source name). Omit to find the connected source that has this card." },
       },
@@ -3559,7 +3560,7 @@ export function gateLearnerCall(env: Env, tool: string, caller: LearnerCaller, a
 
 export async function handleMcpRequest(request: McpRequest, env: Env, userId?: string, mode: McpMode = "public", rawRequest?: Request, jwtSubject?: string, observationRuntime?: ObservationRuntime): Promise<McpResponse> {
   const boundedRead = mode === "private" && request.method === "tools/call"
-    && (request.params?.name === "search" || request.params?.name === "get_document");
+    && ["search", "get_document", "wp_list", "wp_card"].includes(request.params?.name as string);
   if (boundedRead) {
     const idError = privateReadIdError(request.id);
     if (idError) return idError;

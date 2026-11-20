@@ -664,6 +664,41 @@ describe("WP-560 Ф22: wp_list / wp_card read the live governance repository", (
     expect(parse(response).body).not.toMatchObject({ error: "not_found" });
   });
 
+  it("an unreadable governance repository is an outage, not an answer from another repository", async () => {
+    vi.mocked(resolveUserContext).mockResolvedValueOnce({
+      userId: "user-private-1",
+      sources: [
+        { source: "DS-my-strategy", githubOwner: "o", githubRepo: "DS-my-strategy", pathPrefix: "", sourceType: "ds" },
+        { source: "DS-notes", githubOwner: "o", githubRepo: "DS-notes", pathPrefix: "", sourceType: "ds" },
+      ],
+      sourceNames: ["DS-my-strategy", "DS-notes"],
+    });
+    vi.mocked(personalGetDocumentLive).mockImplementation(async (_env, _ctx, filename, source) => {
+      if (source === "DS-my-strategy") throw new ReadFailure("dependency_timeout", "github_content");
+      return { filename, content: REGISTRY, source, source_type: "ds", github_url: null, sha: "a".repeat(40) };
+    });
+    const response = await callTool("wp_list", {}, "private");
+    expect((response.result as { error_code?: string }).error_code).toBe("upstream");
+    expect(personalGetDocumentLive).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), "DS-notes");
+  });
+
+  it("points a cut phase at a get_document call the service accepts", async () => {
+    live({ "inbox/WP-5/WP-5.md": `---\nphases:\n  Ф2: in_progress\n---\n### Ф2 длинная\n${"ж".repeat(40_000)}\n` });
+    const body = parse(await callTool("wp_card", { wp: 5, phase: "Ф2" }, "private")).body;
+    expect(body.truncated).toBe(true);
+    expect(body.next_action).toContain('personal_get_document(source="DS-my-strategy", filename="inbox/WP-5/WP-5.md", section="Ф2 длинная", include_sha:true)');
+    expect(body.next_action).not.toContain("cursor:");
+  });
+
+  it("a cut phase with a long heading still passes the private response guard", async () => {
+    const heading = `Ф2 ${"очень длинный заголовок ".repeat(8)}`;
+    live({ "inbox/WP-5/WP-5.md": `---\nphases:\n  Ф2: in_progress\n---\n### ${heading}\n${'"кавычки"\n'.repeat(5_000)}\n` });
+    const response = await callTool("wp_card", { wp: 5, phase: "Ф2" }, "private");
+    expect((response.result as { isError?: boolean }).isError).toBeUndefined();
+    expect(parse(response).body.truncated).toBe(true);
+    expect(new TextEncoder().encode(JSON.stringify(response)).length).toBeLessThanOrEqual(32_000);
+  });
+
   it("asks for a source when two connected repositories both have the registry", async () => {
     vi.mocked(resolveUserContext).mockResolvedValueOnce({
       userId: "user-private-1",

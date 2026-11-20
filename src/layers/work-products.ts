@@ -41,11 +41,21 @@ const TITLE_CAP = 160;
 const FIELD_CAP = 600;
 /** Excerpt lengths tried in turn until the overview of all open phases fits the budget. */
 const EXCERPT_STEPS = [800, 400, 160, 0] as const;
-/** Leave room for the JSON-RPC envelope and string escaping around the payload. */
-const PAYLOAD_BUDGET_BYTES = PRIVATE_READ_RESPONSE_BUDGET_BYTES - 2_000;
+/**
+ * Room for the JSON-RPC envelope around the tool text and for the fields the dispatcher adds to
+ * these payloads (source, file, wp, next_action with a section heading) — over budget, the
+ * private-read guard would replace the whole answer with response_too_large.
+ */
+const ENVELOPE_RESERVE_BYTES = 1_500;
+const RESPONSE_BUDGET_BYTES = PRIVATE_READ_RESPONSE_BUDGET_BYTES - ENVELOPE_RESERVE_BYTES;
 
 const encoder = new TextEncoder();
-const byteLength = (value: unknown): number => encoder.encode(JSON.stringify(value)).length;
+/**
+ * Bytes `value` occupies in the final response. The tool text is JSON.stringify(payload), and the
+ * response carries that text as a JSON string again — so quotes, backslashes and newlines are
+ * escaped twice. Measuring a single layer undercounts text full of quotes and line breaks.
+ */
+const responseBytes = (value: unknown): number => encoder.encode(JSON.stringify(JSON.stringify(value))).length - 2;
 
 function cleanCell(cell: string): string {
   return cell.replace(/~~|\*\*/g, "").replace(/\s+/g, " ").trim();
@@ -57,12 +67,12 @@ function cap(text: string, limit: number): string {
 
 /** Longest prefix of `text` whose JSON encoding fits `budget` bytes (binary search on length). */
 function prefixWithinBytes(text: string, budget: number): string {
-  if (byteLength(text) <= budget) return text;
+  if (responseBytes(text) <= budget) return text;
   let low = 0;
   let high = text.length;
   while (low < high) {
     const middle = Math.ceil((low + high) / 2);
-    if (byteLength(text.slice(0, middle)) <= budget) low = middle;
+    if (responseBytes(text.slice(0, middle)) <= budget) low = middle;
     else high = middle - 1;
   }
   return text.slice(0, low);
@@ -147,7 +157,7 @@ function rowsWithinBudget(rows: RegistryRow[], budget: number): RegistryRow[] {
   const kept: RegistryRow[] = [];
   let used = 2;
   for (const row of rows) {
-    used += byteLength(row) + 1;
+    used += responseBytes(row) + 1;
     if (used > budget) break;
     kept.push(row);
   }
@@ -167,7 +177,7 @@ export function selectRegistryRows(rows: RegistryRow[], options: WpListOptions =
     (statusFilter === "all" || (statusFilter === "active" ? ACTIVE_STATUSES.has(row.status) : row.status === statusFilter))
     && (!priority || (row.priority ?? "").toUpperCase().split(/[\s,]+/).includes(priority)));
   const wanted = matching.slice(0, limit);
-  const budget = PAYLOAD_BUDGET_BYTES - 300;
+  const budget = RESPONSE_BUDGET_BYTES - 300;
   let kept = rowsWithinBudget(wanted, budget);
   let progressOmitted = false;
   if (kept.length < wanted.length) {
@@ -199,7 +209,7 @@ export function normalizeWpNumber(value: unknown): number | null {
 export function normalizePhase(value: unknown): string | null {
   if (typeof value !== "string" && typeof value !== "number") return null;
   const match = String(value).trim().match(/^(?:Ф|F)?(\d{1,4}[а-яa-z]?)$/iu);
-  return match ? `Ф${match[1].toLowerCase()}` : null;
+  return match ? phaseKey(`Ф${match[1]}`) : null;
 }
 
 /** Card locations in a governance repository: folder form first (WP-434), then legacy flat file. */
@@ -211,21 +221,70 @@ const CARD_FIELDS = ["wp", "title", "status", "priority", "budget", "created", "
 
 interface Heading { level: number; text: string; start: number }
 
+interface PhaseInfo { status: string; title: string | null; note: string | null }
+
 interface ParsedCard {
   fields: Record<string, unknown>;
+  /** Phase id → status, in card order; null when the card has no readable phase map. */
   phases: Record<string, string> | null;
+  phaseInfo: Map<string, PhaseInfo>;
   body: string;
   headings: Heading[];
+  warnings: string[];
 }
 
-function splitFrontmatter(markdown: string): { frontmatter: Record<string, unknown>; body: string } {
+/** Canonical phase id: "Ф3А" and "ф3а" are the same phase as "Ф3а". */
+function phaseKey(raw: string): string {
+  return raw.trim().replace(/^[фf]/iu, "Ф").replace(/[A-ZА-ЯЁ]$/u, letter => letter.toLowerCase());
+}
+
+const text = (value: unknown): string | null => (value === undefined || value === null || value === "" ? null : String(value));
+
+/**
+ * Two shapes live in cards: a map (`Ф1: done`) and a list of objects (`- id: Ф1, status: done,
+ * title: …, note: …`; 20 of 46 cards with phases in the pilot's repository).
+ */
+function readPhases(raw: unknown): Map<string, PhaseInfo> | null {
+  if (Array.isArray(raw)) {
+    const phases = new Map<string, PhaseInfo>();
+    for (const item of raw) {
+      if (!item || typeof item !== "object") continue;
+      const entry = item as Record<string, unknown>;
+      const id = text(entry.id);
+      if (!id) continue;
+      phases.set(phaseKey(id), { status: text(entry.status) ?? "unknown", title: text(entry.title), note: text(entry.note) });
+    }
+    return phases.size > 0 ? phases : null;
+  }
+  if (raw && typeof raw === "object") {
+    const phases = new Map<string, PhaseInfo>();
+    for (const [id, value] of Object.entries(raw as Record<string, unknown>)) {
+      const nested = value && typeof value === "object" ? value as Record<string, unknown> : null;
+      phases.set(phaseKey(id), nested
+        ? { status: text(nested.status) ?? "unknown", title: text(nested.title), note: text(nested.note) }
+        : { status: text(value) ?? "unknown", title: null, note: null });
+    }
+    return phases.size > 0 ? phases : null;
+  }
+  return null;
+}
+
+function splitFrontmatter(markdown: string): { frontmatter: Record<string, unknown>; body: string; warnings: string[] } {
   const match = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
-  if (!match) return { frontmatter: {}, body: markdown };
-  const document = parseDocument(match[1]);
-  const value = document.errors.length === 0 ? document.toJS() : null;
+  if (!match) return { frontmatter: {}, body: markdown, warnings: [] };
+  // Hand-edited cards repeat keys (WP-406 has three); the last value wins instead of losing the whole header.
+  const document = parseDocument(match[1], { uniqueKeys: false });
+  const warnings: string[] = document.errors.map(error => error.code);
+  let value: unknown = null;
+  try {
+    value = document.toJS();
+  } catch (error) {
+    warnings.push(`frontmatter_unreadable: ${error instanceof Error ? error.message : String(error)}`);
+  }
   return {
     frontmatter: value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {},
     body: markdown.slice(match[0].length),
+    warnings,
   };
 }
 
@@ -244,18 +303,16 @@ function findHeadings(body: string): Heading[] {
 }
 
 function parseCard(markdown: string): ParsedCard {
-  const { frontmatter, body } = splitFrontmatter(markdown);
+  const { frontmatter, body, warnings } = splitFrontmatter(markdown);
   const fields: Record<string, unknown> = {};
   for (const name of CARD_FIELDS) {
     const value = frontmatter[name];
     if (value === undefined || value === null || value === "") continue;
     fields[name] = typeof value === "string" ? cap(value, FIELD_CAP) : value;
   }
-  const raw = frontmatter.phases;
-  const phases = raw && typeof raw === "object" && !Array.isArray(raw)
-    ? Object.fromEntries(Object.entries(raw as Record<string, unknown>).map(([key, value]) => [key, String(value)]))
-    : null;
-  return { fields, phases, body, headings: findHeadings(body) };
+  const phaseInfo = readPhases(frontmatter.phases) ?? new Map<string, PhaseInfo>();
+  const phases = phaseInfo.size > 0 ? Object.fromEntries([...phaseInfo].map(([id, info]) => [id, info.status])) : null;
+  return { fields, phases, phaseInfo, body, headings: findHeadings(body), warnings };
 }
 
 function sectionText(card: ParsedCard, index: number): string {
@@ -267,7 +324,7 @@ function sectionText(card: ParsedCard, index: number): string {
 /** "Ф22", "Ф3а" … at the very start of a heading (after optional bold/marker characters). */
 function phaseOfHeading(text: string): string | null {
   const match = text.replace(/^[*_~\s]+/, "").match(/^Ф(\d+[а-яa-z]?)(?![\p{L}\p{N}])/u);
-  return match ? `Ф${match[1].toLowerCase()}` : null;
+  return match ? phaseKey(`Ф${match[1]}`) : null;
 }
 
 function isFinished(card: ParsedCard, phase: string): boolean {
@@ -297,9 +354,44 @@ export interface WpCardOverview {
   fields: Record<string, unknown>;
   phases: Record<string, string> | null;
   open_phases: string[];
-  /** One entry per open phase that has a section; read a full one with wp_card(wp, phase). */
+  /** true when the card has no readable phase map: every phase heading is shown, status unknown. */
+  phases_unknown: boolean;
+  /** One entry per open phase; read a full one with wp_card(wp, phase). */
   sections: WpCardPhaseSummary[];
   excerpt_chars: number;
+  frontmatter_warnings?: string[];
+}
+
+interface PhaseText { phase: string | null; status: string | null; heading: string; text: string }
+
+/**
+ * Text of a phase: its section when the card has a heading for it, otherwise what the phase list
+ * itself says (list-form cards keep title and note in the frontmatter and have no phase headings).
+ */
+function phaseText(card: ParsedCard, phase: string, headingIndex: number | undefined): PhaseText | null {
+  const info = card.phaseInfo.get(phase);
+  const status = info?.status ?? null;
+  if (headingIndex !== undefined) {
+    return { phase, status, heading: card.headings[headingIndex].text, text: sectionText(card, headingIndex) };
+  }
+  if (!info || (!info.title && !info.note)) return null;
+  return { phase, status, heading: info.title ? `${phase} — ${info.title}` : phase, text: info.note ?? "" };
+}
+
+function openPhaseTexts(card: ParsedCard): { texts: PhaseText[]; openPhases: string[]; unknown: boolean } {
+  const headingIndexes = phaseHeadingIndexes(card);
+  if (card.phases) {
+    const openPhases = Object.keys(card.phases).filter(phase => !isFinished(card, phase));
+    const texts = openPhases.flatMap(phase => phaseText(card, phase, headingIndexes.get(phase)) ?? []);
+    return { texts, openPhases, unknown: false };
+  }
+  const texts = [...headingIndexes].flatMap(([phase, index]) => phaseText(card, phase, index) ?? []);
+  if (texts.length === 0) {
+    // A card without phases (template cards often have none) still has its working notes.
+    const remaining = card.headings.findIndex(heading => /^Осталось(?![\p{L}\p{N}])/u.test(heading.text));
+    if (remaining !== -1) texts.push({ phase: null, status: null, heading: card.headings[remaining].text, text: sectionText(card, remaining) });
+  }
+  return { texts, openPhases: [], unknown: true };
 }
 
 /**
@@ -310,36 +402,25 @@ export interface WpCardOverview {
  */
 export function summarizeCard(markdown: string): WpCardOverview {
   const card = parseCard(markdown);
-  const openPhases = card.phases ? Object.keys(card.phases).filter(phase => !isFinished(card, phase)) : [];
-  const entries: Array<{ phase: string | null; index: number }> = [...phaseHeadingIndexes(card)]
-    .filter(([phase]) => !isFinished(card, phase))
-    .map(([phase, index]) => ({ phase, index }));
-  // A card without phase sections (template cards often have none) still has its working notes.
-  if (entries.length === 0) {
-    const remaining = card.headings.findIndex(heading => /^Осталось(?![\p{L}\p{N}])/u.test(heading.text));
-    if (remaining !== -1) entries.push({ phase: null, index: remaining });
-  }
-  const texts = entries.map(entry => ({ ...entry, text: sectionText(card, entry.index) }));
+  const { texts, openPhases, unknown } = openPhaseTexts(card);
   const build = (excerptChars: number): WpCardOverview => ({
     fields: card.fields,
     phases: card.phases,
     open_phases: openPhases,
-    sections: texts.map(({ phase, index, text }) => ({
-      phase,
-      status: phase ? card.phases?.[phase] ?? null : null,
-      heading: card.headings[index].text,
-      excerpt: cap(text, excerptChars),
-      chars: text.length,
+    phases_unknown: unknown,
+    sections: texts.map(({ phase, status, heading, text }) => ({
+      phase, status, heading, excerpt: cap(text, excerptChars), chars: text.length,
     })),
     excerpt_chars: excerptChars,
+    ...(card.warnings.length > 0 ? { frontmatter_warnings: card.warnings } : {}),
   });
   for (const step of EXCERPT_STEPS) {
     const overview = build(step);
-    if (byteLength(overview) <= PAYLOAD_BUDGET_BYTES) return overview;
+    if (responseBytes(overview) <= RESPONSE_BUDGET_BYTES) return overview;
   }
   // Even headings alone do not fit: keep as many phases as fit, the open_phases list stays whole.
   const overview = build(0);
-  while (overview.sections.length > 0 && byteLength(overview) > PAYLOAD_BUDGET_BYTES) overview.sections.pop();
+  while (overview.sections.length > 0 && responseBytes(overview) > RESPONSE_BUDGET_BYTES) overview.sections.pop();
   return overview;
 }
 
@@ -348,19 +429,16 @@ export interface WpCardPhaseText {
   status: string | null;
   heading: string;
   content: string;
-  /** true when the section was longer than the budget; read the rest with get_document(section=heading, cursor:"start"). */
+  /** true when the section was longer than the budget; the rest is read with get_document(section=heading, include_sha:true). */
   truncated: boolean;
 }
 
-/** Full text of one phase section, or null when the card has no heading for that phase. */
+/** Full text of one phase (section or phase-list entry), or null when the card does not have it. */
 export function cardPhase(markdown: string, phase: string): WpCardPhaseText | null {
   const card = parseCard(markdown);
-  const index = phaseHeadingIndexes(card).get(phase);
-  if (index === undefined) return null;
-  const full = sectionText(card, index);
-  const heading = card.headings[index].text;
-  const status = card.phases?.[phase] ?? null;
-  const envelope = byteLength({ phase, status, heading, content: "", truncated: true });
-  const content = prefixWithinBytes(full, PAYLOAD_BUDGET_BYTES - envelope);
-  return { phase, status, heading, content, truncated: content.length < full.length };
+  const found = phaseText(card, phase, phaseHeadingIndexes(card).get(phase));
+  if (!found) return null;
+  const envelope = responseBytes({ phase, status: found.status, heading: found.heading, content: "", truncated: true });
+  const content = prefixWithinBytes(found.text, RESPONSE_BUDGET_BYTES - envelope);
+  return { phase, status: found.status, heading: found.heading, content, truncated: content.length < found.text.length };
 }
