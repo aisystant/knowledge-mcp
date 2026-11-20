@@ -66,6 +66,10 @@ export const PRIVATE_TOOL_NAMES: ReadonlySet<string> = new Set([
   // private mode appears in that registry) — not on any other trigger like
   // "the registry grew a 4th entry", which wouldn't change this fact.
   "index_status",
+  // WP-560 Ф22: live, parsed reads of the person's governance repository — WP registry
+  // (personal_wp_list) and one WP card (personal_wp_card). Read-only.
+  "wp_list",
+  "wp_card",
 ]);
 
 /**
