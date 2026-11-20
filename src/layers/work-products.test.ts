@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { PRIVATE_READ_RESPONSE_BUDGET_BYTES } from "../personal-response-bounds.js";
-import { cardPhase, chooseDayPlan, fitText, normalizePhase, normalizeWpNumber, parseRegistry, selectRegistryRows, summarizeCard, wpCardPaths } from "./work-products.js";
+import { cardPhase, chooseDayPlan, fitText, prepareDayPlan, normalizePhase, normalizeWpNumber, parseRegistry, selectRegistryRows, summarizeCard, wpCardPaths } from "./work-products.js";
 
 const REGISTRY = `# WP-REGISTRY
 
@@ -305,5 +305,13 @@ describe("fitText", () => {
     const long = fitText('"строка"\n'.repeat(10_000), { file: "x" });
     expect(long.truncated).toBe(true);
     expect(new TextEncoder().encode(JSON.stringify(JSON.stringify({ file: "x", ...long }))).length).toBeLessThan(PRIVATE_READ_RESPONSE_BUDGET_BYTES);
+  });
+});
+
+describe("prepareDayPlan", () => {
+  it("drops HTML comments and lists level 2-3 headings for reading by section", () => {
+    const plan = prepareDayPlan("# Day Plan: 20 ноября\n<!-- служебная метка -->\n## На сегодня\nа\n### Саморазвитие\nб\n#### мелочь\n```\n## не заголовок\n```\n");
+    expect(plan.text).not.toContain("служебная метка");
+    expect(plan.headings).toEqual(["На сегодня", "Саморазвитие"]);
   });
 });

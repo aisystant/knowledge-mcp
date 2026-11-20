@@ -82,6 +82,7 @@ import {
   REGISTRY_PATH,
   WP_LIST_STATUS_FILTERS,
   DAY_PLAN_DIRECTORIES,
+  prepareDayPlan,
   cardPhase,
   chooseDayPlan,
   fitText,
@@ -206,7 +207,9 @@ function toolError(id: string | number, content: string | object, errorCode: Too
   };
 }
 
-// --- WP-560 Ф22: work product reads (wp_list, wp_card) ---
+// --- WP-560 Ф22: work product reads (wp_list, wp_card, day_plan) ---
+
+const GITHUB_CONTENTS_LIST_LIMIT = 1000;
 
 interface LiveFile { source: string; path: string; content: string }
 
@@ -292,6 +295,12 @@ async function handleWorkProductRead(
       personalListDirectoryLive(env, ctx, DAY_PLAN_DIRECTORIES.current, governance),
       personalListDirectoryLive(env, ctx, DAY_PLAN_DIRECTORIES.archive, governance),
     ]);
+    // The Contents API lists at most 1000 entries and drops the rest silently — the newest plans
+    // sort last, so a full listing could hide today's plan behind an old one.
+    if ((archive?.length ?? 0) >= GITHUB_CONTENTS_LIST_LIMIT || (current?.length ?? 0) >= GITHUB_CONTENTS_LIST_LIMIT) {
+      log("listing_limit");
+      return toolError(id, { error: "listing_too_large", message: "Папка планов дня содержит 1000 файлов или больше; список неполный. Укажи date или читай план через personal_get_document." }, "upstream");
+    }
     const names = (entries: Array<{ name: string; type: string }> | null) => (entries ?? []).filter(entry => entry.type === "file").map(entry => entry.name);
     const choice = chooseDayPlan(names(current), names(archive), date);
     const today = new Date().toISOString().slice(0, 10);
@@ -304,11 +313,13 @@ async function handleWorkProductRead(
       log("not_found", { date: choice.date });
       return toolError(id, { error: "not_found", message: `План ${choice.path} исчез между чтением списка и файла; повтори запрос.` }, "not_found");
     }
-    const envelope = { source: governance, file: choice.path, ...choice, today_utc: today };
-    const fitted = fitText(file.content, envelope);
+    const plan = prepareDayPlan(file.content);
+    // Day boundary is the person's, not UTC: near midnight today_utc may still be yesterday for them.
+    const envelope = { source: governance, file: choice.path, ...choice, today_utc: today, is_today_utc: choice.date === today, headings: plan.headings };
+    const fitted = fitText(plan.text, envelope);
     log("ok", { date: choice.date, day_closed: choice.day_closed, truncated: fitted.truncated });
     return reply({ ...envelope, ...fitted,
-      ...(fitted.truncated ? { next_action: `personal_get_document(source="${governance}", filename="${choice.path}", include_sha:true, cursor:"start") for the whole plan` } : {}) });
+      ...(fitted.truncated ? { next_action: `personal_get_document(source="${governance}", filename="${choice.path}", include_sha:true, section="<one of headings>") for the rest` } : {}) });
   }
 
   if (toolName === "wp_list") {

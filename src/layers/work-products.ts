@@ -472,6 +472,16 @@ export function chooseDayPlan(current: string[], archive: string[], date?: strin
   return candidates[0] ?? null;
 }
 
+/**
+ * A day plan prepared for the answer: HTML comments (service markers) removed, and the list of
+ * its section headings, so a cut plan can be read further by section rather than page by page.
+ */
+export function prepareDayPlan(markdown: string): { text: string; headings: string[] } {
+  const text = markdown.replace(/<!--[\s\S]*?-->\n?/g, "");
+  const headings = findHeadings(text).filter(heading => heading.level >= 2 && heading.level <= 3).map(heading => heading.text);
+  return { text, headings };
+}
+
 /** `text` cut to what fits the response next to `envelope` (the rest of the payload). */
 export function fitText(text: string, envelope: Record<string, unknown>): { content: string; truncated: boolean } {
   const content = prefixWithinBytes(text, RESPONSE_BUDGET_BYTES - responseBytes({ ...envelope, content: "", truncated: true }));

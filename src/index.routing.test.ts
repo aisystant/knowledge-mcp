@@ -726,6 +726,17 @@ describe("WP-560 Ф22: wp_list / wp_card read the live governance repository", (
     expect(isError).toBe(false);
     expect(body).toMatchObject({ source: "DS-my-strategy", file: "archive/day-plans/DayPlan 2026-11-20.md", date: "2026-11-20", day_closed: true, content: "# Day Plan: 20 ноября", truncated: false });
     expect(body.today_utc).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(body.is_today_utc).toBe(body.today_utc === "2026-11-20");
+    expect(body.headings).toEqual([]);
+  });
+
+  it("day_plan refuses a listing at the GitHub limit instead of picking an old plan", async () => {
+    const full = Array.from({ length: 1000 }, (_, index) => ({ name: `DayPlan 2024-01-${String(index % 28 + 1).padStart(2, "0")}.md`, type: "file" }));
+    vi.mocked(personalListDirectoryLive).mockImplementation(async (_env, _ctx, directory) =>
+      directory === "docs" ? [{ name: "WP-REGISTRY.md", type: "file" }] : directory === "archive/day-plans" ? full : []);
+    const response = await callTool("day_plan", {}, "private");
+    expect(parse(response).body.error).toBe("listing_too_large");
+    expect(personalGetDocumentLive).not.toHaveBeenCalled();
   });
 
   it("day_plan answers not_found when the governance repository is not connected", async () => {

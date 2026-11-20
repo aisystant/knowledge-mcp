@@ -2085,8 +2085,8 @@ export async function personalListDirectoryLive(
           headers: { Authorization: `Bearer ${lease.token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
         }, "github_content", signal);
         const body = await readJson(response, "github_content");
-        // A file path answers with an object, a directory with an array.
-        if (!Array.isArray(body)) throw new ReadFailure("dependency_invalid_response", "github_content");
+        // A file path answers with an object, a directory with an array: a file is "no such directory".
+        if (!Array.isArray(body)) return null;
         return body.flatMap(entry => entry && typeof entry.name === "string" && typeof entry.type === "string"
           ? [{ name: entry.name as string, type: entry.type as string }] : []);
       } finally {
