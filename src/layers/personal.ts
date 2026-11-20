@@ -1881,7 +1881,12 @@ export async function personalGetDocument(
   if (!source && ctx.sourceNames.length === 1 && ctx.sourceNames[0].includes("/")) {
     return personalGetDocumentLive(env, ctx, baseName, ctx.sourceNames[0]);
   }
-  if (!source && ctx.sourceNames.some(name => name.includes("/"))) {
+  const hasTeamSource = ctx.sourceNames.some(name => name.includes("/"));
+  // Team repositories are read live and cannot be searched in the index, so a bare filename is
+  // ambiguous only when there is nothing in the index to resolve it against. With the person's own
+  // indexed sources present the index is tried first (below); the old early throw made every
+  // filename-only read fail for anyone who had connected a single team repository.
+  if (!source && hasTeamSource && !ctx.sourceNames.some(name => !name.includes("/"))) {
     throw new AmbiguousSourceError(ctx.sourceNames);
   }
 
@@ -1934,6 +1939,9 @@ export async function personalGetDocument(
     };
   }
 
+  // Not in the index and a team repository exists: the file may live there, so naming the source is
+  // still required; without a team source it is simply not found.
+  if (!rows.length && src === null && hasTeamSource) throw new AmbiguousSourceError(ctx.sourceNames);
   if (!rows.length) return null;
   const r = rows[0];
   return {
