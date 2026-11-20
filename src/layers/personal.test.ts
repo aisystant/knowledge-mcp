@@ -645,6 +645,50 @@ describe("personalGetDocument", () => {
     expect(doc?.content).toBe("legacy content");
   });
 
+  describe("filename-only read when a team repository is connected (WP-262 F4)", () => {
+    const team = "MimEcoSys/editorial-lpf";
+    const mixed = () => ctx({ sourceNames: ["DS-my-strategy", team] });
+
+    it("resolves the file in the person's own indexed source instead of refusing", async () => {
+      queryQueue.push([
+        { filename: "docs/WP-REGISTRY.md", content: "registry", source: "DS-my-strategy", source_type: "ds", protocol_version: 2, chunk_ordinal: 1 },
+      ]);
+      const doc = await personalGetDocument(ENV, mixed(), "docs/WP-REGISTRY.md");
+      expect(doc?.content).toBe("registry");
+      expect(doc?.source).toBe("DS-my-strategy");
+    });
+
+    it("never reads the index for team sources: only the non-slash names are queried", async () => {
+      queryQueue.push([
+        { filename: "a.md", content: "x", source: "DS-my-strategy", source_type: "ds", protocol_version: 2, chunk_ordinal: 1 },
+      ]);
+      await personalGetDocument(ENV, mixed(), "a.md");
+      expect(sqlCalls.length).toBeGreaterThan(0);
+      expect(sqlCalls.some(call => JSON.stringify(call).includes(team))).toBe(false);
+    });
+
+    it("still asks for a source when the file is not in the index (it may be in the team repository)", async () => {
+      queryQueue.push([]);
+      await expect(personalGetDocument(ENV, mixed(), "only-in-team.md")).rejects.toThrow(/multiple sources/);
+    });
+
+    it("still asks for a source when only team repositories are connected", async () => {
+      await expect(
+        personalGetDocument(ENV, ctx({ sourceNames: [team, "MimEcoSys/other"] }), "x.md"),
+      ).rejects.toThrow(/multiple sources/);
+    });
+
+    it("keeps refusing when two indexed sources hold the same path", async () => {
+      queryQueue.push([
+        { filename: "docs/shared.md", content: "a", source: "DS-my-strategy", source_type: "ds", protocol_version: 2, chunk_ordinal: 1 },
+        { filename: "docs/shared.md", content: "b", source: "DS-other", source_type: "ds", protocol_version: 2, chunk_ordinal: 1 },
+      ]);
+      await expect(
+        personalGetDocument(ENV, ctx({ sourceNames: ["DS-my-strategy", "DS-other", team] }), "docs/shared.md"),
+      ).rejects.toThrow(/multiple sources/);
+    });
+  });
+
   it("throws when the path exists in 2+ sources and source is omitted (WP-7 Ф94 regression)", async () => {
     queryQueue.push([{ source: "DS-my-strategy" }, { source: "DS-other" }]); // ambiguity pre-check
     await expect(
