@@ -443,3 +443,47 @@ export function cardPhase(markdown: string, phase: string): WpCardPhaseText | nu
   const content = prefixWithinBytes(found.text, RESPONSE_BUDGET_BYTES - envelope);
   return { phase, status: found.status, heading: found.heading, content, truncated: content.length < found.text.length };
 }
+
+// --- day plan ---
+
+export const DAY_PLAN_DIRECTORIES = { current: "current", archive: "archive/day-plans" } as const;
+const DAY_PLAN_NAME = /^DayPlan (\d{4}-\d{2}-\d{2})\.md$/;
+
+export interface DayPlanChoice {
+  path: string;
+  date: string;
+  /** The plan was moved to the archive: that day is already closed. */
+  day_closed: boolean;
+}
+
+/**
+ * The day plan to show: the one for `date` if given, otherwise the latest. A plan still in
+ * current/ wins over an archived copy of the same date (the day is not closed yet).
+ */
+export function chooseDayPlan(current: string[], archive: string[], date?: string): DayPlanChoice | null {
+  const candidates = [
+    ...current.map(name => ({ name, directory: DAY_PLAN_DIRECTORIES.current, day_closed: false })),
+    ...archive.map(name => ({ name, directory: DAY_PLAN_DIRECTORIES.archive, day_closed: true })),
+  ].flatMap(entry => {
+    const match = entry.name.match(DAY_PLAN_NAME);
+    return match ? [{ path: `${entry.directory}/${entry.name}`, date: match[1], day_closed: entry.day_closed }] : [];
+  }).filter(plan => !date || plan.date === date);
+  candidates.sort((left, right) => right.date.localeCompare(left.date) || Number(left.day_closed) - Number(right.day_closed));
+  return candidates[0] ?? null;
+}
+
+/**
+ * A day plan prepared for the answer: HTML comments (service markers) removed, and the list of
+ * its section headings, so a cut plan can be read further by section rather than page by page.
+ */
+export function prepareDayPlan(markdown: string): { text: string; headings: string[] } {
+  const text = markdown.replace(/<!--[\s\S]*?-->\n?/g, "");
+  const headings = findHeadings(text).filter(heading => heading.level >= 2 && heading.level <= 3).map(heading => heading.text);
+  return { text, headings };
+}
+
+/** `text` cut to what fits the response next to `envelope` (the rest of the payload). */
+export function fitText(text: string, envelope: Record<string, unknown>): { content: string; truncated: boolean } {
+  const content = prefixWithinBytes(text, RESPONSE_BUDGET_BYTES - responseBytes({ ...envelope, content: "", truncated: true }));
+  return { content, truncated: content.length < text.length };
+}

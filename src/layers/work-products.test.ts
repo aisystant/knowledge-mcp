@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { PRIVATE_READ_RESPONSE_BUDGET_BYTES } from "../personal-response-bounds.js";
-import { cardPhase, normalizePhase, normalizeWpNumber, parseRegistry, selectRegistryRows, summarizeCard, wpCardPaths } from "./work-products.js";
+import { cardPhase, chooseDayPlan, fitText, prepareDayPlan, normalizePhase, normalizeWpNumber, parseRegistry, selectRegistryRows, summarizeCard, wpCardPaths } from "./work-products.js";
 
 const REGISTRY = `# WP-REGISTRY
 
@@ -276,5 +276,42 @@ describe("normalizePhase", () => {
   it("accepts Ф/F prefixes and bare numbers, rejects garbage", () => {
     expect(["Ф22", "ф22", "22", 22, "F22", "Ф3А"].map(normalizePhase)).toEqual(["Ф22", "Ф22", "Ф22", "Ф22", "Ф22", "Ф3а"]);
     expect(["", "Ф", "фаза 2", null].map(normalizePhase)).toEqual([null, null, null, null]);
+  });
+});
+
+describe("chooseDayPlan", () => {
+  it("takes the latest plan; an archived plan means the day is closed", () => {
+    expect(chooseDayPlan([], ["DayPlan 2026-11-19.md", "DayPlan 2026-11-20.md", "DayPlan 2026-10-29.md"])).toEqual({
+      path: "archive/day-plans/DayPlan 2026-11-20.md", date: "2026-11-20", day_closed: true,
+    });
+  });
+
+  it("prefers today's open plan in current/ over an older or same-day archived copy", () => {
+    expect(chooseDayPlan(["DayPlan 2026-11-21.md", "WeekPlan W47.md"], ["DayPlan 2026-11-21.md", "DayPlan 2026-11-20.md"])).toEqual({
+      path: "current/DayPlan 2026-11-21.md", date: "2026-11-21", day_closed: false,
+    });
+  });
+
+  it("returns the plan of a requested day, or null when there is none", () => {
+    expect(chooseDayPlan(["DayPlan 2026-11-21.md"], ["DayPlan 2026-11-19.md"], "2026-11-19")?.path).toBe("archive/day-plans/DayPlan 2026-11-19.md");
+    expect(chooseDayPlan(["DayPlan 2026-11-21.md"], [], "2026-01-01")).toBeNull();
+    expect(chooseDayPlan(["notes.md", "DayPlan draft.md"], [])).toBeNull();
+  });
+});
+
+describe("fitText", () => {
+  it("keeps short text whole and cuts long text to the response budget", () => {
+    expect(fitText("план", { file: "current/DayPlan 2026-11-20.md" })).toEqual({ content: "план", truncated: false });
+    const long = fitText('"строка"\n'.repeat(10_000), { file: "x" });
+    expect(long.truncated).toBe(true);
+    expect(new TextEncoder().encode(JSON.stringify(JSON.stringify({ file: "x", ...long }))).length).toBeLessThan(PRIVATE_READ_RESPONSE_BUDGET_BYTES);
+  });
+});
+
+describe("prepareDayPlan", () => {
+  it("drops HTML comments and lists level 2-3 headings for reading by section", () => {
+    const plan = prepareDayPlan("# Day Plan: 20 ноября\n<!-- служебная метка -->\n## На сегодня\nа\n### Саморазвитие\nб\n#### мелочь\n```\n## не заголовок\n```\n");
+    expect(plan.text).not.toContain("служебная метка");
+    expect(plan.headings).toEqual(["На сегодня", "Саморазвитие"]);
   });
 });
