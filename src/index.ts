@@ -287,6 +287,7 @@ async function handleWorkProductRead(
   };
 
   if (toolName === "day_plan") {
+    if (args.date !== undefined && args.date !== null && typeof args.date !== "string") return toolError(id, "Error: date must be YYYY-MM-DD", "validation");
     const date = typeof args.date === "string" && args.date.trim() ? args.date.trim() : undefined;
     if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) return toolError(id, "Error: date must be YYYY-MM-DD", "validation");
     const governance = source ?? await findGovernanceSource(env, ctx);
@@ -299,7 +300,7 @@ async function handleWorkProductRead(
     // sort last, so a full listing could hide today's plan behind an old one.
     if ((archive?.length ?? 0) >= GITHUB_CONTENTS_LIST_LIMIT || (current?.length ?? 0) >= GITHUB_CONTENTS_LIST_LIMIT) {
       log("listing_limit");
-      return toolError(id, { error: "listing_too_large", message: "Папка планов дня содержит 1000 файлов или больше; список неполный. Укажи date или читай план через personal_get_document." }, "upstream");
+      return toolError(id, { error: "listing_too_large", message: "Папка планов дня содержит 1000 файлов или больше; список неполный. Читай план через personal_get_document(filename=\"current/DayPlan ГГГГ-ММ-ДД.md\")." }, "upstream");
     }
     const names = (entries: Array<{ name: string; type: string }> | null) => (entries ?? []).filter(entry => entry.type === "file").map(entry => entry.name);
     const choice = chooseDayPlan(names(current), names(archive), date);

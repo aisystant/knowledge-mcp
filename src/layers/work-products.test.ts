@@ -153,6 +153,17 @@ describe("summarizeCard", () => {
     expect(new TextEncoder().encode(JSON.stringify(card)).length).toBeLessThan(PRIVATE_READ_RESPONSE_BUDGET_BYTES);
   });
 
+  it("drops excerpts entirely at the last step instead of keeping whole sections", () => {
+    const count = 120;
+    const phases = Array.from({ length: count }, (_, index) => `  Ф${index + 1}: in_progress`).join("\n");
+    const sections = Array.from({ length: count }, (_, index) => `### Ф${index + 1} фаза\n${"ж".repeat(1_800)}`).join("\n");
+    const card = summarizeCard(`---\nphases:\n${phases}\n---\n${sections}\n`);
+    expect(card.excerpt_chars).toBe(0);
+    expect(card.sections).toHaveLength(count);
+    expect(card.sections.every(section => section.excerpt === "")).toBe(true);
+    expect(card.sections[0].chars).toBeGreaterThan(1_800);
+  });
+
   it("tells a lettered sub-phase apart from its parent phase", () => {
     const card = summarizeCard("---\nphases:\n  Ф3: done\n  Ф3а: in_progress\n---\n### Ф3 — закрыта\nстарое\n### Ф3а — открыта\nновое\n");
     expect(card.sections.map(section => section.phase)).toEqual(["Ф3а"]);

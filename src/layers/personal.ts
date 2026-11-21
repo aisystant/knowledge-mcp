@@ -2032,13 +2032,30 @@ export async function personalGetDocumentLive(
         headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
       }, "github_content", signal);
       const body = await readJson(response, "github_content") as { sha?: unknown; content?: unknown; encoding?: unknown };
-      if (!body || typeof body.sha !== "string" || !GIT_BLOB_SHA.test(body.sha)
-          || typeof body.content !== "string" || body.encoding !== "base64") {
+      if (!body || typeof body.sha !== "string" || !GIT_BLOB_SHA.test(body.sha)) {
+        throw new ReadFailure("dependency_invalid_response", "github_content");
+      }
+      let encoded: string;
+      if (body.encoding === "base64" && typeof body.content === "string") {
+        encoded = body.content;
+      } else if (body.encoding === "none" && body.content === "") {
+        // WP-560 Ф22: the Contents API leaves files of 1-100 MB empty; the blob of the same sha
+        // carries them, so content and sha still describe one version.
+        const blobResponse = await fetchReadResponse(`https://api.github.com/repos/${owner}/${repo}/git/blobs/${body.sha}`, {
+          redirect: "manual",
+          headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "aisystant-knowledge" },
+        }, "github_content", signal);
+        const blob = await readJson(blobResponse, "github_content") as { content?: unknown; encoding?: unknown };
+        if (!blob || typeof blob.content !== "string" || blob.encoding !== "base64") {
+          throw new ReadFailure("dependency_invalid_response", "github_content");
+        }
+        encoded = blob.content;
+      } else {
         throw new ReadFailure("dependency_invalid_response", "github_content");
       }
       let content: string;
       try {
-        content = decodeURIComponent(escape(atob(body.content.replace(/\n/g, ""))));
+        content = decodeURIComponent(escape(atob(encoded.replace(/\n/g, ""))));
       } catch {
         throw new ReadFailure("dependency_invalid_response", "github_content");
       }

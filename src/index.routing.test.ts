@@ -746,7 +746,7 @@ describe("WP-560 Ф22: wp_list / wp_card read the live governance repository", (
   });
 
   it("validates arguments before reading GitHub", async () => {
-    for (const [name, args] of [["day_plan", { date: "20.11.2026" }], ["wp_card", { wp: "abc" }], ["wp_card", { wp: 5, phase: "фаза" }], ["wp_list", { status: "nope" }], ["wp_list", { source: "чужой" }]] as const) {
+    for (const [name, args] of [["day_plan", { date: "20.11.2026" }], ["day_plan", { date: 20261120 }], ["wp_card", { wp: "abc" }], ["wp_card", { wp: 5, phase: "фаза" }], ["wp_list", { status: "nope" }], ["wp_list", { source: "чужой" }]] as const) {
       const response = await callTool(name, args, "private");
       expect((response.result as { error_code?: string }).error_code).toBe("validation");
     }

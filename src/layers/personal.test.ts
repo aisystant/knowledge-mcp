@@ -2105,6 +2105,30 @@ describe("personalGetDocumentLive (WP-7 Ф96)", () => {
       .rejects.toMatchObject({ code: "dependency_invalid_response", stage: "github_content" });
   });
 
+  it("reads a file over 1 MB from the blob of the same sha (WP-560 Ф22)", async () => {
+    const original = "# Большая карточка\n" + "строка\n".repeat(10);
+    const sha = "b".repeat(40);
+    const calls = queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha, content: "", encoding: "none" }),
+      responseJson({ sha, content: btoa(unescape(encodeURIComponent(original))), encoding: "base64" }),
+    ]);
+    const doc = await personalGetDocumentLive(ENV_WITH_APP, ctx(), "inbox/WP-7/WP-7.md", "DS-my-strategy");
+    expect(doc?.content).toBe(original);
+    expect(doc?.sha).toBe(sha);
+    expect(calls.at(-1)?.url).toBe(`https://api.github.com/repos/TserenTserenov/DS-my-strategy/git/blobs/${sha}`);
+  });
+
+  it("reports a malformed blob of a large file rather than an empty one", async () => {
+    queuedFetch([
+      ...installationTokenResponses(),
+      responseJson({ sha: "c".repeat(40), content: "", encoding: "none" }),
+      responseJson({ sha: "c".repeat(40), encoding: "none" }),
+    ]);
+    await expect(personalGetDocumentLive(ENV_WITH_APP, ctx(), "inbox/WP-7/WP-7.md", "DS-my-strategy"))
+      .rejects.toMatchObject({ code: "dependency_invalid_response", stage: "github_content" });
+  });
+
   it("adds ref as a query parameter to read a prior version (WP-7 Ф176)", async () => {
     const priorSha = "f".repeat(40);
     const calls = queuedFetch([
