@@ -4,6 +4,8 @@ export type ReadFailureCode =
   | "source_context_unavailable"
   | "github_not_connected"
   | "dependency_access_denied"
+  | "dependency_input_rejected"
+  | "dependency_quota_exhausted"
   | "dependency_rate_limited"
   | "dependency_unavailable"
   | "dependency_timeout"
@@ -13,10 +15,25 @@ const MESSAGES: Record<ReadFailureCode, string> = {
   source_context_unavailable: "Не удалось проверить доступные источники. Это не означает, что файлы отсутствуют. Повтори запрос позже.",
   github_not_connected: "Не удалось получить доступ к GitHub. Проверь подключение репозитория.",
   dependency_access_denied: "Сервис отклонил доступ. Проверь подключение; повтор того же запроса не восстановит права.",
+  dependency_input_rejected: "Внешний сервис смыслового поиска не принял текст этого запроса (проверка содержания). Доступ к источникам в порядке: переформулируй запрос другими словами.",
+  dependency_quota_exhausted: "У платформы временно исчерпан лимит сервиса смыслового поиска. Доступ пользователя в порядке; повтори запрос позже.",
   dependency_rate_limited: "Сервис ограничил частоту запросов. Повтори позже, учитывая retry_after_seconds, если он указан.",
   dependency_unavailable: "Сервис временно недоступен. Повтори запрос позже; файл не объявлен отсутствующим.",
   dependency_timeout: "Сервис не завершил чтение вовремя. Повтори запрос позже; файл не объявлен отсутствующим.",
   dependency_invalid_response: "Сервис вернул неподдерживаемый или повреждённый ответ. Содержимое файла не получено.",
+};
+
+type ReadToolErrorCode = "auth" | "validation" | "upstream";
+
+/**
+ * WP-596 Ф4: every ReadFailure is a dependency problem, not a caller mistake — except
+ * dependency_access_denied (the caller's own credentials/permissions are the blocker) and
+ * dependency_input_rejected (WP-560 Ф23: the provider refused the query text itself, so the
+ * caller fixes it by rewording, not by reconnecting).
+ */
+const TOOL_ERROR_CODES: Partial<Record<ReadFailureCode, ReadToolErrorCode>> = {
+  dependency_access_denied: "auth",
+  dependency_input_rejected: "validation",
 };
 
 export class ReadFailure extends Error {
@@ -35,11 +52,8 @@ export class ReadFailure extends Error {
       error: this.code,
       stage: this.stage,
       message: this.message,
-      retryable: ["source_context_unavailable", "dependency_rate_limited", "dependency_unavailable", "dependency_timeout"].includes(this.code),
-      // WP-596 Ф4: every ReadFailure is a dependency problem, not a caller mistake — except
-      // dependency_access_denied, which means the caller's own credentials/permissions are the
-      // actual blocker (an auth problem, not an upstream outage).
-      error_code: (this.code === "dependency_access_denied" ? "auth" : "upstream") as "auth" | "upstream",
+      retryable: ["source_context_unavailable", "dependency_quota_exhausted", "dependency_rate_limited", "dependency_unavailable", "dependency_timeout"].includes(this.code),
+      error_code: TOOL_ERROR_CODES[this.code] ?? ("upstream" as ReadToolErrorCode),
       ...(this.status === undefined ? {} : { status: this.status }),
       ...(this.retryAfterSeconds === undefined ? {} : { retry_after_seconds: this.retryAfterSeconds }),
     };
@@ -94,6 +108,48 @@ export function readHttpFailure(response: Response, stage: ReadStage): ReadFailu
     : response.status >= 500 ? "dependency_unavailable"
     : "dependency_invalid_response";
   return new ReadFailure(code, stage, response.status, rateLimited ? retryAfterSeconds(response) : undefined);
+}
+
+/** Closed set of refusal reasons; only these words ever reach the log, never provider text. */
+export type ProviderRefusalReason = "input_flagged" | "key_limit" | "other";
+
+const PROVIDER_BODY_LIMIT = 4_096;
+
+/**
+ * WP-560 Ф23: OpenRouter answers 403 both for "your input was flagged" (moderation of the
+ * query text) and for "key limit exceeded" (the platform's spend cap). Before this, both
+ * became dependency_access_denied with error_code "auth", and a participant's agent asked to
+ * "restore access" (21.11). The body is read only to pick a reason from a closed set.
+ */
+export function classifyProviderRefusal(body: string): ProviderRefusalReason {
+  let parsed: { error?: { message?: unknown; metadata?: { reasons?: unknown } } } | undefined;
+  try { parsed = JSON.parse(body); } catch { return "other"; }
+  const error = parsed?.error;
+  if (Array.isArray(error?.metadata?.reasons)) return "input_flagged";
+  const message = typeof error?.message === "string" ? error.message : "";
+  if (/flagged|moderation/i.test(message)) return "input_flagged";
+  if (/limit|credit/i.test(message)) return "key_limit";
+  return "other";
+}
+
+// An unreadable body is not an error of its own: the refusal is then logged with reason "other".
+async function boundedBody(response: Response): Promise<string> {
+  try {
+    return (await response.text()).slice(0, PROVIDER_BODY_LIMIT);
+  } catch {
+    return "";
+  }
+}
+
+/** Embeddings-specific HTTP failure: tells a refused query text and a spent key apart from real access loss. */
+export async function readEmbeddingsFailure(response: Response): Promise<ReadFailure> {
+  const generic = readHttpFailure(response, "embeddings");
+  if (response.status !== 402 && generic.code !== "dependency_access_denied") return generic;
+  const reason = response.status === 402 ? "key_limit" : classifyProviderRefusal(await boundedBody(response));
+  console.warn(JSON.stringify({ event: "embeddings_refused", status: response.status, reason }));
+  if (reason === "input_flagged") return new ReadFailure("dependency_input_rejected", "embeddings", response.status);
+  if (reason === "key_limit") return new ReadFailure("dependency_quota_exhausted", "embeddings", response.status);
+  return generic;
 }
 
 /** Covers headers AND body; racing also bounds a dependency that ignores AbortSignal. */

@@ -1,4 +1,4 @@
-import { ReadFailure, createReadTrace, fetchReadResponse, readHttpFailure, readJson, withReadDeadline, type ReadTrace } from "../read-failure.js";
+import { ReadFailure, createReadTrace, fetchReadResponse, readEmbeddingsFailure, readJson, withReadDeadline, type ReadTrace } from "../read-failure.js";
 import { normalizeSearchResultLimit } from "../search-limits.js";
 import { activeTeamBinding, issueTeamToken, repositoryToken, type TeamBinding, teamMarkdownFiles, teamRepositoryName, teamReposEnabled } from "./team-github.js";
 // Personal-corpus data layer for the private MCP mode (WP-410 срез-2b).
@@ -1639,7 +1639,7 @@ export async function personalGetEmbedding(apiKey: string, text: string, deadlin
         }
         return embedding as number[];
       }
-      const error = readHttpFailure(response, "embeddings");
+      const error = await readEmbeddingsFailure(response);
       if (response.status < 500 && response.status !== 429 || attempt === OPENAI_MAX_ATTEMPTS) throw error;
       const delay = Math.max(error.retryAfterSeconds === undefined ? 0 : error.retryAfterSeconds * 1000,
         Math.min(OPENAI_BASE_DELAY_MS * Math.pow(2, attempt - 1), OPENAI_MAX_DELAY_MS));

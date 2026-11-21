@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ReadFailure, createReadTrace, fetchReadResponse, readHttpFailure, readJson, withReadDeadline } from "./read-failure.js";
+import { ReadFailure, classifyProviderRefusal, createReadTrace, fetchReadResponse, readEmbeddingsFailure, readHttpFailure, readJson, withReadDeadline } from "./read-failure.js";
 
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
@@ -113,5 +113,54 @@ describe("safe read diagnostics", () => {
     } catch (caught) { error = caught; }
     expect(error).toMatchObject({ code: "dependency_unavailable", stage: "github_content" });
     expect(String(error)).not.toContain("PRIVATE-TOKEN");
+  });
+});
+
+describe("embeddings refusal reasons (WP-560 Ф23)", () => {
+  const moderation = JSON.stringify({ error: { code: 403, message: "PRIVATE-TEXT input was flagged", metadata: { reasons: ["harassment"], flagged_input: "PRIVATE-QUERY" } } });
+  const keyLimit = JSON.stringify({ error: { code: 403, message: "Key limit exceeded (weekly limit)" } });
+
+  it.each([
+    [moderation, "input_flagged"],
+    [JSON.stringify({ error: { message: "Your input was flagged by moderation" } }), "input_flagged"],
+    [keyLimit, "key_limit"],
+    [JSON.stringify({ error: { message: "insufficient credits" } }), "key_limit"],
+    [JSON.stringify({ error: { message: "Forbidden" } }), "other"],
+    ["not json", "other"],
+    ["", "other"],
+  ])("classifies %s as %s", (body, reason) => {
+    expect(classifyProviderRefusal(body)).toBe(reason);
+  });
+
+  it("reports flagged query text as a validation problem, logging only the fixed reason", async () => {
+    const logs = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const failure = await readEmbeddingsFailure(new Response(moderation, { status: 403 }));
+    expect(failure.toJSON()).toMatchObject({ error: "dependency_input_rejected", stage: "embeddings", status: 403, retryable: false, error_code: "validation" });
+    expect(logs.mock.calls.map(([line]) => JSON.parse(line))).toEqual([{ event: "embeddings_refused", status: 403, reason: "input_flagged" }]);
+    expect(JSON.stringify([failure.toJSON(), logs.mock.calls])).not.toContain("PRIVATE-");
+  });
+
+  it("reports a spent platform key as a retryable upstream problem, not the user's access", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    for (const response of [new Response(keyLimit, { status: 403 }), new Response("", { status: 402 })]) {
+      expect((await readEmbeddingsFailure(response)).toJSON())
+        .toMatchObject({ error: "dependency_quota_exhausted", retryable: true, error_code: "upstream" });
+    }
+  });
+
+  it("keeps an unexplained 403 as access denied and logs it as other", async () => {
+    const logs = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const failure = await readEmbeddingsFailure(new Response("PRIVATE-BODY", { status: 403 }));
+    expect(failure.toJSON()).toMatchObject({ error: "dependency_access_denied", error_code: "auth" });
+    expect(JSON.parse(logs.mock.calls[0][0])).toEqual({ event: "embeddings_refused", status: 403, reason: "other" });
+  });
+
+  it("does not read the body or log a refusal for rate limits and outages", async () => {
+    const logs = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const limited = new Response(moderation, { status: 429 });
+    expect((await readEmbeddingsFailure(limited)).code).toBe("dependency_rate_limited");
+    expect(limited.bodyUsed).toBe(false);
+    expect((await readEmbeddingsFailure(new Response("", { status: 503 }))).code).toBe("dependency_unavailable");
+    expect(logs).not.toHaveBeenCalled();
   });
 });

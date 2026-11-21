@@ -2821,6 +2821,17 @@ describe("read failures remain distinguishable from missing documents", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("marks a provider-refused query text as rejected input, not lost access (WP-560 Ф23)", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    queuedFetch([responseJson({ error: { code: 403, message: "input was flagged", metadata: { reasons: ["x"] } } }, 403)]);
+    queryQueue.push([]);
+    const result = await personalSearchDocuments(ENV, ctx(), "finding my notes", "DS-my-strategy", 5);
+    expect(result).toHaveLength(0);
+    expect(result).toHaveProperty("degradation.error", "dependency_input_rejected");
+    expect(result).toHaveProperty("degradation.error_code", "validation");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("does not expose provider response text in an embeddings failure", async () => {
     queuedFetch([responseJson({ error: "PRIVATE-SENTINEL" }, 403)]);
     let failure: unknown;

@@ -52,6 +52,15 @@ describe("private search response bounds", () => {
     expect(warning).not.toContain("не доказывает отсутствие");
   });
 
+  it("asks to reword, not to restore access, when the provider refused the query text (WP-560 Ф23)", () => {
+    const diagnostic = { error: "dependency_input_rejected", stage: "embeddings", retryable: false, status: 403, error_code: "validation" };
+    const response = buildPrivateSearchResponse(1, [], diagnostic);
+    const warning = JSON.parse(result(response).content[1].text).warning as string;
+    expect(warning).toContain("Переформулируй запрос");
+    expect(warning).toContain("восстанавливать его не нужно");
+    expect(warning).not.toContain("Не ищи");
+  });
+
   it("keeps the retry-friendly wording when the degradation is retryable", () => {
     const diagnostic = { error: "dependency_rate_limited", stage: "embeddings", retryable: true };
     const response = buildPrivateSearchResponse(1, [], diagnostic);
