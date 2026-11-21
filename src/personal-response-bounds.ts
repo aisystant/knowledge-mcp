@@ -82,6 +82,21 @@ function isTerminalDegradation(degradation: unknown): boolean {
     && "retryable" in degradation && (degradation as { retryable: unknown }).retryable === false;
 }
 
+/** WP-560 Ф23: a refused query text is fixed by rewording it, which the terminal warning forbids. */
+function isRejectedInput(degradation: unknown): boolean {
+  return typeof degradation === "object" && degradation !== null
+    && (degradation as { error?: unknown }).error === "dependency_input_rejected";
+}
+
+function degradationWarning(degradation: unknown): string {
+  if (isRejectedInput(degradation)) {
+    return "Смысловой поиск не принял текст этого запроса (проверка содержания у внешнего сервиса); выполнен только поиск по тексту. Доступ к источникам в порядке, восстанавливать его не нужно. Переформулируй запрос другими словами, не повторяй тот же текст.";
+  }
+  return isTerminalDegradation(degradation)
+    ? "Смысловой поиск недоступен и попытка не восстановит доступ. Не ищи тот же факт другими инструментами в этом ходу — сообщи пользователю, что поиск недоступен, и этим результатом текстового поиска придётся ограничиться."
+    : "Смысловой поиск недоступен; выполнен только поиск по тексту. Пустой результат не доказывает отсутствие документа.";
+}
+
 export function buildPrivateSearchResponse<T extends { content: string }>(
   id: RequestId, results: T[], degradation?: unknown,
 ): ResponseEnvelope {
@@ -93,9 +108,7 @@ export function buildPrivateSearchResponse<T extends { content: string }>(
     });
     const content = [{ type: "text", text: JSON.stringify(hits, null, 2) }];
     if (degradation) content.push({ type: "text", text: JSON.stringify({
-      warning: isTerminalDegradation(degradation)
-        ? "Смысловой поиск недоступен и попытка не восстановит доступ. Не ищи тот же факт другими инструментами в этом ходу — сообщи пользователю, что поиск недоступен, и этим результатом текстового поиска придётся ограничиться."
-        : "Смысловой поиск недоступен; выполнен только поиск по тексту. Пустой результат не доказывает отсутствие документа.",
+      warning: degradationWarning(degradation),
       diagnostic: degradation,
     }) });
     return { jsonrpc: "2.0", id, result: { content, ...(degradation && results.length === 0 ? { isError: true } : {}) } };

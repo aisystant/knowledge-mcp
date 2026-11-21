@@ -50,7 +50,9 @@ export function withoutDependencyTag(reason: string): string {
  */
 const OUTAGE_DETAILS: Record<string, string> = {
   dependency_access_denied:
-    "Сервис векторов (OpenRouter) отклонил ключ сервера знаний, чаще всего из-за исчерпанного лимита трат ключа. Что делать: проверить лимит ключа сервера знаний в панели OpenRouter.",
+    "Сервис векторов (OpenRouter) отклонил ключ сервера знаний. Что делать: проверить, что ключ сервера знаний действует, в панели OpenRouter.",
+  dependency_quota_exhausted:
+    "У ключа сервера знаний в OpenRouter исчерпан лимит трат. Что делать: поднять лимит или дождаться его сброса в панели OpenRouter.",
   dependency_rate_limited:
     "Сервис векторов (OpenRouter) ограничивает частоту запросов сервера знаний. Что делать: если это длится больше часа, проверить лимит ключа сервера знаний в панели OpenRouter.",
 };
@@ -173,6 +175,8 @@ const DEPENDENCY_STAGES: Record<string, string> = {
 
 const DEPENDENCY_CODES: Record<string, string> = {
   dependency_access_denied: "отклонил доступ",
+  dependency_input_rejected: "не принял текст файла",
+  dependency_quota_exhausted: "исчерпал лимит трат",
   dependency_rate_limited: "ограничил частоту запросов",
   dependency_unavailable: "недоступен",
   dependency_timeout: "не ответил вовремя",
