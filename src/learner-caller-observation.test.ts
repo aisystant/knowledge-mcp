@@ -104,6 +104,17 @@ describe("classifyLearnerCaller", () => {
     expect(classifyLearnerCaller(BASE_ENV, "sub", withHeader(GATEWAY_SECRET))).toEqual({ kind: "jwt" });
   });
 
+  it("accepts the gateway's own credential from its dedicated variable, named gateway", () => {
+    const env = { ...BASE_ENV, LEARNER_TOOLS_SERVICE_SECRETS: undefined, LEARNER_TOOLS_GATEWAY_SECRET: "dedicated-gateway-value" } as unknown as Env;
+    expect(classifyLearnerCaller(env, undefined, withHeader("dedicated-gateway-value"))).toEqual({ kind: "service", name: "gateway" });
+    expect(classifyLearnerCaller(env, undefined, withHeader("another-value"))).toEqual({ kind: "unauthenticated" });
+  });
+
+  it("an empty dedicated gateway variable authenticates nobody", () => {
+    const env = { ...BASE_ENV, LEARNER_TOOLS_SERVICE_SECRETS: undefined, LEARNER_TOOLS_GATEWAY_SECRET: "" } as unknown as Env;
+    expect(classifyLearnerCaller(env, undefined, withHeader(""))).toEqual({ kind: "unauthenticated" });
+  });
+
   it.each([undefined, "", "gateway", ":secret-without-name", "gateway:"])("ignores an unusable secret list %j", (secrets) => {
     const env = { ...BASE_ENV, LEARNER_TOOLS_SERVICE_SECRETS: secrets } as unknown as Env;
     expect(classifyLearnerCaller(env, undefined, withHeader(GATEWAY_SECRET))).toEqual({ kind: "unauthenticated" });

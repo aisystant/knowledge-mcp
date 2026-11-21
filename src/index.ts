@@ -145,6 +145,10 @@ export interface Env extends ObservationEnv, VectorScanEnv {
   // WP-7 Ф190: credentials of platform callers (gateway, n8n) that may call the learner tools
   // without a user token, as comma-separated "name:secret" pairs so each can be revoked alone.
   LEARNER_TOOLS_SERVICE_SECRETS?: string;
+  // WP-560 F19: the gateway's own credential, the same variable name and value as on the gateway
+  // worker. A request that presents it is a platform service named "gateway". Kept out of the list
+  // above because that list is write-only in Cloudflare and cannot be appended to without its old value.
+  LEARNER_TOOLS_GATEWAY_SECRET?: string;
   // "enforce": the learner tools refuse callers that present neither a verified JWT nor a
   // service credential. Anything else (unset, "off"): observe only.
   LEARNER_TOOLS_SERVICE_AUTH?: string;
@@ -3604,15 +3608,16 @@ export type LearnerCaller = { kind: "jwt" } | { kind: "service"; name: string } 
 export function classifyLearnerCaller(env: Env, jwtSubject: string | undefined, rawRequest: Request | undefined): LearnerCaller {
   if (jwtSubject !== undefined) return { kind: "jwt" };
   const presented = rawRequest?.headers.get(SERVICE_AUTH_HEADER);
-  if (presented && env.LEARNER_TOOLS_SERVICE_SECRETS) {
+  if (presented && (env.LEARNER_TOOLS_SERVICE_SECRETS || env.LEARNER_TOOLS_GATEWAY_SECRET)) {
     let matched: string | undefined;
     // Compare against every configured secret without stopping at the first match.
-    for (const pair of env.LEARNER_TOOLS_SERVICE_SECRETS.split(",")) {
+    for (const pair of (env.LEARNER_TOOLS_SERVICE_SECRETS ?? "").split(",")) {
       const separator = pair.indexOf(":");
       if (separator <= 0) continue;
       const secret = pair.slice(separator + 1).trim();
       if (secret && secretsEqual(presented, secret)) matched ??= pair.slice(0, separator).trim();
     }
+    if (env.LEARNER_TOOLS_GATEWAY_SECRET && secretsEqual(presented, env.LEARNER_TOOLS_GATEWAY_SECRET)) matched ??= "gateway";
     if (matched) return { kind: "service", name: matched };
   }
   return { kind: "unauthenticated" };
