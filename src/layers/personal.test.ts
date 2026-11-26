@@ -2845,6 +2845,24 @@ describe("read failures remain distinguishable from missing documents", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("ties the refusal record, the keyword fallback record and the read stages to one trace id (WP-560 Ф23)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    queuedFetch([responseJson({ error: "private upstream body" }, 403)]);
+    queryQueue.push([]);
+    await personalSearchDocuments(ENV, ctx(), "finding my notes", "DS-my-strategy", 5);
+    const records = [...warn.mock.calls, ...info.mock.calls].map(([line]) => JSON.parse(String(line)));
+    warn.mockRestore();
+    info.mockRestore();
+    const refused = records.find(r => r.event === "embeddings_refused");
+    const fallback = records.find(r => r.event === "personal_search_keyword_fallback");
+    const stage = records.find(r => r.event === "read_stage" && r.stage === "embedding");
+    expect(refused?.trace_id).toEqual(expect.any(String));
+    expect(fallback?.trace_id).toBe(refused?.trace_id);
+    expect(stage?.trace_id).toBe(refused?.trace_id);
+    expect(JSON.stringify(records)).not.toContain("private upstream body");
+  });
+
   it("marks a provider-refused query text as rejected input, not lost access (WP-560 Ф23)", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     queuedFetch([responseJson({ error: { code: 403, message: "input was flagged", metadata: { reasons: ["x"] } } }, 403)]);

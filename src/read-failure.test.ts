@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ReadFailure, classifyProviderRefusal, createReadTrace, fetchReadResponse, readEmbeddingsFailure, readHttpFailure, readJson, withReadDeadline } from "./read-failure.js";
+import { ReadFailure, classifyProviderRefusal, describeProviderRefusal, createReadTrace, fetchReadResponse, readEmbeddingsFailure, readHttpFailure, readJson, withReadDeadline } from "./read-failure.js";
 
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
@@ -136,7 +136,10 @@ describe("embeddings refusal reasons (WP-560 Ф23)", () => {
     const logs = vi.spyOn(console, "warn").mockImplementation(() => {});
     const failure = await readEmbeddingsFailure(new Response(moderation, { status: 403 }));
     expect(failure.toJSON()).toMatchObject({ error: "dependency_input_rejected", stage: "embeddings", status: 403, retryable: false, error_code: "validation" });
-    expect(logs.mock.calls.map(([line]) => JSON.parse(line))).toEqual([{ event: "embeddings_refused", status: 403, reason: "input_flagged" }]);
+    expect(logs.mock.calls.map(([line]) => JSON.parse(line))).toEqual([{
+      event: "embeddings_refused", status: 403, reason: "input_flagged", body_shape: "json_error", body_length: moderation.length,
+      content_type: "other", provider_code: "403", metadata_keys: ["reasons", "flagged_input"], edge_block: false,
+    }]);
     expect(JSON.stringify([failure.toJSON(), logs.mock.calls])).not.toContain("PRIVATE-");
   });
 
@@ -152,7 +155,62 @@ describe("embeddings refusal reasons (WP-560 Ф23)", () => {
     const logs = vi.spyOn(console, "warn").mockImplementation(() => {});
     const failure = await readEmbeddingsFailure(new Response("PRIVATE-BODY", { status: 403 }));
     expect(failure.toJSON()).toMatchObject({ error: "dependency_access_denied", error_code: "auth" });
-    expect(JSON.parse(logs.mock.calls[0][0])).toEqual({ event: "embeddings_refused", status: 403, reason: "other" });
+    expect(JSON.parse(logs.mock.calls[0][0])).toEqual({
+      event: "embeddings_refused", status: 403, reason: "other", body_shape: "not_json", body_length: 12,
+      content_type: "other", provider_code: null, metadata_keys: [], edge_block: false,
+    });
+    expect(logs.mock.calls[0][0]).not.toContain("PRIVATE-");
+  });
+
+  describe("refusal body shape", () => {
+    const shape = (text: string, headers: Record<string, string> = {}, truncated = false) =>
+      describeProviderRefusal(new Response(text, { status: 403, headers }), { text, length: text.length, truncated, unreadable: false });
+
+    it("tells an HTML block page from an empty body, a cut-off body and a JSON error", () => {
+      expect(shape("<html>PRIVATE-PAGE</html>", { "content-type": "text/html" }))
+        .toMatchObject({ body_shape: "not_json", content_type: "html", provider_code: null });
+      expect(shape("")).toMatchObject({ body_shape: "empty", body_length: 0 });
+      expect(describeProviderRefusal(new Response("", { status: 403 }), { text: "", length: 0, truncated: false, unreadable: true }))
+        .toMatchObject({ body_shape: "unreadable" });
+      expect(shape('{"error":{"code":403,', {}, true)).toMatchObject({ body_shape: "truncated" });
+      expect(shape('{"ok":false}')).toMatchObject({ body_shape: "json_no_error" });
+      expect(shape('{"error":{"code":"region_blocked"}}', { "content-type": "application/json" }))
+        .toMatchObject({ body_shape: "json_error", content_type: "json", provider_code: "region_blocked" });
+    });
+
+    it("reports an edge block marker and drops codes and metadata that could carry text", () => {
+      const result = shape('{"error":{"code":"PRIVATE QUERY WITH SPACES","metadata":{"provider_name":"PRIVATE-NAME","unknown":"x"}}}', { "cf-mitigated": "challenge" });
+      expect(result).toMatchObject({ edge_block: true, provider_code: null, metadata_keys: ["provider_name"] });
+      expect(JSON.stringify(result)).not.toContain("PRIVATE");
+    });
+
+    it.each(["secret_Password", "sk-or-v1-abcdef0123", "word", ""])("keeps only snake_case codes, so %j is checked", code => {
+      const expected = /^[a-z][a-z0-9_]{0,39}$/.test(code) ? code : null;
+      expect(shape(JSON.stringify({ error: { code } })).provider_code).toBe(expected);
+    });
+
+    it.each(["null", '{"error":null}', '{"error":"text"}', '{"error":{"metadata":null}}', '{"error":{"metadata":[1]}}', '{"error":{"code":4.5}}'])(
+      "does not throw on the odd body %s", body => {
+        expect(() => shape(body)).not.toThrow();
+        expect(shape(body).metadata_keys).toEqual([]);
+      });
+
+    it("marks a body longer than the read limit as truncated through readEmbeddingsFailure", async () => {
+      const logs = vi.spyOn(console, "warn").mockImplementation(() => {});
+      await readEmbeddingsFailure(new Response("x".repeat(5_000), { status: 403 }));
+      expect(JSON.parse(logs.mock.calls[0][0])).toMatchObject({ body_shape: "truncated", body_length: 5_000 });
+    });
+
+    it("links the refusal to its trace and leaves a 402 body unread", async () => {
+      const logs = vi.spyOn(console, "warn").mockImplementation(() => {});
+      await readEmbeddingsFailure(new Response("PRIVATE-BODY", { status: 403 }), "trace-1");
+      expect(JSON.parse(logs.mock.calls[0][0])).toMatchObject({ trace_id: "trace-1" });
+      logs.mockClear();
+      const paid = new Response("PRIVATE-BODY", { status: 402 });
+      await readEmbeddingsFailure(paid, "trace-2");
+      expect(paid.bodyUsed).toBe(false);
+      expect(JSON.parse(logs.mock.calls[0][0])).toEqual({ event: "embeddings_refused", status: 402, reason: "key_limit", trace_id: "trace-2" });
+    });
   });
 
   it("does not read the body or log a refusal for rate limits and outages", async () => {
