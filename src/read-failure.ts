@@ -66,6 +66,7 @@ type ReadTraceStage =
   | "db_connect" | "db_begin" | "db_context" | "db_query" | "db_commit" | "db_rollback";
 
 export interface ReadTrace {
+  readonly id: string;
   run<T>(stage: ReadTraceStage, operation: () => Promise<T>): Promise<T>;
 }
 
@@ -73,6 +74,7 @@ export interface ReadTrace {
 export function createReadTrace(operation: ReadOperation): ReadTrace {
   const traceId = crypto.randomUUID();
   return {
+    id: traceId,
     async run<T>(stage: ReadTraceStage, work: () => Promise<T>): Promise<T> {
       const fields = { event: "read_stage", trace_id: traceId, operation, stage };
       const started = performance.now();
@@ -133,20 +135,78 @@ export function classifyProviderRefusal(body: string): ProviderRefusalReason {
 }
 
 // An unreadable body is not an error of its own: the refusal is then logged with reason "other".
-async function boundedBody(response: Response): Promise<string> {
+interface ProviderBody { text: string; length: number; truncated: boolean; unreadable: boolean }
+
+async function boundedBody(response: Response): Promise<ProviderBody> {
   try {
-    return (await response.text()).slice(0, PROVIDER_BODY_LIMIT);
+    const text = await response.text();
+    return { text: text.slice(0, PROVIDER_BODY_LIMIT), length: text.length, truncated: text.length > PROVIDER_BODY_LIMIT, unreadable: false };
   } catch {
-    return "";
+    return { text: "", length: 0, truncated: false, unreadable: true };
   }
 }
 
+// snake_case only: a free-form word from the provider could carry a fragment of the query or a key id.
+const SAFE_PROVIDER_CODE_RE = /^[a-z][a-z0-9_]{0,39}$/;
+// Closed list of metadata key names that may be reported (names only, never values).
+const KNOWN_METADATA_KEYS = ["reasons", "provider_name", "raw", "flagged_input", "model_slug"] as const;
+
+type ProviderBodyShape = "empty" | "unreadable" | "truncated" | "not_json" | "json_no_error" | "json_error";
+
+export interface ProviderRefusalShape {
+  body_shape: ProviderBodyShape;
+  body_length: number;
+  content_type: "json" | "html" | "other";
+  provider_code: string | null;
+  metadata_keys: string[];
+  edge_block: boolean;
+}
+
+/**
+ * WP-560 Ф23: reason "other" alone cannot tell an HTML block page, an empty body, a cut-off body
+ * and an unfamiliar JSON error apart. Only closed-set values, numbers and snake_case codes
+ * are returned: never the provider's message, the query text or any metadata value.
+ */
+export function describeProviderRefusal(response: Response, body: ProviderBody): ProviderRefusalShape {
+  const contentType = response.headers?.get?.("content-type") ?? "";
+  const shape: ProviderRefusalShape = {
+    body_shape: "empty",
+    body_length: body.length,
+    content_type: /json/i.test(contentType) ? "json" : /html/i.test(contentType) ? "html" : "other",
+    provider_code: null,
+    metadata_keys: [],
+    edge_block: response.headers?.has?.("cf-mitigated") ?? false,
+  };
+  if (body.unreadable) return { ...shape, body_shape: "unreadable" };
+  if (body.length === 0) return shape;
+  if (body.truncated) return { ...shape, body_shape: "truncated" };
+  let parsed: { error?: { code?: unknown; metadata?: unknown } } | null;
+  try { parsed = JSON.parse(body.text); } catch { return { ...shape, body_shape: "not_json" }; }
+  const error = parsed?.error;
+  if (typeof error !== "object" || error === null) return { ...shape, body_shape: "json_no_error" };
+  const code = error.code;
+  const providerCode = typeof code === "number" && Number.isInteger(code) ? String(code)
+    : typeof code === "string" && SAFE_PROVIDER_CODE_RE.test(code) ? code : null;
+  const metadata = typeof error.metadata === "object" && error.metadata !== null ? error.metadata : {};
+  return {
+    ...shape,
+    body_shape: "json_error",
+    provider_code: providerCode,
+    metadata_keys: KNOWN_METADATA_KEYS.filter(key => key in metadata),
+  };
+}
+
 /** Embeddings-specific HTTP failure: tells a refused query text and a spent key apart from real access loss. */
-export async function readEmbeddingsFailure(response: Response): Promise<ReadFailure> {
+export async function readEmbeddingsFailure(response: Response, traceId?: string): Promise<ReadFailure> {
   const generic = readHttpFailure(response, "embeddings");
   if (response.status !== 402 && generic.code !== "dependency_access_denied") return generic;
-  const reason = response.status === 402 ? "key_limit" : classifyProviderRefusal(await boundedBody(response));
-  console.warn(JSON.stringify({ event: "embeddings_refused", status: response.status, reason }));
+  // 402 already means "key limit": its body is not read, so a stalled body cannot turn it into a timeout.
+  const body = response.status === 402 ? undefined : await boundedBody(response);
+  const reason = body === undefined ? "key_limit" : classifyProviderRefusal(body.text);
+  console.warn(JSON.stringify({
+    event: "embeddings_refused", status: response.status, reason, ...(traceId ? { trace_id: traceId } : {}),
+    ...(body ? describeProviderRefusal(response, body) : {}),
+  }));
   if (reason === "input_flagged") return new ReadFailure("dependency_input_rejected", "embeddings", response.status);
   if (reason === "key_limit") return new ReadFailure("dependency_quota_exhausted", "embeddings", response.status);
   return generic;

@@ -1614,7 +1614,7 @@ function personalGithubUrl(ctx: UserContext, source: string, filename: string): 
 }
 
 // Exported for reuse by ./reindex.ts (WP-410 Деплой-2 группа Б) — same embedding call.
-export async function personalGetEmbedding(apiKey: string, text: string, deadlineAt: number = Date.now() + 8_000): Promise<number[]> {
+export async function personalGetEmbedding(apiKey: string, text: string, deadlineAt: number = Date.now() + 8_000, traceId?: string): Promise<number[]> {
   const embeddingDeadlineAt = Math.min(deadlineAt, Date.now() + 8_000);
   const timeoutMs = remainingSearchBudget(embeddingDeadlineAt, "embeddings");
   return withReadDeadline("embeddings", async signal => {
@@ -1639,7 +1639,7 @@ export async function personalGetEmbedding(apiKey: string, text: string, deadlin
         }
         return embedding as number[];
       }
-      const error = await readEmbeddingsFailure(response);
+      const error = await readEmbeddingsFailure(response, traceId);
       if (response.status < 500 && response.status !== 429 || attempt === OPENAI_MAX_ATTEMPTS) throw error;
       const delay = Math.max(error.retryAfterSeconds === undefined ? 0 : error.retryAfterSeconds * 1000,
         Math.min(OPENAI_BASE_DELAY_MS * Math.pow(2, attempt - 1), OPENAI_MAX_DELAY_MS));
@@ -1730,7 +1730,7 @@ async function personalVectorSearch(
   deadlineAt: number,
   trace: ReadTrace,
 ): Promise<PersonalSearchResult[]> {
-  const embedding = await trace.run("embedding", () => personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query, deadlineAt));
+  const embedding = await trace.run("embedding", () => personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query, deadlineAt, trace.id));
   const vec = `[${embedding.join(",")}]`;
   const sql = personalDb(env);
   const schema = getKnowledgeSchema(env);
@@ -1784,7 +1784,7 @@ export async function personalSearchDocuments(
       vectorResults = await trace.run("vector", () => personalVectorSearch(env, ctx, query, source, limit, deadlineAt, trace));
     } catch (error) {
       if (!(error instanceof ReadFailure) || error.stage !== "embeddings") throw error;
-      console.warn(JSON.stringify({ event: "personal_search_keyword_fallback", ...error.toJSON() }));
+      console.warn(JSON.stringify({ event: "personal_search_keyword_fallback", trace_id: trace.id, ...error.toJSON() }));
       const fallback = await keyword();
       return Object.assign(await currentIndexedResults(env, ctx, fallback), { degradation: error.toJSON() });
     }
@@ -1817,7 +1817,7 @@ export async function personalMemorySearch(
   const deadlineAt = Date.now() + PERSONAL_SEARCH_BUDGET_MS;
   const trace = createReadTrace("memory_search");
   return trace.run("search", async () => {
-    const embedding = await trace.run("embedding", () => personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query, deadlineAt));
+    const embedding = await trace.run("embedding", () => personalGetEmbedding(env.OPENROUTER_API_KEY ?? "", query, deadlineAt, trace.id));
     const vec = `[${embedding.join(",")}]`;
     const sql = personalDb(env);
     const schema = getKnowledgeSchema(env);
